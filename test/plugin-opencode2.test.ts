@@ -178,6 +178,7 @@ describe("opencode2 provider inventory", () => {
     expect(model!.enabled).toBe(true)
     // Test fixture uses a legacy id that is not in the current pricing table.
     expect(model!.cost).toEqual([])
+    expect(model!.family).toBe("claude-sonnet")
   })
 
   test("attaches published Cursor token rates to catalog cost tiers", () => {

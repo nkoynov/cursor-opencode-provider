@@ -60,6 +60,7 @@ export type ModelInfo2 = {
   modelID: string
   providerID: string
   name: string
+  family?: string
   capabilities: { tools: boolean; input: readonly string[]; output: readonly string[] }
   variants: readonly ModelVariantInfo[]
   time: { released: number }
