@@ -234,6 +234,12 @@ export type CursorSession = {
   knownMcpServers?: string[]
   stream: BidiStream
   frames: AsyncIterator<Frame>
+  /**
+   * A frame read that was started but not consumed (a held tool step closed
+   * while waiting on it, or a frame put back for the next pump pass). Every
+   * reader takes it before calling `frames.next()` so no frame is skipped.
+   */
+  queuedFrame?: Promise<IteratorResult<Frame>>
   pending: Map<number, PendingExec>
   /**
    * Cursor display tool calls (tool_call_started) awaiting either an exec or a

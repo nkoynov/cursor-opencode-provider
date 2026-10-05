@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Tool calls the model makes in parallel (for example several subagents) run at the same time instead of one after another ([#N](https://github.com/oakimov/cursor-opencode-provider/pull/N) by [@nkoynov](https://github.com/nkoynov))
+
 ## [0.8.0] - 2026-10-04
 
 ### Changed

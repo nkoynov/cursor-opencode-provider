@@ -329,6 +329,10 @@ The provider reads the permission-filtered subagent catalog from the current hos
 
 Primary modes and hidden/internal agents are never selected unless OpenCode explicitly exposes them as spawnable. Alternate-host agents and schemas are OCP responsibilities; see its host guides under [Coding-agent compatibility](#coding-agent-compatibility).
 
+### Parallel tool calls
+
+When the model requests several tool calls in one step (for example three subagents "in parallel"), Cursor sends each exec request as soon as that call is generated and then reports how many calls the step requested (`tool_requests_listed`). The provider emits all of them in one AI SDK step and ends it when the count is reached, so OpenCode runs them at the same time and returns their results together. Until Cursor has reported a count in the current process, each call still ends its own step.
+
 ## Package exports
 
 | Import path | Export |
