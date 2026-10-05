@@ -232,6 +232,8 @@ export type CursorSession = {
   toolCatalog?: OpencodeToolDef[]
   /** Configured MCP server ids used to split flattened host tool names. */
   knownMcpServers?: string[]
+  /** The Run's model accepts images, so held-Run exec results may carry them. */
+  supportsImages?: boolean
   stream: BidiStream
   frames: AsyncIterator<Frame>
   pending: Map<number, PendingExec>

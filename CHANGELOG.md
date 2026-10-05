@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Images read with the `read` tool reach the model in the same turn instead of a "Media attached" placeholder ([#42](https://github.com/oakimov/cursor-opencode-provider/pull/42) by [@nkoynov](https://github.com/nkoynov))
+
 ## [0.8.0] - 2026-10-04
 
 ### Changed
