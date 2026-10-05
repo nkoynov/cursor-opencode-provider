@@ -21,7 +21,7 @@ import {
   resolveCursorWireModelId,
   type ModelCache,
 } from "../src/models.js"
-import { modelInfoToConfig, modelsToConfig } from "../src/model-config.js"
+import { cursorModelFamily, modelInfoToConfig, modelsToConfig } from "../src/model-config.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
 
 const tempDirs: string[] = []
@@ -271,6 +271,54 @@ describe("mapAvailableModelsResponse", () => {
     expect(models[0].maxContextForMaxMode).toBe(1000000)
     expect(models[1].maxContext).toBe(272000)
     expect(models[2].maxContext).toBeUndefined()
+  })
+})
+
+describe("cursorModelFamily", () => {
+  it("drops version segments the way models.dev names families", () => {
+    expect(cursorModelFamily("claude-haiku-4-5")).toBe("claude-haiku")
+    expect(cursorModelFamily("claude-opus-5-5")).toBe("claude-opus")
+    expect(cursorModelFamily("claude-4.5-sonnet")).toBe("claude-sonnet")
+    expect(cursorModelFamily("gemini-3.8-flash")).toBe("gemini-flash")
+    expect(cursorModelFamily("gemini-2.5-flash-lite")).toBe("gemini-flash-lite")
+    expect(cursorModelFamily("gpt-5.6-luna")).toBe("gpt-luna")
+    expect(cursorModelFamily("gpt-5.4-nano")).toBe("gpt-nano")
+    expect(cursorModelFamily("gpt-5.5")).toBe("gpt")
+    expect(cursorModelFamily("glm-5p3-flash")).toBe("glm-flash")
+    expect(cursorModelFamily("composer-2.5")).toBe("composer")
+  })
+
+  it("leaves Cursor Auto without a family", () => {
+    expect(cursorModelFamily("default")).toBeUndefined()
+  })
+})
+
+describe("modelInfoToConfig family", () => {
+  it("sets the family OpenCode uses to pick its small model", () => {
+    // OpenCode 2.0 Model.small: gpt-luna, gemini-flash-lite, gemini-flash, claude-haiku;
+    // OpenCode 1.x: gemini-flash, gpt-nano, claude-haiku. No family means titles run on the session model.
+    expect(modelInfoToConfig({ id: "claude-haiku-4-5", variants: [] }).family).toBe("claude-haiku")
+    expect(modelInfoToConfig({ id: "default", variants: [] }).family).toBeUndefined()
+  })
+
+  it("prefers a family reported by Cursor", () => {
+    expect(modelInfoToConfig({ id: "claude-haiku-4-5", family: "claude-haiku-x", variants: [] }).family)
+      .toBe("claude-haiku-x")
+  })
+
+  it("keeps the wire model family on long-context and Fast entries", () => {
+    const config = modelsToConfig([{
+      id: "claude-opus-5-5",
+      displayName: "Claude Opus 5.5",
+      maxContext: 300_000,
+      maxContextForMaxMode: 1_000_000,
+      variants: [
+        { key: "a", displayName: "High", isDefaultNonMax: true, isDefaultMax: false, parameterValues: [{ id: "effort", value: "high" }] },
+        { key: "b", displayName: "High 1M", isDefaultNonMax: false, isDefaultMax: true, parameterValues: [{ id: "effort", value: "high" }, { id: "context", value: "1m" }] },
+      ],
+    }])
+    expect(Object.keys(config).length).toBeGreaterThan(1)
+    for (const entry of Object.values(config)) expect(entry.family).toBe("claude-opus")
   })
 })
 

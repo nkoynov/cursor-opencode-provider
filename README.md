@@ -181,6 +181,10 @@ The provider resolves each catalog context limit in this order:
 
 The docs fallback only fills static catalog metadata. It does not invent Cursor variants or enable a long-context tier that `AvailableModels` did not advertise.
 
+#### Model families
+
+Each catalog entry carries a models.dev-style `family`: the Cursor model id without its version segments (`claude-haiku-4-5` → `claude-haiku`, `gpt-5.6-luna` → `gpt-luna`; `-1m` / `-fast` entries keep their model's family). OpenCode picks the small model for session titles and summaries by family (2.0: `gpt-luna`, `gemini-flash-lite`, `gemini-flash`, `claude-haiku`; 1.x: `gemini-flash`, `gpt-nano`, `claude-haiku`). With no family it uses the session's own model, so every title ran on the model you were coding with. To pick a different one, set the 2.0 `title` agent's `model` (1.x: `small_model`).
+
 #### Image input
 
 The provider advertises `text` + `image` input only when the selected Cursor model supports images; model output remains text. This works in the classic plugin, the 1.18 v2 plugin, and OpenCode 2.0.

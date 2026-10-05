@@ -8,6 +8,7 @@
 - OpenCode 2.0 loads the AI SDK provider at the installed plugin's version instead of the latest npm release ([#41](https://github.com/oakimov/cursor-opencode-provider/pull/41) by [@nkoynov](https://github.com/nkoynov))
 - Images returned by MCP tools reach the model in the same turn instead of after the next user message ([#46](https://github.com/oakimov/cursor-opencode-provider/pull/46) by [@nkoynov](https://github.com/nkoynov))
 - Images read with the `read` tool reach the model in the same turn instead of a "Media attached" placeholder ([#42](https://github.com/oakimov/cursor-opencode-provider/pull/42) by [@nkoynov](https://github.com/nkoynov))
+- Cursor models carry a model `family`, so OpenCode writes session titles and summaries with its small model (for example GPT-5.6 Luna) instead of the model you are coding with ([#43](https://github.com/oakimov/cursor-opencode-provider/pull/43) by [@nkoynov](https://github.com/nkoynov))
 
 ## [0.8.0] - 2026-10-04
 
