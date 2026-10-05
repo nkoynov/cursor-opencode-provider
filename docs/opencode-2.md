@@ -26,7 +26,7 @@ Synced models set `time.released` to `0` (Cursor AvailableModels does not expose
 
 Pin a version if you want: `"cursor-opencode-provider@0.4.1/plugin/opencode2"`.
 
-OpenCode 2.0 installs the published package into its host cache and loads the AI SDK entry from there (`aisdk:cursor-opencode-provider`). No extra env vars are required.
+OpenCode 2.0 installs the published package into its host cache and loads the AI SDK entry from there (`aisdk:cursor-opencode-provider@<version>`, pinned to the version of the plugin that registered it, so a pinned plugin never runs a newer language model). No extra env vars are required.
 
 ## Config isolation
 

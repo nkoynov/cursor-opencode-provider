@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import plugin from "../src/plugin-opencode2.js"
 import { CursorPlugin } from "../src/plugin.js"
-import { applyCursorProviderInventory, CURSOR_AISDK_PACKAGE } from "../src/opencode2/catalog.js"
+import { applyCursorProviderInventory, CURSOR_AISDK_PACKAGE, ownPackageSpec } from "../src/opencode2/catalog.js"
 import {
   accessTokenFromCredential,
   applyCursorIntegration,
@@ -157,6 +157,29 @@ describe("opencode2 provider inventory", () => {
     expect(provider!.package.startsWith("aisdk:")).toBe(true)
     expect(provider!.integrationID).toBe("cursor")
     expect(provider!.activation).toBe("enabled")
+  })
+
+  test("pins the aisdk package to this package's own version", () => {
+    // A bare name is resolved as `@latest`, so the host would load a newer
+    // language model than the plugin the user pinned.
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"))
+    if (!process.env.CURSOR_OPENCODE2_DEV_ENTRY) {
+      expect(CURSOR_AISDK_PACKAGE).toBe(`aisdk:cursor-opencode-provider@${pkg.version}`)
+    }
+    expect(ownPackageSpec()).toBe(`cursor-opencode-provider@${pkg.version}`)
+  })
+
+  test("falls back to the bare package name without a matching package.json", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cursor-pin-"))
+    try {
+      expect(ownPackageSpec(new URL(`file://${dir}/missing.json`))).toBe("cursor-opencode-provider")
+      writeFileSync(join(dir, "other.json"), JSON.stringify({ name: "some-bundle", version: "1.2.3" }))
+      expect(ownPackageSpec(new URL(`file://${dir}/other.json`))).toBe("cursor-opencode-provider")
+      writeFileSync(join(dir, "range.json"), JSON.stringify({ name: "cursor-opencode-provider", version: "^0.8.0" }))
+      expect(ownPackageSpec(new URL(`file://${dir}/range.json`))).toBe("cursor-opencode-provider")
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   test("maps a model into the 2.0 shape", () => {

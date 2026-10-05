@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- OpenCode 2.0 loads the AI SDK provider at the installed plugin's version instead of the latest npm release ([#41](https://github.com/oakimov/cursor-opencode-provider/pull/41) by [@nkoynov](https://github.com/nkoynov))
+
 ## [0.8.0] - 2026-10-04
 
 ### Changed
