@@ -451,6 +451,13 @@ export function createMessageTypes(): protobuf.Root {
     { id: 2, name: "step_duration_ms", type: "int64" },
   ])
 
+  // agent.v1 ToolRequestsListedUpdate (Cursor CLI 2026.10.01:
+  // "ToolRequestsListedUpdate|1 call_count 13"): sent once the model has
+  // finished generating a step's tool calls, with how many it requested.
+  addType(root, "ToolRequestsListed", [
+    { id: 1, name: "call_count", type: "uint32" },
+  ])
+
   // InteractionUpdate — the core streaming update message
   addType(
     root,
@@ -465,8 +472,9 @@ export function createMessageTypes(): protobuf.Root {
       { id: 14, name: "turn_ended", type: "TurnEnded" },
       { id: 16, name: "step_started", type: "StepStarted" },
       { id: 17, name: "step_completed", type: "StepCompleted" },
+      { id: 27, name: "tool_requests_listed", type: "ToolRequestsListed" },
     ],
-    [{ name: "update", fields: ["text_delta", "tool_call_started", "tool_call_completed", "thinking_delta", "partial_tool_call", "heartbeat", "turn_ended", "step_started", "step_completed"] }],
+    [{ name: "update", fields: ["text_delta", "tool_call_started", "tool_call_completed", "thinking_delta", "partial_tool_call", "heartbeat", "turn_ended", "step_started", "step_completed", "tool_requests_listed"] }],
   )
 
   // ── Exec channel ──

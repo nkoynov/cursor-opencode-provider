@@ -1893,29 +1893,44 @@ async function waitUntilNotPumping(
   return !sessionManager.isActivelyPumping(session)
 }
 
-function nextFrameWithTimeout(
-  frames: AsyncIterator<Frame>,
+// Cursor sends `tool_requests_listed` once the model has generated a step's tool
+// calls; until it has in this process, every host call ends its own AI SDK step.
+let cursorListsToolRequests = false
+// Liveness only: closes a held step whose listed calls never all arrive.
+const HELD_TOOL_STEP_QUIET_MS = 1_500
+
+/** The queued frame read, if any, else a new one. */
+function takeFrame(session: CursorSession): Promise<IteratorResult<Frame>> {
+  const queued = session.queuedFrame
+  session.queuedFrame = undefined
+  return queued ?? session.frames.next()
+}
+
+/**
+ * The next frame, or undefined when none arrives within `timeoutMs`. A read
+ * that times out stays queued on the session, so the next reader gets its frame.
+ */
+async function nextFrameWithin(
+  session: CursorSession,
   timeoutMs: number,
-): Promise<IteratorResult<Frame> | { done: true; timedOut: true }> {
-  return new Promise((resolve, reject) => {
-    let settled = false
-    const finish = (
-      value?: IteratorResult<Frame> | { done: true; timedOut: true },
-      error?: unknown,
-    ) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      if (error !== undefined) reject(error)
-      else resolve(value!)
-    }
-    const timer = setTimeout(() => finish({ done: true, timedOut: true }), timeoutMs)
+): Promise<IteratorResult<Frame> | undefined> {
+  const read = takeFrame(session)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timedOut = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), timeoutMs)
     timer.unref?.()
-    void frames.next().then(
-      value => finish(value),
-      error => finish(undefined, error),
-    )
   })
+  try {
+    const result = await Promise.race([read, timedOut])
+    if (result === undefined) {
+      session.queuedFrame = read
+      // The eventual reader observes a failure; do not report it unhandled here.
+      read.catch(() => {})
+    }
+    return result
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 /**
@@ -1943,9 +1958,9 @@ export async function drainSessionUntilTurnEnded(
         break
       }
       const remainingMs = Math.max(1, deadlineAt - Date.now())
-      let next: IteratorResult<Frame> | { done: true; timedOut: true }
+      let next: IteratorResult<Frame> | undefined
       try {
-        next = await nextFrameWithTimeout(session.frames, remainingMs)
+        next = await nextFrameWithin(session, remainingMs)
       } catch (error) {
         trace(
           `fresh turn drain: frame wait failed sessionId=${session.sessionId} ` +
@@ -1954,7 +1969,7 @@ export async function drainSessionUntilTurnEnded(
         outcome = "interrupted"
         break
       }
-      if ("timedOut" in next && next.timedOut) {
+      if (!next) {
         outcome = "timeout"
         break
       }
@@ -2640,7 +2655,7 @@ async function nextFrameWithSemanticDeadline(
     )
   }
   try {
-    return await Promise.race([session.frames.next(), deadline])
+    return await Promise.race([takeFrame(session), deadline])
   } finally {
     if (timer) clearTimeout(timer)
     session.semanticDeadlineCancel = null
@@ -2711,6 +2726,27 @@ export async function pump(
   let assistantText = ""
   let progressContinuationAttempts = 0
   let emittedHostTools = 0
+  // The current model step's tool calls: Cursor's listed count, the call ids that
+  // reached us (exec request or display completion), and those sent to the host.
+  let toolStep = { listed: undefined as number | undefined, resolved: new Set<string>(), hostCalls: 0 }
+  const toolStepComplete = () => toolStep.listed !== undefined && toolStep.resolved.size >= toolStep.listed
+  /** Count a host tool call; true when it must end the AI SDK step now. */
+  const endsToolStep = (): boolean => {
+    toolStep.hostCalls++
+    return !cursorListsToolRequests || toolStepComplete()
+  }
+  /** End a held step; `requeue` is a frame read that belongs to the next pump pass. */
+  const closeHeldToolStep = (reason: string, requeue?: Promise<IteratorResult<Frame>>): void => {
+    if (requeue) {
+      requeue.catch(() => {})
+      session.queuedFrame = requeue
+    }
+    trace(
+      `exec: tool step closed (${reason}) hostCalls=${toolStep.hostCalls} ` +
+        `listed=${toolStep.listed ?? "-"} resolved=${toolStep.resolved.size}`,
+    )
+    emitFinish(undefined, { unified: "tool-calls", raw: undefined })
+  }
   const replaySafety = new AttemptReplaySafety(session.sessionId)
   const failRunProtocol = (message: string, code: string): never => {
     replaySafety.markBarrier("unknown-or-malformed-frame")
@@ -3139,12 +3175,35 @@ export async function pump(
       return
     }
 
+    if (toolStepComplete()) {
+      if (toolStep.hostCalls > 0) {
+        closeHeldToolStep("all listed calls received")
+        return
+      }
+      // A step whose calls Cursor answered itself; the next calls belong to a new step.
+      toolStep = { listed: undefined, resolved: new Set(), hostCalls: 0 }
+    }
+
     let next: IteratorResult<Frame>
     try {
-      next = session.pending.size === 0
-        ? await nextFrameWithSemanticDeadline(session)
-        : await session.frames.next()
+      if (toolStep.hostCalls > 0) {
+        const held = await nextFrameWithin(session, HELD_TOOL_STEP_QUIET_MS)
+        if (!held) {
+          closeHeldToolStep(`quiet ${HELD_TOOL_STEP_QUIET_MS}ms`)
+          return
+        }
+        next = held
+      } else {
+        next = session.pending.size === 0
+          ? await nextFrameWithSemanticDeadline(session)
+          : await takeFrame(session)
+      }
     } catch (error) {
+      if (toolStep.hostCalls > 0) {
+        // Surface the failure on the next pass, after the step's calls ran, as before.
+        closeHeldToolStep("frame read failed", Promise.reject(error))
+        return
+      }
       closeOpenSpans()
       const failure = error instanceof CursorProviderError
         ? error
@@ -3153,6 +3212,10 @@ export async function pump(
             { cause: error },
           )
       throw finalizeFailure(failure)
+    }
+    if (toolStep.hostCalls > 0 && (next.done || next.value.flags & 0x02)) {
+      closeHeldToolStep("Run ended", Promise.resolve(next))
+      return
     }
     if (next.done) {
       closeOpenSpans()
@@ -3209,6 +3272,11 @@ export async function pump(
       continue
     }
     const iu = asm.interaction_update as Record<string, unknown> | undefined
+    // Output after a step's tool calls belongs to the next step.
+    if (toolStep.hostCalls > 0 && (iu?.text_delta || iu?.thinking_delta || iu?.turn_ended)) {
+      closeHeldToolStep("model output", Promise.resolve(next))
+      return
+    }
     const esm = asm.exec_server_message as Record<string, unknown> | undefined
     const kv = asm.kv_server_message as Record<string, unknown> | undefined
     const execControl = asm.exec_server_control_message as Record<string, unknown> | undefined
@@ -3367,9 +3435,20 @@ export async function pump(
         }
         trace(`display tool_call_started: callId=${callIdLog} variant=${variant}${wireFields}`)
       }
+    } else if (iu?.tool_requests_listed) {
+      cursorListsToolRequests = true
+      const listed = iu.tool_requests_listed as Record<string, unknown>
+      toolStep.listed = Number(listed.call_count ?? 0)
+      trace(
+        `tool_requests_listed: count=${toolStep.listed} resolved=${toolStep.resolved.size} ` +
+          `hostCalls=${toolStep.hostCalls}`,
+      )
     } else if (iu?.tool_call_completed) {
       const completed = iu.tool_call_completed as Record<string, unknown>
       const callId = typeof completed.call_id === "string" ? completed.call_id : ""
+      // Only a call no exec has claimed completes here; Cursor also closes the
+      // calls of the previous step once their results arrive.
+      if (callId && session.displayToolCalls.has(callId)) toolStep.resolved.add(callId)
       if (callId) session.editToolCalls?.delete(callId)
       // If exec already claimed this call_id, display map entry is gone — skip.
       if (!callId || !session.displayToolCalls.has(callId)) {
@@ -3444,8 +3523,11 @@ export async function pump(
               toolName: bridged.toolName,
               input,
             } as V3Part)
-            emitFinish(undefined, { unified: "tool-calls", raw: undefined })
-            return
+            if (endsToolStep()) {
+              emitFinish(undefined, { unified: "tool-calls", raw: undefined })
+              return
+            }
+            continue
           }
         }
       }
@@ -3557,6 +3639,10 @@ export async function pump(
         replaySafety.markBarrier("non-control-exec")
         const displayCallId = extractExecDisplayCallId(esm)
         const parsed = parseExecServerMessage(esm, session.hostToolDialect)
+        // An edit's private prerequisite read is not the call's own request; its write is.
+        if (displayCallId && !(parsed?.resultField === "read_result" && session.editToolCalls?.has(displayCallId))) {
+          toolStep.resolved.add(displayCallId)
+        }
         if (parsed) {
           const executableToolName = resolveCustomWebToolAlias(parsed.toolName, session.toolAliases)
           if (executableToolName !== parsed.toolName) {
@@ -3690,8 +3776,11 @@ export async function pump(
               toolName: CURSOR_IMAGE_SAVE_TOOL,
               input: JSON.stringify({ image_id: imageId }),
             } as V3Part)
-            emitFinish(undefined, { unified: "tool-calls", raw: undefined })
-            return
+            if (endsToolStep()) {
+              emitFinish(undefined, { unified: "tool-calls", raw: undefined })
+              return
+            }
+            continue
           }
           // Cursor has native capabilities (Task, filesystem, shell, etc.) in
           // addition to the MCP descriptors sent by this provider. The model
@@ -3781,8 +3870,11 @@ export async function pump(
             toolName: tc.toolName,
             input: tc.input,
           } as V3Part)
-          emitFinish(undefined, { unified: "tool-calls", raw: undefined })
-          return
+          if (endsToolStep()) {
+            emitFinish(undefined, { unified: "tool-calls", raw: undefined })
+            return
+          }
+          continue
         }
         // Known Cursor-native exec variants with no safe OpenCode bridge are
         // soft-denied with a populated typed result or throw, so the turn
@@ -4965,6 +5057,7 @@ export function resetTurnStateForTests(): void {
   promptIdentityBySession.clear()
   mirroredTodosBySession.clear()
   resetContextEpochsForTests()
+  cursorListsToolRequests = false
 }
 
 function extractUserText(lastUser: Record<string, unknown> | undefined): string {
