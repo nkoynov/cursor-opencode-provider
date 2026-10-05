@@ -45,6 +45,7 @@ export type CatalogModelInfo = {
   modelID: string
   providerID: string
   name: string
+  family?: string
   capabilities: {
     tools: boolean
     input: string[]
@@ -105,6 +106,7 @@ export function modelConfigEntryToInfo(id: string, entry: Record<string, any>): 
     time: { released: 0 },
     cost: toOpenCode2Costs(entry.cost as OpenCodeModelCost | undefined),
   }
+  if (typeof entry.family === "string") info.family = entry.family
   if (options) info.settings = { ...options }
   return info
 }
