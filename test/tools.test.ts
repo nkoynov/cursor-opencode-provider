@@ -1551,6 +1551,44 @@ describe("buildExecClientMessages", () => {
     expect(ec.read_result?.content).toBeUndefined()
   })
 
+  it("answers an image read with its bytes in ReadSuccess.data, as Cursor's read executor does", () => {
+    const png = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3])
+    const frames = buildExecClientMessages({
+      execId: 4,
+      resultField: "read_result",
+      output: "Image read successfully",
+      toolName: "read",
+      resultMetadata: { path: "/work/badge.png" },
+      images: [{ data: png, filename: "badge.png", mimeType: "image/png" }],
+    })
+    const ec = decodeMessage<any>("AgentClientMessage", frames[0]).exec_client_message
+    expect(ec.read_result.success.path).toBe("/work/badge.png")
+    expect(Uint8Array.from(ec.read_result.success.data)).toEqual(png)
+    expect(ec.read_result.success.content).toBeUndefined()
+    expect(ec.read_result.success.total_lines).toBe(0)
+    expect(Number(ec.read_result.success.file_size)).toBe(png.length)
+  })
+
+  it("keeps a read error and non-read results text-only when images are attached", () => {
+    const image = { data: Uint8Array.from([1, 2, 3]), filename: "a.png", mimeType: "image/png" }
+    const failed = decodeMessage<any>("AgentClientMessage", buildExecClientMessages({
+      execId: 5,
+      resultField: "read_result",
+      output: "",
+      error: "File not found",
+      images: [image],
+    })[0]).exec_client_message
+    expect(failed.read_result.error.error).toBe("File not found")
+    const grep = decodeMessage<any>("AgentClientMessage", buildExecClientMessages({
+      execId: 6,
+      resultField: "mcp_result",
+      output: "captured",
+      toolName: "screenshot",
+      images: [image],
+    })[0]).exec_client_message
+    expect(grep.mcp_result.success.content).toEqual([{ text: { text: "captured" } }])
+  })
+
   it("includes read error as ReadError oneof", () => {
     const frames = buildExecClientMessages({
       execId: 2,

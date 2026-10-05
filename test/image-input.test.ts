@@ -4,9 +4,30 @@ import {
   assertCursorUserImageSupport,
   extractCursorHistoryImages,
   extractCursorPromptImages,
+  extractCursorToolResultImages,
   extractCursorUserImages,
   hasCursorUserImages,
 } from "../src/image-input.js"
+
+describe("tool-result images", () => {
+  it("decodes host tool media and skips non-image or undecodable parts", async () => {
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9]).toString("base64")
+    const { images, hashes } = await extractCursorToolResultImages([
+      { type: "file", mediaType: "image/png", data: `data:image/png;base64,${png}`, filename: "/work/badge.png" },
+      { type: "file-data", mediaType: "image/png", data: png },
+      // OpenCode 1 synthetic attachments carry the bytes on `url`, not `data`.
+      { type: "file", mediaType: "image/png", url: `data:image/png;base64,${png}`, filename: "oc1.png" },
+      { type: "file", mediaType: "application/pdf", data: png },
+      { type: "file", mediaType: "image/png", data: "not base64!" },
+      { type: "text", text: "Image read successfully" },
+    ])
+    expect(images.map((image) => image.filename)).toEqual(["badge.png", "image-2", "oc1.png"])
+    expect(images.every((image) => image.mimeType === "image/png" && image.data.length === 9)).toBe(true)
+    expect(hashes).toHaveLength(3)
+    expect(hashes[0]).toBe(hashes[1])
+    expect(hashes[0]).toBe(hashes[2])
+  })
+})
 
 describe("Cursor image input", () => {
   it("decodes OpenCode data-URL image file parts", async () => {

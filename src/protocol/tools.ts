@@ -2,6 +2,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { encodeMessage } from "./messages.js"
+import type { CursorImageInput } from "../image-input.js"
 import { encodeJsonAsValue, decodeStructEntriesToJson, readAllFields } from "./struct.js"
 import { buildEnv } from "../context/env.js"
 import { ensureOpencodeProjectDir } from "../context/paths.js"
@@ -1846,6 +1847,22 @@ export type ToolResultInput = {
    * often $HOME and would re-advertise the wrong folder to the model.
    */
   workspaceRoot?: string
+  /** Images the host tool returned; see `execResultImages` for which results carry them. */
+  images?: readonly CursorImageInput[]
+}
+
+/**
+ * The leading tool-result images an exec result can carry on a held Run.
+ * Cursor's own read executor answers an image file with its bytes in
+ * `ReadSuccess.data` (#5) and no text; other result shapes have no image field.
+ */
+export function execResultImages(
+  resultField: string,
+  images: readonly CursorImageInput[] | undefined,
+): CursorImageInput[] {
+  if (!images?.length) return []
+  if (resultField === "read_result") return [images[0]!]
+  return []
 }
 
 /**
@@ -1911,6 +1928,7 @@ export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
       input.resultMetadata,
       input.shellOutcome,
       input.workspaceRoot,
+      execResultImages(resultField, input.images),
     )
     frames.push(
       encodeMessage("AgentClientMessage", {
@@ -2847,6 +2865,7 @@ export function buildTypedExecResult(
   resultMetadata?: Record<string, unknown>,
   shellOutcome?: CursorShellOutcome,
   workspaceRoot?: string,
+  images: readonly CursorImageInput[] = [],
 ): Record<string, unknown> {
   // Prefer the session workspace; never advertise the host process cwd (daemon
   // often starts in $HOME) as the path Cursor shows the model for glob/ls.
@@ -2867,6 +2886,18 @@ export function buildTypedExecResult(
         ?? ""
       const readPath = resolveToolPath(rawPath, resultRoot)
       if (error) return { error: { path: readPath, error } }
+      const image = images[0]
+      if (image) {
+        return {
+          success: {
+            path: readPath,
+            data: image.data,
+            total_lines: 0,
+            file_size: readFileSize(readPath) || image.data.length,
+            truncated: false,
+          },
+        }
+      }
       // The host may have resolved an alternate spelling after the request
       // (for example a Unicode-space filename). Use the result's own path for
       // local stat/newline recovery while preserving the requested path in the

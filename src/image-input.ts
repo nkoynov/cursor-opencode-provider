@@ -382,6 +382,51 @@ export async function extractCursorHistoryImages(
   return { images, hashes, candidateCount: candidates.length, duplicateCount }
 }
 
+/**
+ * Decode the images a host tool returned (its own `file-data` / `image-data`
+ * parts, or the `file` parts OpenCode moves into the trailing
+ * `Attached media from tool result:` message) for a held-Run exec result.
+ * Non-image parts are skipped; a part that cannot be decoded is dropped so the
+ * text result is still delivered.
+ */
+export async function extractCursorToolResultImages(
+  parts: readonly unknown[],
+  options: { signal?: AbortSignal; maxBytes?: number } = {},
+): Promise<{ images: CursorImageInput[]; hashes: string[] }> {
+  const maxBytes = cursorImageBudget(options.maxBytes ?? MAX_CURSOR_IMAGE_INPUT_BYTES)
+  const images: CursorImageInput[] = []
+  const hashes: string[] = []
+  let totalBytes = 0
+  for (const part of parts) {
+    if (!part || typeof part !== "object") continue
+    const file = part as Record<string, unknown>
+    if (
+      (file.type !== "file" && file.type !== "file-data" && file.type !== "image-data")
+      || typeof file.mediaType !== "string"
+      || !file.mediaType.startsWith("image/")
+    ) continue
+    // OpenCode 1's synthetic attachment message uses `url` (often a data: URL);
+    // OpenCode 2 / AI SDK parts usually put the same bytes on `data`.
+    const normalized = file.data == null && (typeof file.url === "string" || file.url instanceof URL)
+      ? { ...file, data: file.url }
+      : file
+    try {
+      const image = await decodeCursorImagePart(
+        normalized,
+        maxBytes - totalBytes,
+        options.signal,
+        `image-${images.length + 1}`,
+      )
+      totalBytes += image.data.length
+      images.push(image)
+      hashes.push(imageContentHash(image.data))
+    } catch (error) {
+      if (!(error instanceof UnsupportedFunctionalityError)) throw error
+    }
+  }
+  return { images, hashes }
+}
+
 export async function extractCursorPromptImages(
   prompt: readonly unknown[],
   lastUser: Record<string, unknown> | undefined,

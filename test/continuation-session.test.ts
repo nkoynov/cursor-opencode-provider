@@ -3,7 +3,7 @@ import fs from "node:fs"
 import path from "node:path"
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import { sessionManager, type CursorSession } from "../src/session.js"
-import { findContinuationSession, deliverContinuationResults, extractTrailingToolResults, hasApprovedUncorrelatedPlanStageResult, rememberMirroredTodos, refreshHeldSessionToolCatalog, resetTurnStateForTests, snapshotMirroredTodosBySession } from "../src/language-model.js"
+import { findContinuationSession, deliverContinuationResults, extractTrailingToolResults, hasApprovedUncorrelatedPlanStageResult, rememberMirroredTodos, refreshHeldSessionToolCatalog, resetTurnStateForTests, snapshotMirroredTodosBySession, snapshotSentHistoryImageHashesForTests } from "../src/language-model.js"
 import { getOrBuildRequestContext } from "../src/context/frozen.js"
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
 import { CREATE_PLAN_RESULT_FIELD } from "../src/protocol/create-plan.js"
@@ -230,7 +230,83 @@ describe("extractTrailingToolResults", () => {
       toolName: "screenshot",
       output: "captured",
       error: undefined,
+      media: [{ type: "file-data", mediaType: "image/png", data: "AQID" }],
     }])
+  })
+
+  it("attributes OpenCode's trailing tool media to the step's single result", () => {
+    const image = { type: "file", mediaType: "image/png", data: "iVBORw0KGgo=", filename: "badge.png" }
+    const read = {
+      role: "tool",
+      content: [{
+        type: "tool-result",
+        toolCallId: "cursor_live_4",
+        toolName: "read",
+        output: { type: "text", value: "Image read successfully" },
+      }],
+    }
+    const caption = { role: "user", content: [{ type: "text", text: "Attached media from tool result:" }, image] }
+
+    const [result] = extractTrailingToolResults([read, caption] as LanguageModelV3CallOptions["prompt"])
+    expect(result).toMatchObject({ execId: 4, output: "Image read successfully", media: [image] })
+
+    // With several results, the media read takes its one file.
+    const several = extractTrailingToolResults([toolMsg("live", 1), read, caption] as LanguageModelV3CallOptions["prompt"])
+    expect(several.map((r) => r.media)).toEqual([undefined, [image]])
+  })
+
+  it("splits one media message across a step's results by OpenCode's markers", () => {
+    const result = (execId: number, toolName: string, value: string) => ({
+      role: "tool",
+      content: [{ type: "tool-result", toolCallId: `cursor_live_${execId}`, toolName, output: { type: "text", value } }],
+    })
+    const badge = { type: "file", mediaType: "image/png", data: "YmFkZ2U=" }
+    const shot = { type: "file", mediaType: "image/png", data: "c2hvdA==", filename: "shot.png" }
+    const step = [
+      result(1, "parity_get_deploy_token", "dtk_123"),
+      result(2, "parity_get_status_badge", "Media attached in the following user message."),
+      result(3, "read", "Image read successfully"),
+      { role: "user", content: [{ type: "text", text: "Attached media from tool result:" }, badge, shot] },
+    ] as LanguageModelV3CallOptions["prompt"]
+
+    expect(extractTrailingToolResults(step).map((r) => r.media)).toEqual([undefined, [badge], [shot]])
+
+    // Without a marker (text plus media), the media rides on the last result.
+    const unmarked = [
+      result(1, "a", "first"),
+      result(2, "parity_get_status_badge", "Status badge attached as an image"),
+      result(3, "read", "Image read successfully"),
+      { role: "user", content: [{ type: "text", text: "Attached media from tool result:" }, badge, shot] },
+    ] as LanguageModelV3CallOptions["prompt"]
+    expect(extractTrailingToolResults(unmarked).map((r) => r.media)).toEqual([undefined, [badge], [shot]])
+  })
+
+  it("keeps plan-mode reminders off the tool result while attributing trailing media", () => {
+    const image = { type: "file", mediaType: "image/png", data: "iVBORw0KGgo=", filename: "shot.png" }
+    const read = {
+      role: "tool",
+      content: [{
+        type: "tool-result",
+        toolCallId: "cursor_live_5",
+        toolName: "read",
+        output: { type: "text", value: "Image read successfully" },
+      }],
+    }
+    const caption = { role: "user", content: [{ type: "text", text: "Attached media from tool result:" }, image] }
+    const reminder = {
+      role: "user",
+      content: [{ type: "text", text: "<system-reminder>Stay in plan mode.</system-reminder>" }],
+    }
+
+    const [result] = extractTrailingToolResults(
+      [read, caption, reminder] as LanguageModelV3CallOptions["prompt"],
+    )
+    expect(result).toMatchObject({
+      execId: 5,
+      output: "Image read successfully",
+      media: [image],
+    })
+    expect(result?.output).not.toContain("Stay in plan mode")
   })
 })
 
@@ -267,6 +343,51 @@ describe("deliverContinuationResults", () => {
     expect(kept).toBe(live)
     expect(writes.length).toBeGreaterThan(0)
     expect(live.pending.has(7)).toBe(false)
+  })
+
+  it("delivers a read image as ReadSuccess.data on the held Run", () => {
+    const writes: Uint8Array[] = []
+    const live = fakeSession("image-read")
+    live.openCodeSessionId = "host-image-read"
+    live.stream.write = (frame: Uint8Array) => { writes.push(frame) }
+    sessionManager.registerPending(12, live, "read_result", "read", false, { path: "/work/badge.png" })
+    const data = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+
+    expect(deliverContinuationResults(live, [{
+      toolCallId: "cursor_image-read_12",
+      sessionId: "image-read",
+      execId: 12,
+      toolName: "read",
+      output: "Image read successfully",
+      images: [{ data, filename: "badge.png", mimeType: "image/png" }],
+      imageHashes: ["hash"],
+    }])).toBe(live)
+
+    const result = decodeMessage<any>("AgentClientMessage", writes[0]).exec_client_message
+    expect(Uint8Array.from(result.read_result.success.data)).toEqual(data)
+    expect(result.read_result.success.content).toBeUndefined()
+    expect(snapshotSentHistoryImageHashesForTests("host-image-read")).toEqual(["hash"])
+  })
+
+  it("does not record history-image hashes when the image write never lands", () => {
+    const live = fakeSession("image-read-fail")
+    live.openCodeSessionId = "host-image-read-fail"
+    live.stream.write = () => {
+      throw new Error("stream closed")
+    }
+    sessionManager.registerPending(13, live, "read_result", "read", false, { path: "/work/badge.png" })
+    const data = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+
+    expect(deliverContinuationResults(live, [{
+      toolCallId: "cursor_image-read-fail_13",
+      sessionId: "image-read-fail",
+      execId: 13,
+      toolName: "read",
+      output: "Image read successfully",
+      images: [{ data, filename: "badge.png", mimeType: "image/png" }],
+      imageHashes: ["hash-fail"],
+    }])).toBeUndefined()
+    expect(snapshotSentHistoryImageHashesForTests("host-image-read-fail")).toEqual([])
   })
 
   it("upgrades a host-authorized external edit read to complete content", () => {
