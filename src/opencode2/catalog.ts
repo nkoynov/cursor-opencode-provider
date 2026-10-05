@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs"
 import { pathToFileURL } from "node:url"
 import { CURSOR_PROVIDER_ID } from "../shared.js"
 import { CURSOR_WIRE_MODEL_ID_KEY, type ModelInfo } from "../models.js"
@@ -17,14 +18,18 @@ import type { ConnectionInfo, ModelVariantInfo, ProviderEditor } from "./types.j
 /** Integration id owning Cursor credentials. Matches the provider id. */
 export const CURSOR_INTEGRATION_ID = CURSOR_PROVIDER_ID
 
+const CURSOR_PACKAGE_NAME = "cursor-opencode-provider"
+
 /**
  * `aisdk:` selects OpenCode 2.0's AI SDK path, which is what surfaces the
  * `aisdk.hook("sdk")` / `("language")` extension points we supply the provider
- * through. The suffix is this package's npm name so the host's built-in
- * fallback can still resolve it if our own hook is ever bypassed — that
- * fallback runs `npm.add(pkg)` against the *published* registry into
- * `<host-cache>/packages/<pkg>/node_modules/<pkg>`, ignoring any local
- * `file://` plugin path this process was loaded from.
+ * through. The suffix is this package's npm name for the host's built-in
+ * fallback, which runs `npm.add(pkg)` against the *published* registry,
+ * ignoring any local `file://` plugin path this process was loaded from. On
+ * OpenCode 2.0.22 that fallback runs before plugin `sdk` hooks
+ * (anomalyco/opencode#42788), so the language model always comes from this
+ * spec. It is pinned to this package's own version: OpenCode resolves a bare
+ * name as `@latest`, which would load whatever was published last.
  *
  * `CURSOR_OPENCODE2_DEV_ENTRY` overrides the suffix with an `aisdk:file://…`
  * spec instead, pointed at a local built entry file (e.g. `dist/index.js`,
@@ -35,7 +40,30 @@ export const CURSOR_INTEGRATION_ID = CURSOR_PROVIDER_ID
  */
 export const CURSOR_AISDK_PACKAGE = process.env.CURSOR_OPENCODE2_DEV_ENTRY
   ? `aisdk:${pathToFileURL(process.env.CURSOR_OPENCODE2_DEV_ENTRY).href}`
-  : "aisdk:cursor-opencode-provider"
+  : `aisdk:${ownPackageSpec()}`
+
+/**
+ * `cursor-opencode-provider@<version>` from this package's own package.json
+ * (two levels up from both `src/opencode2/` and `dist/opencode2/`), or the
+ * bare name when that file is missing or does not describe this package.
+ */
+export function ownPackageSpec(
+  packageJsonUrl: URL = new URL("../../package.json", import.meta.url),
+): string {
+  try {
+    const pkg = JSON.parse(readFileSync(packageJsonUrl, "utf8")) as { name?: unknown; version?: unknown }
+    if (
+      pkg.name === CURSOR_PACKAGE_NAME
+      && typeof pkg.version === "string"
+      && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(pkg.version)
+    ) {
+      return `${CURSOR_PACKAGE_NAME}@${pkg.version}`
+    }
+  } catch {
+    // Bundled or relocated copies have no package.json beside them.
+  }
+  return CURSOR_PACKAGE_NAME
+}
 
 /**
  * Plain-object `Model.Info` equivalent used by `ctx.provider.transform`.
