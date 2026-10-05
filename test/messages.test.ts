@@ -233,6 +233,32 @@ describe("canonical read-result wire fields", () => {
   })
 })
 
+describe("MCP image result wire fields", () => {
+  it("encodes an image item as McpToolResultContentItem #2 McpImageContent{data #1, mime_type #2}", () => {
+    const bytes = encodeMessage("McpToolResultContentItem", {
+      image: { data: Uint8Array.from([1, 2]), mime_type: "image/png" },
+    })
+    expect(Array.from(bytes)).toEqual([
+      0x12, 0x0f, // image #2, 15 bytes
+      0x0a, 0x02, 0x01, 0x02, // data #1
+      0x12, 0x09, ...Buffer.from("image/png"), // mime_type #2
+    ])
+  })
+
+  it("round-trips text and image items on McpSuccess", () => {
+    const decoded = decodeMessage<any>("McpSuccess", encodeMessage("McpSuccess", {
+      content: [
+        { text: { text: "badge" } },
+        { image: { data: Uint8Array.from([9]), mime_type: "image/png" } },
+      ],
+      is_error: false,
+    }))
+    expect(decoded.content[0].text.text).toBe("badge")
+    expect(Uint8Array.from(decoded.content[1].image.data)).toEqual(Uint8Array.from([9]))
+    expect(decoded.content[1].image.mime_type).toBe("image/png")
+  })
+})
+
 describe("message schema accuracy", () => {
   it("all message types are resolvable", () => {
     const root = getMessageTypes()

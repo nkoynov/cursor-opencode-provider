@@ -1113,11 +1113,20 @@ export function createMessageTypes(): protobuf.Root {
   ])
 
   addType(root, "McpTextContent", [{ id: 1, name: "text", type: "string" }])
+  // Cursor CLI 2026.10.01 `agent/v1/mcp_exec_pb.js`: "McpImageContent|1 data 12|2 mime_type 9",
+  // "McpToolResultContentItem|1 text #0 content|2 image #1 content".
+  addType(root, "McpImageContent", [
+    { id: 1, name: "data", type: "bytes" },
+    { id: 2, name: "mime_type", type: "string" },
+  ])
   addType(
     root,
     "McpToolResultContentItem",
-    [{ id: 1, name: "text", type: "McpTextContent" }],
-    [{ name: "content", fields: ["text"] }],
+    [
+      { id: 1, name: "text", type: "McpTextContent" },
+      { id: 2, name: "image", type: "McpImageContent" },
+    ],
+    [{ name: "content", fields: ["text", "image"] }],
   )
   addType(root, "McpSuccess", [
     { id: 1, name: "content", type: "McpToolResultContentItem", repeated: true },

@@ -1569,7 +1569,7 @@ describe("buildExecClientMessages", () => {
     expect(Number(ec.read_result.success.file_size)).toBe(png.length)
   })
 
-  it("keeps a read error and non-read results text-only when images are attached", () => {
+  it("keeps a read error and results without an image field text-only", () => {
     const image = { data: Uint8Array.from([1, 2, 3]), filename: "a.png", mimeType: "image/png" }
     const failed = decodeMessage<any>("AgentClientMessage", buildExecClientMessages({
       execId: 5,
@@ -1579,14 +1579,35 @@ describe("buildExecClientMessages", () => {
       images: [image],
     })[0]).exec_client_message
     expect(failed.read_result.error.error).toBe("File not found")
-    const grep = decodeMessage<any>("AgentClientMessage", buildExecClientMessages({
+    const write = decodeMessage<any>("AgentClientMessage", buildExecClientMessages({
       execId: 6,
-      resultField: "mcp_result",
-      output: "captured",
-      toolName: "screenshot",
+      resultField: "write_result",
+      output: "Wrote file",
+      toolName: "write",
+      resultMetadata: { path: "/work/a.txt" },
       images: [image],
     })[0]).exec_client_message
-    expect(grep.mcp_result.success.content).toEqual([{ text: { text: "captured" } }])
+    expect(write.write_result.success.path).toBe("/work/a.txt")
+  })
+
+  it("appends MCP images as McpImageContent items after the text, as Cursor's MCP executor does", () => {
+    const png = Uint8Array.from([0x89, 0x50, 0x4e, 0x47])
+    const ec = decodeMessage<any>("AgentClientMessage", buildExecClientMessages({
+      execId: 7,
+      resultField: "mcp_result",
+      output: "Status badge for build 4821",
+      toolName: "parity_status_badge",
+      images: [
+        { data: png, filename: "image-1", mimeType: "image/png" },
+        { data: Uint8Array.from([0xff, 0xd8, 0xff]), filename: "image-2", mimeType: "image/jpeg" },
+      ],
+    })[0]).exec_client_message
+    const content = ec.mcp_result.success.content
+    expect(content[0]).toEqual({ text: { text: "Status badge for build 4821" } })
+    expect(Uint8Array.from(content[1].image.data)).toEqual(png)
+    expect(content[1].image.mime_type).toBe("image/png")
+    expect(content[2].image.mime_type).toBe("image/jpeg")
+    expect(ec.mcp_result.success.is_error).toBe(false)
   })
 
   it("includes read error as ReadError oneof", () => {

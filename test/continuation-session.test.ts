@@ -512,6 +512,29 @@ describe("deliverContinuationResults", () => {
     expect(snapshotSentHistoryImageHashesForTests("host-image-read-fail")).toEqual([])
   })
 
+  it("delivers MCP tool images on the held Run instead of waiting for the next user turn", () => {
+    const writes: Uint8Array[] = []
+    const live = fakeSession("mcp-image")
+    live.stream.write = (frame: Uint8Array) => { writes.push(frame) }
+    sessionManager.registerPending(13, live, "mcp_result", "parity_status_badge")
+    const data = Uint8Array.from([0x89, 0x50, 0x4e, 0x47])
+
+    expect(deliverContinuationResults(live, [{
+      toolCallId: "cursor_mcp-image_13",
+      sessionId: "mcp-image",
+      execId: 13,
+      toolName: "parity_status_badge",
+      output: "Media attached in the following user message.",
+      images: [{ data, filename: "image-1", mimeType: "image/png" }],
+      imageHashes: ["hash"],
+    }])).toBe(live)
+
+    const content = decodeMessage<any>("AgentClientMessage", writes[0]).exec_client_message.mcp_result.success.content
+    expect(content).toHaveLength(2)
+    expect(Uint8Array.from(content[1].image.data)).toEqual(data)
+    expect(content[1].image.mime_type).toBe("image/png")
+  })
+
   it("upgrades a host-authorized external edit read to complete content", () => {
     const writes: Uint8Array[] = []
     const root = fs.mkdtempSync(path.join("/tmp", "cursor-edit-workspace-"))

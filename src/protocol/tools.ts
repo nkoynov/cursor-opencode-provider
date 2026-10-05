@@ -1854,7 +1854,8 @@ export type ToolResultInput = {
 /**
  * The leading tool-result images an exec result can carry on a held Run.
  * Cursor's own read executor answers an image file with its bytes in
- * `ReadSuccess.data` (#5) and no text; other result shapes have no image field.
+ * `ReadSuccess.data` (#5) and no text; its MCP executor appends each MCP image
+ * as an `McpImageContent` item (#2). Other result shapes have no image field.
  */
 export function execResultImages(
   resultField: string,
@@ -1862,7 +1863,12 @@ export function execResultImages(
 ): CursorImageInput[] {
   if (!images?.length) return []
   if (resultField === "read_result") return [images[0]!]
+  if (resultField === "mcp_result") return [...images]
   return []
+}
+
+function mcpImageItems(images: readonly CursorImageInput[]): Array<Record<string, unknown>> {
+  return images.map((image) => ({ image: { data: image.data, mime_type: image.mimeType } }))
 }
 
 /**
@@ -3159,18 +3165,20 @@ export function buildTypedExecResult(
       if (toolName === "grep" || toolName === "glob") {
         return {
           success: {
-            content: [{ text: { text: groundSearchOutput(output, resultRoot) } }],
+            content: [{ text: { text: groundSearchOutput(output, resultRoot) } }, ...mcpImageItems(images)],
             is_error: false,
           },
         }
       }
       if (toolName !== "read") {
-        return { success: { content: [{ text: { text: output } }], is_error: false } }
+        return {
+          success: { content: [{ text: { text: output } }, ...mcpImageItems(images)], is_error: false },
+        }
       }
       const listing = parseOpenCode2DirectoryListing(output, resultRoot)
       if (listing) {
         return {
-          success: { content: [{ text: { text: listing.text } }], is_error: false },
+          success: { content: [{ text: { text: listing.text } }, ...mcpImageItems(images)], is_error: false },
         }
       }
       // Carry the truncation notice as its own content item: the file content
@@ -3184,6 +3192,7 @@ export function buildTypedExecResult(
           content: [
             { text: { text: unwrapReadOutput(output) } },
             ...notices.map((notice) => ({ text: { text: notice } })),
+            ...mcpImageItems(images),
           ],
           is_error: false,
         },
