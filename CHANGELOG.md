@@ -6,6 +6,7 @@
 
 - OpenCode 2 plugin `generate.text` calls (memory recall, summaries) complete instead of waiting forever for a tool catalog ([#40](https://github.com/oakimov/cursor-opencode-provider/pull/40) by [@nkoynov](https://github.com/nkoynov))
 - OpenCode 2.0 loads the AI SDK provider at the installed plugin's version instead of the latest npm release ([#41](https://github.com/oakimov/cursor-opencode-provider/pull/41) by [@nkoynov](https://github.com/nkoynov))
+- Images returned by MCP tools reach the model in the same turn instead of after the next user message ([#46](https://github.com/oakimov/cursor-opencode-provider/pull/46) by [@nkoynov](https://github.com/nkoynov))
 - Images read with the `read` tool reach the model in the same turn instead of a "Media attached" placeholder ([#42](https://github.com/oakimov/cursor-opencode-provider/pull/42) by [@nkoynov](https://github.com/nkoynov))
 
 ## [0.8.0] - 2026-10-04
