@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- OpenCode 2 plugin `generate.text` calls (memory recall, summaries) complete instead of waiting forever for a tool catalog ([#40](https://github.com/oakimov/cursor-opencode-provider/pull/40) by [@nkoynov](https://github.com/nkoynov))
+
 ## [0.8.0] - 2026-10-04
 
 ### Changed

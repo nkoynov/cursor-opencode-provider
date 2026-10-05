@@ -1,4 +1,6 @@
 import { beforeEach, describe, it, expect } from "bun:test"
+import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
+import { createCursor } from "../src/index.js"
 import {
   computeAllowTools,
   MAX_TURN_STATE_SESSIONS,
@@ -125,6 +127,26 @@ describe("compaction tool catalog", () => {
     abort.abort()
     await expect(lifecycle).rejects.toThrow("tool-catalog wait cancelled")
   })
+
+  it("does not park OpenCode 2's stateless generate.text on a sibling catalog", async () => {
+    // OpenCode 2 `generate.text`: one user message, no tools, no AbortSignal,
+    // and only a freshly minted `x-opencode-session` header.
+    const model = createCursor({
+      name: "cursor",
+      accessToken: "token",
+      agentBaseURL: "https://not-cursor.example",
+    }).languageModel("cursor-test")
+    const call = model.doGenerate({
+      prompt: [{ role: "user", content: [{ type: "text", text: "Pick the relevant memories." }] }],
+      headers: { "x-opencode-session": "ses_generate_text_only" },
+    } as LanguageModelV3CallOptions)
+    const parked = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("generate.text is still waiting for a sibling tool catalog")), 10_000).unref?.()
+    })
+
+    // Reaching the agent-host check means the call went on to open its Run.
+    await expect(Promise.race([call, parked])).rejects.toThrow("Invalid Cursor agent base URL override")
+  }, 20_000)
 
   it("advertises every enabled tool in a fixed name order", async () => {
     expect(await resolveTurnToolState({

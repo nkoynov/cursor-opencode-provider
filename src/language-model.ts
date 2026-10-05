@@ -4614,12 +4614,14 @@ export function opencodeSessionKey(callOptions: LanguageModelV3CallOptions): str
   // as the parent (or fork source) session so subagents share prompt-cache
   // affinity. Only x-opencode-session-id names the requesting session; keying
   // on the others makes a subagent take over its parent's Cursor conversation.
+  // `x-opencode-session` is not a fallback: session requests always carry the
+  // headers above, and OpenCode 2's stateless `generate.text` sends only a
+  // fresh `x-opencode-session` id that no other request will ever share.
   const raw =
     h["x-opencode-session-id"] ??
     h["x-session-id"] ??
     h["X-Session-Id"] ??
-    h["x-session-affinity"] ??
-    h["x-opencode-session"]
+    h["x-session-affinity"]
   if (typeof raw === "string" && raw.trim().length > 0) return raw.trim()
   return undefined
 }

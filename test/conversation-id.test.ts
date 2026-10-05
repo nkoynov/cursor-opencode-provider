@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from "bun:test"
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import {
+  opencodeSessionKey,
   resolveConversationId,
   sessionIdToUuid,
 } from "../src/language-model.js"
@@ -57,6 +58,15 @@ describe("sessionIdToUuid / resolveConversationId", () => {
     } as LanguageModelV3CallOptions)
     expect(child).toBe(sessionIdToUuid("ses_child"))
     expect(child).not.toBe(parent)
+  })
+
+  it("does not treat OpenCode 2's one-shot generate.text id as a session", () => {
+    // OpenCode 2 `generate.text` mints a new `x-opencode-session` per call and
+    // stores no session; nothing else will ever arrive under that id.
+    const headers = { "x-opencode-session": "ses_one_shot" }
+    expect(opencodeSessionKey({ prompt: [], headers } as LanguageModelV3CallOptions)).toBeUndefined()
+    expect(resolveConversationId({ prompt: [], headers } as LanguageModelV3CallOptions))
+      .not.toBe(sessionIdToUuid("ses_one_shot"))
   })
 
   it("falls back to a random UUID when no session header is present", () => {
