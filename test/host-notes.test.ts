@@ -77,29 +77,99 @@ afterEach(() => {
 })
 
 describe("host notes on held-Run exec results", () => {
-  it("delivers an OpenCode 2 read followed by a note as parsed file content", () => {
+  it("keeps a note out of a read's numbered file lines and adds it to the Run's next result", () => {
     const root = fs.mkdtempSync(path.join("/tmp", "cursor-host-notes-"))
     const file = path.join(root, "main.go")
-    fs.writeFileSync(file, "package main\n\tfunc main() {}\n")
+    const lines = Array.from({ length: 161 }, (_, i) => `\tline ${i + 1}`)
+    fs.writeFileSync(file, `${lines.join("\n")}\n`)
     try {
       const writes: Uint8Array[] = []
       const live = liveSession(writes, root)
       sessionManager.registerPending(1, live, "read_result", "read", false, { path: file })
 
       const results = extractTrailingToolResults(step(
-        toolResult(live, 1, "read", `Read file ${file}, lines 1-2\n1: package main\n2: \tfunc main() {}`),
+        toolResult(live, 1, "read", `Read file ${file}, lines 1-161\n${lines.map((line, i) => `${i + 1}: ${line}`).join("\n")}`),
         hostNote(NOTE),
       ))
       expect(deliverContinuationResults(live, results)).toBe(live)
 
-      const content: string = execMessages(writes)[0].read_result.success.content
-      expect(content).toBe(`package main\n\tfunc main() {}\n\n${NOTE}`)
-      expect(content).not.toContain("Read file")
-      expect(content).not.toMatch(/^\d+: /m)
+      const read = execMessages(writes)[0].read_result.success
+      expect(read.content).toBe(`${lines.join("\n")}\n`)
+      expect(read.content.split("\n").length - 1).toBe(read.total_lines)
+      expect(read.total_lines).toBe(161)
+      expect(live.deferredNote).toBe(NOTE)
+
+      writes.length = 0
+      sessionManager.registerPending(2, live, "shell_stream", "shell", false, {
+        shell_stream: true,
+        command: "ls",
+        working_directory: root,
+      })
+      deliverContinuationResults(live, extractTrailingToolResults(step(toolResult(live, 2, "shell", "main.go\n"))))
+
+      const stdout = execMessages(writes).flatMap((message) => message.shell_stream?.stdout?.data ?? [])
+      expect(stdout).toEqual([`main.go\n\n${NOTE}`])
       expect(live.deferredNote).toBeUndefined()
     } finally {
       fs.rmSync(root, { recursive: true, force: true })
     }
+  })
+
+  it("puts a note that follows a read on an earlier result of the step", () => {
+    const root = fs.mkdtempSync(path.join("/tmp", "cursor-host-notes-"))
+    const file = path.join(root, "a.txt")
+    fs.writeFileSync(file, "alpha\n")
+    try {
+      const writes: Uint8Array[] = []
+      const live = liveSession(writes, root)
+      sessionManager.registerPending(20, live, "shell_stream", "shell", false, {
+        shell_stream: true,
+        command: "ls",
+        working_directory: root,
+      })
+      sessionManager.registerPending(21, live, "read_result", "read", false, { path: file })
+
+      deliverContinuationResults(live, extractTrailingToolResults(step(
+        toolResult(live, 20, "shell", "a.txt\n"),
+        toolResult(live, 21, "read", `Read file ${file}, lines 1-1\n1: alpha`),
+        hostNote(NOTE),
+      )))
+
+      const messages = execMessages(writes)
+      expect(messages.flatMap((message) => message.shell_stream?.stdout?.data ?? [])).toEqual([`a.txt\n\n${NOTE}`])
+      expect(messages.find((message) => message.read_result).read_result.success.content).toBe("alpha\n")
+      expect(live.deferredNote).toBeUndefined()
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it("keeps a note out of Pi read content", () => {
+    const writes: Uint8Array[] = []
+    const live = liveSession(writes)
+    sessionManager.registerPending(22, live, "pi_read_result", "read", false, { path: "/tmp/pi.txt" })
+
+    deliverContinuationResults(live, extractTrailingToolResults(step(
+      toolResult(live, 22, "read", "alpha\nbeta"),
+      hostNote(NOTE),
+    )))
+
+    expect(execMessages(writes)[0].pi_read_result.success.output).toBe("alpha\nbeta")
+    expect(live.deferredNote).toBe(NOTE)
+  })
+
+  it("appends the note to a failed read's error text", () => {
+    const writes: Uint8Array[] = []
+    const live = liveSession(writes)
+    sessionManager.registerPending(23, live, "read_result", "read", false, { path: "/tmp/missing.txt" })
+
+    deliverContinuationResults(live, extractTrailingToolResults(step(
+      toolResult(live, 23, "read", "File not found: /tmp/missing.txt", "error-text"),
+      hostNote(NOTE),
+    )))
+
+    expect(execMessages(writes)[0].read_result.error.error).toBe(`File not found: /tmp/missing.txt\n\n${NOTE}`)
+    expect(live.deferredNote).toBeUndefined()
   })
 
   it("appends the note to a failed result's error text", () => {
@@ -241,7 +311,7 @@ describe("host notes on held-Run exec results", () => {
     }
   })
 
-  it("carries the note on an edit transaction's read that is too large to return whole", () => {
+  it("keeps the note out of an edit transaction's read that is too large to return whole", () => {
     const root = fs.mkdtempSync(path.join("/tmp", "cursor-host-notes-"))
     const file = path.join(root, "huge.ts")
     fs.writeFileSync(file, "")
@@ -257,14 +327,14 @@ describe("host notes on held-Run exec results", () => {
         hostNote(NOTE),
       )))
 
-      expect(execMessages(writes)[0].read_result.success.content).toBe(`capped preview\n\n${NOTE}`)
-      expect(live.deferredNote).toBeUndefined()
+      expect(execMessages(writes)[0].read_result.success.content).toBe("capped preview")
+      expect(live.deferredNote).toBe(NOTE)
     } finally {
       fs.rmSync(root, { recursive: true, force: true })
     }
   })
 
-  it("carries the note on an edit transaction's read whose complete file cannot be read", () => {
+  it("keeps the note out of an edit transaction's read whose complete file cannot be read", () => {
     const root = fs.mkdtempSync(path.join("/tmp", "cursor-host-notes-"))
     const file = path.join(root, "locked.ts")
     fs.writeFileSync(file, "secret\n")
@@ -280,8 +350,8 @@ describe("host notes on held-Run exec results", () => {
         hostNote(NOTE),
       )))
 
-      expect(execMessages(writes)[0].read_result.success.content).toBe(`host preview\n\n${NOTE}`)
-      expect(live.deferredNote).toBeUndefined()
+      expect(execMessages(writes)[0].read_result.success.content).toBe("host preview")
+      expect(live.deferredNote).toBe(NOTE)
     } finally {
       fs.chmodSync(file, 0o600)
       fs.rmSync(root, { recursive: true, force: true })
