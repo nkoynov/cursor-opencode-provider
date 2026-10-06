@@ -4110,11 +4110,7 @@ export async function pump(
             && permittedToolNames.size > 0
             && !permittedToolNames.has(parsed.toolName)
           ) {
-            const permitted = [...permittedToolNames].sort().join(", ")
-            const reason =
-              `OpenCode tool '${parsed.toolName}' is not permitted for the current agent this turn. ` +
-              `Permitted tools: ${permitted || "none"}. Continue using only permitted tools; do not retry ` +
-              `'${parsed.toolName}'.`
+            const reason = notPermittedToolReason(parsed.toolName, permittedToolNames)
             trace(
               `exec: not permitted this turn toolName=${parsed.toolName} ` +
                 `permitted=[${[...permittedToolNames].sort().join(",")}]`,
@@ -4968,6 +4964,32 @@ export function groundCheckpointTurnText(
   return appendCheckpointUserGrounding(userText, workspaceRoot, {
     requireAbsolutePathArg: hostToolDialectFromTools(tools).filePathKey === "path",
   })
+}
+
+/**
+ * An epoch-advertised tool the host left out of this step. OpenCode 2 moves
+ * tools between the direct list and Code Mode (MCP servers, plugin reloads),
+ * so point at `execute` instead of telling the model to give the tool up.
+ */
+export function notPermittedToolReason(
+  toolName: string,
+  permittedToolNames: ReadonlySet<string>,
+): string {
+  const permitted = [...permittedToolNames].sort().join(", ") || "none"
+  if (permittedToolNames.has("execute")) {
+    return (
+      `OpenCode tool '${toolName}' is not in the direct tool list this turn. ` +
+      `Permitted tools: ${permitted}. If the host Code Mode catalog has this tool (a direct name ` +
+      "`<namespace>_<tool>` appears there as `<namespace>.<tool>`; its `search` function finds it too), " +
+      "call it through OpenCode `execute` with the catalog's exact path; otherwise continue using only " +
+      `permitted tools and do not retry '${toolName}'.`
+    )
+  }
+  return (
+    `OpenCode tool '${toolName}' is not permitted for the current agent this turn. ` +
+    `Permitted tools: ${permitted}. Continue using only permitted tools; do not retry ` +
+    `'${toolName}'.`
+  )
 }
 
 /**

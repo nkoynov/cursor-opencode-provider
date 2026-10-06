@@ -1,4 +1,4 @@
-import type { ToolDraft } from "./types.js"
+import type { McpServerConfig, ToolDraft } from "./types.js"
 
 /**
  * OpenCode 2 puts an MCP server's tools in Code Mode unless that server's
@@ -30,7 +30,7 @@ export function mcpServerNamespace(server: string): string {
 
 export function rememberDirectMcpNamespaces(
   target: Set<string>,
-  servers: readonly (readonly [string, { readonly codemode?: boolean }])[],
+  servers: readonly (readonly [string, McpServerConfig])[],
 ): void {
   target.clear()
   // The editor exposes normalized namespaces, not server ownership. Keep
@@ -67,5 +67,44 @@ export function exposeDirectMcpTools(editor: ToolDraft, namespaces: ReadonlySet<
       options.codemode = false
       draft.options = options
     })
+  }
+}
+
+export type DirectMcpPlacement = {
+  rememberServers(servers: readonly (readonly [string, McpServerConfig])[]): void
+  expose(editor: ToolDraft): void
+}
+
+/**
+ * Keeps the tool registry in step with the MCP namespaces it was built from.
+ *
+ * OpenCode rebuilds the MCP and tool registries lazily and independently. After
+ * a plugin reload the tool registry can rebuild before the MCP transform has
+ * recorded any namespace, and nothing rebuilds it again while the MCP config is
+ * unchanged, so every MCP tool would stay in Code Mode. Reload the tool
+ * registry whenever the recorded namespaces differ from the ones it last used.
+ */
+export function createDirectMcpPlacement(reloadTools: () => Promise<void>): DirectMcpPlacement {
+  const namespaces = new Set<string>()
+  let applied: string | undefined
+  let scheduled = false
+  const key = () => [...namespaces].sort().join("\0")
+  return {
+    rememberServers(servers) {
+      rememberDirectMcpNamespaces(namespaces, servers)
+      if (scheduled || applied === undefined || applied === key()) return
+      scheduled = true
+      // Transforms run while the host rebuilds MCP state; reload tools after it.
+      void Promise.resolve()
+        .then(() => {
+          scheduled = false
+          if (applied !== key()) return reloadTools()
+        })
+        .catch(() => {})
+    },
+    expose(editor) {
+      exposeDirectMcpTools(editor, namespaces)
+      applied = key()
+    },
   }
 }

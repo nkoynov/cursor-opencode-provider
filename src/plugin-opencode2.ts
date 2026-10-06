@@ -33,7 +33,7 @@ import {
   requireCursorAccessToken,
   resolveCursorAccessToken,
 } from "./opencode2/integration.js"
-import { exposeDirectMcpTools, rememberDirectMcpNamespaces } from "./opencode2/mcp-direct.js"
+import { createDirectMcpPlacement } from "./opencode2/mcp-direct.js"
 import { registerTodoTools } from "./opencode2/todo-tools.js"
 import { OPENCODE_2_TOOL_DIALECT } from "./protocol/tools.js"
 import { clearSessionTodos } from "./todo-store.js"
@@ -315,14 +315,14 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
       )
     }
 
-    // Namespaces whose tools belong on the direct catalog. Filled by the MCP
+    // Namespaces whose tools belong on the direct catalog. Recorded by the MCP
     // transform (config is not written) and read when tool transforms replay,
     // including after a later MCP discovery reload.
-    const directMcpNamespaces = new Set<string>()
+    const directMcp = createDirectMcpPlacement(() => ctx.tool.reload())
     if (ctx.mcp) {
       await track(
         ctx.mcp.transform((editor) => {
-          rememberDirectMcpNamespaces(directMcpNamespaces, editor.list())
+          directMcp.rememberServers(editor.list())
         }),
       )
     }
@@ -338,7 +338,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
         // explicitly opt in onto the direct catalog so this provider can
         // advertise them to Cursor (issue #29 still routes via CallDynamicTool).
         // See `opencode2/mcp-direct.ts`.
-        exposeDirectMcpTools(draft, directMcpNamespaces)
+        directMcp.expose(draft)
       }),
     )
 
