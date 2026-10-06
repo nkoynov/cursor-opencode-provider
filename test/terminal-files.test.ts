@@ -294,7 +294,8 @@ describe("soft-background shell into a Cursor terminal file", () => {
 
   it("keeps the command's exit code and leaves the footer out when a descendant writes after it", () => {
     const folder = tempDir()
-    const late = `(until grep -q '^status: failed' ${folder}/*.txt 2>/dev/null; do sleep 0.02; done; printf 'exit_code: 9\\n') & echo parent; exit 3`
+    // The descendant outlives the test; it must stop once the test removes the folder.
+    const late = `(until grep -q '^status: failed' ${folder}/*.txt 2>/dev/null; do [ -d ${folder} ] || exit 0; sleep 0.02; done; printf 'exit_code: 9\\n') & echo parent; exit 3`
     const result = consumeCursorShellResult("cursor_soft_1", run(softPolicy(folder, late, 8_000)))
     expect(result.outcome).toEqual({ kind: "exit", code: 3 })
     expect(result.output).toBe("parent\n")
