@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A tool that runs for more than 10 minutes without OpenCode activity (a long foreground shell, a slow MCP call) no longer closes the held Run and restarts the turn without its earlier tool results: the Run is held while OpenCode reports one of its tools running, up to 4 hours, and each pending exec gets Cursor CLI's exec heartbeat ([#N](https://github.com/oakimov/cursor-opencode-provider/pull/N) by [@nkoynov](https://github.com/nkoynov))
+
 ## [0.8.0] - 2026-10-04
 
 ### Changed

@@ -34,6 +34,7 @@ import {
   resetHostAgentModeSwitchForTests,
 } from "../src/host-agent-mode.js"
 import { registerCursorShellCall } from "../src/shell-timeout.js"
+import { sessionActivity } from "../src/activity.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { writeCache } from "../src/models.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
@@ -1400,5 +1401,60 @@ describe("opencode2 setup", () => {
     }
     await hooks.get("session.title")!(event)
     expect(event.options.opencodeCompaction).toBe(false)
+  })
+})
+
+describe("opencode2 running tool tracking", () => {
+  async function withPluginEvents(events: unknown[], check: () => boolean): Promise<void> {
+    const configDir = mkdtempSync(join(tmpdir(), "cursor-oc2-tools-config-"))
+    const cacheDir = mkdtempSync(join(tmpdir(), "cursor-oc2-tools-cache-"))
+    const previousConfigDir = process.env.OPENCODE_CONFIG_DIR
+    process.env.OPENCODE_CONFIG_DIR = configDir
+    setHostCacheDirOverride(cacheDir)
+    try {
+      await writeCache(cacheDir, { models: [baseModel], fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION })
+      const cleanup = await plugin.setup(fakeContext(events).ctx)
+      try {
+        for (let i = 0; i < 100 && !check(); i++) await new Promise((resolve) => setTimeout(resolve, 5))
+      } finally {
+        await cleanup()
+      }
+    } finally {
+      setHostCacheDirOverride(undefined)
+      if (previousConfigDir === undefined) delete process.env.OPENCODE_CONFIG_DIR
+      else process.env.OPENCODE_CONFIG_DIR = previousConfigDir
+      rmSync(configDir, { recursive: true, force: true })
+      rmSync(cacheDir, { recursive: true, force: true })
+    }
+  }
+
+  const toolEvent = (type: string, id: string) => ({
+    type,
+    data: { sessionID: "ses_tools", assistantMessageID: "msg_1", id, executed: false },
+  })
+
+  test("a tool runs from tool.called until its success, failure or the end of the execution", async () => {
+    sessionActivity.clear()
+    try {
+      await withPluginEvents([
+        toolEvent("session.tool.called", "cursor_run_1"),
+        toolEvent("session.tool.called", "cursor_run_2"),
+        toolEvent("session.tool.called", "cursor_run_3"),
+        toolEvent("session.tool.success", "cursor_run_1"),
+        toolEvent("session.tool.failed", "cursor_run_2"),
+      ], () => sessionActivity.isToolRunning("cursor_run_3") && !sessionActivity.isToolRunning("cursor_run_2"))
+      expect(sessionActivity.isToolRunning("cursor_run_1")).toBe(false)
+      expect(sessionActivity.isToolRunning("cursor_run_2")).toBe(false)
+      expect(sessionActivity.isToolRunning("cursor_run_3")).toBe(true)
+      expect(sessionActivity.lastActivityAt("ses_tools")).toBeNumber()
+
+      await withPluginEvents(
+        [{ type: "session.execution.interrupted", data: { sessionID: "ses_tools" } }],
+        () => !sessionActivity.isToolRunning("cursor_run_3"),
+      )
+      expect(sessionActivity.isToolRunning("cursor_run_3")).toBe(false)
+    } finally {
+      sessionActivity.clear()
+    }
   })
 })
