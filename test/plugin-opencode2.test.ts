@@ -34,6 +34,7 @@ import {
   resetHostAgentModeSwitchForTests,
 } from "../src/host-agent-mode.js"
 import { registerCursorShellCall } from "../src/shell-timeout.js"
+import { forgetEarlySteers, listenForHostSteers } from "../src/host-steer.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { writeCache } from "../src/models.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
@@ -1400,5 +1401,53 @@ describe("opencode2 setup", () => {
     }
     await hooks.get("session.title")!(event)
     expect(event.options.opencodeCompaction).toBe(false)
+  })
+})
+
+describe("opencode2 inbox steers", () => {
+  async function withPluginEvents(events: unknown[], check: () => boolean): Promise<void> {
+    const configDir = mkdtempSync(join(tmpdir(), "cursor-oc2-inbox-config-"))
+    const cacheDir = mkdtempSync(join(tmpdir(), "cursor-oc2-inbox-cache-"))
+    const previousConfigDir = process.env.OPENCODE_CONFIG_DIR
+    process.env.OPENCODE_CONFIG_DIR = configDir
+    setHostCacheDirOverride(cacheDir)
+    try {
+      await writeCache(cacheDir, { models: [baseModel], fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION })
+      const cleanup = await plugin.setup(fakeContext(events).ctx)
+      try {
+        for (let i = 0; i < 100 && !check(); i++) await new Promise((resolve) => setTimeout(resolve, 5))
+      } finally {
+        if (typeof cleanup === "function") await cleanup()
+      }
+    } finally {
+      setHostCacheDirOverride(undefined)
+      if (previousConfigDir === undefined) delete process.env.OPENCODE_CONFIG_DIR
+      else process.env.OPENCODE_CONFIG_DIR = previousConfigDir
+      rmSync(configDir, { recursive: true, force: true })
+      rmSync(cacheDir, { recursive: true, force: true })
+    }
+  }
+
+  test("announces a plain-text message enqueued as a steer, or switched to one", async () => {
+    const seen: string[] = []
+    const stop = listenForHostSteers("ses_inbox", (steer) => { seen.push(`${steer.inboxID}:${steer.text}`); return true })
+    const enqueued = (inboxID: string, delivery: string, payload: Record<string, unknown>) => ({
+      type: "session.inbox.enqueued",
+      data: { sessionID: "ses_inbox", inboxID, item: { type: "user", delivery, payload } },
+    })
+    try {
+      await withPluginEvents([
+        enqueued("msg_inbox_1", "steer", { text: "change of plan" }),
+        enqueued("msg_inbox_2", "steer", { text: "see this", files: [{ data: "AA==", mime: "image/png", source: { type: "inline" } }] }),
+        enqueued("msg_inbox_3", "queue", { text: "after the turn" }),
+        { type: "session.inbox.enqueued", data: { sessionID: "ses_inbox", inboxID: "msg_inbox_4", item: { type: "synthetic", delivery: "steer", payload: { text: "note" } } } },
+        enqueued("msg_inbox_5", "queue", { text: "now please" }),
+        { type: "session.inbox.delivery.changed", data: { sessionID: "ses_inbox", inboxID: "msg_inbox_5", delivery: "steer" } },
+      ], () => seen.length >= 2)
+      expect(seen).toEqual(["msg_inbox_1:change of plan", "msg_inbox_5:now please"])
+    } finally {
+      stop()
+      forgetEarlySteers("ses_inbox")
+    }
   })
 })
