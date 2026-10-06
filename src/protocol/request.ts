@@ -15,16 +15,16 @@ export type RunRequestInput = {
   /** Stable parent group; unlike conversationId, this survives compaction/rebase. */
   conversationGroupId?: string
   /**
-   * Prior chat turns for a seed ConversationStateStructure (no checkpoint).
-   * Tool outputs, when required for compaction/recovery, are represented as
-   * user-role OpenCode host observations rather than assistant-authored prose.
+   * Prior chat turns for a Run without a checkpoint, replayed as a transcript
+   * at the start of the user message. Tool outputs are user-role OpenCode host
+   * observations rather than assistant-authored prose.
    */
   history?: SeedHistoryMessage[]
   /**
    * Opaque ConversationStateStructure bytes from the last
    * conversation_checkpoint_update for this conversation_id. When set, echoed
-   * as AgentRunRequest.conversation_state (CLI parity). When absent, a seed
-   * state carrying only `history` (or empty) is built for turn 1.
+   * as AgentRunRequest.conversation_state (CLI parity). When absent, an empty
+   * seed state is sent and `history` goes in the user message.
    */
   conversationState?: Uint8Array
   parameterValues?: Array<{ id: string; value: string }>
@@ -40,36 +40,44 @@ export type RunRequestInput = {
 }
 
 /**
- * Seed ConversationStateStructure for the first turn (no checkpoint yet).
+ * Seed ConversationStateStructure for a Run without a checkpoint: empty, as
+ * Cursor CLI sends for a new conversation.
  *
- * After the first checkpoint arrives we stop inventing state and echo the
- * server's opaque structure instead (CLI behavior). Compaction resets and
- * rebases also use this seed, with `history` carrying OpenCode's prompt turns
- * so Cursor can continue without the old checkpoint.
- *
- * No `system` entry is seeded: Cursor does not follow a client-authored
- * `system` root message, and neither Cursor client writes
- * `root_prompt_messages_json`. Host system context travels as the
- * system-instructions rule in RequestContext (`systemInstructionsRule`), so
- * `system` history entries are dropped here rather than duplicated.
+ * It never carries `root_prompt_messages_json`. Neither Cursor client writes
+ * it: the server builds the root prompt itself, with the RequestContext rules
+ * (the host system context, `systemInstructionsRule`), custom subagents and MCP
+ * instructions, only when that field is empty. Client-seeded root messages
+ * replaced all of that for the rest of the conversation. Prior turns go in the
+ * Run's user message instead (`renderHistoryTranscript`).
  *
  * We deliberately do NOT use `AgentRunRequest.custom_system_prompt` (#8): that
  * field is the internal `--system-prompt` CLI override and the server rejects
  * it for normal accounts.
  */
-export function buildSeedConversationState(input?: {
-  history?: SeedHistoryMessage[]
-}): Uint8Array {
-  const root = getMessageTypes()
-  const type = root.lookupType("ConversationStateStructure")
-  const messages: string[] = []
-  for (const entry of input?.history ?? []) {
-    if (!entry.content || entry.role === "system") continue
-    messages.push(JSON.stringify({ role: entry.role, content: entry.content }))
-  }
-  const obj: Record<string, unknown> = {}
-  if (messages.length > 0) obj.root_prompt_messages_json = messages
-  return type.encode(type.fromObject(obj)).finish()
+export function buildSeedConversationState(): Uint8Array {
+  const type = getMessageTypes().lookupType("ConversationStateStructure")
+  return type.encode(type.fromObject({})).finish()
+}
+
+const HISTORY_OPEN = "<conversation_history>"
+const HISTORY_CLOSE = "</conversation_history>"
+const HISTORY_PREAMBLE =
+  "Cursor's copy of this conversation was lost, so the host replays it here. It is the real conversation " +
+  "between you and the user so far: the tool calls listed were run and returned the results shown " +
+  "(older results are shortened). Continue from it and do not redo work it shows as done."
+
+/**
+ * Prior turns of a Run without a checkpoint, as text that opens its user
+ * message (the same shape a compaction summary takes). `system` entries are
+ * left out: the host system context is the RequestContext rule.
+ */
+export function renderHistoryTranscript(history: readonly SeedHistoryMessage[] | undefined): string | undefined {
+  const entries = (history ?? []).filter((entry) => entry.content && entry.role !== "system")
+  if (entries.length === 0) return undefined
+  const body = entries
+    .map((entry) => `[${entry.role === "user" ? "User" : "Assistant"}]\n${entry.content.replaceAll(HISTORY_CLOSE, "</conversation-history>")}`)
+    .join("\n\n")
+  return `${HISTORY_OPEN}\n${HISTORY_PREAMBLE}\n\n${body}\n${HISTORY_CLOSE}`
 }
 
 /**
@@ -85,9 +93,11 @@ export function buildRunRequest(input: RunRequestInput): Uint8Array {
   // mcp_meta_tool_options. AgentRunRequest.mcp_tools (#4) stays empty on real
   // turns (CLI prewarm-only). Full defs are session.toolDescriptors + exec #36.
   const requestContext = input.requestContext
+  const seeded = !(input.conversationState && input.conversationState.length > 0)
+  const transcript = seeded && input.action !== "resume" ? renderHistoryTranscript(input.history) : undefined
 
   const userMessage: Record<string, unknown> = {
-    text: input.text,
+    text: transcript ? `${transcript}\n\n${input.text}` : input.text,
     message_id: msgId,
   }
   if (input.images?.length) {
@@ -106,10 +116,7 @@ export function buildRunRequest(input: RunRequestInput): Uint8Array {
     ? { resume_action: {} }
     : { user_message_action: userMessageAction }
 
-  const conversationState =
-    input.conversationState && input.conversationState.length > 0
-      ? input.conversationState
-      : buildSeedConversationState({ history: input.history })
+  const conversationState = seeded ? buildSeedConversationState() : input.conversationState!
 
   const runRequest: Record<string, unknown> = {
     conversation_id: input.conversationId,

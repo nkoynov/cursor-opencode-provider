@@ -1517,8 +1517,10 @@ async function startSession(
   const history = extractPromptHistory(prompt, {
     preserveTrailingUser: recovery?.kind === "rebase" && !checkpointUnusable,
     // A foreign-history rebase replays every tool result: the other model's work
-    // exists only in OpenCode history, never in a Cursor checkpoint.
-    toolResults: isCompaction || foreignHistory || checkpointUnusable ? "all" : (recovery?.kind === "rebase" ? "trailing" : "omit"),
+    // exists only in OpenCode history, never in a Cursor checkpoint. Other Runs
+    // without a checkpoint keep each call and a shortened result, so the model
+    // does not take its earlier work for undone.
+    toolResults: isCompaction || foreignHistory || checkpointUnusable ? "all" : "transcript",
     trailingSteer: recovery?.kind === "rebase" && recovery.steer === true,
     ...(recovery?.kind === "rebase" && recovery.toolCallIds ? { keepToolCallIds: recovery.toolCallIds } : {}),
   })
@@ -5526,29 +5528,34 @@ export function cursorTurnEndedProviderMetadata(
   }
 }
 
+/** Characters of an earlier tool result a history transcript keeps; the trailing live results stay whole. */
+export const TRANSCRIPT_TOOL_RESULT_CHARS = 2_000
+const TRANSCRIPT_TOOL_INPUT_CHARS = 2_000
+
 /**
- * Prior prompt turns for a seed ConversationStateStructure. Tool results must
+ * Prior prompt turns for a Run without a checkpoint. Tool results must
  * never be replayed as assistant-authored prose: that teaches the model to
  * counterfeit `Tool result (...)` text instead of emitting a real tool call.
- * Normal rebases omit old results; compaction can retain all results and
- * interrupted continuations retain only the trailing live result suffix as
- * explicit OpenCode-host observations.
+ * They are user-role OpenCode-host observations. `all` keeps every result
+ * whole (compaction, foreign history) and `transcript` shortens results before
+ * the trailing live ones; both name each call in its assistant entry.
+ * `trailing` keeps only the trailing results, `omit` none.
  */
 export function extractPromptHistory(
   prompt: LanguageModelV3CallOptions["prompt"],
   options?: {
     preserveTrailingUser?: boolean
-    toolResults?: "omit" | "all" | "trailing"
+    toolResults?: "omit" | "all" | "trailing" | "transcript"
     /** The step's results are followed by mid-turn user messages as well as host notes. */
     trailingSteer?: boolean
-    /** With `trailing`, earlier results of the step that must be replayed too. */
+    /** With `trailing` or `transcript`, earlier results of the step that are replayed whole too. */
     keepToolCallIds?: ReadonlySet<string>
   },
 ): SeedHistoryMessage[] {
   const out: SeedHistoryMessage[] = []
   const toolResults = options?.toolResults ?? "omit"
   let trailingToolStart = prompt.length
-  if (toolResults === "trailing") {
+  if (toolResults === "trailing" || toolResults === "transcript") {
     // A rebased continuation may end with host notes (or a steer's messages) after the step's results.
     let notesStart = prompt.length
     while (
@@ -5580,7 +5587,10 @@ export function extractPromptHistory(
       continue
     }
     if (m.role === "assistant") {
-      const text = extractAssistantHistoryText(m as unknown as Record<string, unknown>)
+      const text = extractAssistantHistoryText(
+        m as unknown as Record<string, unknown>,
+        toolResults === "all" || toolResults === "transcript",
+      )
       if (text) appendSeedHistory(out, "assistant", text)
       continue
     }
@@ -5588,6 +5598,7 @@ export function extractPromptHistory(
       if (toolResults === "omit") continue
       const keptOnly = toolResults === "trailing" && messageIndex < trailingToolStart
       if (keptOnly && !options?.keepToolCallIds?.size) continue
+      const earlier = toolResults === "transcript" && messageIndex < trailingToolStart
       const results: string[] = []
       for (const part of m.content) {
         const p = part as unknown as Record<string, unknown>
@@ -5596,10 +5607,11 @@ export function extractPromptHistory(
         const toolCallId = typeof p.toolCallId === "string" ? p.toolCallId : ""
         if (keptOnly && !options?.keepToolCallIds?.has(toolCallId)) continue
         const result = toolResultOutputToText(p.output)
+        const shorten = earlier && !options?.keepToolCallIds?.has(toolCallId)
         results.push(formatSeedToolObservation({
           toolName,
           toolCallId,
-          output: result.text,
+          output: shorten ? shortenForTranscript(result.text, TRANSCRIPT_TOOL_RESULT_CHARS) : result.text,
           isError: result.isError,
         }))
       }
@@ -5628,7 +5640,12 @@ function formatSeedToolObservation(input: {
   return `OpenCode host observation ${metadata}:\n${input.output}`
 }
 
-function extractAssistantHistoryText(msg: Record<string, unknown>): string {
+function shortenForTranscript(text: string, max: number): string {
+  if (text.length <= max) return text
+  return `${text.slice(0, max)}\n[… ${text.length - max} more characters]`
+}
+
+function extractAssistantHistoryText(msg: Record<string, unknown>, withToolCalls = false): string {
   const content = msg.content
   if (typeof content === "string") return content
   if (!Array.isArray(content)) return ""
@@ -5637,6 +5654,10 @@ function extractAssistantHistoryText(msg: Record<string, unknown>): string {
     const p = part as Record<string, unknown>
     if (p.type === "text" && typeof p.text === "string" && p.text.length > 0) {
       texts.push(p.text)
+    } else if (withToolCalls && p.type === "tool-call") {
+      const name = typeof p.toolName === "string" && p.toolName ? p.toolName : "tool"
+      const input = typeof p.input === "string" ? p.input : (JSON.stringify(p.input) ?? "")
+      texts.push(`[called ${name}] ${shortenForTranscript(input, TRANSCRIPT_TOOL_INPUT_CHARS)}`)
     }
   }
   return texts.join("\n")
