@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
+  createDirectMcpPlacement,
   exposeDirectMcpTools,
   mcpServerNamespace,
   rememberDirectMcpNamespaces,
@@ -92,5 +93,75 @@ describe("exposeDirectMcpTools", () => {
     exposeDirectMcpTools(editor(tools), new Set())
     exposeDirectMcpTools({ add: () => {} }, new Set(["github"]))
     expect(tools[0]?.options?.codemode).toBe(true)
+  })
+})
+
+describe("createDirectMcpPlacement", () => {
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
+  const mcpTools = (): Tool[] => [
+    { id: "github_echo", options: { namespace: "github", codemode: true } },
+    { id: "linear_list_issues", options: { namespace: "linear", codemode: true } },
+  ]
+
+  test("reloads tools once when namespaces arrive after the tool transform ran", async () => {
+    const tools = mcpTools()
+    let reloads = 0
+    const placement = createDirectMcpPlacement(async () => {
+      reloads++
+      placement.expose(editor(tools))
+    })
+
+    placement.expose(editor(tools))
+    placement.rememberServers([["github", {}]])
+    placement.rememberServers([["github", {}], ["linear", {}]])
+    expect(reloads).toBe(0)
+    await settle()
+
+    expect(reloads).toBe(1)
+    expect(tools.map((tool) => tool.options?.codemode)).toEqual([false, false])
+  })
+
+  test("does not reload when MCP state replays first or does not change", async () => {
+    const tools = mcpTools()
+    let reloads = 0
+    const placement = createDirectMcpPlacement(async () => void reloads++)
+
+    placement.rememberServers([["github", {}]])
+    await settle()
+    placement.expose(editor(tools))
+    placement.rememberServers([["github", { codemode: false }]])
+    await settle()
+
+    expect(reloads).toBe(0)
+    expect(tools.map((tool) => tool.options?.codemode)).toEqual([false, true])
+  })
+
+  test("skips the reload when the tool transform catches up first", async () => {
+    let reloads = 0
+    const placement = createDirectMcpPlacement(async () => void reloads++)
+
+    placement.expose(editor(mcpTools()))
+    placement.rememberServers([["github", {}]])
+    placement.expose(editor(mcpTools()))
+    await settle()
+
+    expect(reloads).toBe(0)
+  })
+
+  test("reloads again after a failed reload", async () => {
+    let attempts = 0
+    const placement = createDirectMcpPlacement(() => {
+      attempts++
+      if (attempts === 1) throw new Error("plugin scope closed")
+      return Promise.reject(new Error("still closed"))
+    })
+
+    placement.expose(editor(mcpTools()))
+    placement.rememberServers([["github", {}]])
+    await settle()
+    placement.rememberServers([["linear", {}]])
+    await settle()
+
+    expect(attempts).toBe(2)
   })
 })

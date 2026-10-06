@@ -601,6 +601,7 @@ function fakeContext(events: readonly unknown[] = []) {
   ctx.tool = {
     hook: hookDomain("tool").hook,
     transform: transformDomain("tool").transform,
+    reload: async () => void reloads.push("tool"),
   }
 
   return { ctx, registered, disposed, hooks, transforms, sessionLocations, reloads, inventory }
@@ -731,6 +732,44 @@ describe("opencode2 setup", () => {
     applyTools()
     expect(tools[0]?.options.codemode).toBe(true)
     await cleanup()
+  })
+
+  test("reloads tools when MCP namespaces arrive after the tool catalog was built", async () => {
+    const { ctx, transforms, reloads } = fakeContext()
+    const tools = [
+      { id: "linear_list_issues", options: { namespace: "linear", codemode: true as boolean | undefined } },
+    ]
+    const applyTools = () => {
+      transforms.get("tool")?.({
+        add: () => {},
+        list: () => tools,
+        update: (id: string, update: (tool: (typeof tools)[number]) => void) => {
+          const tool = tools.find((item) => item.id === id)
+          if (tool) update(tool)
+        },
+      })
+    }
+    ctx.tool.reload = async () => {
+      reloads.push("tool")
+      applyTools()
+    }
+    const cleanup = await plugin.setup(ctx)
+    const servers = () => [["linear", { type: "remote" }]] as const
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+    // A plugin reload can rebuild the tool registry before the MCP registry.
+    applyTools()
+    expect(tools[0]?.options.codemode).toBe(true)
+
+    transforms.get("mcp")?.({ list: servers })
+    await settle()
+    expect(reloads.filter((domain) => domain === "tool")).toEqual(["tool"])
+    expect(tools[0]?.options).toEqual({ namespace: "linear", codemode: false })
+
+    transforms.get("mcp")?.({ list: servers })
+    await settle()
+    expect(reloads.filter((domain) => domain === "tool")).toEqual(["tool"])
+    if (typeof cleanup === "function") await cleanup()
   })
 
   test("sets up on a host without the mcp domain", async () => {
