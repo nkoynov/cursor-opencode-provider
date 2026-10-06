@@ -3692,6 +3692,7 @@ export async function pump(
       if (injection && state && injection.state !== "delivered") injection.state = state as SteerInjection["state"]
     } else if (iu?.user_message_appended) {
       trace("steer: Cursor appended a user message to the Run")
+      if (textStarted) textSeparator = "\n\n"
     } else if (iu?.tool_call_started) {
       cacheDiagnostics.displayToolCalls++
       // Stash Cursor display ToolCall until exec claims it, or completed bridges it.
