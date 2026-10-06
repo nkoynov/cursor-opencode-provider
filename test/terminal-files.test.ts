@@ -57,6 +57,35 @@ function slowFailingShim(name: string, seconds: number): string {
   return `${shim}:${process.env.PATH}`
 }
 
+/** Each shell here that can stand in for `sh`, which runs the wrapper, the runner and the command. */
+const shShells = [...new Set(["sh", "dash", "bash", "zsh"]
+  .map((name) => spawnSync("sh", ["-c", `command -v ${name}`], { encoding: "utf8" }).stdout.trim())
+  .filter(Boolean)
+  .map((bin) => fs.realpathSync(bin)))]
+
+/** `sh` as `shell`; without `setsid`, one that starts no session, so the command gets no process group of its own outside bash. */
+function shAs(shell: string, setsid = true): { sh: string; PATH: string } {
+  const shim = tempDir()
+  fs.symlinkSync(shell, path.join(shim, "sh"))
+  if (!setsid) fs.writeFileSync(path.join(shim, "setsid"), '#!/bin/sh\nexec "$@"\n', { mode: 0o755 })
+  return { sh: path.join(shim, "sh"), PATH: `${shim}:${process.env.PATH}` }
+}
+
+/** Whether the runner gives the command its own process group with `sh` from `PATH`. */
+function ownGroup(sh: string, PATH: string): boolean {
+  return spawnSync(sh, ["-c", '[ -n "$BASH_VERSION" ] || command -v setsid >/dev/null'], { env: { ...process.env, PATH } }).status === 0
+}
+
+/** Whether `pid` is still running a second from now; a zombie has stopped. */
+function stillRunning(pid: number): boolean {
+  for (let i = 0; i < 40; i++) {
+    const stat = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" }).stdout.trim()
+    if (!stat || stat.startsWith("Z")) return false
+    Bun.sleepSync(25)
+  }
+  return true
+}
+
 function readyMarkers(tmp: string): string[] {
   return fs.readdirSync(tmp).filter((name) => name.startsWith("cursor-opencode-shell-ready."))
 }
@@ -246,6 +275,30 @@ describe("background spawn into a Cursor terminal file", () => {
     expect(Date.now() - started).toBeLessThan(7_000)
     expect(text).toMatch(terminalFile(pid!, "/w", "succeeded", "early\n", 0))
   }, 20_000)
+
+  it("stops the command and its child processes when its shell id is sent a TERM", async () => {
+    for (const shell of shShells) {
+      // While the command runs, and once it has exited but a child still holds its output.
+      for (const [child, rest, exitCode] of [[">/dev/null 2>&1 ", "; sleep 30", 143], ["", "", 0]] as const) {
+        const folder = tempDir()
+        const pidFile = path.join(tempDir(), "pid")
+        const { sh, PATH } = shAs(shell)
+        // Without a process group, a child is out of reach once the command's shell is gone.
+        if (exitCode === 0 && !ownGroup(sh, PATH)) continue
+        const command = `sleep 30 ${child}& echo $! >'${pidFile}'; printf 'start\\n'${rest}`
+        const stdout = spawnSync(sh, ["-c", buildBackgroundShellCommand(command, { folder, cwd: "/w" })], { encoding: "utf8", env: { ...process.env, PATH } }).stdout
+        const [, pid, file] = /__CURSOR_BACKGROUND_SHELL__(\d+):(.+)\n/.exec(stdout)!
+        for (let i = 0; i < 200 && !fs.readFileSync(file!, "utf8").includes("start\n"); i++) await Bun.sleep(25)
+        await Bun.sleep(300)
+        const signalled = Date.now()
+        process.kill(Number(pid), "SIGTERM")
+        expect({ shell, exitCode, text: await finished(file!) })
+          .toEqual({ shell, exitCode, text: expect.stringMatching(terminalFile(pid!, "/w", "aborted", "start\n", exitCode)) })
+        expect(Date.now() - signalled).toBeLessThan(3_000)
+        expect({ shell, exitCode, running: stillRunning(Number(fs.readFileSync(pidFile, "utf8"))) }).toEqual({ shell, exitCode, running: false })
+      }
+    }
+  }, 60_000)
 })
 
 describe("soft-background shell into a Cursor terminal file", () => {
@@ -517,6 +570,23 @@ describe("soft-background shell into a Cursor terminal file", () => {
     expect(Date.now() - started).toBeLessThan(4_000)
     expect(fs.readdirSync(folder)).toEqual([])
   })
+
+  it("stops the command's child processes too on the hard timeout", () => {
+    for (const shell of shShells) {
+      for (const setsid of [true, false]) {
+        const folder = tempDir()
+        const pidFile = path.join(tempDir(), "pid")
+        const { sh, PATH } = shAs(shell, setsid)
+        const command = `sleep 30 >/dev/null 2>&1 & echo $! >'${pidFile}'; sleep 30; echo after`
+        const started = Date.now()
+        const stdout = spawnSync(sh, ["-c", softPolicy(folder, command, 5_000, 300)], { encoding: "utf8", timeout: 20_000, env: { ...process.env, PATH } }).stdout
+        expect({ shell, setsid, result: consumeCursorShellResult("cursor_soft_1", stdout) })
+          .toEqual({ shell, setsid, result: { output: "Timed out after 300ms.\n", outcome: { kind: "timeout", timeoutMs: 300 } } })
+        expect(Date.now() - started).toBeLessThan(4_000)
+        expect({ shell, setsid, running: stillRunning(Number(fs.readFileSync(pidFile, "utf8"))) }).toEqual({ shell, setsid, running: false })
+      }
+    }
+  }, 30_000)
 
   it("marks a command the hard timeout stops after the handoff as aborted, and leaves no status file", async () => {
     const folder = tempDir()
