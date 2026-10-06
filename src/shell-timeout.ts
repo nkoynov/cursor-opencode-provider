@@ -229,7 +229,9 @@ const TERMINAL_RUNNER = [
   'reader=""; p="$ready.fifo"',
   'if [ "$aborted" = 0 ] && mkfifo -m 600 "$p" 2>/dev/null; then',
   // The runner opens both ends itself (through a brief read-write open, so neither blocks) and hands them out.
-  '  if { command exec 4<>"$p" 5<"$p" 6>"$p" 4<&-; } 2>/dev/null; then cat <&5 >>"$f" 5<&- 6>&- & reader=$!; fi',
+  // Not `command exec`, which bash 3.2 (macOS's sh) gets wrong: it leaks a writer, and later trapped signals spin `wait`.
+  // The subshell tries the opens first, so a failing one cannot end the runner.
+  '  if (exec 4<>"$p" 5<"$p" 6>"$p") 2>/dev/null && exec 4<>"$p" 5<"$p" 6>"$p" 4<&-; then cat <&5 >>"$f" 5<&- 6>&- & reader=$!; fi',
   '  rm -f -- "$p"',
   "fi",
   // Taking the ready marker claims the launch; a launcher that gave up on this runner took it first, and reads no file.
