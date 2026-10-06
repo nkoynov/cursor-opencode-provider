@@ -7,11 +7,17 @@ import {
   deliverContinuationResults,
   extractPromptHistory,
   extractTrailingToolResults,
+  preparePriorSessionForFreshTurn,
+  pump,
   pumpWithRecovery,
   resetTurnStateForTests,
 } from "../src/language-model.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { resetCursorShellCalls } from "../src/shell-timeout.js"
+import { resetConversationBindingsForTests, restoreConversationBinding } from "../src/protocol/conversation-bind.js"
+import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
+import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
+import { hydrateConversationState } from "../src/protocol/conversation-state.js"
 
 type Prompt = LanguageModelV3CallOptions["prompt"]
 
@@ -70,10 +76,44 @@ function execMessages(writes: Uint8Array[]): any[] {
     .filter((message) => message !== undefined)
 }
 
+const turnEndedFrame = () => ({
+  flags: 0,
+  payload: encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: { input_tokens: 1, output_tokens: 1 } } }),
+})
+
+/** Let the Run checkpoint and end its turn, saving the restart snapshot under `root`. */
+function endsTurn(live: CursorSession, root: string, sessionKey: string): CursorSession {
+  live.cacheDir = root
+  live.openCodeSessionId = sessionKey
+  restoreConversationBinding(sessionKey, live.conversationId)
+  const frames = [
+    { flags: 0, payload: encodeMessage("AgentServerMessage", { conversation_checkpoint_update: Uint8Array.from([7]) }) },
+    turnEndedFrame(),
+  ]
+  live.frames = {
+    next: async () => frames.length > 0 ? { done: false, value: frames.shift()! } : { done: true, value: undefined },
+  } as CursorSession["frames"]
+  return live
+}
+
+const controller = { enqueue() {}, error(error: Error) { throw error } } as unknown as ReadableStreamDefaultController<any>
+
+/** The note the next fresh Run of `sessionKey` gets after a provider restart. */
+async function hostNoteAfterRestart(root: string, sessionKey: string): Promise<string | undefined> {
+  resetConversationPersistenceForTests()
+  resetConversationBindingsForTests()
+  resetCheckpointsForTests()
+  resetTurnStateForTests()
+  return (await hydrateConversationState(root, sessionKey))?.hostNote
+}
+
 afterEach(() => {
   sessionManager.dispose()
   resetCursorShellCalls()
   resetTurnStateForTests()
+  resetConversationPersistenceForTests()
+  resetConversationBindingsForTests()
+  resetCheckpointsForTests()
 })
 
 describe("host notes on held-Run exec results", () => {
@@ -372,26 +412,21 @@ describe("host notes on held-Run exec results", () => {
   })
 
   it("keeps a deferred note when the held Run is resumed after an interruption", async () => {
-    const live = liveSession([])
-    live.resumeCheckpoint = new Uint8Array([1])
-    live.deferredNote = NOTE
-    let resumed: CursorSession | undefined
-    await pumpWithRecovery({
-      initialSession: live,
-      controller: { enqueue() {}, error(error: Error) { throw error } } as unknown as ReadableStreamDefaultController<any>,
-      recover: async () => {
-        resumed = liveSession([])
-        resumed.frames = {
-          next: async () => ({
-            done: false,
-            value: { flags: 0, payload: encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: { input_tokens: 1, output_tokens: 1 } } }) },
-          }),
-        } as CursorSession["frames"]
-        return resumed
-      },
-    })
+    const root = fs.mkdtempSync(path.join("/tmp", "cursor-host-notes-"))
+    try {
+      const live = liveSession([])
+      live.resumeCheckpoint = new Uint8Array([1])
+      live.deferredNote = NOTE
+      await pumpWithRecovery({
+        initialSession: live,
+        controller,
+        recover: async () => endsTurn(liveSession([]), root, "ses_resumed"),
+      })
 
-    expect(resumed!.deferredNote).toBe(NOTE)
+      expect(await hostNoteAfterRestart(root, "ses_resumed")).toBe(NOTE)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
   })
 
   it("carries the note on a background spawn that returned no process id", () => {
@@ -420,5 +455,49 @@ describe("host notes on held-Run exec results", () => {
 
     expect(execMessages(writes)[0].mcp_result.success.content.map((item: any) => item.text.text)).toEqual(["{}"])
     expect(live.deferredNote).toBeUndefined()
+  })
+})
+
+describe("host notes a turn ends without delivering", () => {
+  let root: string
+  const readResult = (live: CursorSession, execId: number) => {
+    sessionManager.registerPending(execId, live, "read_result", "read", false, { path: "/tmp/a.ts" })
+    return toolResult(live, execId, "read", "Read file /tmp/a.ts, lines 1-1\n1: alpha")
+  }
+
+  afterEach(() => fs.rmSync(root, { recursive: true, force: true }))
+
+  it("keeps the note of a turn's last read, with its checkpoint, for the session's next user turn", async () => {
+    root = fs.mkdtempSync(path.join("/tmp", "cursor-host-notes-"))
+    const live = liveSession([])
+    deliverContinuationResults(live, extractTrailingToolResults(step(readResult(live, 1), hostNote(NOTE))))
+
+    await pump(endsTurn(live, root, "ses_read"), controller, { textId: "t", reasoningId: "r" })
+
+    expect(live.deferredNote).toBeUndefined()
+    expect(await hostNoteAfterRestart(root, "ses_read")).toBe(NOTE)
+  })
+
+  it("does not keep a note a later result of the turn carried", async () => {
+    root = fs.mkdtempSync(path.join("/tmp", "cursor-host-notes-"))
+    const live = liveSession([])
+    deliverContinuationResults(live, extractTrailingToolResults(step(readResult(live, 1), hostNote(NOTE))))
+    sessionManager.registerPending(2, live, "mcp_result", "t3_thread_read")
+    deliverContinuationResults(live, extractTrailingToolResults(step(toolResult(live, 2, "t3_thread_read", "{}"))))
+
+    await pump(endsTurn(live, root, "ses_carried"), controller, { textId: "t", reasoningId: "r" })
+
+    expect(await hostNoteAfterRestart(root, "ses_carried")).toBeUndefined()
+  })
+
+  it("keeps the note when a fresh turn drains the prior Run", async () => {
+    root = fs.mkdtempSync(path.join("/tmp", "cursor-host-notes-"))
+    const live = endsTurn(liveSession([]), root, "ses_drained")
+    live.deferredNote = NOTE
+    sessionManager.registerSession(live)
+
+    expect(await preparePriorSessionForFreshTurn("ses_drained", { timeoutMs: 1_000 })).toBe("drained")
+
+    expect(await hostNoteAfterRestart(root, "ses_drained")).toBe(NOTE)
   })
 })

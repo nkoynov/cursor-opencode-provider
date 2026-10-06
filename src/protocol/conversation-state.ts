@@ -36,6 +36,7 @@ export async function hydrateConversationState(
   toolCatalog: OpencodeToolDef[]
   hostAgent?: string
   systemPromptHash?: string
+  hostNote?: string
 } | undefined> {
   if (hasConversationBinding(sessionKey)) return undefined
   const loaded = await loadPersistedConversation(cacheDir, sessionKey)
@@ -65,6 +66,7 @@ export async function hydrateConversationState(
     toolCatalog: structuredClone(persisted.toolCatalog),
     ...(persisted.hostAgent ? { hostAgent: persisted.hostAgent } : {}),
     ...(persisted.systemPromptHash ? { systemPromptHash: persisted.systemPromptHash } : {}),
+    ...(persisted.hostNote ? { hostNote: persisted.hostNote } : {}),
   }
 }
 
@@ -88,6 +90,7 @@ export async function persistConversationState(
     postCompactionRebase?: boolean
     hostAgent?: string
     systemPromptHash?: string
+    hostNote?: string
   },
 ): Promise<void> {
   // A newer Run may have reset/superseded this conversation while its final
@@ -114,6 +117,7 @@ export async function persistConversationState(
     postCompactionRebase: input.postCompactionRebase,
     hostAgent: input.hostAgent,
     systemPromptHash: input.systemPromptHash,
+    hostNote: input.hostNote,
     ...(provenance?.conversationId === input.conversationId
       ? { turnProvenance: serializeTurnProvenance(provenance) }
       : {}),
