@@ -231,6 +231,25 @@ describe("a message sent while Cursor works on the step", () => {
     expect(held.writes.length).toBe(writesBefore)
   })
 
+  it("starts its answer on a new paragraph when Cursor takes it after the model's text", async () => {
+    const held = heldReads("talking")
+    serve(held, [
+      () => {
+        announceHostSteer(hostSteer("change of plan"))
+        return serverFrame({ text_delta: { text: "The essay ends here." } })
+      },
+      () => injectionState(injections(held.writes)[0].injection_id, { delivered: { step: 2 } }),
+      () => serverFrame({ user_message_appended: { user_message: { text: "change of plan", message_id: "m" } } }),
+      () => serverFrame({ text_delta: { text: "STEERED" } }),
+      turnEnded,
+    ])
+
+    const { parts } = await stream(readStep("talking") as Prompt)
+
+    const text = parts.filter((part) => part.type === "text-delta").map((part: any) => part.delta).join("")
+    expect(text).toBe("The essay ends here.\n\nSTEERED")
+  })
+
   it("is not injected again when OpenCode promotes it after the step's results", async () => {
     const held = heldReads("promoted")
     held.steerInjections = [{ id: "inj-early", text: "change of plan", state: "queued" }]

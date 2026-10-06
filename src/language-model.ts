@@ -2885,6 +2885,7 @@ export async function pump(
   let textStarted = false
   let reasoningStarted = false
   let assistantText = ""
+  let textSeparator = ""
   let progressContinuationAttempts = 0
   let emittedHostTools = 0
   const replaySafety = new AttemptReplaySafety(session.sessionId)
@@ -3147,8 +3148,10 @@ export async function pump(
     textStarted = false
   }
 
-  const emitText = (text: string) => {
-    if (!text) return
+  const emitText = (delta: string) => {
+    if (!delta) return
+    const text = textSeparator + delta
+    textSeparator = ""
     assistantText += text
     replaySafety.markBarrier("visible-text")
     // Close reasoning before text (hosts expect reasoning-end before text-start).
@@ -3581,6 +3584,7 @@ export async function pump(
       if (injection && state && injection.state !== "delivered") injection.state = state as SteerInjection["state"]
     } else if (iu?.user_message_appended) {
       trace("steer: Cursor appended a user message to the Run")
+      if (textStarted) textSeparator = "\n\n"
     } else if (iu?.tool_call_started) {
       cacheDiagnostics.displayToolCalls++
       // Stash Cursor display ToolCall until exec claims it, or completed bridges it.
