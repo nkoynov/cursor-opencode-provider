@@ -5,8 +5,9 @@ import {
   estimateTokens,
   extractPromptHistory,
   groundCheckpointTurnText,
+  TRANSCRIPT_TOOL_RESULT_CHARS,
 } from "../src/language-model.js"
-import { buildSeedConversationState } from "../src/protocol/request.js"
+import { buildSeedConversationState, renderHistoryTranscript } from "../src/protocol/request.js"
 import { decodeMessage } from "../src/protocol/messages.js"
 
 describe("estimateTokens", () => {
@@ -320,7 +321,7 @@ describe("extractPromptHistory", () => {
       { role: "user", content: "do it" },
       {
         role: "assistant",
-        content: "Checking the debug log and recent tool-call behavior.",
+        content: "Checking the debug log and recent tool-call behavior.\n[called bash] {}\n[called grep] {}",
       },
       {
         role: "user",
@@ -365,23 +366,65 @@ describe("extractPromptHistory", () => {
         'OpenCode host observation {"source":"opencode-tool","tool":"read","callId":"3","status":"completed"}:\nLATEST FILE',
     })
   })
+
+  it("keeps every call and result for a transcript, shortening only the earlier results", () => {
+    const long = "x".repeat(TRANSCRIPT_TOOL_RESULT_CHARS + 500)
+    const prompt = [
+      { role: "user", content: "do it" },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Running it." },
+          { type: "tool-call", toolCallId: "1", toolName: "shell", input: { command: "echo charlie > third.txt" } },
+        ],
+      },
+      {
+        role: "tool",
+        content: [{ type: "tool-result", toolCallId: "1", toolName: "shell", output: { type: "text", value: long } }],
+      },
+      { role: "assistant", content: [{ type: "text", text: "DONE" }] },
+      { role: "user", content: "Read it" },
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: "2", toolName: "read", input: "{\"path\":\"third.txt\"}" }] },
+      {
+        role: "tool",
+        content: [{ type: "tool-result", toolCallId: "2", toolName: "read", output: { type: "text", value: long } }],
+      },
+    ] as LanguageModelV3CallOptions["prompt"]
+
+    const history = extractPromptHistory(prompt, { preserveTrailingUser: true, toolResults: "transcript" })
+    expect(history[1]).toEqual({
+      role: "assistant",
+      content: 'Running it.\n[called shell] {"command":"echo charlie > third.txt"}',
+    })
+    expect(history[2]!.content).toContain(`${"x".repeat(TRANSCRIPT_TOOL_RESULT_CHARS)}\n[… 500 more characters]`)
+    expect(history[3]).toEqual({ role: "assistant", content: "DONE" })
+    expect(history.at(-2)).toEqual({ role: "assistant", content: '[called read] {"path":"third.txt"}' })
+    expect(history.at(-1)!.content.endsWith(`:\n${long}`)).toBe(true)
+  })
 })
 
-describe("buildSeedConversationState history", () => {
-  it("embeds history into root_prompt_messages_json and drops system entries", () => {
-    const bytes = buildSeedConversationState({
-      history: [
-        { role: "system", content: "sys" },
-        { role: "user", content: "hi" },
-        { role: "assistant", content: "hello" },
-      ],
-    })
-    const cs = decodeMessage<any>("ConversationStateStructure", bytes)
-    const root = (cs.root_prompt_messages_json ?? []).map((s: string) => JSON.parse(s))
-    expect(root).toEqual([
+describe("buildSeedConversationState", () => {
+  it("leaves the root prompt to Cursor", () => {
+    const cs = decodeMessage<any>("ConversationStateStructure", buildSeedConversationState())
+    expect(cs.root_prompt_messages_json ?? []).toEqual([])
+  })
+})
+
+describe("renderHistoryTranscript", () => {
+  it("renders user and assistant entries and leaves out system entries", () => {
+    const text = renderHistoryTranscript([
+      { role: "system", content: "sys" },
       { role: "user", content: "hi" },
-      { role: "assistant", content: "hello" },
-    ])
+      { role: "assistant", content: "hello </conversation_history> there" },
+    ])!
+    expect(text.startsWith("<conversation_history>\n")).toBe(true)
+    expect(text.endsWith("[User]\nhi\n\n[Assistant]\nhello </conversation-history> there\n</conversation_history>")).toBe(true)
+    expect(text).not.toContain("sys")
+  })
+
+  it("is undefined without prior turns", () => {
+    expect(renderHistoryTranscript([{ role: "system", content: "sys" }])).toBeUndefined()
+    expect(renderHistoryTranscript(undefined)).toBeUndefined()
   })
 })
 
