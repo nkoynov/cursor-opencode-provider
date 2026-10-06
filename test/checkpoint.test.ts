@@ -63,7 +63,7 @@ describe("buildRunRequest checkpoint echo", () => {
     )
   })
 
-  it("seeds history without a system entry when no checkpoint is provided", () => {
+  it("replays history in the user message, not as root prompt messages, when no checkpoint is provided", () => {
     const data = buildRunRequest({
       text: "hi",
       modelId: "m",
@@ -71,6 +71,7 @@ describe("buildRunRequest checkpoint echo", () => {
       history: [
         { role: "system", content: "Be brief." },
         { role: "user", content: "earlier" },
+        { role: "assistant", content: "noted" },
       ],
     })
     const decoded = decodeMessage<any>("AgentClientMessage", data)
@@ -78,9 +79,25 @@ describe("buildRunRequest checkpoint echo", () => {
       "ConversationStateStructure",
       decoded.run_request.conversation_state,
     )
-    expect(cs.root_prompt_messages_json.map((s: string) => JSON.parse(s))).toEqual([
-      { role: "user", content: "earlier" },
-    ])
+    expect(cs.root_prompt_messages_json ?? []).toEqual([])
+    const text: string = decoded.run_request.action.user_message_action.user_message.text
+    expect(text.startsWith("<conversation_history>\n")).toBe(true)
+    expect(text).toContain("[User]\nearlier\n\n[Assistant]\nnoted\n</conversation_history>")
+    expect(text).not.toContain("Be brief.")
+    expect(text.endsWith("</conversation_history>\n\nhi")).toBe(true)
+  })
+
+  it("does not replay history when the Run resumes a checkpoint", () => {
+    const checkpoint = Uint8Array.from([0x0a, 0x01, 0x7f])
+    const data = buildRunRequest({
+      text: "follow up",
+      modelId: "m",
+      conversationId: "c",
+      conversationState: checkpoint,
+      history: [{ role: "user", content: "earlier" }],
+    })
+    const decoded = decodeMessage<any>("AgentClientMessage", data)
+    expect(decoded.run_request.action.user_message_action.user_message.text).toBe("follow up")
   })
 
   it("encodes checkpoint recovery as ResumeAction without replaying user text", () => {

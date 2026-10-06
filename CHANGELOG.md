@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A Run without a Cursor checkpoint (after a restart, a lost Run, a foreign-history or history-rewrite rebase) keeps the host system context, subagents and MCP instructions, and replays earlier tool calls with their results: prior turns now open the user message instead of replacing Cursor's root prompt, where they dropped the rules for the rest of the conversation and the model took its own earlier work for undone
+
 ## [0.8.0] - 2026-10-04
 
 ### Changed

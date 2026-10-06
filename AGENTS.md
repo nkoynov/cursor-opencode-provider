@@ -165,8 +165,15 @@ entry in `root_prompt_messages_json` is not followed, an untyped `CursorRule`
 is not applied (the Cursor CLI types AGENTS.md as `alwaysApply` → `global`;
 untyped falls to `manuallyAttached`), and `RequestContext.system_prompt_override`
 (#53) is ignored; the `global` rule is followed and costs the tokens of its
-text. So no `system` entry is seeded (`system` history entries are dropped
-too), and the provider does not read instruction or skill files itself.
+text. So `system` history entries are never replayed, and the provider does
+not read instruction or skill files itself. Never write
+`root_prompt_messages_json` at all: neither Cursor client does, and the server
+builds the root prompt (its system prompt plus these rules, custom subagents
+and MCP instructions) only when it is empty. Client-seeded root messages drop
+all of that for the rest of the conversation (seen live as Cursor's `rules`
+context category falling to 0). A Run without a checkpoint sends an empty
+`ConversationStateStructure` and opens its user message with the prior turns
+as a `<conversation_history>` transcript (`renderHistoryTranscript`).
 Merged `opencode.json` (`loadMergedConfig`) is still read for MCP server ids,
 plugin lists, and interaction guidance.
 
