@@ -1979,29 +1979,38 @@ async function waitUntilNotPumping(
   return !sessionManager.isActivelyPumping(session)
 }
 
-function nextFrameWithTimeout(
-  frames: AsyncIterator<Frame>,
+/** The queued frame read, if any, else a new one. */
+function takeFrame(session: CursorSession): Promise<IteratorResult<Frame>> {
+  const queued = session.queuedFrame
+  session.queuedFrame = undefined
+  return queued ?? session.frames.next()
+}
+
+/**
+ * The next frame, or undefined when none arrives within `timeoutMs`. A read
+ * that times out stays queued on the session, so the next reader gets its frame.
+ */
+async function nextFrameWithin(
+  session: CursorSession,
   timeoutMs: number,
-): Promise<IteratorResult<Frame> | { done: true; timedOut: true }> {
-  return new Promise((resolve, reject) => {
-    let settled = false
-    const finish = (
-      value?: IteratorResult<Frame> | { done: true; timedOut: true },
-      error?: unknown,
-    ) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      if (error !== undefined) reject(error)
-      else resolve(value!)
-    }
-    const timer = setTimeout(() => finish({ done: true, timedOut: true }), timeoutMs)
+): Promise<IteratorResult<Frame> | undefined> {
+  const read = takeFrame(session)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timedOut = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), timeoutMs)
     timer.unref?.()
-    void frames.next().then(
-      value => finish(value),
-      error => finish(undefined, error),
-    )
   })
+  try {
+    const result = await Promise.race([read, timedOut])
+    if (result === undefined) {
+      session.queuedFrame = read
+      // The eventual reader observes a failure; do not report it unhandled here.
+      read.catch(() => {})
+    }
+    return result
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 /**
@@ -2029,9 +2038,9 @@ export async function drainSessionUntilTurnEnded(
         break
       }
       const remainingMs = Math.max(1, deadlineAt - Date.now())
-      let next: IteratorResult<Frame> | { done: true; timedOut: true }
+      let next: IteratorResult<Frame> | undefined
       try {
-        next = await nextFrameWithTimeout(session.frames, remainingMs)
+        next = await nextFrameWithin(session, remainingMs)
       } catch (error) {
         trace(
           `fresh turn drain: frame wait failed sessionId=${session.sessionId} ` +
@@ -2040,7 +2049,7 @@ export async function drainSessionUntilTurnEnded(
         outcome = "interrupted"
         break
       }
-      if ("timedOut" in next && next.timedOut) {
+      if (!next) {
         outcome = "timeout"
         break
       }
@@ -2815,7 +2824,7 @@ async function nextFrameWithSemanticDeadline(
     )
   }
   try {
-    return await Promise.race([session.frames.next(), deadline])
+    return await Promise.race([takeFrame(session), deadline])
   } finally {
     if (timer) clearTimeout(timer)
     session.semanticDeadlineCancel = null
@@ -3318,7 +3327,7 @@ export async function pump(
     try {
       next = session.pending.size === 0
         ? await nextFrameWithSemanticDeadline(session)
-        : await session.frames.next()
+        : await takeFrame(session)
     } catch (error) {
       closeOpenSpans()
       const failure = error instanceof CursorProviderError

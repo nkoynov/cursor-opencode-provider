@@ -241,6 +241,12 @@ export type CursorSession = {
   knownMcpServers?: string[]
   stream: BidiStream
   frames: AsyncIterator<Frame>
+  /**
+   * A frame read that was started but not consumed (a drain that timed out
+   * while waiting on it, or a frame put back for another reader). Every
+   * reader takes it before calling `frames.next()` so no frame is skipped.
+   */
+  queuedFrame?: Promise<IteratorResult<Frame>>
   pending: Map<number, PendingExec>
   /**
    * Cursor display tool calls (tool_call_started) awaiting either an exec or a
@@ -745,6 +751,7 @@ export class SessionManager {
     const old = session.stream
     session.stream = next
     session.frames = next.frames()[Symbol.asyncIterator]()
+    session.queuedFrame = undefined
     this.subscribeTerminal(session)
     try { old.destroy() } catch { /* already closed */ }
   }
