@@ -158,9 +158,10 @@ describe("extractTrailingToolResults", () => {
 
     const trailing = extractTrailingToolResults(prompt)
     expect(trailing.map((r) => r.toolCallId)).toEqual(["cursor_live_1"])
-    // Notes ride on the last result so Cursor still sees them.
-    expect(trailing[0]!.output).toBe(
-      "ok\n\n<system-update>\nThe following skill IDs are no longer available: repro-r7.\n</system-update>" +
+    // Notes ride on the last result, outside its output, so Cursor still sees them.
+    expect(trailing[0]!.output).toBe("ok")
+    expect(trailing[0]!.note).toBe(
+      "<system-update>\nThe following skill IDs are no longer available: repro-r7.\n</system-update>" +
         "\n\nMCP server instructions are no longer available.",
     )
     // A note after a real user message is still a fresh turn.

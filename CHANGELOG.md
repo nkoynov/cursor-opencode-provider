@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Host notes that follow a step's tool results (nested `AGENTS.md` instructions, background completions, other `<system-update>` notes) no longer turn an OpenCode 2 read into its numbered raw text or get lost on errors, searches and writes: they are added after the result is parsed, to the last result with a text field or else the Run's next result ([#49](https://github.com/oakimov/cursor-opencode-provider/pull/49) by [@nkoynov](https://github.com/nkoynov))
+
 ## [0.8.0] - 2026-10-04
 
 ### Changed
