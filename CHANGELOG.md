@@ -17,7 +17,7 @@
 - A tool that runs for more than 10 minutes without OpenCode activity (a long foreground shell, a slow MCP call) no longer closes the held Run and restarts the turn without its earlier tool results: the Run is held while OpenCode reports one of its tools running, up to 4 hours, and each pending exec gets Cursor CLI's exec heartbeat ([#N](https://github.com/oakimov/cursor-opencode-provider/pull/N) by [@nkoynov](https://github.com/nkoynov))
 - On OpenCode 2, a message sent while the model waits on Cursor's side (a long `AwaitShell` on a background shell, a long answer) reaches the model within about a second instead of when the wait ends: the plugin sees OpenCode queue the steer and the Run in progress injects it, the way Cursor CLI steers, and the copy OpenCode adds to the next prompt is not sent or answered again ([#N](https://github.com/oakimov/cursor-opencode-provider/pull/N) by [@nkoynov](https://github.com/nkoynov))
 - On OpenCode 2, Cursor shells could run without the provider's wrapper when the plugin's copy of the module was not the one the model registered them in: a shell that outlived its wait timed out instead of moving to the background, and a failing command was reported to Cursor with exit code 0 ([#N](https://github.com/oakimov/cursor-opencode-provider/pull/N) by [@nkoynov](https://github.com/nkoynov))
-
+- Shell output reaches the model verbatim again. Lines such as `S=/tmp/x`, `#!/bin/sh`, branch names and diff lines were prefixed with the workspace root, and relative paths printed after a `cd` pointed at the wrong directory ([#54](https://github.com/oakimov/cursor-opencode-provider/pull/54) by [@nkoynov](https://github.com/nkoynov))
 ## [0.8.0] - 2026-10-04
 
 ### Changed

@@ -2055,10 +2055,6 @@ function encodeExecResult(input: ToolResultInput, note?: string): { frames: Uint
   let noteCarried = false
 
   if (resultField === "shell_stream") {
-    const stdout = groundShellPathText(
-      input.output,
-      shellPathRoot(input.resultMetadata, input.workspaceRoot),
-    )
     noteCarried = note !== undefined
     // Real clients always emit Start → Stdout/Stderr* → Exit (capture/tests).
     frames.push(encodeShellStream(input.execId, undefined, { start: {} }))
@@ -2067,7 +2063,7 @@ function encodeExecResult(input: ToolResultInput, note?: string): { frames: Uint
       frames.push(encodeShellStream(input.execId, undefined, { stderr: { data: stderr } }))
       frames.push(encodeShellStream(input.execId, input.executionTimeMs, { exit: { code: 1, aborted: false } }))
     } else {
-      const text = note === undefined ? stdout : appendNote(stdout, note)
+      const text = note === undefined ? input.output : appendNote(input.output, note)
       if (text) {
         frames.push(encodeShellStream(input.execId, undefined, { stdout: { data: text } }))
       }
@@ -2591,21 +2587,6 @@ function splitForeignAbsolute(
   }
 }
 
-function isRelativePathToken(token: string): boolean {
-  if (!token || isAbsoluteToolPath(token)) return false
-  // A slash alone does not make arbitrary shell output a path. In particular,
-  // compact JSON, quoted strings, package ids, and shell syntax must remain
-  // byte-for-byte model-visible rather than being prefixed with the workspace.
-  if (/[\0"'`{}\[\]<>|;]/.test(token) || token.startsWith("@")) return false
-  if (
-    token.startsWith("./")
-    || token.startsWith("../")
-    || token.startsWith(".\\")
-    || token.startsWith("..\\")
-  ) return true
-  return token.includes("/") || (path.sep === "\\" && token.includes("\\"))
-}
-
 function resolveListedEntry(directory: string, entry: string): string {
   if (!entry || isAbsoluteToolPath(entry)) return entry
   if (entry === "~" || entry.startsWith("~/") || entry.startsWith("~\\")) return entry
@@ -2809,46 +2790,6 @@ function rewriteSearchPathLine(line: string, workspaceRoot: string): string {
   }
   if (line.includes("://")) return line
   return resolveToolPath(line, workspaceRoot)
-}
-
-/**
- * Shell stdout is mixed prose. Rewrite only tokens that are clearly relative
- * paths, including `file:line` and `file:line:col`. Leave sentences, URLs, and
- * status words alone.
- */
-function groundShellPathText(output: string, root: string | undefined): string {
-  if (!root || !output) return output
-  return normalizeToolText(output).split("\n").map((line) => rewriteShellPathLine(line, root)).join("\n")
-}
-
-function shellPathRoot(
-  resultMetadata: Record<string, unknown> | undefined,
-  workspaceRoot: string | undefined,
-): string | undefined {
-  const workingDirectory = str(resultMetadata?.working_directory)?.trim()
-  if (!workingDirectory) return workspaceRoot
-  if (isAbsoluteToolPath(workingDirectory)) return workingDirectory
-  return workspaceRoot ? joinToolPath(workspaceRoot, workingDirectory) : undefined
-}
-
-function rewriteShellPathLine(line: string, root: string): string {
-  if (!line || line.startsWith(" ") || line.startsWith("\t")) return line
-  const trimmed = line.trimEnd()
-  if (trimmed.includes("://") || trimmed === "~" || trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
-    return line
-  }
-  const located = /^(.+?):(\d+)(?::(\d+))?$/.exec(trimmed)
-  if (located && located[1] && isRelativePathToken(located[1])) {
-    const suffix = located[3] !== undefined ? `:${located[2]}:${located[3]}` : `:${located[2]}`
-    return `${resolveToolPath(located[1], root)}${suffix}`
-  }
-  if (/\s/.test(trimmed)) return line
-  const header = /^(.*):$/.exec(trimmed)
-  if (header && header[1] && isRelativePathToken(header[1])) {
-    return `${resolveToolPath(header[1], root)}:`
-  }
-  if (isRelativePathToken(trimmed)) return resolveToolPath(trimmed, root)
-  return line
 }
 
 type ParsedGrepContent = {
@@ -3204,14 +3145,13 @@ export function buildTypedExecResult(
     case "shell_result": {
       const command = str(resultMetadata?.command) ?? ""
       const workingDirectory = str(resultMetadata?.working_directory) ?? ""
-      const stdout = groundShellPathText(output, shellPathRoot(resultMetadata, resultRoot))
       if (error) {
         return {
           failure: {
             command,
             working_directory: workingDirectory,
             exit_code: 1,
-            stdout: stdout || "",
+            stdout: output || "",
             stderr: error,
             aborted: false,
           },
@@ -3232,7 +3172,7 @@ export function buildTypedExecResult(
             command: shellOutcome.command || command,
             working_directory: shellOutcome.workingDirectory || workingDirectory,
             exit_code: 0,
-            stdout: stdout,
+            stdout: output,
             shell_id: shellOutcome.shellId,
             pid: shellOutcome.pid,
             ms_to_wait: shellOutcome.msToWait,
@@ -3250,13 +3190,11 @@ export function buildTypedExecResult(
           command,
           working_directory: workingDirectory,
           exit_code: exitCode,
-          stdout: stdout,
+          stdout: output,
         },
       }
     }
     case "pi_bash_result":
-      if (error) return { error: { error } }
-      return { success: { output: groundShellPathText(output, shellPathRoot(resultMetadata, resultRoot)) } }
     case "pi_edit_result":
       if (error) return { error: { error } }
       return { success: { output } }
