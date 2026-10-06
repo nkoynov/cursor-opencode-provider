@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- MCP tools stay on the OpenCode 2 direct tool list after a plugin reload instead of moving into Code Mode until an MCP server reconnects, and a call to a tool the host left out of the direct list points the model at `execute` when Code Mode is available instead of telling it to give the tool up ([#55](https://github.com/oakimov/cursor-opencode-provider/pull/55) by [@nkoynov](https://github.com/nkoynov))
+
 ## [0.8.0] - 2026-10-04
 
 ### Changed

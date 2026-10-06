@@ -2,6 +2,7 @@ import { beforeEach, describe, it, expect } from "bun:test"
 import {
   computeAllowTools,
   MAX_TURN_STATE_SESSIONS,
+  notPermittedToolReason,
   resetTurnStateForTests,
   restoreTurnToolCatalog,
   resolveTurnConversationReset,
@@ -362,5 +363,23 @@ describe("refuse exec while tools disallowed", () => {
     })
     const close = decodeMessage("AgentClientMessage", frames[1]) as Record<string, unknown>
     expect(close.exec_client_control_message).toEqual({ stream_close: { id: 1 } })
+  })
+})
+
+describe("notPermittedToolReason", () => {
+  it("points a tool left out of the direct list at Code Mode when execute is permitted", () => {
+    const reason = notPermittedToolReason("linear_list_issues", new Set(["read", "execute"]))
+    expect(reason).toContain("OpenCode tool 'linear_list_issues' is not in the direct tool list this turn")
+    expect(reason).toContain("Permitted tools: execute, read.")
+    expect(reason).toContain("`<namespace>_<tool>` appears there as `<namespace>.<tool>`")
+    expect(reason).toContain("call it through OpenCode `execute` with the catalog's exact path")
+    expect(reason).not.toContain("not permitted for the current agent")
+  })
+
+  it("keeps the plain refusal on hosts without Code Mode", () => {
+    expect(notPermittedToolReason("edit", new Set(["read", "grep"]))).toBe(
+      "OpenCode tool 'edit' is not permitted for the current agent this turn. "
+        + "Permitted tools: grep, read. Continue using only permitted tools; do not retry 'edit'.",
+    )
   })
 })
