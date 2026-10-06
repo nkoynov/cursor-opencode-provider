@@ -1062,14 +1062,20 @@ export async function pumpWithRecovery(input: {
     if (recovery.kind === "resume") {
       next.usageEstimate = { ...pumpedSession.usageEstimate }
       next.editToolCalls = new Map(pumpedSession.editToolCalls)
-      next.deferredNote = pumpedSession.deferredNote
       next.pendingFollowUp = recovery.followUp
       // The resumed Run never saw these; its turn_ended sends them as a follow-up. One delivered
       // after the checkpoint it resumes from is lost with that checkpoint, so it goes too.
-      const resend = pumpedSession.steerInjections
-        ?.filter((injection) => injection.state !== "delivered" || !injection.checkpointed)
+      // A host note goes with the resumed Run's next results instead.
+      const unheld = pumpedSession.steerInjections
+        ?.filter((injection) => injection.state !== "delivered" || !injection.checkpointed) ?? []
+      next.deferredNote = joinNotes([
+        pumpedSession.deferredNote,
+        ...unheld.filter((injection) => injection.hostNote).map((injection) => injection.text),
+      ])
+      const resend = unheld
+        .filter((injection) => !injection.hostNote)
         .map((injection) => ({ ...injection, state: "carried" as const, checkpointed: false }))
-      if (resend?.length) next.steerInjections = resend
+      if (resend.length) next.steerInjections = resend
       // mirroredTodos rides along via rememberMirroredTodos (per-OpenCode-
       // session, seeded in startSession) — no handoff needed here.
     }
@@ -2337,6 +2343,10 @@ export async function drainSessionUntilTurnEnded(
         }
       }
 
+      if (iu?.context_injection_state) {
+        recordInjectionState(session, iu.context_injection_state as Record<string, unknown>)
+      }
+
       if (iu?.turn_ended) {
         trace(`fresh turn drain: turn_ended raw wire fields: ${debugWalkTurnEnded(payload)}`)
         keepUndeliveredHostNote(session)
@@ -2605,6 +2615,10 @@ export function deliverContinuationResults(
   let note = joinNotes([session.deferredNote, ...trailingToolResults.map((r) => r.note)])
   session.deferredNote = undefined
   const noteCarrier = note === undefined ? undefined : findNoteCarrier(session, pendingResults)
+  if (note !== undefined && !noteCarrier && session.runId) {
+    if (!injectHostNote(session, note)) return undefined
+    note = undefined
+  }
   for (const r of pendingResults) {
     const claim = sessionManager.claim(session.sessionId, r.execId)
     if ("kind" in claim) {
@@ -2907,11 +2921,11 @@ function joinNotes(notes: ReadonlyArray<string | undefined>): string | undefined
   return present.length > 0 ? present.join("\n\n") : undefined
 }
 
-/** At turn_ended, keep a note no exec result could carry for the session's next fresh Run. */
+/** At turn_ended, keep a note no exec result carried and Cursor did not deliver for the session's next fresh Run. */
 function keepUndeliveredHostNote(session: CursorSession): void {
-  const note = session.deferredNote
-  if (note === undefined) return
+  const note = joinNotes([session.deferredNote, ...takeUndeliveredNoteInjections(session)])
   session.deferredNote = undefined
+  if (note === undefined) return
   const sessionKey = session.openCodeSessionId
   if (!sessionKey) {
     trace(`continuation: turn ended before an exec result could carry the host note; dropped noteLen=${note.length}`)
@@ -2922,6 +2936,33 @@ function keepUndeliveredHostNote(session: CursorSession): void {
     `continuation: turn ended before an exec result could carry the host note; ` +
       `kept for the next user turn sessionKey=${sessionKey} noteLen=${note.length}`,
   )
+}
+
+function recordInjectionState(session: CursorSession, update: Record<string, unknown>): void {
+  const stateVariants = (update.state ?? {}) as Record<string, unknown>
+  const state = Object.keys(stateVariants).find((key) => stateVariants[key])
+  const reason = (stateVariants.rejected as Record<string, unknown> | undefined)?.reason
+  const injection = session.steerInjections?.find((i) => i.id === update.injection_id)
+  trace(
+    `${injection?.hostNote ? "continuation: host note" : "steer:"} injection id=${String(update.injection_id)} state=${state ?? "-"}` +
+      (typeof reason === "string" && reason ? ` reason=${JSON.stringify(reason)}` : ""),
+  )
+  if (injection && state && injection.state !== "delivered") injection.state = state as SteerInjection["state"]
+}
+
+/** Remove the host notes from the Run's injections and return the ones Cursor did not deliver. */
+function takeUndeliveredNoteInjections(session: CursorSession): string[] {
+  const injections = session.steerInjections
+  if (!injections?.some((injection) => injection.hostNote)) return []
+  session.steerInjections = injections.filter((injection) => !injection.hostNote)
+  const undelivered = injections.filter((injection) => injection.hostNote && injection.state !== "delivered")
+  if (undelivered.length > 0) {
+    trace(
+      `continuation: Cursor did not deliver ${undelivered.length} injected host note(s) ` +
+        `states=${undelivered.map((injection) => injection.state).join(",")}`,
+    )
+  }
+  return undelivered.map((injection) => injection.text)
 }
 
 function rememberUndeliveredHostNote(sessionKey: string, note: string): void {
@@ -3958,16 +3999,7 @@ export async function pump(
       sessionManager.close(session)
       return
     } else if (iu?.context_injection_state) {
-      const update = iu.context_injection_state as Record<string, unknown>
-      const stateVariants = (update.state ?? {}) as Record<string, unknown>
-      const state = Object.keys(stateVariants).find((key) => stateVariants[key])
-      const reason = (stateVariants.rejected as Record<string, unknown> | undefined)?.reason
-      trace(
-        `steer: injection id=${String(update.injection_id)} state=${state ?? "-"}` +
-          (typeof reason === "string" && reason ? ` reason=${JSON.stringify(reason)}` : ""),
-      )
-      const injection = session.steerInjections?.find((i) => i.id === update.injection_id)
-      if (injection && state && injection.state !== "delivered") injection.state = state as SteerInjection["state"]
+      recordInjectionState(session, iu.context_injection_state as Record<string, unknown>)
     } else if (iu?.user_message_appended) {
       trace("steer: Cursor appended a user message to the Run")
       if (textStarted) textSeparator = "\n\n"
@@ -5174,6 +5206,32 @@ function injectHostSteer(session: CursorSession, steer: HostSteer): boolean {
       `id=${injection.id} inboxID=${steer.inboxID}`,
   )
   return true
+}
+
+/**
+ * Queue a host note no result of the step can carry on the held Run before its results. Cursor adds
+ * it as a user message after them, where OpenCode puts it for other providers, so the model reads it
+ * before its next step instead of a turn later.
+ */
+function injectHostNote(session: CursorSession, note: string): CursorSession | undefined {
+  const injection: SteerInjection = { id: crypto.randomUUID(), text: note, state: "sent", hostNote: true }
+  try {
+    session.stream.write(buildInjectUserMessage({
+      injectionId: injection.id,
+      expectedRunId: session.runId!,
+      text: note,
+    }))
+  } catch (error) {
+    trace(`continuation: host note inject write FAILED sessionId=${session.sessionId} err=${(error as Error).message}`)
+    sessionManager.close(session, "result-write-failed")
+    return undefined
+  }
+  ;(session.steerInjections ??= []).push(injection)
+  trace(
+    `continuation: no result could carry the host note; injected into the Run runId=${session.runId} ` +
+      `id=${injection.id} noteLen=${note.length}`,
+  )
+  return session
 }
 
 /** Detect a host-owned canonical plan review, excluding Cursor exec replies. */

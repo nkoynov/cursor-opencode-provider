@@ -16,7 +16,7 @@ import {
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { resetCursorShellCalls } from "../src/shell-timeout.js"
 import { resetConversationBindingsForTests, restoreConversationBinding } from "../src/protocol/conversation-bind.js"
-import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
+import { getCheckpoint, resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
 import { hydrateConversationState } from "../src/protocol/conversation-state.js"
 
@@ -82,12 +82,33 @@ const turnEndedFrame = () => ({
   payload: encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: { input_tokens: 1, output_tokens: 1 } } }),
 })
 
+function injectionStateFrame(injectionId: string, state: Record<string, unknown>) {
+  return {
+    flags: 0,
+    payload: encodeMessage("AgentServerMessage", {
+      interaction_update: { context_injection_state: { injection_id: injectionId, state } },
+    }),
+  }
+}
+
+function injectedNotes(writes: Uint8Array[]): any[] {
+  return writes
+    .map((frame) => decodeMessage<any>("AgentClientMessage", frame).conversation_action?.inject_context_action)
+    .filter((action) => action !== undefined)
+}
+
 /** Let the Run checkpoint and end its turn, saving the restart snapshot under `root`. */
-function endsTurn(live: CursorSession, root: string, sessionKey: string): CursorSession {
+function endsTurn(
+  live: CursorSession,
+  root: string,
+  sessionKey: string,
+  before: Array<{ flags: number; payload: Uint8Array }> = [],
+): CursorSession {
   live.cacheDir = root
   live.openCodeSessionId = sessionKey
   restoreConversationBinding(sessionKey, live.conversationId)
   const frames = [
+    ...before,
     { flags: 0, payload: encodeMessage("AgentServerMessage", { conversation_checkpoint_update: Uint8Array.from([7]) }) },
     turnEndedFrame(),
   ]
@@ -520,5 +541,168 @@ describe("host notes a turn ends without delivering", () => {
     expect(await preparePriorSessionForFreshTurn("ses_stopped", { timeoutMs: 1_000 })).toBe("drained")
 
     expect(await hostNoteAfterRestart(root, "ses_stopped")).toBe(NOTE)
+  })
+})
+
+describe("host notes injected into the held Run", () => {
+  let root: string | undefined
+  const heldRun = (writes: Uint8Array[]) => {
+    const live = liveSession(writes)
+    live.runId = `run-${live.sessionId}`
+    return live
+  }
+  const readResult = (live: CursorSession, execId: number) => {
+    sessionManager.registerPending(execId, live, "read_result", "read", false, { path: "/tmp/a.ts" })
+    return toolResult(live, execId, "read", "Read file /tmp/a.ts, lines 1-1\n1: alpha")
+  }
+  const noFollowUp = (live: CursorSession) => {
+    live.reopenWithUserMessage = async () => { throw new Error("a host note is never a follow-up Run") }
+  }
+
+  afterEach(() => {
+    if (root) fs.rmSync(root, { recursive: true, force: true })
+    root = undefined
+  })
+
+  it("injects a note no result of the step can carry before the step's results", () => {
+    const writes: Uint8Array[] = []
+    const live = heldRun(writes)
+
+    expect(deliverContinuationResults(live, extractTrailingToolResults(step(
+      readResult(live, 1),
+      readResult(live, 2),
+      hostNote(NOTE),
+    )))).toBe(live)
+
+    const [first, ...rest] = writes.map((frame) => decodeMessage<any>("AgentClientMessage", frame))
+    expect(first.conversation_action.inject_context_action).toMatchObject({
+      expected_run_id: live.runId,
+      user_context: { user_message: { text: NOTE } },
+    })
+    expect(rest.filter((message) => message.exec_client_message?.read_result)).toHaveLength(2)
+    expect(JSON.stringify(rest)).not.toContain("system-update")
+    expect(live.deferredNote).toBeUndefined()
+    expect(live.steerInjections).toMatchObject([{ text: NOTE, state: "sent", hostNote: true }])
+  })
+
+  it("leaves a note on a result of the step that can carry it", () => {
+    const writes: Uint8Array[] = []
+    const live = heldRun(writes)
+    sessionManager.registerPending(3, live, "mcp_result", "t3_thread_read")
+
+    deliverContinuationResults(live, extractTrailingToolResults(step(
+      toolResult(live, 3, "t3_thread_read", "{}"),
+      readResult(live, 4),
+      hostNote(NOTE),
+    )))
+
+    expect(injectedNotes(writes)).toEqual([])
+    expect(execMessages(writes)[0].mcp_result.success.content.at(-1).text.text).toBe(NOTE)
+  })
+
+  it("injects a deferred note with the Run's next results", () => {
+    const writes: Uint8Array[] = []
+    const live = heldRun(writes)
+    live.deferredNote = NOTE
+
+    deliverContinuationResults(live, extractTrailingToolResults(step(readResult(live, 5), hostNote(LATER_NOTE))))
+
+    expect(injectedNotes(writes).map((action) => action.user_context.user_message.text)).toEqual([`${NOTE}\n\n${LATER_NOTE}`])
+    expect(live.deferredNote).toBeUndefined()
+  })
+
+  it("closes the Run when the note cannot be written", () => {
+    const live = heldRun([])
+    live.stream.write = () => { throw new Error("stream closed") }
+
+    expect(deliverContinuationResults(live, extractTrailingToolResults(step(readResult(live, 6), hostNote(NOTE))))).toBeUndefined()
+    expect(live.closed).toBe(true)
+  })
+
+  it("keeps nothing for the next user turn once Cursor delivered the note", async () => {
+    root = fs.mkdtempSync(path.join("/tmp", "cursor-host-notes-"))
+    const writes: Uint8Array[] = []
+    const live = heldRun(writes)
+    noFollowUp(live)
+    deliverContinuationResults(live, extractTrailingToolResults(step(readResult(live, 1), hostNote(NOTE))))
+    const id = injectedNotes(writes)[0].injection_id
+
+    await pump(endsTurn(live, root, "ses_injected", [
+      injectionStateFrame(id, { queued: {} }),
+      injectionStateFrame(id, { delivered: { step: 2 } }),
+    ]), controller, { textId: "t", reasoningId: "r" })
+
+    expect(getCheckpoint(live.conversationId)).toEqual(Uint8Array.from([7]))
+    expect(await hostNoteAfterRestart(root, "ses_injected")).toBeUndefined()
+  })
+
+  it("keeps a note Cursor did not deliver for the next user turn, with the turn's checkpoint", async () => {
+    const outcomes: Record<string, unknown> = {}
+    for (const state of ["rejected", "queued_for_next_turn", "cancelled", "unanswered"]) {
+      const dir = fs.mkdtempSync(path.join("/tmp", "cursor-host-notes-"))
+      try {
+        const writes: Uint8Array[] = []
+        const live = heldRun(writes)
+        noFollowUp(live)
+        deliverContinuationResults(live, extractTrailingToolResults(step(readResult(live, 1), hostNote(NOTE))))
+        const id = injectedNotes(writes)[0].injection_id
+        const answer = state === "unanswered" ? [] : [injectionStateFrame(id, { [state]: {} })]
+
+        await pump(endsTurn(live, dir, `ses_${state}`, answer), controller, { textId: "t", reasoningId: "r" })
+
+        outcomes[state] = {
+          checkpoint: getCheckpoint(live.conversationId),
+          note: await hostNoteAfterRestart(dir, `ses_${state}`),
+        }
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    }
+
+    for (const outcome of Object.values(outcomes)) {
+      expect(outcome).toEqual({ checkpoint: Uint8Array.from([7]), note: NOTE })
+    }
+    expect(Object.keys(outcomes)).toHaveLength(4)
+  })
+
+  it("sends a note the resumed checkpoint may not hold with the resumed Run's next results", async () => {
+    root = fs.mkdtempSync(path.join("/tmp", "cursor-host-notes-"))
+    const live = heldRun([])
+    live.resumeCheckpoint = new Uint8Array([1])
+    live.steerInjections = [
+      { id: "held", text: LATER_NOTE, state: "delivered", checkpointed: true, hostNote: true },
+      { id: "unheld", text: NOTE, state: "queued", hostNote: true },
+    ]
+
+    await pumpWithRecovery({
+      initialSession: live,
+      controller,
+      recover: async () => {
+        const resumed = endsTurn(heldRun([]), root!, "ses_resumed_injection")
+        noFollowUp(resumed)
+        return resumed
+      },
+    })
+
+    expect(await hostNoteAfterRestart(root, "ses_resumed_injection")).toBe(NOTE)
+  })
+
+  it("keeps only an undelivered note when a fresh turn drains the prior Run", async () => {
+    const outcomes: Record<string, unknown> = {}
+    for (const state of ["delivered", "rejected"]) {
+      const dir = fs.mkdtempSync(path.join("/tmp", "cursor-host-notes-"))
+      try {
+        const live = endsTurn(heldRun([]), dir, `ses_drained_${state}`, [injectionStateFrame("note-1", { [state]: {} })])
+        live.steerInjections = [{ id: "note-1", text: NOTE, state: "sent", hostNote: true }]
+        sessionManager.registerSession(live)
+
+        expect(await preparePriorSessionForFreshTurn(`ses_drained_${state}`, { timeoutMs: 1_000 })).toBe("drained")
+        outcomes[state] = await hostNoteAfterRestart(dir, `ses_drained_${state}`)
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    }
+
+    expect(outcomes).toEqual({ delivered: undefined, rejected: NOTE })
   })
 })

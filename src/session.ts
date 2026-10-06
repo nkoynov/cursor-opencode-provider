@@ -278,15 +278,15 @@ export type CursorSession = {
    */
   editToolCalls?: Map<string, { path: string; completeRead?: boolean }>
   /**
-   * Host note (`<system-update>`, background completion) that arrived with
-   * results whose typed shapes have no text slot. It rides on the next exec
-   * result this Run delivers, or on the session's next user turn when the
-   * turn ends first.
+   * Host note (`<system-update>`, background completion) that no result could
+   * carry and no injection into this Run delivered yet. It goes with the next
+   * results this Run gets, or with the session's next user turn when the turn
+   * ends first.
    */
   deferredNote?: string
   /** AgentRunRequest.run_id of the Run on `stream`; Cursor checks injections against it. */
   runId?: string
-  /** Mid-turn user messages injected into this Run, in send order. */
+  /** Mid-turn user messages and host notes injected into this Run, in send order. */
   steerInjections?: SteerInjection[]
   /** User text of a follow-up Run that has not reached its first checkpoint; a resume must resend it. */
   pendingFollowUp?: string
@@ -372,6 +372,8 @@ export type SteerInjection = {
   state: "sent" | "carried" | "queued" | "delivered" | "queued_for_next_turn" | "cancelled" | "rejected"
   /** A checkpoint arrived after Cursor answered this injection, so it holds the message and the step. */
   checkpointed?: boolean
+  /** A host note rather than a user message: one Cursor does not deliver waits for the next user turn, never a follow-up Run. */
+  hostNote?: true
 }
 
 type Tombstone = {
