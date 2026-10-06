@@ -146,6 +146,7 @@ export type PendingExec = {
 }
 
 export type ContinuationTerminalReason =
+  | "host-interrupted"
   | "hard-cap-expired"
   | "remote-clean-close"
   | "remote-error"
@@ -229,6 +230,8 @@ export type CursorSession = {
   }
   /** OpenCode session whose own or descendant activity renews tool leases. */
   openCodeSessionId?: string
+  /** OpenCode session whose Stop cancels this Run, also for a helper isolated from it. */
+  stoppedWithSessionId?: string
   /** Host primary agent whose prompt/permissions this Run was seeded with. */
   hostAgent?: string
   /** Stable host-system + provider-guidance identity for restart validation. */
@@ -348,11 +351,15 @@ export type CursorSession = {
   deferredTerminalReason: "remote-clean-close" | "remote-error" | null
   policy: CursorContinuationPolicy
   createdAt: number
+  /** When the host's model call that opened this Run started; it may open the Run after a stop. */
+  requestedAt?: number
   lastInboundAt: number
   lastHeartbeatWriteAt: number
   semanticDeadlineAt: number
   closeError: CursorProviderError | null
   closed: boolean
+  /** The host stopped the turn (OpenCode 2 interrupt); the Run is being cancelled and must not be continued. */
+  hostInterrupted?: string
   reopenWithUserMessage?: (text: string, abortSignal?: AbortSignal) => Promise<void>
 }
 
@@ -378,6 +385,10 @@ type SessionManagerOptions = {
   tombstoneTtlMs?: number
   tombstoneLimit?: number
   maxOpenSessions?: number
+}
+
+export function stoppedWith(session: CursorSession): string | undefined {
+  return session.stoppedWithSessionId ?? session.openCodeSessionId
 }
 
 export class SessionManager {
@@ -495,6 +506,30 @@ export class SessionManager {
 
   isActivelyPumping(session: CursorSession): boolean {
     return this.isPumping(session)
+  }
+
+  /** Every open Run a Stop of this OpenCode session cancels, including one a newer Run did not supersede. */
+  openSessionsStoppedWith(openCodeSessionId: string): CursorSession[] {
+    return [...this.sessions].filter((session) => !session.closed && stoppedWith(session) === openCodeSessionId)
+  }
+
+  /**
+   * Forget every result the host still owed this Run, without writing any: the
+   * host stopped the turn, and the Run is about to be cancelled.
+   *
+   * @returns number of pendings dropped
+   */
+  abandonPending(session: CursorSession): number {
+    if (session.closed) return 0
+    const dropped = session.pending.size
+    for (const execId of session.pending.keys()) {
+      const key = this.key(session.sessionId, execId)
+      this.byExecId.delete(key)
+      this.putTombstone(key, "host-interrupted")
+    }
+    session.pending.clear()
+    this.scheduleHardDeadline(session)
+    return dropped
   }
 
   /** Cursor withdrew this exec; returns false when it is not one the host still owes. */
