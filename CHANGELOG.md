@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- On OpenCode 2, Cursor shells could run without the provider's wrapper when the plugin's copy of the module was not the one the model registered them in: a shell that outlived its wait timed out instead of moving to the background, and a failing command was reported to Cursor with exit code 0 ([#53](https://github.com/oakimov/cursor-opencode-provider/pull/53) by [@nkoynov](https://github.com/nkoynov))
+
 ## [0.8.0] - 2026-10-04
 
 ### Changed
