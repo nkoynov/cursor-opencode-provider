@@ -452,6 +452,25 @@ export function buildAsyncAskQuestionCompletion(
   })
 }
 
+/** A message the user sent while the Run's tools ran, injected the way Cursor CLI steers. */
+export function buildInjectUserMessage(input: {
+  injectionId: string
+  expectedRunId: string
+  text: string
+}): Uint8Array {
+  return encodeMessage("AgentClientMessage", {
+    conversation_action: {
+      inject_context_action: {
+        injection_id: input.injectionId,
+        expected_run_id: input.expectedRunId,
+        user_context: {
+          user_message: { text: input.text, message_id: input.injectionId },
+        },
+      },
+    },
+  })
+}
+
 /**
  * CreatePlan persistence and execution approval. Cursor CLI writes
  * `~/.cursor/plans/*.plan.md` with YAML frontmatter; this provider writes plain

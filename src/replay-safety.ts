@@ -44,7 +44,7 @@ export type ReplayFrameAnalysis = {
   barrier?: ReplayBarrierReason
 }
 
-const INTERACTION_UPDATE_FIELDS = new Set([1, 2, 3, 4, 7, 13, 14, 16, 17])
+const INTERACTION_UPDATE_FIELDS = new Set([1, 2, 3, 4, 6, 7, 13, 14, 16, 17, 23])
 const INTERACTION_QUERY_FIELDS = new Set([2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14])
 const TOP_LEVEL_FIELDS = new Set([1, 2, 3, 4, 5, 7])
 
