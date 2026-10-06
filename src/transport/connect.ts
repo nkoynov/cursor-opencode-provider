@@ -499,6 +499,16 @@ export function installSessionInvalidationForTests(
   installSessionInvalidation(origin, session)
 }
 
+/** Node-runtime regression hook: cache a connected local session for `origin`. */
+export function cacheHttp2SessionForTests(
+  origin: string,
+  session: http2.ClientHttp2Session,
+): void {
+  installSessionInvalidation(origin, session)
+  _http2SessionCreatedAt.set(session, Date.now())
+  _http2Sessions.set(origin, session)
+}
+
 function invalidateSession(origin: string, session: http2.ClientHttp2Session): void {
   dropSession(origin, session)
   _http2SessionListenerCleanup.get(session)?.()
@@ -702,7 +712,10 @@ function acquireSession(
           }
         } catch (error) {
           trace(`h2 cached session ping failed: origin=${origin} err=${(error as Error).message}`)
-          invalidateSession(origin, existing)
+          // Sibling Runs may still be streaming on this session; destroy() would
+          // abort them mid-output, where they cannot be replayed.
+          dropSession(origin, existing)
+          try { existing.close() } catch { /* already closed */ }
         }
       }
     }
