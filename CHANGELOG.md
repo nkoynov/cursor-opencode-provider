@@ -6,6 +6,7 @@
 
 - Host notes that follow a step's tool results (nested `AGENTS.md` instructions, background completions, other `<system-update>` notes) no longer turn an OpenCode 2 read into its numbered raw text or get lost on errors, searches and writes: they are added after the result is parsed, to the last result with a text field other than a read's file content, or else the Run's next result, or the next user message when the turn ends first ([#49](https://github.com/oakimov/cursor-opencode-provider/pull/49) by [@nkoynov](https://github.com/nkoynov))
 - A message sent while a step's tools run no longer cancels the held Run's pending results and makes the model redo them: when the Run waits on exactly that step's results, the message is injected into that Run the way Cursor CLI steers, then the results are delivered, and a message Cursor does not take is sent as a follow-up when the turn ends ([#50](https://github.com/oakimov/cursor-opencode-provider/pull/50) by [@nkoynov](https://github.com/nkoynov))
+- A host note no result of the step can hold, such as the nested `AGENTS.md` of a file the model only read, now applies to the answer of the same turn instead of from the next user message: it is injected into the held Run as a user message after the step's results, where OpenCode puts it for other providers, and a note Cursor does not deliver still goes with the next user message ([#59](https://github.com/oakimov/cursor-opencode-provider/pull/59) by [@nkoynov](https://github.com/nkoynov))
 
 ## [0.8.0] - 2026-10-04
 

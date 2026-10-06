@@ -509,6 +509,41 @@ describe("doStream with a mid-turn user message", () => {
     expect(outcomes["checkpointed"]).toMatchObject({ checkpoint: Uint8Array.from([7, 7]) })
   })
 
+  it("injects a host note that trails the step's results along with the message, never as a follow-up", async () => {
+    const outcomes: Record<string, unknown> = {}
+    for (const state of ["delivered", "rejected"]) {
+      const held = heldReads(`noted-${state}`)
+      held.resumeCheckpoint = new Uint8Array([1])
+      const followUps: string[] = []
+      held.reopenWithUserMessage = async (text) => {
+        followUps.push(text)
+        serve(held, [turnEnded])
+      }
+      serve(held, [
+        () => injectionState(injections(held.writes)[0].injection_id, { [state]: {} }),
+        () => injectionState(injections(held.writes)[1].injection_id, { [state]: {} }),
+        completed("call_1"),
+        completed("call_2"),
+        checkpoint,
+        turnEnded,
+      ])
+
+      await streamSteer(held, steer(`noted-${state}`, user(NOTE), user("also check 3.ts")))
+
+      outcomes[state] = {
+        injected: injections(held.writes).map((action) => action.user_context.user_message.text),
+        followUps,
+      }
+      expect(JSON.stringify(execMessages(held.writes))).not.toContain("system-update")
+      sessionManager.dispose()
+    }
+
+    expect(outcomes).toEqual({
+      delivered: { injected: ["also check 3.ts", NOTE], followUps: [] },
+      rejected: { injected: ["also check 3.ts", NOTE], followUps: ["also check 3.ts"] },
+    })
+  })
+
   it("sends no follow-up for a delivered message", async () => {
     const held = heldReads("delivered")
     held.resumeCheckpoint = new Uint8Array([1])
@@ -523,6 +558,28 @@ describe("doStream with a mid-turn user message", () => {
     await streamSteer(held, steer("delivered", user("also check 3.ts")))
 
     expect(followUps).toEqual([])
+  })
+})
+
+describe("doStream with a host note after a step of reads", () => {
+  it("injects the note into the held Run before the results", async () => {
+    const held = heldReads("plain-note")
+    serve(held, [
+      () => injectionState(injections(held.writes)[0].injection_id, { delivered: { step: 2 } }),
+      turnEnded,
+    ])
+
+    const { parts, fetched } = await streamSteer(held, steer("plain-note", user(NOTE)))
+
+    expect(parts.at(-1)?.type).toBe("finish")
+    const [first] = clientMessages(held.writes)
+    expect(first.conversation_action.inject_context_action).toMatchObject({
+      expected_run_id: "run_plain-note",
+      user_context: { user_message: { text: NOTE } },
+    })
+    expect(execMessages(held.writes).map((message) => message.read_result.success.content)).toEqual(["alpha\nbeta", "alpha\nbeta"])
+    expect(held.resultsAfterCheckpoint).toBeUndefined()
+    expect(fetched).toEqual([])
   })
 })
 
