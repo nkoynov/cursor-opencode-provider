@@ -19,6 +19,8 @@
 - On OpenCode 2, Cursor shells could run without the provider's wrapper when the plugin's copy of the module was not the one the model registered them in: a shell that outlived its wait timed out instead of moving to the background, and a failing command was reported to Cursor with exit code 0 ([#N](https://github.com/oakimov/cursor-opencode-provider/pull/N) by [@nkoynov](https://github.com/nkoynov))
 - Shell output reaches the model verbatim again. Lines such as `S=/tmp/x`, `#!/bin/sh`, branch names and diff lines were prefixed with the workspace root, and relative paths printed after a `cd` pointed at the wrong directory ([#54](https://github.com/oakimov/cursor-opencode-provider/pull/54) by [@nkoynov](https://github.com/nkoynov))
 - MCP tools stay on the OpenCode 2 direct tool list after a plugin reload instead of moving into Code Mode until an MCP server reconnects, and a call to a tool the host left out of the direct list points the model at `execute` when Code Mode is available instead of telling it to give the tool up ([#55](https://github.com/oakimov/cursor-opencode-provider/pull/55) by [@nkoynov](https://github.com/nkoynov))
+- A restart while OpenCode runs a Cursor tool call (a pending `question`, a permission prompt, a long shell) no longer makes the next message look like another model's history: the turn continues the same Cursor conversation instead of replaying the whole session, which for long sessions failed with "prompt is too long" and forced a compaction. A Run waiting on host tools is now saved with its latest checkpoint, so the resumed conversation includes the interrupted turn's finished steps
+
 ## [0.8.0] - 2026-10-04
 
 ### Changed

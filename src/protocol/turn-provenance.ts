@@ -1,4 +1,5 @@
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
+import { parseExecIdFromToolCallId } from "./tools.js"
 
 // A sticky Cursor conversation only knows what Cursor itself produced. When the
 // host answers a turn with another model (another provider or a local model)
@@ -195,6 +196,9 @@ export function detectForeignHistory(input: {
   // A turn carrying only typed reasoning gives no evidence either way.
   if (toolCallIds.length === 0 && !text) return undefined
   if (toolCallIds.some((id) => entry.toolCallIds.includes(id))) return undefined
+  // Only this provider mints `cursor_<run>_<exec>` ids. A restart while the host
+  // ran such a call loses the step's record, but the step is still ours.
+  if (toolCallIds.some((id) => parseExecIdFromToolCallId(id))) return undefined
   // Compare against the latest step only: a foreign "Done." must not match an
   // older Cursor turn that happened to contain the same words. Same model: the
   // host keeps our reasoning typed, so its text parts match our text. After a

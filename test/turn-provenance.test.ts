@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, it } from "bun:test"
+import { afterAll, beforeEach, describe, expect, it, jest } from "bun:test"
 import { mkdtemp, rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -17,23 +17,32 @@ import {
 import {
   assertForeignHistoryRebaseFits,
   extractPromptHistory,
+  HELD_RUN_SAVE_DELAY_MS,
   pump,
   resetTurnStateForTests,
 } from "../src/language-model.js"
+import { createCursor } from "../src/index.js"
 import {
   getPersistedConversation,
   resetConversationPersistenceForTests,
+  type PersistedConversation,
 } from "../src/protocol/conversation-persistence.js"
 import { hydrateConversationState, hydrateTurnProvenance } from "../src/protocol/conversation-state.js"
 import {
+  peekConversationId,
   resetConversationBindingsForTests,
   restoreConversationBinding,
 } from "../src/protocol/conversation-bind.js"
-import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
-import { resetConversationBlobsForTests } from "../src/protocol/blob-store.js"
+import { getCheckpoint, resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
+import {
+  conversationBlobCount,
+  resetConversationBlobsForTests,
+  setConversationBlob,
+} from "../src/protocol/blob-store.js"
 import { resetFrozenRequestContextsForTests } from "../src/context/frozen.js"
+import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { encodeMessage } from "../src/protocol/messages.js"
-import type { CursorSession, Frame } from "../src/session.js"
+import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 
 type Prompt = LanguageModelV3CallOptions["prompt"]
 
@@ -86,6 +95,16 @@ describe("detectForeignHistory", () => {
     trackTurnProvenance(SESSION, CONVERSATION)
     recordEmittedPart(SESSION, CONVERSATION, { type: "tool-call", toolCallId: "call_ours" })
     expect(detect(promptEndingWith(assistantToolCall("call_ours", "Reading it")))).toBeUndefined()
+  })
+
+  it("accepts a turn carrying a tool call id this provider minted, even without its record", () => {
+    trackTurnProvenance(SESSION, CONVERSATION)
+    recordEmittedPart(SESSION, CONVERSATION, { type: "text-delta", delta: "Earlier step" })
+    const ours = "cursor_db32c773-3087-4d91-818c-9d0813c22cd4_900000"
+    expect(detect(promptEndingWith(assistantToolCall(ours, "Asking the user")))).toBeUndefined()
+    expect(detect(promptEndingWith(assistantToolCall("call_theirs", "Asking the user")))).toBe("foreign-assistant")
+    expect(detect(promptEndingWith(assistantToolCall("cursor_no-exec-id", "Asking the user"))))
+      .toBe("foreign-assistant")
   })
 
   it("flags an assistant turn another model produced", () => {
@@ -307,13 +326,16 @@ describe("provenance through a Cursor Run", () => {
   })
 
   function textTurnSession(root: string, text: string): CursorSession {
-    const payloads = [
+    return runSession(root, [
       encodeMessage("AgentServerMessage", { interaction_update: { text_delta: { text } } }),
       encodeMessage("AgentServerMessage", { conversation_checkpoint_update: Uint8Array.from([1, 2, 3]) }),
       encodeMessage("AgentServerMessage", {
         interaction_update: { turn_ended: { input_tokens: 3, output_tokens: 1 } },
       }),
-    ]
+    ])
+  }
+
+  function runSession(root: string, payloads: Uint8Array[], sessionId = "provenance-run"): CursorSession {
     let index = 0
     const frames: AsyncIterator<Frame> = {
       next: async () => index < payloads.length
@@ -321,7 +343,7 @@ describe("provenance through a Cursor Run", () => {
         : { done: true, value: undefined },
     }
     return {
-      sessionId: "provenance-run",
+      sessionId,
       conversationId: CONVERSATION,
       cacheDir: root,
       openCodeSessionId: SESSION,
@@ -351,7 +373,7 @@ describe("provenance through a Cursor Run", () => {
       displayToolCalls: new Map(),
       nextBridgedExecId: 900_000,
       blobs: new Map(),
-      toolDescriptors: [],
+      toolDescriptors: [{ name: "opencode-question", tool_name: "question", provider_identifier: "opencode" }],
       requestContext: { rules_info_complete: true },
       allowTools: true,
       usageEstimate: { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 },
@@ -388,5 +410,215 @@ describe("provenance through a Cursor Run", () => {
     resetTurnProvenanceForTests()
     await hydrateTurnProvenance(root, SESSION)
     expect(detect(promptEndingWith(assistantText("Somebody else")))).toBe("foreign-assistant")
+  })
+
+  // A decodable checkpoint that references no blobs, so TurnEnded compaction would drop them all.
+  const MID_RUN_CHECKPOINT = Uint8Array.from([0x98, 0x06, 0x01])
+  const LATER_CHECKPOINT = Uint8Array.from([0x98, 0x06, 0x02])
+
+  function questionStep(checkpoint: Uint8Array, interactionId: number): Uint8Array[] {
+    return [
+      encodeMessage("AgentServerMessage", { conversation_checkpoint_update: checkpoint }),
+      encodeMessage("AgentServerMessage", { interaction_update: { thinking_delta: { text: "The user seems confused" } } }),
+      encodeMessage("AgentServerMessage", {
+        interaction_query: {
+          id: interactionId,
+          ask_question_interaction_query: encodeMessage("AskQuestionInteractionQuery", {
+            args: {
+              title: "Question",
+              questions: [{ id: "q1", prompt: "Do all five?", options: [{ id: "yes", label: "Yes" }] }],
+            },
+            tool_call_id: `toolu_question_${interactionId}`,
+          }),
+        },
+      }),
+    ]
+  }
+
+  function questionRunSession(root: string): CursorSession {
+    return runSession(root, [
+      ...questionStep(MID_RUN_CHECKPOINT, 42),
+      ...questionStep(LATER_CHECKPOINT, 43),
+    ], "question-run")
+  }
+
+  async function pumpUntilQuestion(session: CursorSession): Promise<string> {
+    const parts: any[] = []
+    await pump(session, {
+      enqueue(part: unknown) { parts.push(part) },
+      error(error: unknown) { throw error },
+    } as unknown as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
+    // pumpWithRecovery's endPump: OpenCode now runs the question tool.
+    session.pumpActive = false
+    const toolCall = parts.find((part) => part.type === "tool-call")
+    expect(toolCall?.toolName).toBe("question")
+    expect(session.pending.size).toBe(1)
+    return toolCall.toolCallId
+  }
+
+  async function persistedOnDisk(root: string, until: (value: PersistedConversation | undefined) => boolean) {
+    for (let attempt = 0; attempt < 200; attempt++) {
+      resetConversationPersistenceForTests()
+      const value = await getPersistedConversation(root, SESSION)
+      if (until(value)) return value
+      await Bun.sleep(5)
+    }
+    throw new Error("snapshot never reached the expected state")
+  }
+
+  function restartProcess(session: CursorSession): void {
+    sessionManager.close(session, "process-disposed")
+    resetTurnProvenanceForTests()
+    resetConversationPersistenceForTests()
+    resetConversationBindingsForTests()
+    resetCheckpointsForTests()
+    resetConversationBlobsForTests()
+    resetFrozenRequestContextsForTests()
+    resetTurnStateForTests()
+  }
+
+  // OpenCode 2 marks the interrupted question as an error and replays the
+  // errored step's reasoning as text.
+  function promptAfterRestart(toolCallId: string): Prompt {
+    return [
+      { role: "user", content: [{ type: "text", text: "first" }] },
+      assistantText("Cursor wrote this"),
+      { role: "user", content: [{ type: "text", text: "what are you talking about?" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "The user seems confused" },
+          { type: "tool-call", toolCallId, toolName: "question", input: { questions: [] } },
+        ],
+      },
+      {
+        role: "tool",
+        content: [{
+          type: "tool-result",
+          toolCallId,
+          toolName: "question",
+          output: { type: "error-text", value: "Tool execution interrupted" },
+        }],
+      },
+      { role: "user", content: [{ type: "text", text: "okay, I rebuilt the system" }] },
+    ]
+  }
+
+  // Runs the next fresh turn up to the point where it would open the Run: the
+  // agent host override is rejected only after the conversation is bound.
+  async function conversationOfNextTurn(root: string, prompt: Prompt): Promise<string> {
+    const model = createCursor({
+      name: "cursor",
+      accessToken: "token",
+      agentBaseURL: "https://evil.example",
+      cacheDir: root,
+    }).languageModel("cursor-test")
+    try {
+      await expect(model.doStream({
+        prompt,
+        tools: [{ type: "function", name: "question", description: "Ask", inputSchema: { type: "object" } }],
+        headers: { "x-opencode-session-id": SESSION, "x-opencode-directory": root },
+      } as LanguageModelV3CallOptions)).rejects.toThrow("Invalid Cursor agent base URL override")
+    } finally {
+      setHostCacheDirOverride(undefined)
+    }
+    return peekConversationId(SESSION)
+  }
+
+  async function turnThenQuestion(root: string): Promise<{ session: CursorSession; toolCallId: string }> {
+    restoreConversationBinding(SESSION, CONVERSATION)
+    await pump(textTurnSession(root, "Cursor wrote this"), {
+      enqueue() {},
+      error(error: unknown) { throw error },
+    } as unknown as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
+    const session = questionRunSession(root)
+    beginEmittedStep(SESSION, CONVERSATION)
+    return { session, toolCallId: await pumpUntilQuestion(session) }
+  }
+
+  it("keeps the conversation and the latest checkpoint after a restart while a question is pending", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "cursor-provenance-"))
+    roots.push(root)
+    jest.useFakeTimers()
+    let session: CursorSession
+    let toolCallId: string
+    try {
+      ;({ session, toolCallId } = await turnThenQuestion(root))
+      jest.advanceTimersByTime(HELD_RUN_SAVE_DELAY_MS)
+    } finally {
+      jest.useRealTimers()
+    }
+    const saved = await persistedOnDisk(root, (value) => value?.checkpoint?.join() === MID_RUN_CHECKPOINT.join())
+    expect(parseTurnProvenance(saved!.turnProvenance!)?.toolCallIds).toEqual([toolCallId])
+
+    restartProcess(session)
+    expect(await conversationOfNextTurn(root, promptAfterRestart(toolCallId))).toBe(CONVERSATION)
+    expect(getCheckpoint(CONVERSATION)).toEqual(MID_RUN_CHECKPOINT)
+    expect((await getPersistedConversation(root, SESSION))?.conversationId).toBe(CONVERSATION)
+  })
+
+  it("keeps the conversation when the restart comes before the held Run is saved", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "cursor-provenance-"))
+    roots.push(root)
+    jest.useFakeTimers()
+    let session: CursorSession
+    let toolCallId: string
+    try {
+      ;({ session, toolCallId } = await turnThenQuestion(root))
+      jest.advanceTimersByTime(HELD_RUN_SAVE_DELAY_MS - 1)
+    } finally {
+      jest.useRealTimers()
+    }
+    restartProcess(session)
+    expect(await conversationOfNextTurn(root, promptAfterRestart(toolCallId))).toBe(CONVERSATION)
+    expect(getCheckpoint(CONVERSATION)).toEqual(Uint8Array.from([1, 2, 3]))
+  })
+
+  it("still rebases after a restart when another model answered last", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "cursor-provenance-"))
+    roots.push(root)
+    jest.useFakeTimers()
+    let session: CursorSession
+    try {
+      ;({ session } = await turnThenQuestion(root))
+      jest.advanceTimersByTime(HELD_RUN_SAVE_DELAY_MS)
+    } finally {
+      jest.useRealTimers()
+    }
+    await persistedOnDisk(root, (value) => value?.checkpoint?.join() === MID_RUN_CHECKPOINT.join())
+    restartProcess(session)
+    const prompt = promptEndingWith(assistantToolCall("call_theirs", "Another model asked this"))
+    expect(await conversationOfNextTurn(root, prompt)).not.toBe(CONVERSATION)
+  })
+
+  it("saves only a Run still waiting on the host, and keeps the blobs the Run may still need", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "cursor-provenance-"))
+    roots.push(root)
+    let session: CursorSession
+    jest.useFakeTimers()
+    try {
+      ;({ session } = await turnThenQuestion(root))
+      // The answer came back and the Run is generating again when the delay ends.
+      session.pending.clear()
+      session.pumpActive = true
+      jest.advanceTimersByTime(HELD_RUN_SAVE_DELAY_MS)
+    } finally {
+      jest.useRealTimers()
+    }
+    await Bun.sleep(20)
+    expect((await getPersistedConversation(root, SESSION))?.checkpoint).toEqual(Uint8Array.from([1, 2, 3]))
+
+    setConversationBlob(CONVERSATION, Uint8Array.from([0xab]), Uint8Array.from([7]))
+    jest.useFakeTimers()
+    try {
+      await pumpUntilQuestion(session)
+      jest.advanceTimersByTime(HELD_RUN_SAVE_DELAY_MS)
+    } finally {
+      jest.useRealTimers()
+    }
+    const saved = await persistedOnDisk(root, (value) => value?.checkpoint?.join() === LATER_CHECKPOINT.join())
+    expect(saved!.blobs.map((blob) => blob.id)).toContain("ab")
+    expect(conversationBlobCount(CONVERSATION)).toBe(1)
+    sessionManager.close(session, "ordinary-cleanup")
   })
 })
