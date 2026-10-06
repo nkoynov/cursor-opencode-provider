@@ -1073,7 +1073,8 @@ export async function pumpWithRecovery(input: {
     const pumpedSession = session
     const pumpOwner = Symbol("cursor-pump")
     sessionManager.beginPump(pumpedSession, pumpOwner)
-    const stopSteers = pumpedSession.openCodeSessionId
+    // A compaction Run keeps the session id, but a steer is for the agent, not the summarizer.
+    const stopSteers = pumpedSession.openCodeSessionId && !pumpedSession.postCompactionRebase
       ? listenForHostSteers(pumpedSession.openCodeSessionId, (steer) => injectHostSteer(pumpedSession, steer))
       : undefined
     try {
