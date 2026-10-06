@@ -189,16 +189,20 @@ function cursorQuoted(value: string): string {
  * Cursor tells the model to read that file for the returned shell id, which is
  * the runner's pid (`nohup` execs it). The header's `running_for_ms` is
  * refreshed every 5 s like Cursor CLI's, by a ticker the runner stops before
- * its final rewrite. A TERM is forwarded to the command and escalated to KILL
- * after 3 s, so the footer is still written, with status `aborted`; one that
- * arrives before the command started keeps it from starting. The runner
- * removes its ready marker just before it starts the command. A waiting
- * wrapper's `$donef` stays until the wrapper removes it or is gone.
+ * its final rewrite. A TERM is forwarded to the command and what it started,
+ * and escalated to KILL after 3 s, so the footer is still written, with status
+ * `aborted`; one that arrives before the command started keeps it from
+ * starting. The runner removes its ready marker just before it starts the
+ * command. A waiting wrapper's `$donef` stays until the wrapper removes it or
+ * is gone.
  */
 const TERMINAL_RUNNER = [
-  'f="$1/$$.txt"; cmd="$2"; cwdl="$3"; cmdl="$4"; titl="$5"; donef="$6"; waiter="$7"; ready="$8"; aborted=0; child=""',
-  `stop_child() { kill -TERM "$child" 2>/dev/null; (sleep 3; kill -KILL "$child" 2>/dev/null) & }`,
-  `trap 'aborted=1; [ -z "$child" ] || stop_child' TERM INT`,
+  'f="$1/$$.txt"; cmd="$2"; cwdl="$3"; cmdl="$4"; titl="$5"; donef="$6"; waiter="$7"; ready="$8"; aborted=0; child=""; grp=""',
+  // The command's process group, or without one its process tree, collected before any of it is signalled.
+  'targets() { if kill -0 "-$1" 2>/dev/null; then echo "-$1"; else for p in $(pgrep -P "$1" 2>/dev/null); do targets "$p"; done; echo "$1"; fi; }',
+  // Once the command is reaped, only its process group is left to stop: its pid alone may be another process's.
+  `stop_child() { if [ -n "$child" ]; then tg=$(targets "$child"); elif [ -n "$grp" ] && kill -0 "-$grp" 2>/dev/null; then tg="-$grp"; else return 0; fi; kill -TERM $tg 2>/dev/null; (sleep 3; kill -KILL $tg 2>/dev/null) & }`,
+  `trap 'aborted=1; stop_child' TERM INT`,
   // Milliseconds where `date` has %N (GNU, busybox), else whole seconds.
   'now_ms() { t=$(date +%s%3N 2>/dev/null); case "$t" in ""|*[!0-9]*) t=$(( $(date +%s) * 1000 ));; esac; echo "$t"; }',
   'started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; t0=$(now_ms)',
@@ -218,8 +222,11 @@ const TERMINAL_RUNNER = [
   // Taking the ready marker claims the launch; a launcher that gave up on this runner took it first, and reads no file.
   'if [ "$aborted" = 0 ] && ! rm -- "$ready" 2>/dev/null; then rm -f -- "$f"; exit 1; fi',
   'if [ "$aborted" = 0 ]; then',
-  '  if [ -n "$reader" ]; then sh -c "$cmd" >&6 2>&1 </dev/null 5<&- 6>&- & else sh -c "$cmd" >>"$f" 2>&1 </dev/null & fi',
-  "  child=$!",
+  // In its own process group, a TERM reaches the command's children too. Job control needs a terminal in dash
+  // and zsh (which also aborts the script without one), so other shells use `setsid` where there is one.
+  '  own=""; if [ -n "$BASH_VERSION" ]; then set -m; elif command -v setsid >/dev/null 2>&1; then own=setsid; fi',
+  '  if [ -n "$reader" ]; then $own sh -c "$cmd" >&6 2>&1 </dev/null 5<&- 6>&- & else $own sh -c "$cmd" >>"$f" 2>&1 </dev/null & fi',
+  '  child=$!; grp=$child; [ -z "$BASH_VERSION" ] || set +m',
   // A TERM taken while the command was being started found no child to stop.
   '  [ "$aborted" = 0 ] || stop_child',
   "fi",
