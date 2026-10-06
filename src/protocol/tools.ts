@@ -1988,8 +1988,10 @@ function mcpImageItems(images: readonly CursorImageInput[]): Array<Record<string
   return images.map((image) => ({ image: { data: image.data, mime_type: image.mimeType } }))
 }
 
-// Success shapes with no free-text field. Every typed error/failure shape has
-// one, and so do the other success shapes (content, stdout, output).
+// Cursor shows a read's content to the model as numbered file lines, so a note
+// there would read as part of the file.
+const FILE_CONTENT_RESULTS = new Set(["read_result", "pi_read_result"])
+
 /** Whether this result's typed shape has a text slot for a host note after its parsed payload. */
 export function resultCanCarryNote(input: ToolResultInput): boolean {
   const resultField = input.resultField || "mcp_result"
@@ -2003,7 +2005,7 @@ export function resultCanCarryNote(input: ToolResultInput): boolean {
     input.shellOutcome,
     input.workspaceRoot,
   )
-  return attachResultNote(typed, " ") !== undefined
+  return attachResultNote(resultField, typed, " ") !== undefined
 }
 
 function appendNote(text: unknown, note: string): string {
@@ -2011,11 +2013,15 @@ function appendNote(text: unknown, note: string): string {
   return `${text.endsWith("\n") ? text : `${text}\n`}\n${note}`
 }
 
-function attachResultNote(typed: Record<string, unknown>, note: string): Record<string, unknown> | undefined {
+function attachResultNote(
+  resultField: string,
+  typed: Record<string, unknown>,
+  note: string,
+): Record<string, unknown> | undefined {
   const { success, error, failure } = typed as Record<string, Record<string, unknown> | undefined>
   if (error && typeof error.error === "string") return { ...typed, error: { ...error, error: appendNote(error.error, note) } }
   if (failure) return { ...typed, failure: { ...failure, stderr: appendNote(failure.stderr, note) } }
-  if (!success) return undefined
+  if (!success || FILE_CONTENT_RESULTS.has(resultField)) return undefined
   if (Array.isArray(success.content)) {
     return { ...typed, success: { ...success, content: [...success.content, { text: { text: note } }] } }
   }
@@ -2040,7 +2046,7 @@ export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
  * `buildExecClientMessages` with a host note appended after the parsed
  * payload. In the raw output the note would break parsing: an OpenCode 2 read
  * would reach Cursor with its header and line numbers. `noteCarried` is false
- * when the result shape has no text slot for it.
+ * when the result shape has no text slot for it other than file content.
  */
 export function buildExecClientMessagesWithNote(
   input: ToolResultInput,
@@ -2107,7 +2113,7 @@ function encodeExecResult(input: ToolResultInput, note?: string): { frames: Uint
       input.workspaceRoot,
       execResultImages(resultField, input.images),
     )
-    const noted = note === undefined ? undefined : attachResultNote(typed, note)
+    const noted = note === undefined ? undefined : attachResultNote(resultField, typed, note)
     noteCarried = noted !== undefined
     clientMsg[resultField] = noted ?? typed
     frames.push(

@@ -2391,17 +2391,9 @@ export function deliverContinuationResults(
       `${pendingResults.length} pending for sessionId=${session.sessionId} ` +
       `pending={${[...session.pending.keys()].join(",")}}`,
   )
-  // Built once, so the note's carrier is chosen against the frames actually sent.
-  const completeEditReads = new Map<number, Uint8Array[]>()
-  for (const r of pendingResults) {
-    const pending = session.pending.get(r.execId)
-    const editRead = pending && !pending.bridged ? correlatedEditRead(session, pending, r) : undefined
-    const frames = editRead && buildCompleteEditReadMessages(r.execId, editRead.absolutePath, editRead.requestedPath)
-    if (frames) completeEditReads.set(r.execId, frames)
-  }
   let note = joinNotes([session.deferredNote, ...trailingToolResults.map((r) => r.note)])
   session.deferredNote = undefined
-  const noteCarrier = note === undefined ? undefined : findNoteCarrier(session, pendingResults, completeEditReads)
+  const noteCarrier = note === undefined ? undefined : findNoteCarrier(session, pendingResults)
   for (const r of pendingResults) {
     const claim = sessionManager.claim(session.sessionId, r.execId)
     if ("kind" in claim) {
@@ -2470,7 +2462,7 @@ export function deliverContinuationResults(
           : undefined
         const editRead = correlatedEditRead(session, pending, r)
         if (editRead) {
-          frames = completeEditReads.get(r.execId) ?? []
+          frames = buildCompleteEditReadMessages(r.execId, editRead.absolutePath, editRead.requestedPath) ?? []
           if (frames.length > 0) {
             editRead.edit.completeRead = true
             trace(
@@ -2673,14 +2665,11 @@ function continuationResultInput(
 function findNoteCarrier(
   session: CursorSession,
   results: readonly ExtractedToolResult[],
-  completeEditReads: ReadonlyMap<number, Uint8Array[]>,
 ): ExtractedToolResult | undefined {
   return [...results].reverse().find((r) => {
     const pending = session.pending.get(r.execId)
     if (!pending || !isExecResultPending(pending)) return false
-    // Cursor rewrites the complete-file read of an edit as the new file, and
-    // image saves have their own encoders.
-    if (completeEditReads.has(r.execId)) return false
+    // Image saves have their own encoders.
     if (
       pending.toolName === CURSOR_IMAGE_SAVE_TOOL
       && pending.resultField === "write_result"
