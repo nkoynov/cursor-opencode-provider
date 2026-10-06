@@ -303,6 +303,24 @@ describe("a message sent while Cursor works on the step", () => {
     expect(injections(held.writes).map((action) => action.user_context.user_message.text)).toEqual(["change of plan"])
   })
 
+  it("is left to the next step while a compaction Run summarizes the session", async () => {
+    const held = heldReads("compacting")
+    held.postCompactionRebase = true
+    let taken: boolean | undefined
+    serve(held, [
+      () => {
+        taken = announceHostSteer(hostSteer("change of plan"))
+        return serverFrame({ text_delta: { text: "summary" } })
+      },
+      turnEnded,
+    ])
+
+    await stream(readStep("compacting") as Prompt)
+
+    expect(taken).toBe(false)
+    expect(injections(held.writes)).toEqual([])
+  })
+
   it("is left to the next step while the Run waits on the host's tools", () => {
     heldReads("held")
     expect(announceHostSteer(hostSteer("change of plan"))).toBe(false)
