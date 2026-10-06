@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs"
 import { tmpdir } from "node:os"
-import { basename, delimiter, dirname, join } from "node:path"
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path"
 
 /** Cursor agent.v1 TimeoutBehavior enum values. */
 export const CURSOR_TIMEOUT_CANCEL = 1
@@ -61,11 +61,24 @@ type CursorShellEnvWrap = {
   cleanup: () => void
 }
 
-const policies = new Map<string, CursorShellPolicy>()
-const outcomes = new Map<string, CursorShellOutcome>()
-/** callIDs that need shell.env injectors or a direct-command fallback. */
-const pendingEnvWraps = new Set<string>()
-const activeEnvWraps = new Map<string, CursorShellEnvWrap>()
+// OpenCode 2 loads plugins in a separate module graph per project, so the
+// provider registers a call in one copy of this module and the plugin hooks
+// run in another. Keep per-call state in the process registry.
+const SHELL_CALLS = Symbol.for("cursor-opencode-provider.shell-calls")
+type ShellCallState = {
+  policies: Map<string, CursorShellPolicy>
+  outcomes: Map<string, CursorShellOutcome>
+  /** callIDs that need shell.env injectors or a direct-command fallback. */
+  pendingEnvWraps: Set<string>
+  activeEnvWraps: Map<string, CursorShellEnvWrap>
+}
+const globals = globalThis as typeof globalThis & { [SHELL_CALLS]?: ShellCallState }
+const { policies, outcomes, pendingEnvWraps, activeEnvWraps } = globals[SHELL_CALLS] ??= {
+  policies: new Map(),
+  outcomes: new Map(),
+  pendingEnvWraps: new Set(),
+  activeEnvWraps: new Map(),
+}
 let configuredShell: string | undefined
 
 /** Track OpenCode's configured shell from the classic config hook. */
@@ -705,21 +718,28 @@ export function cursorShellEnvForCommand(
   workingDirectory?: string,
 ): Record<string, string> | undefined {
   if (typeof command !== "string" || !command) return undefined
-  if (workingDirectory) {
+  const directory = workingDirectory && isAbsolute(workingDirectory) ? resolve(workingDirectory) : undefined
+  if (directory) {
     for (const [id, policy] of policies) {
       if (!pendingEnvWraps.has(id)) continue
-      // An omitted working_directory runs in the workspace root, which the terminal target records.
-      const directory = policy.workingDirectory || policy.terminal?.cwd
-      if (policy.command === command && directory === workingDirectory) {
+      if (policy.command === command && policyDirectory(policy) === directory) {
         return cursorShellEnvForCall(id)
       }
     }
   }
   for (const [id, policy] of policies) {
-    if (!pendingEnvWraps.has(id)) continue
-    if (policy.command === command) return cursorShellEnvForCall(id)
+    if (!pendingEnvWraps.has(id) || policy.command !== command) continue
+    // The registry is process-wide: a call for another directory may be another project's.
+    if (directory && policyDirectory(policy) !== undefined) continue
+    return cursorShellEnvForCall(id)
   }
   return undefined
+}
+
+function policyDirectory(policy: CursorShellPolicy): string | undefined {
+  // An omitted working_directory runs in the workspace root, which the terminal target records.
+  const directory = policy.workingDirectory || policy.terminal?.cwd || ""
+  return isAbsolute(directory) ? resolve(directory) : undefined
 }
 
 function withoutMarker(output: string, index: number): string {

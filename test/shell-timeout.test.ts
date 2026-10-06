@@ -85,6 +85,22 @@ describe("Cursor shell timeout translation", () => {
     })
   })
 
+  it("shares calls with a plugin hook running in another copy of the module", async () => {
+    const pluginCopy = await import(`../src/shell-timeout.js?copy=${Date.now()}`) as typeof import("../src/shell-timeout.js")
+    pluginCopy.setCursorShellPath("/bin/bash")
+    const wrapped = "cursor_session_copy_wrapped"
+    registerCursorShellCall(wrapped, metadata({ timeout_behavior: CURSOR_TIMEOUT_BACKGROUND }))
+    const args: Record<string, unknown> = { command: "sleep 60", timeout: 30_000 }
+    pluginCopy.prepareCursorShellArgs(wrapped, args)
+    expect(args.timeout).toBe(45_000)
+    expect(pluginCopy.cursorShellEnvForCall(wrapped)?.BASH_ENV).toBeString()
+
+    const plain = "cursor_session_copy_plain"
+    registerCursorShellCall(plain, metadata())
+    pluginCopy.captureCursorShellResult(plain, "failed\n", { exit: 3 })
+    expect(consumeCursorShellResult(plain, "failed\n").outcome).toEqual({ kind: "exit", code: 3 })
+  })
+
   it("does not consume wrapper-like output from an ordinary foreground command", () => {
     const id = "cursor_session_foreground_marker"
     registerCursorShellCall(id, metadata())
@@ -470,5 +486,21 @@ describe("cursorShellEnvForCommand", () => {
     expect(cursorShellEnvForCall(first)).toBeDefined()
     releaseCursorShellEnv(first)
     releaseCursorShellEnv(second)
+  })
+
+  it("never hands a shell another directory's wrap", () => {
+    const elsewhere = "cursor_cmd_elsewhere"
+    const unknown = "cursor_cmd_unknown"
+    registerCursorShellCall(elsewhere, { background_shell_spawn: true, command: "echo same", working_directory: "/other/project" })
+    prepareCursorShellArgs(elsewhere, { command: "echo same" })
+    expect(cursorShellEnvForCommand("echo same", "/this/project")).toBeUndefined()
+    expect(cursorShellEnvForCommand("echo same", "/other/project/")).toBeDefined()
+
+    registerCursorShellCall(unknown, { background_shell_spawn: true, command: "echo same", working_directory: "" })
+    prepareCursorShellArgs(unknown, { command: "echo same" })
+    expect(cursorShellEnvForCommand("echo same", "/this/project")).toBeDefined()
+    expect(cursorShellEnvForCall(unknown)).toBeUndefined()
+    releaseCursorShellEnv(elsewhere)
+    releaseCursorShellEnv(unknown)
   })
 })
