@@ -8,6 +8,7 @@ import { opencodeGlobalCacheDir } from "./context/paths.js"
 import { discoverModels, isCacheFresh, readCache, type ModelInfo } from "./models.js"
 import { resolveAgentUrl } from "./agent-url.js"
 import { sessionActivity } from "./activity.js"
+import { notifyHostInterrupt } from "./host-interrupt.js"
 import {
   fetchOpenCodeWebSearchText,
   parseExaWebSearchResults,
@@ -661,6 +662,14 @@ function applySessionActivity(event: any, onCredentialSwitch?: () => void): void
       if (id) {
         sessionActivity.recordActivity(id)
         sessionActivity.endSessionTools(id)
+        // A shutdown keeps the turn for the next server start to resume.
+        if (event.type === "session.execution.interrupted" && payload?.reason !== "shutdown") {
+          notifyHostInterrupt(
+            id,
+            typeof payload?.reason === "string" ? payload.reason : "user",
+            typeof event.created === "number" ? event.created : Date.now(),
+          )
+        }
       }
       break
     }

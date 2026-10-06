@@ -13,7 +13,8 @@ import {
 import { trace, traceRequestContextPaths } from "./debug.js"
 import { isExchangeableApiKey } from "./auth.js"
 import { resolveBearerToken } from "./auth-renewal.js"
-import { buildRunRequest, buildHeartbeat, buildExecHeartbeat } from "./protocol/request.js"
+import { buildRunRequest, buildHeartbeat, buildExecHeartbeat, buildCancelAction } from "./protocol/request.js"
+import { onHostInterrupt } from "./host-interrupt.js"
 import { decodeFramePayload } from "./protocol/framing.js"
 import { debugWalkTurnEnded, decodeMessage, encodeMessage } from "./protocol/messages.js"
 import {
@@ -161,6 +162,7 @@ import { initializeConversationPersistence } from "./protocol/conversation-persi
 import {
   resolveContinuationPolicy,
   sessionManager,
+  stoppedWith,
   type CursorSession,
   type Frame,
   type PendingExec,
@@ -782,6 +784,7 @@ async function doStreamImpl(
   const credentialRenewable = Boolean(options.getAccessToken)
     || (!options.accessToken && options.apiKey !== undefined && isExchangeableApiKey(options.apiKey))
   let prefetchedToken: string | undefined
+  const requestedAt = Date.now()
   // pumpWithRecovery owns the complete per-turn attempt budget.  Opening a
   // replacement session here must be a single attempt; otherwise setup retry
   // loops nest inside recovery and `maxAttempts` no longer caps total Runs.
@@ -793,7 +796,9 @@ async function doStreamImpl(
     const token = prefetched !== undefined && !forceRefresh
       ? prefetched
       : await resolveRunBearerToken(options, forceRefresh)
-    return startSession(modelId, token, callOptions, options, startOptions)
+    const opened = await startSession(modelId, token, callOptions, options, { ...startOptions, requestedAt })
+    cancelIfHostStoppedSince(opened)
+    return opened
   }
 
   // ── Continuation vs fresh turn ──
@@ -964,7 +969,8 @@ async function doStreamImpl(
         } catch (e) {
           activeSession.pumpActive = false
           trace(`pull: pump threw (cleaning up): ${(e as Error).message}`)
-          sessionManager.close(activeSession)
+          // A Run the host stopped is drained and closed by its cancel.
+          if (!activeSession.hostInterrupted) sessionManager.close(activeSession)
           try {
             controller.error(e instanceof Error ? e : new Error(String(e)))
           } catch {
@@ -1064,6 +1070,11 @@ export async function pumpWithRecovery(input: {
       )
       return session
     } catch (error) {
+      // A cancelled Run's stream fails or ends on purpose; recovering would restart the stopped turn.
+      if (pumpedSession.hostInterrupted) {
+        if (error instanceof CursorLocalCancellationError) throw error
+        throw new CursorLocalCancellationError("Cursor Run cancelled: the host stopped the turn", error)
+      }
       const failure = toCursorProviderError(error, {
         replaySafe: error instanceof CursorProviderError ? error.replaySafe : false,
         fallback: "Cursor Run interrupted",
@@ -1228,7 +1239,7 @@ async function startSession(
   token: string,
   callOptions: LanguageModelV3CallOptions,
   options: CreateCursorOptions,
-  startOptions?: { recovery?: CursorRunRecovery; isolate?: boolean },
+  startOptions?: { recovery?: CursorRunRecovery; isolate?: boolean; requestedAt?: number },
 ): Promise<CursorSession> {
   const continuationPolicy = resolveContinuationPolicy(options.continuation)
   const prompt = callOptions.prompt
@@ -1710,6 +1721,7 @@ async function startSession(
       switchModeInTurn: false,
     },
     openCodeSessionId: ephemeralRun ? undefined : sessionKey,
+    stoppedWithSessionId: lifecycle ? undefined : sessionKey,
     checkpointRebaseEligible: !ephemeralRun && !resuming && !recovery && !!conversationState,
     hostAgent,
     stableSystemPromptHash: frozenSystemPromptHash,
@@ -1749,6 +1761,7 @@ async function startSession(
     deferredTerminalReason: null,
     policy: continuationPolicy,
     createdAt: Date.now(),
+    requestedAt: startOptions?.requestedAt ?? Date.now(),
     lastInboundAt: Date.now(),
     lastHeartbeatWriteAt: Date.now(),
     semanticDeadlineAt: Date.now() + continuationPolicy.semanticIdleMs,
@@ -1761,9 +1774,9 @@ async function startSession(
 
   session.reopenWithUserMessage = async (text: string, abortSignal = callOptions.abortSignal) => {
     const abortIfNeeded = (stream?: BidiStream): void => {
-      if (!session.closed && !abortSignal?.aborted) return
+      if (!session.closed && !abortSignal?.aborted && !session.hostInterrupted) return
       try { stream?.destroy() } catch { /* already closed */ }
-      if (abortSignal?.aborted) {
+      if (abortSignal?.aborted || session.hostInterrupted) {
         throw new CursorLocalCancellationError("Cursor progress-only continuation cancelled")
       }
       throw new CursorProtocolError("Cannot reopen a closed Cursor session")
@@ -1980,6 +1993,84 @@ export function cancelPendingExecsForFreshTurn(session: CursorSession): number {
   return Math.max(0, before - session.pending.size)
 }
 
+/** Cursor CLI's cancel reason for a user Stop. */
+const HOST_INTERRUPT_CANCEL_REASON = "user_cancelled"
+/** How long a cancelled Run may take to end by itself before its stream is closed. */
+export const HOST_INTERRUPT_GRACE_MS = 3_000
+
+/**
+ * The host stopped the turn. OpenCode 2 never aborts `doStream` for that, so
+ * the Run would keep generating, and a held one would wait on results that
+ * never come. Cancel it as Cursor CLI's Stop does: forget what the host owed,
+ * send `cancel_action`, give Cursor a moment to end the Run, then close it.
+ */
+export async function cancelRunForHostInterrupt(
+  session: CursorSession,
+  reason: string,
+  opts?: { graceMs?: number },
+): Promise<void> {
+  if (session.closed || session.hostInterrupted) return
+  session.hostInterrupted = reason
+  const graceMs = opts?.graceMs ?? HOST_INTERRUPT_GRACE_MS
+  const dropped = sessionManager.abandonPending(session)
+  session.heartbeatCancel?.()
+  trace(
+    `host interrupt: cancelling Run sessionId=${session.sessionId} reason=${reason} ` +
+      `pumping=${sessionManager.isActivelyPumping(session)} droppedPending=${dropped}`,
+  )
+  const startedAt = Date.now()
+  try {
+    await writeWithBackpressure(session.stream, buildCancelAction(HOST_INTERRUPT_CANCEL_REASON), "cancel action")
+  } catch (error) {
+    trace(`host interrupt: cancel write failed sessionId=${session.sessionId} err=${(error as Error).message}`)
+    sessionManager.close(session, "host-interrupted")
+    return
+  }
+  const remainingMs = () => Math.max(1, graceMs - (Date.now() - startedAt))
+  // A pump stops at its next frame and leaves it queued for the drain.
+  if (!(await waitUntilNotPumping(session, { timeoutMs: remainingMs() }))) {
+    trace(`host interrupt: Run sessionId=${session.sessionId} still pumping after ${Date.now() - startedAt}ms`)
+    sessionManager.close(session, "host-interrupted")
+    return
+  }
+  // The pump may have taken an exec it was already handling.
+  sessionManager.abandonPending(session)
+  const outcome = await drainSessionUntilTurnEnded(session, { timeoutMs: remainingMs(), cancelled: true })
+  trace(`host interrupt: Run sessionId=${session.sessionId} drain outcome=${outcome} afterMs=${Date.now() - startedAt}`)
+  sessionManager.close(session, "host-interrupted")
+}
+
+const HOST_INTERRUPT_MEMORY_MS = 10 * 60_000
+/** The latest stop per OpenCode session, for a Run whose model call started before it but opened after it. */
+const hostInterrupts = new Map<string, { at: number; reason: string }>()
+
+function cancelForHostInterrupt(session: CursorSession, reason: string): void {
+  void cancelRunForHostInterrupt(session, reason).catch((error) => {
+    trace(`host interrupt: cancel failed sessionId=${session.sessionId} err=${(error as Error).message}`)
+  })
+}
+
+/** Runs of the stopped call were requested before the stop; the next turn's after it. */
+function requestedBefore(session: CursorSession, at: number): boolean {
+  return (session.requestedAt ?? session.createdAt) < at
+}
+
+export function cancelIfHostStoppedSince(session: CursorSession): void {
+  const sessionId = stoppedWith(session)
+  const stop = sessionId ? hostInterrupts.get(sessionId) : undefined
+  if (stop && requestedBefore(session, stop.at)) cancelForHostInterrupt(session, stop.reason)
+}
+
+onHostInterrupt((openCodeSessionId, reason, at) => {
+  for (const [id, stop] of hostInterrupts) {
+    if (stop.at < at - HOST_INTERRUPT_MEMORY_MS) hostInterrupts.delete(id)
+  }
+  hostInterrupts.set(openCodeSessionId, { at, reason })
+  for (const session of sessionManager.openSessionsStoppedWith(openCodeSessionId)) {
+    if (requestedBefore(session, at)) cancelForHostInterrupt(session, reason)
+  }
+})
+
 const heldRunWatchers = new WeakSet<CursorSession>()
 
 /**
@@ -2113,11 +2204,14 @@ async function nextFrameWithin(
 /**
  * Read remaining frames on an idle held-open Run until `turn_ended`, a
  * response-requiring request we cannot answer without the host, or timeout.
- * Used only on the fresh-turn settle path — not a general pump substitute.
+ * Used only to settle a Run the host left (a fresh turn, a host interrupt) —
+ * not a general pump substitute. `cancelled`: the Run was sent `cancel_action`,
+ * so nothing it still sends (display updates, an exec already in flight) needs
+ * the host, and Cursor's closing frames (the final checkpoint) are worth reading.
  */
 export async function drainSessionUntilTurnEnded(
   session: CursorSession,
-  opts?: { timeoutMs?: number },
+  opts?: { timeoutMs?: number; cancelled?: boolean },
 ): Promise<"turn-ended" | "busy" | "timeout" | "interrupted" | "skipped"> {
   if (session.closed) return "skipped"
   if (session.pending.size > 0 || sessionManager.isActivelyPumping(session)) return "busy"
@@ -2275,6 +2369,10 @@ export async function drainSessionUntilTurnEnded(
 
       // Text/thinking/heartbeat/partial display updates can be ignored while draining.
       if (iu?.text_delta || iu?.thinking_delta || iu?.heartbeat || iu?.partial_tool_call || iu?.step_started || iu?.step_completed) {
+        sessionManager.recordSemanticProgress(session)
+        continue
+      }
+      if (opts?.cancelled) {
         sessionManager.recordSemanticProgress(session)
         continue
       }
@@ -3450,7 +3548,16 @@ export async function pump(
     } as V3Part)
   }
 
+  // The cancel path drains and closes the Run; a frame read here goes back to it.
+  const stopForHostInterrupt = (read?: IteratorResult<Frame>): never => {
+    if (read) session.queuedFrame = Promise.resolve(read)
+    closeOpenSpans()
+    trace(`pump: host interrupted the turn sessionId=${session.sessionId} — leaving the cancelled Run to its drain`)
+    throw new CursorLocalCancellationError("Cursor Run cancelled: the host stopped the turn")
+  }
+
   while (true) {
+    if (session.hostInterrupted) stopForHostInterrupt()
     // Consumer cancelled / closed the ReadableStream. Stop reading Cursor
     // frames so a continuation doStream can resume the same iterator —
     // keeping the loop alive would discard frames the next pump needs.
@@ -3505,6 +3612,7 @@ export async function pump(
           )
       throw finalizeFailure(failure)
     }
+    if (session.hostInterrupted) stopForHostInterrupt(next)
     if (toolStep.hostCalls > 0 && (next.done || next.value.flags & 0x02)) {
       closeHeldToolStep("Run ended", Promise.resolve(next))
       return
@@ -5608,6 +5716,7 @@ export function resetTurnStateForTests(): void {
   mirroredTodosBySession.clear()
   resetContextEpochsForTests()
   cursorListsToolRequests = false
+  hostInterrupts.clear()
 }
 
 function extractUserText(lastUser: Record<string, unknown> | undefined): string {
