@@ -35,6 +35,7 @@ import {
 } from "../src/host-agent-mode.js"
 import { registerCursorShellCall } from "../src/shell-timeout.js"
 import { sessionActivity } from "../src/activity.js"
+import { forgetEarlySteers, listenForHostSteers } from "../src/host-steer.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { writeCache } from "../src/models.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
@@ -1479,6 +1480,29 @@ describe("opencode2 running tool tracking", () => {
       expect(sessionActivity.isToolRunning("cursor_run_3")).toBe(false)
     } finally {
       sessionActivity.clear()
+    }
+  })
+
+  test("announces a plain-text message enqueued as a steer, or switched to one", async () => {
+    const seen: string[] = []
+    const stop = listenForHostSteers("ses_inbox", (steer) => { seen.push(`${steer.inboxID}:${steer.text}`); return true })
+    const enqueued = (inboxID: string, delivery: string, payload: Record<string, unknown>) => ({
+      type: "session.inbox.enqueued",
+      data: { sessionID: "ses_inbox", inboxID, item: { type: "user", delivery, payload } },
+    })
+    try {
+      await withPluginEvents([
+        enqueued("msg_inbox_1", "steer", { text: "change of plan" }),
+        enqueued("msg_inbox_2", "steer", { text: "see this", files: [{ data: "AA==", mime: "image/png", source: { type: "inline" } }] }),
+        enqueued("msg_inbox_3", "queue", { text: "after the turn" }),
+        { type: "session.inbox.enqueued", data: { sessionID: "ses_inbox", inboxID: "msg_inbox_4", item: { type: "synthetic", delivery: "steer", payload: { text: "note" } } } },
+        enqueued("msg_inbox_5", "queue", { text: "now please" }),
+        { type: "session.inbox.delivery.changed", data: { sessionID: "ses_inbox", inboxID: "msg_inbox_5", delivery: "steer" } },
+      ], () => seen.length >= 2)
+      expect(seen).toEqual(["msg_inbox_1:change of plan", "msg_inbox_5:now please"])
+    } finally {
+      stop()
+      forgetEarlySteers("ses_inbox")
     }
   })
 })

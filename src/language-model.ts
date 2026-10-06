@@ -222,6 +222,14 @@ import {
   type CursorShellOutcome,
 } from "./shell-timeout.js"
 import { analyzeReplayFrame, AttemptReplaySafety } from "./replay-safety.js"
+import {
+  clearEarlySteers,
+  listenForHostSteers,
+  markEarlySteersAnswered,
+  recordEarlySteer,
+  takeEarlySteers,
+  type HostSteer,
+} from "./host-steer.js"
 import { readAllFieldsStrict } from "./protocol/struct.js"
 import {
   cursorUsageCountersFromTurnEnded,
@@ -804,6 +812,7 @@ async function doStreamImpl(
   // started the next step with old tools still in the prompt body.
   let trailingToolResults = extractTrailingToolResults(prompt)
   let steerMessages: string[] = []
+  let steeredPrompt = false
   if (trailingToolResults.length === 0 && mayBeUserStep(callOptions)) {
     const steered = extractLiveSteerResults(
       prompt,
@@ -812,13 +821,24 @@ async function doStreamImpl(
       extractTools(callOptions),
     )
     if (steered) {
+      const held = findContinuationSession(steered.results)
+      const early = takeEarlySteers(
+        opencodeSessionKey(callOptions),
+        steered.messages,
+        (record) => record.conversationId === held?.conversationId,
+      )
       trace(
         `continuation: ${steered.messages.length} mid-turn user message(s) after ` +
-          `${steered.results.length} trailing tool result(s)`,
+          `${steered.results.length} trailing tool result(s)` +
+          (early.taken.length > 0 ? `, ${early.taken.length} already injected` : ""),
       )
       trailingToolResults = steered.results
-      steerMessages = steered.messages
+      steerMessages = early.remaining
+      steeredPrompt = true
     }
+  }
+  if (trailingToolResults.length === 0 && mayBeUserStep(callOptions) && answeredEarlySteersOnly(callOptions)) {
+    return { stream: answeredSteerStream() }
   }
   let session = findContinuationSession(trailingToolResults)
   // A call that must open a Run gets its credential before it changes any
@@ -840,7 +860,7 @@ async function doStreamImpl(
       ? await decodeTrailingToolImages(trailingToolResults, callOptions.abortSignal)
       : trailingToolResults
     if (steerMessages.length > 0) session = injectSteerMessages(session, steerMessages)
-    const resultsAfterCheckpoint = session && (steerMessages.length > 0 || session.resultsAfterCheckpoint)
+    const resultsAfterCheckpoint = session && (steeredPrompt || session.resultsAfterCheckpoint)
       ? resultsAwaitingCheckpoint(session, results)
       : undefined
     if (session) session = deliverContinuationResults(session, results)
@@ -858,7 +878,7 @@ async function doStreamImpl(
       // Cursor can continue instead of deadlocking.
       const ids = trailingToolResults.map((r) => `${r.sessionId}:${r.execId}`).join(",")
       trace(`continuation: ${trailingToolResults.length} interrupted trailing tool result(s) [${ids}] — rebasing fresh Run`)
-      session = await openSession({ recovery: { kind: "rebase", ...(steerMessages.length > 0 ? { steer: true } : {}) } })
+      session = await openSession({ recovery: { kind: "rebase", ...(steeredPrompt ? { steer: true } : {}) } })
     } else {
       // Fresh turn (prompt ends with user/assistant text). Historical tool
       // results may exist mid-prompt; they are not live exec replies.
@@ -888,6 +908,7 @@ async function doStreamImpl(
         // drain turn_ended) before opening the new Run so the checkpoint prefix
         // is preserved. registerSession will not close a prior Run that still
         // has real pending execs; a failed prepare leaves that Run held.
+        clearEarlySteers(sessionKey)
         try {
           await preparePriorSessionForFreshTurn(sessionKey)
         } catch (error) {
@@ -928,7 +949,7 @@ async function doStreamImpl(
             retryPolicy,
             recover: (recovery) => openSession({ recovery }),
             onSession: (next) => { activeSession = next },
-            ...(steerMessages.length > 0 ? { steer: true } : {}),
+            ...(steeredPrompt ? { steer: true } : {}),
             ...(credentialRenewable
               ? { renewRejectedCredential: () => { forceCredentialRefresh = true } }
               : {}),
@@ -1052,6 +1073,9 @@ export async function pumpWithRecovery(input: {
     const pumpedSession = session
     const pumpOwner = Symbol("cursor-pump")
     sessionManager.beginPump(pumpedSession, pumpOwner)
+    const stopSteers = pumpedSession.openCodeSessionId
+      ? listenForHostSteers(pumpedSession.openCodeSessionId, (steer) => injectHostSteer(pumpedSession, steer))
+      : undefined
     try {
       await pump(
         pumpedSession,
@@ -1108,6 +1132,7 @@ export async function pumpWithRecovery(input: {
       await sleepForRetry(delayMs, input.abortSignal)
       session = await reopen(pumpedSession, failure)
     } finally {
+      stopSteers?.()
       sessionManager.endPump(pumpedSession, pumpOwner)
     }
   }
@@ -3555,6 +3580,8 @@ export async function pump(
         trace(`continuation: turn ended before an exec result could carry the host note noteLen=${session.deferredNote.length}`)
       }
       const turnEnded = iu.turn_ended as Record<string, unknown>
+      endingTurns.add(session)
+      const injectionIds = (session.steerInjections ?? []).map((injection) => injection.id)
       const undelivered = (session.steerInjections ?? []).filter((injection) => injection.state !== "delivered")
       // A checkpoint from before the step's results (or from an earlier Run) would drop the step
       // from any turn that resumed it, so it is neither kept nor saved.
@@ -3608,10 +3635,13 @@ export async function pump(
         textId = crypto.randomUUID()
         reasoningId = crypto.randomUUID()
         await session.reopenWithUserMessage(followUp, abortSignal)
+        endingTurns.delete(session)
+        markEarlySteersAnswered(session.openCodeSessionId, injectionIds)
         trace("steer: sent undelivered message(s) as a follow-up Run")
         assistantText = ""
         continue
       }
+      markEarlySteersAnswered(session.openCodeSessionId, injectionIds)
       if (
         typeof session.reopenWithUserMessage === "function"
         && checkpoint
@@ -3634,6 +3664,7 @@ export async function pump(
               workspaceRootFromRequestContext(session.requestContext),
             ),
           )
+          endingTurns.delete(session)
           assistantText = ""
           continue
         } catch (error) {
@@ -4797,6 +4828,69 @@ function injectSteerMessages(session: CursorSession, messages: readonly string[]
       `ids=${injections.map((i) => i.id).join(",")}`,
   )
   return session
+}
+
+/** OpenCode still promotes an early steer after the turn that answered it, as a new step. */
+function answeredEarlySteersOnly(callOptions: LanguageModelV3CallOptions): boolean {
+  const sessionKey = opencodeSessionKey(callOptions)
+  if (!sessionKey || sessionManager.findOpenByOpenCodeSessionId(sessionKey)?.pending.size) return false
+  const steer = trailingSteer(callOptions.prompt)
+  if (!steer || steer.hostNote) return false
+  const { taken } = takeEarlySteers(sessionKey, steer.messages, (record) => record.answered, true)
+  if (taken.length === 0) return false
+  trace(
+    `fresh turn: the model already answered ${taken.length} mid-step message(s) in its last turn ` +
+      `inboxIDs=${taken.map((record) => record.inboxID).join(",")} — ending the step without a Run`,
+  )
+  return true
+}
+
+function answeredSteerStream(): ReadableStream<V3Part> {
+  return new ReadableStream<V3Part>({
+    start(controller) {
+      controller.enqueue({ type: "stream-start", warnings: [] } as V3Part)
+      controller.enqueue({
+        type: "finish",
+        finishReason: { unified: "stop", raw: undefined },
+        usage: emptyLanguageModelV3Usage(),
+        providerMetadata: { ...OPENCODE_DISPLAY_ONLY_COST_METADATA, cursor: { usageVersion: 3, occupancyOnly: true } },
+      } as V3Part)
+      controller.close()
+    },
+  })
+}
+
+/** Runs whose `turn_ended` is being handled; a message injected now would never be delivered. */
+const endingTurns = new WeakSet<CursorSession>()
+
+/** Inject a message OpenCode holds until this step ends, while Cursor still works on the step. */
+function injectHostSteer(session: CursorSession, steer: HostSteer): boolean {
+  if (session.closed || !session.runId || endingTurns.has(session) || !sessionManager.isActivelyPumping(session)) {
+    return false
+  }
+  const injection: SteerInjection = { id: crypto.randomUUID(), text: steer.text, state: "sent" }
+  try {
+    session.stream.write(buildInjectUserMessage({
+      injectionId: injection.id,
+      expectedRunId: session.runId,
+      text: injection.text,
+    }))
+  } catch (error) {
+    trace(`steer: early inject write FAILED sessionId=${session.sessionId} err=${(error as Error).message}`)
+    return false
+  }
+  ;(session.steerInjections ??= []).push(injection)
+  recordEarlySteer({
+    ...steer,
+    injectionId: injection.id,
+    conversationId: session.conversationId,
+    answered: false,
+  })
+  trace(
+    `steer: injected a mid-step message before OpenCode promotes it runId=${session.runId} ` +
+      `id=${injection.id} inboxID=${steer.inboxID}`,
+  )
+  return true
 }
 
 /** Detect a host-owned canonical plan review, excluding Cursor exec replies. */
