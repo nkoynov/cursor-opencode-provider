@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A restart while OpenCode runs a Cursor tool call (a pending `question`, a permission prompt, a long shell) no longer makes the next message look like another model's history: the turn continues the same Cursor conversation instead of replaying the whole session, which for long sessions failed with "prompt is too long" and forced a compaction. A Run waiting on host tools is now saved with its latest checkpoint, so the resumed conversation includes the interrupted turn's finished steps
+
 ## [0.8.0] - 2026-10-04
 
 ### Changed

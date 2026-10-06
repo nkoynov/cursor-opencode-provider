@@ -11,6 +11,7 @@ import {
 import {
   compactConversationBlobs,
   restoreConversationBlobs,
+  snapshotConversationBlobs,
 } from "./blob-store.js"
 import { getCheckpoint, setCheckpoint } from "./checkpoint.js"
 import type { OpencodeToolDef } from "./tools.js"
@@ -77,7 +78,10 @@ export async function hydrateTurnProvenance(cacheDir: string, sessionKey: string
   if (provenance?.conversationId === persisted.conversationId) restoreTurnProvenance(sessionKey, provenance)
 }
 
-/** Persist the complete resumable state only after Cursor confirms TurnEnded. */
+/**
+ * Persist the resumable state at Cursor's TurnEnded, or while a Run waits on
+ * host tools (`runInProgress`) so a restart resumes up to the latest checkpoint.
+ */
 export async function persistConversationState(
   cacheDir: string,
   input: {
@@ -88,6 +92,7 @@ export async function persistConversationState(
     postCompactionRebase?: boolean
     hostAgent?: string
     systemPromptHash?: string
+    runInProgress?: boolean
   },
 ): Promise<void> {
   // A newer Run may have reset/superseded this conversation while its final
@@ -100,8 +105,11 @@ export async function persistConversationState(
     return
   }
   const checkpoint = getCheckpoint(input.conversationId)
-  const blobCompaction = compactConversationBlobs(input.conversationId, checkpoint)
-  const blobs = blobCompaction.blobs
+  // A Run still in progress may need blobs that only its next checkpoint references.
+  const blobCompaction = input.runInProgress
+    ? undefined
+    : compactConversationBlobs(input.conversationId, checkpoint)
+  const blobs = blobCompaction?.blobs ?? snapshotConversationBlobs(input.conversationId)
   const requestContext = getFrozenRequestContext(input.conversationId) ?? input.requestContext
   const provenance = getTurnProvenance(input.sessionKey)
   await persistConversation(cacheDir, {
@@ -119,11 +127,13 @@ export async function persistConversationState(
       : {}),
   })
   trace(
-    `conversation persistence: saved sessionKey=${input.sessionKey} ` +
+    `conversation persistence: saved${blobCompaction ? "" : " held Run"} sessionKey=${input.sessionKey} ` +
       `conversationId=${input.conversationId} checkpoint=${checkpoint?.length ?? 0}B ` +
-      `blobs=${blobCompaction.beforeCount}->${blobCompaction.afterCount} ` +
-      `blobBytes=${blobCompaction.beforeBytes}->${blobCompaction.afterBytes}` +
-      (blobCompaction.fallbackReason ? ` compactionFallback=${blobCompaction.fallbackReason}` : ""),
+      (blobCompaction
+        ? `blobs=${blobCompaction.beforeCount}->${blobCompaction.afterCount} ` +
+          `blobBytes=${blobCompaction.beforeBytes}->${blobCompaction.afterBytes}` +
+          (blobCompaction.fallbackReason ? ` compactionFallback=${blobCompaction.fallbackReason}` : "")
+        : `blobs=${blobs.length}`),
   )
 }
 

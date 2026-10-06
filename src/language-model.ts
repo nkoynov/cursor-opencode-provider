@@ -2627,6 +2627,36 @@ async function nextFrameWithSemanticDeadline(
   }
 }
 
+/** How long a Run must wait on host tools before its state is saved for a restart. */
+export const HELD_RUN_SAVE_DELAY_MS = 1_000
+const heldRunSaveTimers = new WeakMap<CursorSession, ReturnType<typeof setTimeout>>()
+
+// TurnEnded alone would leave a restart during a long host tool (a question, a
+// permission prompt, a slow shell) with the previous turn's checkpoint and record.
+function scheduleHeldRunSave(session: CursorSession): void {
+  const sessionKey = session.openCodeSessionId
+  if (!sessionKey) return
+  clearTimeout(heldRunSaveTimers.get(session))
+  const timer = setTimeout(() => {
+    heldRunSaveTimers.delete(session)
+    if (session.closed || session.pending.size === 0 || session.pumpActive || session.pumpOwner != null) return
+    persistConversationState(session.cacheDir ?? opencodeGlobalCacheDir(), {
+      sessionKey,
+      conversationId: session.conversationId,
+      requestContext: session.requestContext,
+      toolCatalog: session.toolCatalog ?? [],
+      postCompactionRebase: session.postCompactionRebase,
+      hostAgent: session.hostAgent,
+      systemPromptHash: session.stableSystemPromptHash,
+      runInProgress: true,
+    }).catch((error) => {
+      trace(`conversation persistence: held Run save failed sessionKey=${sessionKey}: ${String(error)}`)
+    })
+  }, HELD_RUN_SAVE_DELAY_MS)
+  timer.unref?.()
+  heldRunSaveTimers.set(session, timer)
+}
+
 /**
  * Read the held-open stream, emitting stream parts, until the turn boundary:
  *  - a tool call (exec_server_message) → emit tool-call, finish "tool-calls",
@@ -3094,12 +3124,13 @@ export async function pump(
         cacheDiagnostics,
       ))
     }
-    safeEnqueue({
+    const enqueued = safeEnqueue({
       type: "finish",
       usage,
       finishReason: reason,
       ...(providerMetadata ? { providerMetadata } : {}),
     } as V3Part)
+    if (enqueued && reason.unified === "tool-calls") scheduleHeldRunSave(session)
   }
 
   while (true) {
