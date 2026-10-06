@@ -271,7 +271,8 @@ export type CursorSession = {
   /**
    * Host note (`<system-update>`, background completion) that arrived with
    * results whose typed shapes have no text slot. It rides on the next exec
-   * result this Run delivers instead of being dropped.
+   * result this Run delivers, or on the session's next user turn when the
+   * turn ends first.
    */
   deferredNote?: string
   /** AgentRunRequest.run_id of the Run on `stream`; Cursor checks injections against it. */

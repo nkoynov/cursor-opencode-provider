@@ -260,6 +260,8 @@ const sentHistoryImageHashesBySession = new Map<string, Set<string>>()
 const postCompactionRebaseBySession = new Set<string>()
 type PromptIdentity = { hostAgent?: string; systemPromptHash?: string }
 const promptIdentityBySession = new Map<string, PromptIdentity>()
+// Host notes a turn ended without delivering, for the session's next user turn.
+const undeliveredHostNoteBySession = new Map<string, string>()
 export const MAX_TURN_STATE_SESSIONS = 256
 const MAX_SENT_HISTORY_IMAGES_PER_SESSION = 256
 const DEFAULT_RETRY_POLICY = {
@@ -1251,6 +1253,7 @@ async function startSession(
       return undefined
     })
     if (restored?.postCompactionRebase) rememberPostCompactionRebase(sessionKey)
+    if (restored?.hostNote) rememberUndeliveredHostNote(sessionKey, restored.hostNote)
     if (restored?.toolCatalog.length) restoreTurnToolCatalog(sessionKey, restored.toolCatalog)
     if (restored?.hostAgent || restored?.systemPromptHash) {
       rememberPromptIdentity(sessionKey, {
@@ -1417,9 +1420,14 @@ async function startSession(
   const kickoffWarning = isCompaction || lifecycle
     ? undefined
     : takePlanExecutionKickoffWarning(sessionKey)
+  // A Run without a checkpoint seeds the host history, which already holds the note.
+  const undeliveredHostNote = isCompaction || ephemeralRun || resuming || !sessionKey
+    ? undefined
+    : undeliveredHostNoteBySession.get(sessionKey)
   const oneShotReminders = [
     modeReminder,
     kickoffWarning ? `<system_reminder>${kickoffWarning}</system_reminder>` : undefined,
+    startedWithCheckpoint ? undeliveredHostNote : undefined,
   ].filter((part): part is string => !!part)
 
   // `systemPrompt` is the host system context composed for a seed Run (kept for
@@ -1680,6 +1688,9 @@ async function startSession(
   try {
     await writeWithBackpressure(stream, reqBytes, "initial Run request")
     rememberSentHistoryImageHashes(sessionKey, imageExtraction.hashes)
+    if (sessionKey && undeliveredHostNote !== undefined) {
+      forgetUndeliveredHostNote(sessionKey, undeliveredHostNote, startedWithCheckpoint ? "user-turn" : "seed-history")
+    }
   } catch (error) {
     stream.destroy()
     throw error
@@ -2134,6 +2145,7 @@ export async function drainSessionUntilTurnEnded(
 
       if (iu?.turn_ended) {
         trace(`fresh turn drain: turn_ended raw wire fields: ${debugWalkTurnEnded(payload)}`)
+        keepUndeliveredHostNote(session)
         if (session.openCodeSessionId) {
           await persistConversationState(
             session.cacheDir ?? opencodeGlobalCacheDir(),
@@ -2145,6 +2157,7 @@ export async function drainSessionUntilTurnEnded(
               postCompactionRebase: session.postCompactionRebase,
               hostAgent: session.hostAgent,
               systemPromptHash: session.stableSystemPromptHash,
+              hostNote: undeliveredHostNoteBySession.get(session.openCodeSessionId),
             },
           ).catch((error) => {
             trace(
@@ -2690,6 +2703,39 @@ function isExecResultPending(pending: PendingExec): boolean {
 function joinNotes(notes: ReadonlyArray<string | undefined>): string | undefined {
   const present = notes.filter((note): note is string => !!note)
   return present.length > 0 ? present.join("\n\n") : undefined
+}
+
+/** At turn_ended, keep a note no exec result could carry for the session's next fresh Run. */
+function keepUndeliveredHostNote(session: CursorSession): void {
+  const note = session.deferredNote
+  if (note === undefined) return
+  session.deferredNote = undefined
+  const sessionKey = session.openCodeSessionId
+  if (!sessionKey) {
+    trace(`continuation: turn ended before an exec result could carry the host note; dropped noteLen=${note.length}`)
+    return
+  }
+  rememberUndeliveredHostNote(sessionKey, joinNotes([undeliveredHostNoteBySession.get(sessionKey), note])!)
+  trace(
+    `continuation: turn ended before an exec result could carry the host note; ` +
+      `kept for the next user turn sessionKey=${sessionKey} noteLen=${note.length}`,
+  )
+}
+
+function rememberUndeliveredHostNote(sessionKey: string, note: string): void {
+  undeliveredHostNoteBySession.delete(sessionKey)
+  undeliveredHostNoteBySession.set(sessionKey, note)
+  while (undeliveredHostNoteBySession.size > MAX_TURN_STATE_SESSIONS) {
+    const oldest = undeliveredHostNoteBySession.keys().next().value as string | undefined
+    if (!oldest) break
+    undeliveredHostNoteBySession.delete(oldest)
+  }
+}
+
+function forgetUndeliveredHostNote(sessionKey: string, note: string, carrier: "user-turn" | "seed-history"): void {
+  if (undeliveredHostNoteBySession.get(sessionKey) !== note) return
+  undeliveredHostNoteBySession.delete(sessionKey)
+  trace(`continuation: undelivered host note sent in the ${carrier} sessionKey=${sessionKey} noteLen=${note.length}`)
 }
 
 async function loadAvailableModels(): Promise<void> {
@@ -3597,9 +3643,7 @@ export async function pump(
       emitReasoning(((iu.thinking_delta as Record<string, unknown>).text as string) ?? "")
     } else if (iu?.turn_ended) {
       trace(`turn_ended raw wire fields: ${debugWalkTurnEnded(payload)}`)
-      if (session.deferredNote !== undefined) {
-        trace(`continuation: turn ended before an exec result could carry the host note noteLen=${session.deferredNote.length}`)
-      }
+      keepUndeliveredHostNote(session)
       const turnEnded = iu.turn_ended as Record<string, unknown>
       endingTurns.add(session)
       const injectionIds = (session.steerInjections ?? []).map((injection) => injection.id)
@@ -3626,6 +3670,7 @@ export async function pump(
             postCompactionRebase: session.postCompactionRebase,
             hostAgent: session.hostAgent,
             systemPromptHash: session.stableSystemPromptHash,
+            hostNote: undeliveredHostNoteBySession.get(session.openCodeSessionId),
           },
         ).catch((error) => {
           trace(
@@ -5642,6 +5687,7 @@ export function resetTurnStateForTests(): void {
   toolCatalogBySession.clear()
   postCompactionRebaseBySession.clear()
   promptIdentityBySession.clear()
+  undeliveredHostNoteBySession.clear()
   mirroredTodosBySession.clear()
   resetContextEpochsForTests()
   cursorListsToolRequests = false
