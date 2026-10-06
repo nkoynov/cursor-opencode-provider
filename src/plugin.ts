@@ -303,8 +303,17 @@ export async function CursorPlugin(input: PluginInput): Promise<Hooks> {
         case "message.updated":
           sessionActivity.recordActivity(event.properties.info.sessionID)
           break
-        case "message.part.updated":
-          sessionActivity.recordActivity(event.properties.part.sessionID)
+        case "message.part.updated": {
+          const part = event.properties.part
+          sessionActivity.recordActivity(part.sessionID)
+          if (part.type === "tool") {
+            if (part.state.status === "running") sessionActivity.toolStarted(part.sessionID, part.callID)
+            else if (part.state.status === "completed" || part.state.status === "error") sessionActivity.toolEnded(part.callID)
+          }
+          break
+        }
+        case "session.idle":
+          sessionActivity.endSessionTools(event.properties.sessionID)
           break
       }
       await dispatchHostEventBridge({

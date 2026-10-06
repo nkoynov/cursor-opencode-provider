@@ -117,6 +117,30 @@ describe("session activity hooks", () => {
       sessionActivity.clear()
     }
   })
+
+  it("tracks a tool part from running until it completes, fails or the session goes idle", async () => {
+    const hooks = await CursorPlugin({} as any)
+    sessionActivity.clear()
+    const toolPart = (callID: string, status: string) => ({
+      event: {
+        type: "message.part.updated",
+        properties: { part: { sessionID: "ses_v1", type: "tool", callID, tool: "bash", state: { status } } },
+      } as any,
+    })
+    try {
+      for (const callID of ["cursor_v1_1", "cursor_v1_2", "cursor_v1_3"]) await hooks.event?.(toolPart(callID, "running"))
+      await hooks.event?.(toolPart("cursor_v1_1", "completed"))
+      await hooks.event?.(toolPart("cursor_v1_2", "error"))
+      expect(sessionActivity.isToolRunning("cursor_v1_1")).toBe(false)
+      expect(sessionActivity.isToolRunning("cursor_v1_2")).toBe(false)
+      expect(sessionActivity.isToolRunning("cursor_v1_3")).toBe(true)
+
+      await hooks.event?.({ event: { type: "session.idle", properties: { sessionID: "ses_v1" } } as any })
+      expect(sessionActivity.isToolRunning("cursor_v1_3")).toBe(false)
+    } finally {
+      sessionActivity.clear()
+    }
+  })
 })
 
 describe("modelInfoToConfig", () => {
