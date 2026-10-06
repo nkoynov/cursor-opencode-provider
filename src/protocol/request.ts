@@ -143,3 +143,10 @@ export function buildHeartbeat(): Uint8Array {
     client_heartbeat: {},
   })
 }
+
+/** Exec control heartbeat for an exec still running, which Cursor CLI sends every 3 s. */
+export function buildExecHeartbeat(execId: number): Uint8Array {
+  return encodeMessage("AgentClientMessage", {
+    exec_client_control_message: { heartbeat: { id: execId } },
+  })
+}

@@ -642,6 +642,28 @@ function applySessionActivity(event: any, onCredentialSwitch?: () => void): void
       if (id) sessionActivity.recordActivity(id)
       break
     }
+    case "session.tool.called":
+    case "session.tool.success":
+    case "session.tool.failed": {
+      const id = payload?.sessionID
+      const callID = typeof payload?.id === "string" ? payload.id : undefined
+      if (id) sessionActivity.recordActivity(id)
+      if (id && callID) {
+        if (event.type === "session.tool.called") sessionActivity.toolStarted(id, callID)
+        else sessionActivity.toolEnded(callID)
+      }
+      break
+    }
+    case "session.execution.succeeded":
+    case "session.execution.failed":
+    case "session.execution.interrupted": {
+      const id = payload?.sessionID
+      if (id) {
+        sessionActivity.recordActivity(id)
+        sessionActivity.endSessionTools(id)
+      }
+      break
+    }
     default: {
       // OpenCode 2.0 emits granular `session.*` progress events instead of
       // the V1 `message.updated` family (`session.tool.called/success/failed`,
