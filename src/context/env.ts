@@ -48,6 +48,16 @@ export function buildEnv(workspaceRoot: string): Record<string, unknown> {
   return env
 }
 
+/** The `terminals_folder` this session advertised to Cursor, if any. */
+export function terminalsFolderFromRequestContext(
+  requestContext: Record<string, unknown> | undefined,
+): string | undefined {
+  const env = requestContext?.env
+  if (!env || typeof env !== "object") return undefined
+  const folder = (env as Record<string, unknown>).terminals_folder
+  return typeof folder === "string" && folder.trim() ? path.resolve(folder) : undefined
+}
+
 /**
  * Real workspace root for path resolution (edits, reads, …).
  * Uses `env.workspace_paths[0]` — never `project_folder` /

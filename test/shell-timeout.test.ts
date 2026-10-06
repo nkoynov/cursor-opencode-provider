@@ -450,4 +450,25 @@ describe("cursorShellEnvForCommand", () => {
     releaseCursorShellEnv(first)
     releaseCursorShellEnv(second)
   })
+
+  it("matches an omitted working directory by the workspace its terminal file names", () => {
+    const first = "cursor_cmd_project_a"
+    const second = "cursor_cmd_project_b"
+    for (const [id, root] of [[first, "/project-a"], [second, "/project-b"]]) {
+      registerCursorShellCall(id, {
+        background_shell_spawn: true,
+        command: "npm run dev",
+        working_directory: "",
+        terminals_folder: `${root}/.terminals`,
+        terminal_cwd: root,
+      })
+      prepareCursorShellArgs(id, { command: "npm run dev" })
+    }
+
+    expect(cursorShellEnvForCommand("npm run dev", "/project-b")).toBeDefined()
+    expect(cursorShellEnvForCall(second)).toBeUndefined()
+    expect(cursorShellEnvForCall(first)).toBeDefined()
+    releaseCursorShellEnv(first)
+    releaseCursorShellEnv(second)
+  })
 })

@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Background shells keep their output reachable: a command Cursor starts in the background, or a foreground one that outlives its wait, writes Cursor's terminal file (`<terminals_folder>/<shell id>.txt`, with Cursor CLI's header and exit footer), and the provider answers Cursor's reads of it, so `AwaitShell` and the model see the output and exit code instead of "No shell found". Such a command that ends within its wait now reports its real exit code under bash ([#N](https://github.com/oakimov/cursor-opencode-provider/pull/N) by [@nkoynov](https://github.com/nkoynov))
+- An MCP call to OpenCode 2's `shell` keeps its `background` flag ([#N](https://github.com/oakimov/cursor-opencode-provider/pull/N) by [@nkoynov](https://github.com/nkoynov))
+
 ## [0.8.0] - 2026-10-04
 
 ### Changed

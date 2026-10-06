@@ -772,6 +772,7 @@ export function createMessageTypes(): protobuf.Root {
     // foreground cancellation deadline from a soft background handoff.
     { id: 13, name: "timeout_behavior", type: "uint32" },
     { id: 14, name: "hard_timeout", type: "uint32" },
+    { id: 15, name: "description", type: "string" },
   ])
 
   addType(root, "ShellStreamStart", []) // optional SandboxPolicy only; empty is valid
