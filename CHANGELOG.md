@@ -16,6 +16,7 @@
 - An MCP call to OpenCode 2's `shell` keeps its `background` flag ([#N](https://github.com/oakimov/cursor-opencode-provider/pull/N) by [@nkoynov](https://github.com/nkoynov))
 - A tool that runs for more than 10 minutes without OpenCode activity (a long foreground shell, a slow MCP call) no longer closes the held Run and restarts the turn without its earlier tool results: the Run is held while OpenCode reports one of its tools running, up to 4 hours, and each pending exec gets Cursor CLI's exec heartbeat ([#N](https://github.com/oakimov/cursor-opencode-provider/pull/N) by [@nkoynov](https://github.com/nkoynov))
 - On OpenCode 2, Cursor shells could run without the provider's wrapper when the plugin's copy of the module was not the one the model registered them in: a shell that outlived its wait timed out instead of moving to the background, and a failing command was reported to Cursor with exit code 0 ([#N](https://github.com/oakimov/cursor-opencode-provider/pull/N) by [@nkoynov](https://github.com/nkoynov))
+- When Cursor withdraws an exec (`ExecServerControlMessage.abort`), the provider stops holding the Run for it and drops its late result without writing anything back, as Cursor CLI does, instead of ignoring the abort. Frames Cursor sends while the host still runs a step's tools (KV writes, exec aborts) are now answered as they arrive ([#N](https://github.com/oakimov/cursor-opencode-provider/pull/N) by [@nkoynov](https://github.com/nkoynov))
 
 ## [0.8.0] - 2026-10-04
 

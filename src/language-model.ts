@@ -1109,6 +1109,7 @@ export async function pumpWithRecovery(input: {
       session = await reopen(pumpedSession, failure)
     } finally {
       sessionManager.endPump(pumpedSession, pumpOwner)
+      if (!pumpedSession.closed && pumpedSession.pending.size > 0) void watchHeldRun(pumpedSession)
     }
   }
 }
@@ -1145,10 +1146,26 @@ const INTERACTION_RESULT_FIELDS: ReadonlySet<string> = new Set([
 export function pendingExecIds(session: CursorSession): number[] {
   const ids: number[] = []
   for (const [execId, pending] of session.pending) {
-    if (pending.bridged || pending.state !== "pending" || INTERACTION_RESULT_FIELDS.has(pending.resultField)) continue
+    if (pending.bridged || pending.aborted || pending.state !== "pending" || INTERACTION_RESULT_FIELDS.has(pending.resultField)) continue
     ids.push(execId)
   }
   return ids
+}
+
+/** `ExecServerControlMessage`: Cursor withdrew an exec, e.g. when it stops the Run. */
+export function applyExecControl(session: CursorSession, control: Record<string, unknown>, where: string): void {
+  const id = (control.abort as Record<string, unknown> | undefined)?.id
+  if (typeof id !== "number") {
+    trace(`exec control: unknown message ${JSON.stringify(Object.keys(control))} (${where}) sessionId=${session.sessionId}`)
+    return
+  }
+  const pending = session.pending.get(id)
+  const owed = pending !== undefined && !INTERACTION_RESULT_FIELDS.has(pending.resultField)
+  const marked = owed && sessionManager.markExecAborted(session, id)
+  trace(
+    `exec control: Cursor aborted execId=${id} (${where}) sessionId=${session.sessionId} ` +
+      `${marked ? "— no result will be written for it" : "— not an exec the host still owes"}`,
+  )
 }
 
 /** Start (or replace) the per-session heartbeat. In-flight writes from a prior attach are ignored. */
@@ -1941,7 +1958,7 @@ export function cancelPendingExecsForFreshTurn(session: CursorSession): number {
   if (session.closed || session.pending.size === 0) return 0
   const synthetic: ExtractedToolResult[] = []
   for (const [execId, pending] of session.pending.entries()) {
-    if (pending.bridged) continue
+    if (pending.bridged || pending.aborted) continue
     if (pending.state !== "pending") continue
     synthetic.push({
       toolCallId: `cursor_${session.sessionId}_${execId}`,
@@ -1961,6 +1978,79 @@ export function cancelPendingExecsForFreshTurn(session: CursorSession): number {
     return Math.max(0, before - session.pending.size)
   }
   return Math.max(0, before - session.pending.size)
+}
+
+const heldRunWatchers = new WeakSet<CursorSession>()
+
+/**
+ * While the host runs a step's tools nobody reads the held Run, yet Cursor
+ * keeps sending: KV writes, heartbeats, an exec abort. Answer those as they
+ * come and leave any other frame queued for the pump that delivers the results.
+ */
+async function watchHeldRun(session: CursorSession): Promise<void> {
+  if (heldRunWatchers.has(session)) return
+  heldRunWatchers.add(session)
+  try {
+    while (!session.closed && session.pending.size > 0 && !sessionManager.isActivelyPumping(session)) {
+      const read = takeFrame(session)
+      session.queuedFrame = read
+      let next: IteratorResult<Frame>
+      try {
+        next = await read
+      } catch {
+        return
+      }
+      if (session.queuedFrame !== read || session.closed || sessionManager.isActivelyPumping(session)) return
+      if (next.done || next.value.flags & 0x02) return
+      const frame = heldRunControlFrame(session, next.value)
+      if (!frame) return
+      // Taken before any await, so a pump starting meanwhile reads the next frame instead.
+      session.queuedFrame = undefined
+      sessionManager.recordSemanticProgress(session)
+      if (frame.kind === "exec-control") {
+        applyExecControl(session, frame.control, "held")
+      } else if (frame.kind === "kv") {
+        try {
+          await writeWithBackpressure(session.stream, frame.handled.reply, `held KV ${frame.handled.kind}_blob reply id=${frame.handled.id}`)
+          trace(`held Run: answered KV ${frame.handled.kind} id=${frame.handled.id} sessionId=${session.sessionId}`)
+        } catch (error) {
+          trace(`held Run: KV reply failed sessionId=${session.sessionId} err=${(error as Error).message}`)
+          sessionManager.close(session, "reply-write-failed")
+          return
+        }
+      }
+    }
+  } finally {
+    heldRunWatchers.delete(session)
+  }
+}
+
+type HeldRunControlFrame =
+  | { kind: "heartbeat" }
+  | { kind: "exec-control"; control: Record<string, unknown> }
+  | { kind: "kv"; handled: NonNullable<ReturnType<typeof handleKvServerMessage>> }
+
+/** A frame the held-Run watcher answers itself; anything else is the pump's. */
+function heldRunControlFrame(session: CursorSession, frame: Frame): HeldRunControlFrame | undefined {
+  let payload: Uint8Array
+  let asm: Record<string, unknown>
+  try {
+    payload = decodeFramePayload(frame)
+    asm = decodeMessage<Record<string, unknown>>("AgentServerMessage", payload)
+  } catch {
+    return undefined
+  }
+  const fields = readAllFieldsStrict(payload)
+  if (!fields || fields.length !== 1) return undefined
+  const control = asm.exec_server_control_message as Record<string, unknown> | undefined
+  if (control) return { kind: "exec-control", control }
+  if (!isSoleControlFrame(payload)) return undefined
+  const iu = asm.interaction_update as Record<string, unknown> | undefined
+  if (iu?.heartbeat) return { kind: "heartbeat" }
+  // A get can miss, which only the pump knows how to recover from.
+  const kv = asm.kv_server_message as Record<string, unknown> | undefined
+  const handled = kv?.set_blob_args ? handleKvServerMessage(kv, session) : undefined
+  return handled ? { kind: "kv", handled } : undefined
 }
 
 async function waitUntilNotPumping(
@@ -2090,6 +2180,11 @@ export async function drainSessionUntilTurnEnded(
       const interactionQuery = asm.interaction_query as Record<string, unknown> | undefined
       const checkpointRaw = asm.conversation_checkpoint_update
       const requiredChannel = responseRequiredChannel(payload)
+      const execControl = asm.exec_server_control_message as Record<string, unknown> | undefined
+      if (execControl) {
+        applyExecControl(session, execControl, "drain")
+        continue
+      }
 
       if (checkpointRaw != null) {
         const bytes = normalizeCheckpointBytes(checkpointRaw)
@@ -2369,7 +2464,7 @@ export function deliverContinuationResults(
   const completeEditReads = new Map<number, Uint8Array[]>()
   for (const r of pendingResults) {
     const pending = session.pending.get(r.execId)
-    const editRead = pending && !pending.bridged ? correlatedEditRead(session, pending, r) : undefined
+    const editRead = pending && !pending.bridged && !pending.aborted ? correlatedEditRead(session, pending, r) : undefined
     const frames = editRead && buildCompleteEditReadMessages(r.execId, editRead.absolutePath, editRead.requestedPath)
     if (frames) completeEditReads.set(r.execId, frames)
   }
@@ -2437,6 +2532,9 @@ export function deliverContinuationResults(
         sessionManager.close(session, "result-write-failed")
         return undefined
       }
+    } else if (pending.aborted) {
+      if (isShellResultField(pending.resultField)) consumeCursorShellResult(r.toolCallId, r.output)
+      trace(`continuation: dropped the result of execId=${r.execId}, which Cursor aborted`)
     } else if (!pending.bridged) {
       try {
         const shellResult = isShellResultField(pending.resultField)
@@ -2667,6 +2765,7 @@ function findNoteCarrier(
 
 function isExecResultPending(pending: PendingExec): boolean {
   return !pending.bridged
+    && !pending.aborted
     && pending.resultField !== ASK_QUESTION_RESULT_FIELD
     && pending.resultField !== SWITCH_MODE_RESULT_FIELD
     && pending.resultField !== CREATE_PLAN_RESULT_FIELD
@@ -4412,6 +4511,8 @@ export async function pump(
         emitFinish(undefined, { unified: "tool-calls", raw: undefined })
         return
       }
+    } else if (execControl) {
+      applyExecControl(session, execControl, "pump")
     } else if (kv) {
       // KV blob channel: ack set_blob / answer get_blob, then keep pumping.
       // Not replying hangs the turn — see protocol/kv.ts.
