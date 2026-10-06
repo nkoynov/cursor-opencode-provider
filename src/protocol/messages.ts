@@ -1694,8 +1694,10 @@ export function createMessageTypes(): protobuf.Root {
     { id: 2, name: "request_context", type: "RequestContext" },
   ])
 
+  // Cursor CLI's Stop sends `user_cancelled`; field 3 (resolutions for shells
+  // and subagents it moved to the background) is not modeled.
   addType(root, "CancelAction", [
-    { id: 1, name: "conversation_id", type: "string" },
+    { id: 1, name: "reason", type: "string" },
   ])
 
   // Deferred answers for an AskQuestion the client already replied to with

@@ -316,6 +316,23 @@ describe("a message sent while Cursor works on the step", () => {
     expect(injections(held.writes)).toEqual([])
   })
 
+  it("keeps the step's checkpoint when Cursor withdrew one of its execs", async () => {
+    const held = heldReads("withdrawn")
+    expect(sessionManager.markExecAborted(held, 1)).toBe(true)
+    serve(held, [
+      () => injectionState(injections(held.writes)[0].injection_id, { delivered: { step: 2 } }),
+      () => serverFrame({ tool_call_completed: { call_id: "call_2" } }),
+      () => ({ flags: 0, payload: encodeMessage("AgentServerMessage", { conversation_checkpoint_update: Uint8Array.from([7, 7]) }) }),
+      turnEnded,
+    ])
+
+    await stream([...readStep("withdrawn"), user("change of plan")] as Prompt)
+
+    expect(execResults(held.writes).map((message) => message.id)).toEqual([2])
+    expect(held.resultsAfterCheckpoint).toBeUndefined()
+    expect([...held.resumeCheckpoint ?? []]).toEqual([7, 7])
+  })
+
   it("is left to the next step while the Run waits on the host's tools", () => {
     heldReads("held")
     expect(announceHostSteer(hostSteer("change of plan"))).toBe(false)

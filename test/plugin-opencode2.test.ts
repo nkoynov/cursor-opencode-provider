@@ -36,6 +36,7 @@ import {
 import { registerCursorShellCall } from "../src/shell-timeout.js"
 import { sessionActivity } from "../src/activity.js"
 import { forgetEarlySteers, listenForHostSteers } from "../src/host-steer.js"
+import { onHostInterrupt } from "../src/host-interrupt.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { writeCache } from "../src/models.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
@@ -1542,6 +1543,27 @@ describe("opencode2 running tool tracking", () => {
     } finally {
       stop()
       forgetEarlySteers("ses_inbox")
+    }
+  })
+
+  test("a stopped execution is reported to the model, except a shutdown and a normal end", async () => {
+    const heard: Array<[string, string, number]> = []
+    const stop = onHostInterrupt((sessionID, reason, at) => { heard.push([sessionID, reason, at]) })
+    try {
+      await withPluginEvents([
+        { type: "session.execution.succeeded", data: { sessionID: "ses_done" } },
+        { type: "session.execution.failed", data: { sessionID: "ses_failed", error: { type: "unknown", message: "x" } } },
+        { type: "session.execution.interrupted", created: 1_790_000_000_000, data: { sessionID: "ses_restart", reason: "shutdown" } },
+        { type: "session.execution.interrupted", created: 1_790_000_000_001, data: { sessionID: "ses_stop", reason: "user" } },
+        { type: "session.execution.interrupted", created: 1_790_000_000_002, data: { sessionID: "ses_idle", reason: "inactivity" } },
+      ], () => heard.length >= 2)
+      expect(heard).toEqual([
+        ["ses_stop", "user", 1_790_000_000_001],
+        ["ses_idle", "inactivity", 1_790_000_000_002],
+      ])
+    } finally {
+      stop()
+      sessionActivity.clear()
     }
   })
 })

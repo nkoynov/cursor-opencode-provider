@@ -4,6 +4,7 @@ import path from "node:path"
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import { sessionManager, type CursorSession } from "../src/session.js"
 import {
+  cancelRunForHostInterrupt,
   deliverContinuationResults,
   extractPromptHistory,
   extractTrailingToolResults,
@@ -499,5 +500,25 @@ describe("host notes a turn ends without delivering", () => {
     expect(await preparePriorSessionForFreshTurn("ses_drained", { timeoutMs: 1_000 })).toBe("drained")
 
     expect(await hostNoteAfterRestart(root, "ses_drained")).toBe(NOTE)
+  })
+
+  it("keeps the note when the host stops the turn and Cursor ends the Run without turn_ended", async () => {
+    root = fs.mkdtempSync(path.join("/tmp", "cursor-host-notes-"))
+    const stopped = liveSession([])
+    stopped.openCodeSessionId = "ses_stopped"
+    stopped.deferredNote = NOTE
+    stopped.frames = {
+      next: async () => ({ done: false, value: { flags: 0x02, payload: new Uint8Array() } }),
+    } as CursorSession["frames"]
+    sessionManager.registerSession(stopped)
+
+    await cancelRunForHostInterrupt(stopped, "user", { graceMs: 200 })
+    expect(stopped.closed).toBe(true)
+
+    const next = endsTurn(liveSession([]), root, "ses_stopped")
+    sessionManager.registerSession(next)
+    expect(await preparePriorSessionForFreshTurn("ses_stopped", { timeoutMs: 1_000 })).toBe("drained")
+
+    expect(await hostNoteAfterRestart(root, "ses_stopped")).toBe(NOTE)
   })
 })
