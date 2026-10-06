@@ -4918,9 +4918,9 @@ export function extractTrailingToolResults(
   if (i === end - 1) return []
   const results = extractToolResults(prompt.slice(i + 1, end))
   if (media.length > 0) attributeTrailingMedia(results, media)
-  // A Run continuation only carries exec results, so the host notes ride on one
-  // of them; otherwise Cursor would never see e.g. a removed skill. Delivery
-  // picks the result whose typed shape can hold them.
+  // A Run continuation only carries exec results, so the host notes go with
+  // them; otherwise Cursor would never see e.g. a removed skill. Delivery puts
+  // them on a result whose typed shape can hold them, or injects them.
   const last = results.at(-1)
   if (last && notes.length > 0) {
     results[results.length - 1] = { ...last, note: notes.join("\n\n") }
