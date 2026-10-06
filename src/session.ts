@@ -137,6 +137,12 @@ export type PendingExec = {
    * exec result back to Cursor — just clear pending and keep pumping.
    */
   bridged?: boolean
+  /**
+   * Cursor withdrew the exec (`ExecServerControlMessage.abort`). As in Cursor
+   * CLI, nothing is written back for it, and it no longer holds the Run, but
+   * the host's late result still finds this Run so the turn goes on.
+   */
+  aborted?: boolean
 }
 
 export type ContinuationTerminalReason =
@@ -491,18 +497,28 @@ export class SessionManager {
     return this.isPumping(session)
   }
 
+  /** Cursor withdrew this exec; returns false when it is not one the host still owes. */
+  markExecAborted(session: CursorSession, execId: number): boolean {
+    const pending = session.pending.get(execId)
+    if (session.closed || !pending || pending.bridged || pending.aborted || pending.state !== "pending") return false
+    pending.aborted = true
+    this.scheduleHardDeadline(session)
+    return true
+  }
+
   /**
-   * Clear display-only bridged pendings that do not require a Cursor exec write.
-   * Used when the host starts a fresh user turn instead of returning the bridged
-   * tool result (e.g. human `continue` while a todowrite mirror is outstanding).
+   * Clear pendings that do not require a Cursor exec write: display-only bridged
+   * ones and execs Cursor aborted. Used when the host starts a fresh user turn
+   * instead of returning the result (e.g. human `continue` while a todowrite
+   * mirror is outstanding).
    *
-   * @returns number of bridged pendings settled
+   * @returns number of pendings settled
    */
   settleBridgedPending(session: CursorSession): number {
     if (session.closed) return 0
     let settled = 0
     for (const [execId, pending] of [...session.pending.entries()]) {
-      if (!pending.bridged) continue
+      if (!pending.bridged && !pending.aborted) continue
       if (pending.state === "claimed") continue
       const key = this.key(session.sessionId, execId)
       this.putTombstone(key, "delivered")
@@ -670,7 +686,7 @@ export class SessionManager {
 
     let framesWritten = 0
     try {
-      if (!pending.bridged && frames.length === 0) {
+      if (!pending.bridged && !pending.aborted && frames.length === 0) {
         throw new CursorProtocolError("No result frames were produced")
       }
       for (const frame of frames) {
@@ -884,7 +900,8 @@ export class SessionManager {
   private hasToolRunningLocally(session: CursorSession): boolean {
     const source = this.activitySource
     if (!source.isToolRunning) return false
-    for (const execId of session.pending.keys()) {
+    for (const [execId, pending] of session.pending) {
+      if (pending.aborted) continue
       if (source.isToolRunning(`cursor_${session.sessionId}_${execId}`)) return true
     }
     return false
