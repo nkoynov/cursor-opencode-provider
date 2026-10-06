@@ -1805,6 +1805,43 @@ function mcpImageItems(images: readonly CursorImageInput[]): Array<Record<string
   return images.map((image) => ({ image: { data: image.data, mime_type: image.mimeType } }))
 }
 
+// Success shapes with no free-text field. Every typed error/failure shape has
+// one, and so do the other success shapes (content, stdout, output).
+/** Whether this result's typed shape has a text slot for a host note after its parsed payload. */
+export function resultCanCarryNote(input: ToolResultInput): boolean {
+  const resultField = input.resultField || "mcp_result"
+  if (resultField === "shell_stream") return true
+  const typed = buildTypedExecResult(
+    resultField,
+    input.output,
+    input.error,
+    input.toolName,
+    input.resultMetadata,
+    input.shellOutcome,
+    input.workspaceRoot,
+  )
+  return attachResultNote(typed, " ") !== undefined
+}
+
+function appendNote(text: unknown, note: string): string {
+  if (typeof text !== "string" || !text) return note
+  return `${text.endsWith("\n") ? text : `${text}\n`}\n${note}`
+}
+
+function attachResultNote(typed: Record<string, unknown>, note: string): Record<string, unknown> | undefined {
+  const { success, error, failure } = typed as Record<string, Record<string, unknown> | undefined>
+  if (error && typeof error.error === "string") return { ...typed, error: { ...error, error: appendNote(error.error, note) } }
+  if (failure) return { ...typed, failure: { ...failure, stderr: appendNote(failure.stderr, note) } }
+  if (!success) return undefined
+  if (Array.isArray(success.content)) {
+    return { ...typed, success: { ...success, content: [...success.content, { text: { text: note } }] } }
+  }
+  for (const slot of ["content", "stdout", "output", "final_message"]) {
+    if (typeof success[slot] === "string") return { ...typed, success: { ...success, [slot]: appendNote(success[slot], note) } }
+  }
+  return undefined
+}
+
 /**
  * Build one or more ExecClientMessage frames for a tool result.
  * Shell replies are a sequence of ShellStream oneofs under the same id —
@@ -1813,22 +1850,43 @@ function mcpImageItems(images: readonly CursorImageInput[]): Array<Record<string
  * shell execs hang on heartbeats forever).
  */
 export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
+  return encodeExecResult(input).frames
+}
+
+/**
+ * `buildExecClientMessages` with a host note appended after the parsed
+ * payload. In the raw output the note would break parsing: an OpenCode 2 read
+ * would reach Cursor with its header and line numbers. `noteCarried` is false
+ * when the result shape has no text slot for it.
+ */
+export function buildExecClientMessagesWithNote(
+  input: ToolResultInput,
+  note: string,
+): { frames: Uint8Array[]; noteCarried: boolean } {
+  return encodeExecResult(input, note)
+}
+
+function encodeExecResult(input: ToolResultInput, note?: string): { frames: Uint8Array[]; noteCarried: boolean } {
   const resultField = input.resultField || "mcp_result"
   const frames: Uint8Array[] = []
+  let noteCarried = false
 
   if (resultField === "shell_stream") {
     const stdout = groundShellPathText(
       input.output,
       shellPathRoot(input.resultMetadata, input.workspaceRoot),
     )
+    noteCarried = note !== undefined
     // Real clients always emit Start → Stdout/Stderr* → Exit (capture/tests).
     frames.push(encodeShellStream(input.execId, undefined, { start: {} }))
     if (input.error) {
-      frames.push(encodeShellStream(input.execId, undefined, { stderr: { data: input.error } }))
+      const stderr = note === undefined ? input.error : appendNote(input.error, note)
+      frames.push(encodeShellStream(input.execId, undefined, { stderr: { data: stderr } }))
       frames.push(encodeShellStream(input.execId, input.executionTimeMs, { exit: { code: 1, aborted: false } }))
     } else {
-      if (stdout) {
-        frames.push(encodeShellStream(input.execId, undefined, { stdout: { data: stdout } }))
+      const text = note === undefined ? stdout : appendNote(stdout, note)
+      if (text) {
+        frames.push(encodeShellStream(input.execId, undefined, { stdout: { data: text } }))
       }
       if (input.shellOutcome?.kind === "backgrounded") {
         frames.push(encodeShellStream(input.execId, input.executionTimeMs, {
@@ -1860,7 +1918,7 @@ export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
       id: input.execId,
       local_execution_time_ms: input.executionTimeMs ?? 0,
     }
-    clientMsg[resultField] = buildTypedExecResult(
+    const typed = buildTypedExecResult(
       resultField,
       input.output,
       input.error,
@@ -1870,6 +1928,9 @@ export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
       input.workspaceRoot,
       execResultImages(resultField, input.images),
     )
+    const noted = note === undefined ? undefined : attachResultNote(typed, note)
+    noteCarried = noted !== undefined
+    clientMsg[resultField] = noted ?? typed
     frames.push(
       encodeMessage("AgentClientMessage", {
         exec_client_message: clientMsg,
@@ -1879,7 +1940,7 @@ export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
 
   // Always close the exec stream — mirrors CLI agent-exec after every handler.
   frames.push(buildExecStreamClose(input.execId))
-  return frames
+  return { frames, noteCarried }
 }
 
 /** ACM #5 exec_client_control_message { stream_close { id } }. */

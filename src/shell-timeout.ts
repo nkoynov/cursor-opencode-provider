@@ -547,34 +547,46 @@ export function captureCursorShellResult(
   output: string,
   metadata?: Record<string, unknown>,
 ): string {
-  if (typeof output !== "string") return output
-  if (typeof toolCallId !== "string" || !toolCallId.startsWith("cursor_")) return output
+  const parsed = parseCursorShellResult(toolCallId, output, metadata)
+  if (parsed.outcome) remember(outcomes, toolCallId, parsed.outcome)
+  return parsed.output
+}
+
+function parseCursorShellResult(
+  toolCallId: string,
+  output: string,
+  metadata?: Record<string, unknown>,
+): { output: string; outcome?: CursorShellOutcome } {
+  if (typeof output !== "string") return { output }
+  if (typeof toolCallId !== "string" || !toolCallId.startsWith("cursor_")) return { output }
   const policy = policies.get(toolCallId)
   if (policy?.backgroundSpawn) {
     const spawn = parseBackgroundSpawnOutcome(output, policy)
-    if (spawn) {
-      remember(outcomes, toolCallId, spawn.outcome)
-      return formatShellOutcomeDisplay(spawn.output, spawn.outcome)
-    }
+    if (spawn) return { output: formatShellOutcomeDisplay(spawn.output, spawn.outcome), outcome: spawn.outcome }
   }
   // Private wrapper sentinels are meaningful only for calls we transformed.
   // A normal foreground command is allowed to print the same text verbatim.
   const wrapper = policy?.timeoutBehavior === CURSOR_TIMEOUT_BACKGROUND
     ? parseSoftBackgroundOutcome(output, policy)
     : undefined
-  if (wrapper) {
-    remember(outcomes, toolCallId, wrapper.outcome)
-    return formatShellOutcomeDisplay(wrapper.output, wrapper.outcome)
-  }
+  if (wrapper) return { output: formatShellOutcomeDisplay(wrapper.output, wrapper.outcome), outcome: wrapper.outcome }
   const timeout = parseOpenCodeTimeout(output)
   if (timeout) {
     const outcome = { kind: "timeout" as const, timeoutMs: timeout.timeoutMs }
-    remember(outcomes, toolCallId, outcome)
-    return formatShellOutcomeDisplay(timeout.output, outcome)
+    return { output: formatShellOutcomeDisplay(timeout.output, outcome), outcome }
   }
   const exitCode = finiteNonNegative(metadata?.exit)
-  if (exitCode !== undefined) remember(outcomes, toolCallId, { kind: "exit", code: exitCode })
-  return output
+  return exitCode === undefined ? { output } : { output, outcome: { kind: "exit", code: exitCode } }
+}
+
+/** What {@link consumeCursorShellResult} would return, without consuming it. */
+export function peekCursorShellResult(
+  toolCallId: string,
+  output: string,
+): { output: string; outcome?: CursorShellOutcome } {
+  if (typeof toolCallId !== "string" || !toolCallId) return { output }
+  const outcome = outcomes.get(toolCallId)
+  return outcome ? { output, outcome } : parseCursorShellResult(toolCallId, output)
 }
 
 /** Consume the structured result, with an inline fallback when no plugin hook ran. */
