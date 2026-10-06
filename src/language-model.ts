@@ -78,6 +78,7 @@ import {
   buildAskQuestionInteractionReply,
   buildAsyncAskQuestionCompletion,
   buildCreatePlanInteractionReply,
+  buildInjectUserMessage,
   buildSwitchModeInteractionReply,
   handleInteractionQuery,
 } from "./protocol/interactions.js"
@@ -125,7 +126,7 @@ import {
 } from "./protocol/generate-image.js"
 import { stageCursorImage } from "./image-staging.js"
 import { IMAGE_PERMISSION_DENIED_PREFIX } from "./image-save.js"
-import { getCheckpoint, setCheckpoint } from "./protocol/checkpoint.js"
+import { clearCheckpoint, getCheckpoint, setCheckpoint } from "./protocol/checkpoint.js"
 import {
   cursorContextUsageMetadata,
   decodeConversationTokenDetails,
@@ -162,6 +163,7 @@ import {
   type CursorSession,
   type Frame,
   type PendingExec,
+  type SteerInjection,
 } from "./session.js"
 import {
   CursorAuthError,
@@ -798,7 +800,24 @@ async function doStreamImpl(
   // live continuation. Treating mid-prompt history as continuation caused
   // false "orphaned tool results" errors after Cursor turn_ended and OpenCode
   // started the next step with old tools still in the prompt body.
-  const trailingToolResults = extractTrailingToolResults(prompt)
+  let trailingToolResults = extractTrailingToolResults(prompt)
+  let steerMessages: string[] = []
+  if (trailingToolResults.length === 0 && mayBeUserStep(callOptions)) {
+    const steered = extractLiveSteerResults(
+      prompt,
+      opencodeSessionKey(callOptions),
+      resolveCursorWireModelId(callOptions.providerOptions?.cursor as Record<string, unknown> | undefined, modelId),
+      extractTools(callOptions),
+    )
+    if (steered) {
+      trace(
+        `continuation: ${steered.messages.length} mid-turn user message(s) after ` +
+          `${steered.results.length} trailing tool result(s)`,
+      )
+      trailingToolResults = steered.results
+      steerMessages = steered.messages
+    }
+  }
   let session = findContinuationSession(trailingToolResults)
   // A call that must open a Run gets its credential before it changes any
   // session state (plan mode, finishing the prior held Run), so a login that
@@ -818,7 +837,12 @@ async function doStreamImpl(
     const results = session.supportsImages
       ? await decodeTrailingToolImages(trailingToolResults, callOptions.abortSignal)
       : trailingToolResults
-    session = deliverContinuationResults(session, results)
+    if (steerMessages.length > 0) session = injectSteerMessages(session, steerMessages)
+    const resultsAfterCheckpoint = session && (steerMessages.length > 0 || session.resultsAfterCheckpoint)
+      ? resultsAwaitingCheckpoint(session, results)
+      : undefined
+    if (session) session = deliverContinuationResults(session, results)
+    if (session && resultsAfterCheckpoint) session.resultsAfterCheckpoint = resultsAfterCheckpoint
     if (session) await refreshHeldSessionToolCatalog(session, callOptions)
   }
 
@@ -832,7 +856,7 @@ async function doStreamImpl(
       // Cursor can continue instead of deadlocking.
       const ids = trailingToolResults.map((r) => `${r.sessionId}:${r.execId}`).join(",")
       trace(`continuation: ${trailingToolResults.length} interrupted trailing tool result(s) [${ids}] — rebasing fresh Run`)
-      session = await openSession({ recovery: { kind: "rebase" } })
+      session = await openSession({ recovery: { kind: "rebase", ...(steerMessages.length > 0 ? { steer: true } : {}) } })
     } else {
       // Fresh turn (prompt ends with user/assistant text). Historical tool
       // results may exist mid-prompt; they are not live exec replies.
@@ -902,6 +926,7 @@ async function doStreamImpl(
             retryPolicy,
             recover: (recovery) => openSession({ recovery }),
             onSession: (next) => { activeSession = next },
+            ...(steerMessages.length > 0 ? { steer: true } : {}),
             ...(credentialRenewable
               ? { renewRejectedCredential: () => { forceCredentialRefresh = true } }
               : {}),
@@ -963,6 +988,8 @@ export async function pumpWithRecovery(input: {
   recover: (recovery: CursorRunRecovery) => Promise<CursorSession>
   onSession?: (session: CursorSession) => void
   maxRecoveries?: number
+  /** The call's prompt ends with mid-turn user messages after the step's results. */
+  steer?: boolean
   /**
    * Set when the credential source can renew: called once per turn after
    * Cursor rejects the token (401 / unauthenticated) before the attempt did
@@ -980,8 +1007,12 @@ export async function pumpWithRecovery(input: {
   let credentialRenewed = false
   input.onSession?.(session)
 
+  const resumableCheckpoint = (pumpedSession: CursorSession) =>
+    pumpedSession.resultsAfterCheckpoint ? undefined : pumpedSession.resumeCheckpoint
+
   const reopen = async (pumpedSession: CursorSession, failure: CursorProviderError) => {
-    const checkpoint = pumpedSession.resumeCheckpoint
+    const checkpoint = resumableCheckpoint(pumpedSession)
+    const toolCallIds = pumpedSession.resultsAfterCheckpoint?.toolCallIds
     const recovery: CursorRunRecovery = failure.checkpointUnusable
       ? { kind: "rebase", reason: "checkpoint-unusable" }
       : checkpoint
@@ -989,13 +1020,25 @@ export async function pumpWithRecovery(input: {
             kind: "resume",
             conversationId: pumpedSession.conversationId,
             checkpoint: Uint8Array.from(checkpoint),
+            ...(pumpedSession.pendingFollowUp !== undefined ? { followUp: pumpedSession.pendingFollowUp } : {}),
           }
-        : { kind: "rebase" }
+        : {
+            kind: "rebase",
+            ...(input.steer ? { steer: true } : {}),
+            ...(toolCallIds?.size ? { toolCallIds: new Set(toolCallIds) } : {}),
+          }
     const next = await input.recover(recovery)
     if (recovery.kind === "resume") {
       next.usageEstimate = { ...pumpedSession.usageEstimate }
       next.editToolCalls = new Map(pumpedSession.editToolCalls)
       next.deferredNote = pumpedSession.deferredNote
+      next.pendingFollowUp = recovery.followUp
+      // The resumed Run never saw these; its turn_ended sends them as a follow-up. One delivered
+      // after the checkpoint it resumes from is lost with that checkpoint, so it goes too.
+      const resend = pumpedSession.steerInjections
+        ?.filter((injection) => injection.state !== "delivered" || !injection.checkpointed)
+        .map((injection) => ({ ...injection, state: "carried" as const, checkpointed: false }))
+      if (resend?.length) next.steerInjections = resend
       // mirroredTodos rides along via rememberMirroredTodos (per-OpenCode-
       // session, seeded in startSession) — no handoff needed here.
     }
@@ -1041,7 +1084,7 @@ export async function pumpWithRecovery(input: {
         continue
       }
       if (!failure.transient) throw failure
-      const checkpoint = pumpedSession.resumeCheckpoint
+      const checkpoint = resumableCheckpoint(pumpedSession)
       if (!failure.replaySafe && !checkpoint) {
         throw retrySuppressedError(
           failure,
@@ -1069,8 +1112,12 @@ export async function pumpWithRecovery(input: {
 }
 
 export type CursorRunRecovery =
-  | { kind: "rebase"; reason?: "checkpoint-unusable" }
-  | { kind: "resume"; conversationId: string; checkpoint: Uint8Array }
+  /**
+   * `steer`: the prompt ends with mid-turn user messages after the step's results.
+   * `toolCallIds`: earlier results of this step that no checkpoint holds.
+   */
+  | { kind: "rebase"; reason?: "checkpoint-unusable"; steer?: boolean; toolCallIds?: ReadonlySet<string> }
+  | { kind: "resume"; conversationId: string; checkpoint: Uint8Array; followUp?: string }
 
 const heartbeatWritePendingBySession = new WeakMap<CursorSession, boolean>()
 const heartbeatGenerationBySession = new WeakMap<CursorSession, number>()
@@ -1378,6 +1425,8 @@ async function startSession(
     // A foreign-history rebase replays every tool result: the other model's work
     // exists only in OpenCode history, never in a Cursor checkpoint.
     toolResults: isCompaction || foreignHistory || checkpointUnusable ? "all" : (recovery?.kind === "rebase" ? "trailing" : "omit"),
+    trailingSteer: recovery?.kind === "rebase" && recovery.steer === true,
+    ...(recovery?.kind === "rebase" && recovery.toolCallIds ? { keepToolCallIds: recovery.toolCallIds } : {}),
   })
 
   await loadAvailableModels()
@@ -1499,11 +1548,14 @@ async function startSession(
   // Session exec remap / bridges need full McpToolDefinition identity. The wire
   // omits RequestContext.tools (#7); do not read descriptors from there.
   const toolDescriptors = toolsToDescriptors(cursorTools, "opencode", knownMcpServers)
+  const runId = crypto.randomUUID()
   // CLI parity: echo the last conversation_checkpoint_update as conversation_state.
   // After compaction or an unsafe checkpoint reset there is no checkpoint —
   // seed a new Cursor conversation from OpenCode's authoritative history.
+  const followUp = resuming ? resumeRecovery?.followUp : undefined
   const reqBytes = buildRunRequest({
-    text: userText,
+    messageId: runId,
+    text: followUp ?? userText,
     images,
     modelId: cursorModelId,
     conversationId,
@@ -1515,7 +1567,7 @@ async function startSession(
     tools: cursorTools,
     toolDescriptors,
     requestContext,
-    action: resuming ? "resume" : "user",
+    action: resuming && followUp === undefined ? "resume" : "user",
   })
   // Content hashes — Cursor content-addresses large payloads; logging these lets
   // us match a server get_blob_args.blob_id to what it wants served.
@@ -1623,6 +1675,7 @@ async function startSession(
     knownMcpServers,
     supportsImages,
     stream,
+    runId,
     frames: stream.frames()[Symbol.asyncIterator](),
     pending: new Map(),
     displayToolCalls: new Map(),
@@ -1663,16 +1716,15 @@ async function startSession(
 
   attachSessionHeartbeat(session)
 
-  const abortIfNeeded = (stream?: BidiStream): void => {
-    if (!session.closed && !callOptions.abortSignal?.aborted) return
-    try { stream?.destroy() } catch { /* already closed */ }
-    if (callOptions.abortSignal?.aborted) {
-      throw new CursorLocalCancellationError("Cursor progress-only continuation cancelled")
+  session.reopenWithUserMessage = async (text: string, abortSignal = callOptions.abortSignal) => {
+    const abortIfNeeded = (stream?: BidiStream): void => {
+      if (!session.closed && !abortSignal?.aborted) return
+      try { stream?.destroy() } catch { /* already closed */ }
+      if (abortSignal?.aborted) {
+        throw new CursorLocalCancellationError("Cursor progress-only continuation cancelled")
+      }
+      throw new CursorProtocolError("Cannot reopen a closed Cursor session")
     }
-    throw new CursorProtocolError("Cannot reopen a closed Cursor session")
-  }
-
-  session.reopenWithUserMessage = async (text: string) => {
     abortIfNeeded()
     const freshToken = await resolveRunBearerToken(options)
     abortIfNeeded()
@@ -1681,7 +1733,9 @@ async function startSession(
     const next = await bidiRunStream(freshToken, { baseURL: agentBaseUrl, headers: options.headers })
     abortIfNeeded(next)
     const conversationState = session.resumeCheckpoint ?? getCheckpoint(session.conversationId)
+    const nextRunId = crypto.randomUUID()
     const reqBytes = buildRunRequest({
+      messageId: nextRunId,
       text,
       modelId: cursorModelId,
       conversationId: session.conversationId,
@@ -1704,6 +1758,7 @@ async function startSession(
     await waitForStreamWrites(session.stream)
     abortIfNeeded(next)
     sessionManager.replaceStream(session, next)
+    session.runId = nextRunId
     attachSessionHeartbeat(session)
   }
 
@@ -2797,7 +2852,7 @@ export async function pump(
     }
     return replaySafety.applyTo(failure)
   }
-  const { textId, reasoningId } = ids
+  let { textId, reasoningId } = ids
   const advertisedToolNames = advertisedToolNamesFromDescriptors(session.toolDescriptors)
   const advertisedToolNameSet = new Set(
     advertisedToolNames.map((name) => resolveCustomWebToolAlias(name, session.toolAliases)),
@@ -2805,6 +2860,7 @@ export async function pump(
   let textStarted = false
   let reasoningStarted = false
   let assistantText = ""
+  let textSeparator = ""
   let progressContinuationAttempts = 0
   let emittedHostTools = 0
   // The current model step's tool calls: Cursor's listed count, the call ids that
@@ -3088,8 +3144,10 @@ export async function pump(
     textStarted = false
   }
 
-  const emitText = (text: string) => {
-    if (!text) return
+  const emitText = (delta: string) => {
+    if (!delta) return
+    const text = textSeparator + delta
+    textSeparator = ""
     assistantText += text
     replaySafety.markBarrier("visible-text")
     // Close reasoning before text (hosts expect reasoning-end before text-start).
@@ -3410,6 +3468,13 @@ export async function pump(
         cacheDiagnostics.checkpointUpdates++
         setCheckpoint(session.conversationId, bytes)
         session.resumeCheckpoint = Uint8Array.from(bytes)
+        session.pendingFollowUp = undefined
+        const results = session.resultsAfterCheckpoint
+        if (results && !results.unconfirmed && results.awaiting.size === 0) session.resultsAfterCheckpoint = undefined
+        // Cursor answers an injection before checkpointing past it; one read earlier may predate it.
+        for (const injection of session.steerInjections ?? []) {
+          if (injection.state !== "sent") injection.checkpointed = true
+        }
         const tokenDetails = decodeConversationTokenDetails(bytes)
         if (tokenDetails) {
           cacheDiagnostics.tokenDetailUpdates++
@@ -3436,6 +3501,18 @@ export async function pump(
         trace(`continuation: turn ended before an exec result could carry the host note noteLen=${session.deferredNote.length}`)
       }
       const turnEnded = iu.turn_ended as Record<string, unknown>
+      const undelivered = (session.steerInjections ?? []).filter((injection) => injection.state !== "delivered")
+      // A checkpoint from before the step's results (or from an earlier Run) would drop the step
+      // from any turn that resumed it, so it is neither kept nor saved.
+      const checkpointPredatesStep = !!session.resultsAfterCheckpoint || (
+        undelivered.length > 0
+        && (!session.resumeCheckpoint?.length || undelivered.some((injection) => !injection.checkpointed))
+      )
+      if (checkpointPredatesStep) {
+        trace(`checkpoint: dropped for conversationId=${session.conversationId} — it predates this step's results`)
+        clearCheckpoint(session.conversationId)
+        session.resumeCheckpoint = undefined
+      }
       if (session.openCodeSessionId) {
         await persistConversationState(
           session.cacheDir ?? opencodeGlobalCacheDir(),
@@ -3456,10 +3533,36 @@ export async function pump(
         })
       }
       const checkpoint = session.resumeCheckpoint ?? getCheckpoint(session.conversationId)
+      session.steerInjections = undefined
+      session.pendingFollowUp = undefined
+      if (undelivered.length > 0) {
+        trace(
+          `steer: ${undelivered.length} injection(s) not delivered before turn_ended ` +
+            `states=${undelivered.map((i) => i.state).join(",")}`,
+        )
+        if (typeof session.reopenWithUserMessage !== "function" || checkpointPredatesStep) {
+          throw new CursorProtocolError(
+            "Cursor did not take a message sent during this turn, and there is no checkpoint to send it as a follow-up",
+          )
+        }
+        // Cursor CLI resends an injection the Run did not take as a follow-up
+        // message. If opening it fails, Run recovery resends it.
+        const followUp = undelivered.map((i) => i.text).join("\n\n")
+        session.pendingFollowUp = followUp
+        // The follow-up Run starts with its own reasoning, which must not open inside this Run's text.
+        closeOpenSpans()
+        textId = crypto.randomUUID()
+        reasoningId = crypto.randomUUID()
+        await session.reopenWithUserMessage(followUp, abortSignal)
+        trace("steer: sent undelivered message(s) as a follow-up Run")
+        assistantText = ""
+        continue
+      }
       if (
         typeof session.reopenWithUserMessage === "function"
         && checkpoint
         && checkpoint.length > 0
+        && !session.resultsAfterCheckpoint
         && shouldContinueProgressOnlyTurn({
              allowTools: session.allowTools,
              advertisedToolCount: advertisedToolNames.length,
@@ -3491,6 +3594,19 @@ export async function pump(
       )
       sessionManager.close(session)
       return
+    } else if (iu?.context_injection_state) {
+      const update = iu.context_injection_state as Record<string, unknown>
+      const stateVariants = (update.state ?? {}) as Record<string, unknown>
+      const state = Object.keys(stateVariants).find((key) => stateVariants[key])
+      const reason = (stateVariants.rejected as Record<string, unknown> | undefined)?.reason
+      trace(
+        `steer: injection id=${String(update.injection_id)} state=${state ?? "-"}` +
+          (typeof reason === "string" && reason ? ` reason=${JSON.stringify(reason)}` : ""),
+      )
+      const injection = session.steerInjections?.find((i) => i.id === update.injection_id)
+      if (injection && state && injection.state !== "delivered") injection.state = state as SteerInjection["state"]
+    } else if (iu?.user_message_appended) {
+      trace("steer: Cursor appended a user message to the Run")
     } else if (iu?.tool_call_started) {
       cacheDiagnostics.displayToolCalls++
       // Stash Cursor display ToolCall until exec claims it, or completed bridges it.
@@ -3534,6 +3650,7 @@ export async function pump(
       // calls of the previous step once their results arrive.
       if (callId && session.displayToolCalls.has(callId)) toolStep.resolved.add(callId)
       if (callId) session.editToolCalls?.delete(callId)
+      if (callId) session.resultsAfterCheckpoint?.awaiting.delete(callId)
       // If exec already claimed this call_id, display map entry is gone — skip.
       if (!callId || !session.displayToolCalls.has(callId)) {
         if (callId) {
@@ -3845,6 +3962,7 @@ export async function pump(
                 binaryWriteBytes: undefined,
                 imageByteLength: binaryWrite.data.length,
               },
+              displayCallId,
             )
             const toolCallId = `cursor_${session.sessionId}_${parsed.id}`
             trace(
@@ -3932,6 +4050,7 @@ export async function pump(
             parsed.toolName,
             false,
             parsed.resultMetadata,
+            displayCallId,
           )
           // A direct host `todowrite` is a replace-all snapshot: it is the new
           // truth for later Cursor merge patches, which otherwise apply onto a
@@ -4454,6 +4573,166 @@ async function decodeTrailingToolImages(
   }))
 }
 
+// A tool OpenCode interrupted (user stop, declined permission). OpenCode 2 and 1.x's newer session
+// engine (`type: "unknown"`) replay a failed tool as plain text holding exactly `{ error, content }`,
+// the same output type as a completed tool's; 1.x's classic loop sends plain error text.
+const OPENCODE_INTERRUPTED_TEXT = new Set(["Tool execution aborted", "[Tool execution was interrupted]"])
+
+function isOpenCodeInterruptedEnvelope(output: string): boolean {
+  if (!output.startsWith('{"error":{')) return false
+  let envelope: unknown
+  try {
+    envelope = JSON.parse(output)
+  } catch {
+    return false
+  }
+  const { error, content, ...rest } = envelope as Record<string, unknown>
+  if (Object.keys(rest).length > 0 || !Array.isArray(content) || JSON.stringify(envelope) !== output) return false
+  const { type, message } = error as Record<string, unknown>
+  if (typeof type !== "string" || typeof message !== "string") return false
+  return type === "aborted" || message === "Tool execution interrupted" || message.startsWith("Tool execution interrupted: ")
+}
+
+function isInterruptedToolResult(result: ExtractedToolResult): boolean {
+  return isOpenCodeInterruptedEnvelope(result.output)
+    || (result.error !== undefined && OPENCODE_INTERRUPTED_TEXT.has(result.error.trim()))
+}
+
+function plainUserText(message: LanguageModelV3CallOptions["prompt"][number]): string | undefined {
+  if (message.role !== "user" || !Array.isArray(message.content) || message.content.length === 0) return undefined
+  const texts: string[] = []
+  for (const part of message.content) {
+    if (part.type !== "text") return undefined
+    texts.push(part.text)
+  }
+  return texts.join("\n")
+}
+
+/**
+ * Plain-text user messages that arrived during a step, from the first one to
+ * the end of the prompt, and the host notes among them. Host notes before the
+ * first stay with the tool results. A message with an attachment is no steer.
+ */
+function trailingSteer(
+  prompt: LanguageModelV3CallOptions["prompt"],
+): { start: number; messages: string[]; hostNote?: string } | undefined {
+  let start: number | undefined
+  for (let i = prompt.length - 1; i >= 0; i--) {
+    if (hostTailNote(prompt[i])) continue
+    if (plainUserText(prompt[i]) === undefined) break
+    start = i
+  }
+  if (start === undefined) return undefined
+  const messages: string[] = []
+  const hostNotes: string[] = []
+  for (const message of prompt.slice(start)) {
+    const hostNote = hostTailNote(message)
+    if (hostNote) {
+      if (hostNote.text) hostNotes.push(hostNote.text)
+    } else {
+      messages.push(plainUserText(message)!)
+    }
+  }
+  return { start, messages, hostNote: joinNotes(hostNotes) }
+}
+
+/**
+ * OpenCode promotes a mid-turn user message after the step's tool results, so
+ * the prompt ends with a user message instead of the results. When a held Run
+ * waits on exactly those results, they are still a live continuation and the
+ * messages are injected into that Run. Otherwise the call stays a fresh turn.
+ * An in-session helper replaying the history under a reduced catalog is no steer.
+ */
+export function extractLiveSteerResults(
+  prompt: LanguageModelV3CallOptions["prompt"],
+  sessionKey: string | undefined,
+  wireModelId: string,
+  incomingTools: ReadonlyArray<{ name?: string }> = [],
+): { results: ExtractedToolResult[]; messages: string[] } | undefined {
+  if (!sessionKey) return undefined
+  const steer = trailingSteer(prompt)
+  if (!steer) return undefined
+  const results = extractTrailingToolResults(prompt.slice(0, steer.start))
+  const held = findContinuationSession(results)
+  if (
+    !held
+    || held.closed
+    || !held.runId
+    || held.openCodeSessionId !== sessionKey
+    || sessionManager.isActivelyPumping(held)
+    || isProperCatalogSubset(incomingTools, held.toolCatalog ?? [])
+  ) {
+    return undefined
+  }
+  const heldModel = held.cacheDiagnostics?.modelId
+  if (heldModel !== undefined && heldModel !== wireModelId) return undefined
+  if (results.some((r) => r.sessionId !== held.sessionId || held.pending.get(r.execId)?.state !== "pending")) {
+    return undefined
+  }
+  const answered = new Set(results.map((r) => r.execId))
+  for (const execId of held.pending.keys()) if (!answered.has(execId)) return undefined
+  if (results.some(isInterruptedToolResult)) return undefined
+  if (steer.hostNote) {
+    const last = results[results.length - 1]
+    results[results.length - 1] = { ...last, note: joinNotes([last.note, steer.hostNote]) }
+  }
+  return { results, messages: steer.messages }
+}
+
+/**
+ * Title, summary and compaction calls replay the history with their own prompt last, which can
+ * look like a steer; they carry no tools (or `toolChoice: none`) or are marked as compaction.
+ */
+export function mayBeUserStep(callOptions: LanguageModelV3CallOptions): boolean {
+  if (extractTools(callOptions).length === 0 || callOptions.toolChoice?.type === "none") return false
+  const compaction = (callOptions.providerOptions?.cursor as Record<string, unknown> | undefined)?.[CURSOR_COMPACTION_OPTION]
+  if (compaction !== undefined) return compaction !== true
+  const sessionKey = opencodeSessionKey(callOptions)
+  return !sessionKey || !isCompactionSession(sessionKey)
+}
+
+/** Cursor completes an exec's tool call once it has the result; other replies have no such signal. */
+function resultsAwaitingCheckpoint(
+  session: CursorSession,
+  results: readonly ExtractedToolResult[],
+): NonNullable<CursorSession["resultsAfterCheckpoint"]> {
+  const awaiting = new Set(session.resultsAfterCheckpoint?.awaiting)
+  let unconfirmed = session.resultsAfterCheckpoint?.unconfirmed ?? false
+  const toolCallIds = new Set(session.resultsAfterCheckpoint?.toolCallIds)
+  for (const result of results) {
+    toolCallIds.add(result.toolCallId)
+    const pending = result.sessionId === session.sessionId ? session.pending.get(result.execId) : undefined
+    if (!pending || pending.bridged) continue
+    if (pending.displayCallId) awaiting.add(pending.displayCallId)
+    else unconfirmed = true
+  }
+  return { awaiting, unconfirmed, toolCallIds }
+}
+
+/** Queue mid-turn user messages on the held Run before its results, as Cursor CLI steers. */
+function injectSteerMessages(session: CursorSession, messages: readonly string[]): CursorSession | undefined {
+  const injections: SteerInjection[] = messages.map((text) => ({ id: crypto.randomUUID(), text, state: "sent" }))
+  try {
+    for (const injection of injections) {
+      session.stream.write(buildInjectUserMessage({
+        injectionId: injection.id,
+        expectedRunId: session.runId!,
+        text: injection.text,
+      }))
+    }
+  } catch (error) {
+    trace(`steer: inject write FAILED sessionId=${session.sessionId} err=${(error as Error).message}`)
+    sessionManager.close(session, "result-write-failed")
+    return undefined
+  }
+  ;(session.steerInjections ??= []).push(...injections)
+  trace(
+    `steer: injected ${injections.length} message(s) runId=${session.runId} ` +
+      `ids=${injections.map((i) => i.id).join(",")}`,
+  )
+  return session
+}
+
 /** Detect a host-owned canonical plan review, excluding Cursor exec replies. */
 export function hasApprovedUncorrelatedPlanStageResult(
   prompt: LanguageModelV3CallOptions["prompt"],
@@ -4733,15 +5012,27 @@ export function extractPromptHistory(
   options?: {
     preserveTrailingUser?: boolean
     toolResults?: "omit" | "all" | "trailing"
+    /** The step's results are followed by mid-turn user messages as well as host notes. */
+    trailingSteer?: boolean
+    /** With `trailing`, earlier results of the step that must be replayed too. */
+    keepToolCallIds?: ReadonlySet<string>
   },
 ): SeedHistoryMessage[] {
   const out: SeedHistoryMessage[] = []
   const toolResults = options?.toolResults ?? "omit"
   let trailingToolStart = prompt.length
   if (toolResults === "trailing") {
-    // A rebased continuation may end with host notes after the step's results.
+    // A rebased continuation may end with host notes (or a steer's messages) after the step's results.
     let notesStart = prompt.length
-    while (notesStart > 0 && hostTailNote(prompt[notesStart - 1]!)) notesStart--
+    while (
+      notesStart > 0
+      && (
+        hostTailNote(prompt[notesStart - 1]!)
+        || (options?.trailingSteer === true && plainUserText(prompt[notesStart - 1]!) !== undefined)
+      )
+    ) {
+      notesStart--
+    }
     trailingToolStart = notesStart
     while (trailingToolStart > 0 && prompt[trailingToolStart - 1]?.role === "tool") {
       trailingToolStart--
@@ -4767,16 +5058,16 @@ export function extractPromptHistory(
       continue
     }
     if (m.role === "tool" && Array.isArray(m.content)) {
-      if (
-        toolResults === "omit" ||
-        (toolResults === "trailing" && messageIndex < trailingToolStart)
-      ) continue
+      if (toolResults === "omit") continue
+      const keptOnly = toolResults === "trailing" && messageIndex < trailingToolStart
+      if (keptOnly && !options?.keepToolCallIds?.size) continue
       const results: string[] = []
       for (const part of m.content) {
         const p = part as unknown as Record<string, unknown>
         if (p.type !== "tool-result") continue
         const toolName = typeof p.toolName === "string" && p.toolName ? p.toolName : "tool"
         const toolCallId = typeof p.toolCallId === "string" ? p.toolCallId : ""
+        if (keptOnly && !options?.keepToolCallIds?.has(toolCallId)) continue
         const result = toolResultOutputToText(p.output)
         results.push(formatSeedToolObservation({
           toolName,

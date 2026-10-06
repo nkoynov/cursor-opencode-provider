@@ -11,6 +11,7 @@
 - Cursor models carry a model `family`, so OpenCode writes session titles and summaries with its small model (for example GPT-5.6 Luna) instead of the model you are coding with ([#43](https://github.com/oakimov/cursor-opencode-provider/pull/43) by [@nkoynov](https://github.com/nkoynov))
 - Tool calls the model makes in parallel (for example several subagents) run at the same time instead of one after another ([#N](https://github.com/oakimov/cursor-opencode-provider/pull/N) by [@nkoynov](https://github.com/nkoynov))
 - Host notes that follow a step's tool results (nested `AGENTS.md` instructions, background completions, other `<system-update>` notes) no longer turn an OpenCode 2 read into its numbered raw text or get lost on errors, searches and writes: they are added after the result is parsed, to the last result with a text field or else the Run's next result ([#N](https://github.com/oakimov/cursor-opencode-provider/pull/N) by [@nkoynov](https://github.com/nkoynov))
+- A message sent while a step's tools run no longer cancels the held Run's pending results and makes the model redo them: when the Run waits on exactly that step's results, the message is injected into that Run the way Cursor CLI steers, then the results are delivered, and a message Cursor does not take is sent as a follow-up when the turn ends ([#N](https://github.com/oakimov/cursor-opencode-provider/pull/N) by [@nkoynov](https://github.com/nkoynov))
 
 ## [0.8.0] - 2026-10-04
 
