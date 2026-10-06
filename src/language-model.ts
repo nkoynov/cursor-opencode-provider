@@ -13,7 +13,7 @@ import {
 import { trace, traceRequestContextPaths } from "./debug.js"
 import { isExchangeableApiKey } from "./auth.js"
 import { resolveBearerToken } from "./auth-renewal.js"
-import { buildRunRequest, buildHeartbeat } from "./protocol/request.js"
+import { buildRunRequest, buildHeartbeat, buildExecHeartbeat } from "./protocol/request.js"
 import { decodeFramePayload } from "./protocol/framing.js"
 import { debugWalkTurnEnded, decodeMessage, encodeMessage } from "./protocol/messages.js"
 import {
@@ -1126,6 +1126,22 @@ function isCurrentHeartbeatGeneration(session: CursorSession, generation: number
   return heartbeatGenerationBySession.get(session) === generation
 }
 
+const INTERACTION_RESULT_FIELDS: ReadonlySet<string> = new Set([
+  ASK_QUESTION_RESULT_FIELD,
+  SWITCH_MODE_RESULT_FIELD,
+  CREATE_PLAN_RESULT_FIELD,
+])
+
+/** Execs Cursor sent that still wait on the host; interaction queries and display bridges are not execs. */
+export function pendingExecIds(session: CursorSession): number[] {
+  const ids: number[] = []
+  for (const [execId, pending] of session.pending) {
+    if (pending.bridged || pending.state !== "pending" || INTERACTION_RESULT_FIELDS.has(pending.resultField)) continue
+    ids.push(execId)
+  }
+  return ids
+}
+
 /** Start (or replace) the per-session heartbeat. In-flight writes from a prior attach are ignored. */
 export function attachSessionHeartbeat(session: CursorSession): void {
   session.heartbeatCancel?.()
@@ -1142,7 +1158,15 @@ export function attachSessionHeartbeat(session: CursorSession): void {
     }
     heartbeatWritePendingBySession.set(session, true)
     const stream = session.stream
+    const execIds = pendingExecIds(session)
     void writeWithBackpressure(stream, buildHeartbeat(), "heartbeat")
+      .then(async () => {
+        for (const execId of execIds) {
+          if (session.closed || !isCurrentHeartbeatGeneration(session, generation)) return
+          if (session.pending.get(execId)?.state !== "pending") continue
+          await writeWithBackpressure(stream, buildExecHeartbeat(execId), `exec heartbeat id=${execId}`)
+        }
+      })
       .then(() => {
         if (!isCurrentHeartbeatGeneration(session, generation) || session.closed) return
         sessionManager.recordHeartbeatWrite(session)

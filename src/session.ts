@@ -16,7 +16,7 @@ export type CursorContinuationOptions = {
   semanticIdleMs?: number
   /** @deprecated Use semanticIdleMs. Kept as a strict alias for compatibility. */
   softHealthMs?: number
-  /** Pending-tool inactivity window, renewed by OpenCode session progress. */
+  /** Pending-tool inactivity window, renewed by OpenCode session progress and held while a tool runs. */
   hardCapMs?: number
   heartbeatMs?: number
 }
@@ -34,6 +34,11 @@ export const DEFAULT_CONTINUATION_POLICY: Readonly<CursorContinuationPolicy> = {
 }
 
 const MAX_TIMER_MS = 2_147_483_647
+/**
+ * A tool the host still runs extends a held Run's lease up to this long after
+ * the exec arrived. It never shortens a configured `hardCapMs` that is longer.
+ */
+export const RUNNING_TOOL_LEASE_CEILING_MS = 4 * 60 * 60_000
 const DEFAULT_TOMBSTONE_TTL_MS = 15 * 60_000
 const DEFAULT_TOMBSTONE_LIMIT = 1_024
 // Well below Cursor's server-side concurrent-Run ceiling per HTTP/2 connection,
@@ -850,6 +855,14 @@ export class SessionManager {
   }
 
   private refreshHardDeadline(session: CursorSession, pending: PendingExec): number {
+    // The host returns a step's results together, so one running tool holds every pending exec.
+    if (this.hasToolRunningLocally(session)) {
+      const heldUntil = Math.min(
+        this.now() + session.policy.hardCapMs,
+        pending.registeredAt + RUNNING_TOOL_LEASE_CEILING_MS,
+      )
+      if (heldUntil > pending.hardDeadlineAt) pending.hardDeadlineAt = heldUntil
+    }
     if (!session.openCodeSessionId) return pending.hardDeadlineAt
     const activityAt = this.activitySource.lastActivityAt(session.openCodeSessionId)
     if (activityAt === undefined || activityAt <= pending.registeredAt) return pending.hardDeadlineAt
@@ -859,6 +872,15 @@ export class SessionManager {
       trace("continuation lease renewed from OpenCode session activity")
     }
     return pending.hardDeadlineAt
+  }
+
+  private hasToolRunningLocally(session: CursorSession): boolean {
+    const source = this.activitySource
+    if (!source.isToolRunning) return false
+    for (const execId of session.pending.keys()) {
+      if (source.isToolRunning(`cursor_${session.sessionId}_${execId}`)) return true
+    }
+    return false
   }
 
   private hardDeadlineExpired(session: CursorSession, pending: PendingExec): boolean {
