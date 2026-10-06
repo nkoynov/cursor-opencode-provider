@@ -1,0 +1,354 @@
+import { describe, it, expect, afterEach } from "bun:test"
+import fs from "node:fs"
+import path from "node:path"
+import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
+import { sessionManager, type CursorSession } from "../src/session.js"
+import {
+  deliverContinuationResults,
+  extractPromptHistory,
+  extractTrailingToolResults,
+  pumpWithRecovery,
+  resetTurnStateForTests,
+} from "../src/language-model.js"
+import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
+import { resetCursorShellCalls } from "../src/shell-timeout.js"
+
+type Prompt = LanguageModelV3CallOptions["prompt"]
+
+const NOTE = "<system-update>\nInstructions from: /repo/pkg/AGENTS.md\nIndent with tabs.\n</system-update>"
+const LATER_NOTE = "<system-update>\nThe following skill IDs are no longer available: repro.\n</system-update>"
+
+let seq = 0
+function liveSession(writes: Uint8Array[], root = "/tmp"): CursorSession {
+  const id = `hostnotes${++seq}`
+  return {
+    sessionId: id,
+    conversationId: `conv-${id}`,
+    stream: {
+      write(frame: Uint8Array) { writes.push(frame) },
+      end() {},
+      frames: () => ({ [Symbol.asyncIterator]: () => ({ next: async () => ({ done: true, value: undefined }) }) }),
+      destroy() {},
+      isClosed: () => false,
+    } as any,
+    frames: { next: async () => ({ done: true, value: undefined }) } as any,
+    pending: new Map(),
+    blobs: new Map(),
+    toolDescriptors: [],
+    requestContext: { env: { workspace_paths: [root] } },
+    usageEstimate: { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 },
+    allowTools: true,
+    pumpActive: false,
+    heartbeat: null,
+    expiresAt: Date.now() + 10_000,
+  } as unknown as CursorSession
+}
+
+function toolResult(live: CursorSession, execId: number, toolName: string, value: string, type = "text"): Prompt[number] {
+  return {
+    role: "tool",
+    content: [{
+      type: "tool-result",
+      toolCallId: `cursor_${live.sessionId}_${execId}`,
+      toolName,
+      output: { type, value },
+    }],
+  } as Prompt[number]
+}
+
+function hostNote(text: string): Prompt[number] {
+  return { role: "user", content: [{ type: "text", text }] } as Prompt[number]
+}
+
+function step(...messages: Prompt): Prompt {
+  return [{ role: "user", content: [{ type: "text", text: "go" }] }, ...messages] as Prompt
+}
+
+function execMessages(writes: Uint8Array[]): any[] {
+  return writes
+    .map((frame) => decodeMessage<any>("AgentClientMessage", frame).exec_client_message)
+    .filter((message) => message !== undefined)
+}
+
+afterEach(() => {
+  sessionManager.dispose()
+  resetCursorShellCalls()
+  resetTurnStateForTests()
+})
+
+describe("host notes on held-Run exec results", () => {
+  it("delivers an OpenCode 2 read followed by a note as parsed file content", () => {
+    const root = fs.mkdtempSync(path.join("/tmp", "cursor-host-notes-"))
+    const file = path.join(root, "main.go")
+    fs.writeFileSync(file, "package main\n\tfunc main() {}\n")
+    try {
+      const writes: Uint8Array[] = []
+      const live = liveSession(writes, root)
+      sessionManager.registerPending(1, live, "read_result", "read", false, { path: file })
+
+      const results = extractTrailingToolResults(step(
+        toolResult(live, 1, "read", `Read file ${file}, lines 1-2\n1: package main\n2: \tfunc main() {}`),
+        hostNote(NOTE),
+      ))
+      expect(deliverContinuationResults(live, results)).toBe(live)
+
+      const content: string = execMessages(writes)[0].read_result.success.content
+      expect(content).toBe(`package main\n\tfunc main() {}\n\n${NOTE}`)
+      expect(content).not.toContain("Read file")
+      expect(content).not.toMatch(/^\d+: /m)
+      expect(live.deferredNote).toBeUndefined()
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it("appends the note to a failed result's error text", () => {
+    const writes: Uint8Array[] = []
+    const live = liveSession(writes)
+    sessionManager.registerPending(2, live, "write_result", "write", false, { path: "/tmp/x" })
+
+    deliverContinuationResults(live, extractTrailingToolResults(step(
+      toolResult(live, 2, "write", "The user rejected permission to use this specific tool call.", "error-text"),
+      hostNote(NOTE),
+    )))
+
+    expect(execMessages(writes)[0].write_result.error.error)
+      .toBe(`The user rejected permission to use this specific tool call.\n\n${NOTE}`)
+  })
+
+  it("adds the note as its own MCP content item", () => {
+    const writes: Uint8Array[] = []
+    const live = liveSession(writes)
+    sessionManager.registerPending(3, live, "mcp_result", "t3_thread_read")
+
+    deliverContinuationResults(live, extractTrailingToolResults(step(
+      toolResult(live, 3, "t3_thread_read", "{\"messages\":[]}"),
+      hostNote(NOTE),
+    )))
+
+    expect(execMessages(writes)[0].mcp_result.success.content.map((item: any) => item.text.text))
+      .toEqual(["{\"messages\":[]}", NOTE])
+  })
+
+  it("streams the note after shell stdout", () => {
+    const writes: Uint8Array[] = []
+    const live = liveSession(writes)
+    sessionManager.registerPending(4, live, "shell_stream", "shell", false, {
+      shell_stream: true,
+      command: "ls",
+      working_directory: "/tmp",
+    })
+
+    deliverContinuationResults(live, extractTrailingToolResults(step(
+      toolResult(live, 4, "shell", "a.txt\n"),
+      hostNote(NOTE),
+    )))
+
+    const stdout = execMessages(writes).flatMap((message) => message.shell_stream?.stdout?.data ?? [])
+    expect(stdout).toEqual([`a.txt\n\n${NOTE}`])
+  })
+
+  it("puts the note on the last result whose shape can hold it", () => {
+    const writes: Uint8Array[] = []
+    const live = liveSession(writes)
+    sessionManager.registerPending(5, live, "mcp_result", "t3_thread_read")
+    sessionManager.registerPending(6, live, "write_result", "write", false, { path: "/tmp/out.txt" })
+
+    deliverContinuationResults(live, extractTrailingToolResults(step(
+      toolResult(live, 5, "t3_thread_read", "{}"),
+      toolResult(live, 6, "write", "Wrote file successfully."),
+      hostNote(NOTE),
+    )))
+
+    const [mcp, write] = execMessages(writes)
+    expect(mcp.mcp_result.success.content.at(-1).text.text).toBe(NOTE)
+    expect(JSON.stringify(write)).not.toContain("system-update")
+    expect(live.deferredNote).toBeUndefined()
+  })
+
+  it("holds a note no result can carry for the Run's next exec result", () => {
+    const writes: Uint8Array[] = []
+    const live = liveSession(writes)
+    sessionManager.registerPending(7, live, "grep_result", "glob", false, { pattern: "*.ts" })
+    sessionManager.registerPending(8, live, "todowrite", "todowrite", true)
+
+    deliverContinuationResults(live, extractTrailingToolResults(step(
+      toolResult(live, 7, "glob", "a.ts"),
+      toolResult(live, 8, "todowrite", "ok"),
+      hostNote(NOTE),
+    )))
+    expect(JSON.stringify(execMessages(writes))).not.toContain("system-update")
+    expect(live.deferredNote).toBe(NOTE)
+
+    writes.length = 0
+    sessionManager.registerPending(9, live, "mcp_result", "t3_thread_read")
+    deliverContinuationResults(live, extractTrailingToolResults(step(
+      toolResult(live, 9, "t3_thread_read", "{}"),
+      hostNote(LATER_NOTE),
+    )))
+
+    expect(execMessages(writes)[0].mcp_result.success.content.at(-1).text.text).toBe(`${NOTE}\n\n${LATER_NOTE}`)
+    expect(live.deferredNote).toBeUndefined()
+  })
+
+  it("skips a last result whose encoded shape has no text slot", () => {
+    const writes: Uint8Array[] = []
+    const live = liveSession(writes)
+    sessionManager.registerPending(11, live, "mcp_result", "t3_thread_read")
+    sessionManager.registerPending(12, live, "shell_result", "shell", false, {
+      shell_stream: true,
+      command: "sleep 9",
+      working_directory: "/tmp",
+      timeout_ms: 1000,
+      timeout_behavior: 0,
+    })
+
+    deliverContinuationResults(live, extractTrailingToolResults(step(
+      toolResult(live, 11, "t3_thread_read", "{}"),
+      toolResult(live, 12, "shell", "<shell_metadata>\nshell tool terminated command after exceeding timeout 1000 ms.\n</shell_metadata>"),
+      hostNote(NOTE),
+    )))
+
+    const [mcp, shell] = execMessages(writes)
+    expect(shell.shell_result.timeout).toBeDefined()
+    expect(mcp.mcp_result.success.content.at(-1).text.text).toBe(NOTE)
+    expect(live.deferredNote).toBeUndefined()
+  })
+
+  it("keeps the note out of the complete file an edit transaction reads", () => {
+    const root = fs.mkdtempSync(path.join("/tmp", "cursor-host-notes-"))
+    const file = path.join(root, "edit.ts")
+    fs.writeFileSync(file, "export const a = 1\n")
+    try {
+      const writes: Uint8Array[] = []
+      const live = liveSession(writes, root)
+      live.editToolCalls = new Map([["edit-1", { path: file }]])
+      sessionManager.registerPending(13, live, "mcp_result", "t3_thread_read")
+      sessionManager.registerPending(14, live, "read_result", "read", false, { path: file, correlatedEditCallId: "edit-1" })
+
+      deliverContinuationResults(live, extractTrailingToolResults(step(
+        toolResult(live, 13, "t3_thread_read", "{}"),
+        toolResult(live, 14, "read", `Read file ${file}, lines 1-1\n1: export const a = 1`),
+        hostNote(NOTE),
+      )))
+
+      const [mcp, read] = execMessages(writes)
+      expect(read.read_result.success.content).toBe("export const a = 1\n")
+      expect(mcp.mcp_result.success.content.at(-1).text.text).toBe(NOTE)
+      expect(live.deferredNote).toBeUndefined()
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it("carries the note on an edit transaction's read that is too large to return whole", () => {
+    const root = fs.mkdtempSync(path.join("/tmp", "cursor-host-notes-"))
+    const file = path.join(root, "huge.ts")
+    fs.writeFileSync(file, "")
+    fs.truncateSync(file, 50 * 1024 * 1024 + 1)
+    try {
+      const writes: Uint8Array[] = []
+      const live = liveSession(writes, root)
+      live.editToolCalls = new Map([["edit-1", { path: file }]])
+      sessionManager.registerPending(15, live, "read_result", "read", false, { path: file, correlatedEditCallId: "edit-1" })
+
+      deliverContinuationResults(live, extractTrailingToolResults(step(
+        toolResult(live, 15, "read", `Read file ${file}, lines 1-1\n1: capped preview`),
+        hostNote(NOTE),
+      )))
+
+      expect(execMessages(writes)[0].read_result.success.content).toBe(`capped preview\n\n${NOTE}`)
+      expect(live.deferredNote).toBeUndefined()
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it("carries the note on an edit transaction's read whose complete file cannot be read", () => {
+    const root = fs.mkdtempSync(path.join("/tmp", "cursor-host-notes-"))
+    const file = path.join(root, "locked.ts")
+    fs.writeFileSync(file, "secret\n")
+    fs.chmodSync(file, 0o000)
+    try {
+      const writes: Uint8Array[] = []
+      const live = liveSession(writes, root)
+      live.editToolCalls = new Map([["edit-1", { path: file }]])
+      sessionManager.registerPending(17, live, "read_result", "read", false, { path: file, correlatedEditCallId: "edit-1" })
+
+      deliverContinuationResults(live, extractTrailingToolResults(step(
+        toolResult(live, 17, "read", `Read file ${file}, lines 1-1\n1: host preview`),
+        hostNote(NOTE),
+      )))
+
+      expect(execMessages(writes)[0].read_result.success.content).toBe(`host preview\n\n${NOTE}`)
+      expect(live.deferredNote).toBeUndefined()
+    } finally {
+      fs.chmodSync(file, 0o600)
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it("keeps a step's results and its trailing notes when a dead Run is rebased", () => {
+    const live = liveSession([])
+    const history = extractPromptHistory(step(
+      toolResult(live, 18, "write", "Wrote file successfully."),
+      hostNote(NOTE),
+      { role: "system", content: LATER_NOTE } as Prompt[number],
+    ), { preserveTrailingUser: true, toolResults: "trailing" })
+
+    expect(JSON.stringify(history)).toContain("Wrote file successfully.")
+    // System messages reach Cursor through the context epoch, not the seed history.
+    expect(history.slice(-2)).toEqual([{ role: "user", content: NOTE }, { role: "system", content: LATER_NOTE }])
+  })
+
+  it("keeps a deferred note when the held Run is resumed after an interruption", async () => {
+    const live = liveSession([])
+    live.resumeCheckpoint = new Uint8Array([1])
+    live.deferredNote = NOTE
+    let resumed: CursorSession | undefined
+    await pumpWithRecovery({
+      initialSession: live,
+      controller: { enqueue() {}, error(error: Error) { throw error } } as unknown as ReadableStreamDefaultController<any>,
+      recover: async () => {
+        resumed = liveSession([])
+        resumed.frames = {
+          next: async () => ({
+            done: false,
+            value: { flags: 0, payload: encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: { input_tokens: 1, output_tokens: 1 } } }) },
+          }),
+        } as CursorSession["frames"]
+        return resumed
+      },
+    })
+
+    expect(resumed!.deferredNote).toBe(NOTE)
+  })
+
+  it("carries the note on a background spawn that returned no process id", () => {
+    const writes: Uint8Array[] = []
+    const live = liveSession(writes)
+    sessionManager.registerPending(16, live, "background_shell_spawn_result", "shell", false, {
+      command: "sleep 30",
+      working_directory: "/tmp",
+    })
+
+    deliverContinuationResults(live, extractTrailingToolResults(step(
+      toolResult(live, 16, "shell", "started"),
+      hostNote(NOTE),
+    )))
+
+    expect(execMessages(writes)[0].background_shell_spawn_result.error.error).toEndWith(`\n\n${NOTE}`)
+    expect(live.deferredNote).toBeUndefined()
+  })
+
+  it("leaves results without a trailing note unchanged", () => {
+    const writes: Uint8Array[] = []
+    const live = liveSession(writes)
+    sessionManager.registerPending(10, live, "mcp_result", "t3_thread_read")
+
+    deliverContinuationResults(live, extractTrailingToolResults(step(toolResult(live, 10, "t3_thread_read", "{}"))))
+
+    expect(execMessages(writes)[0].mcp_result.success.content.map((item: any) => item.text.text)).toEqual(["{}"])
+    expect(live.deferredNote).toBeUndefined()
+  })
+})

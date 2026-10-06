@@ -253,6 +253,12 @@ export type CursorSession = {
    * lets the pump expose the final mutation to OpenCode as a targeted edit.
    */
   editToolCalls?: Map<string, { path: string; completeRead?: boolean }>
+  /**
+   * Host note (`<system-update>`, background completion) that arrived with
+   * results whose typed shapes have no text slot. It rides on the next exec
+   * result this Run delivers instead of being dropped.
+   */
+  deferredNote?: string
   /** Monotonic synthetic exec ids for bridged (display-only) OpenCode tool calls. */
   nextBridgedExecId: number
   /** KV blob store: blob_id (hex) → data, for Cursor's out-of-band payload channel. */

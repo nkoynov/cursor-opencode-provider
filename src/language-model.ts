@@ -20,6 +20,9 @@ import {
   parseExecServerMessage,
   buildToolCallPart,
   buildExecClientMessages,
+  buildExecClientMessagesWithNote,
+  resultCanCarryNote,
+  type ToolResultInput,
   buildReadRejectionMessages,
   buildUnsupportedExecDeny,
   classifyMissingReadTarget,
@@ -204,7 +207,9 @@ import { assertCursorUserImageSupport, extractCursorPromptImages } from "./image
 import { getDocumentedCursorModelContext, resolveCursorModelSupportsImages } from "./model-metadata.js"
 import {
   consumeCursorShellResult,
+  peekCursorShellResult,
   registerCursorShellCall,
+  type CursorShellOutcome,
 } from "./shell-timeout.js"
 import { analyzeReplayFrame, AttemptReplaySafety } from "./replay-safety.js"
 import { readAllFieldsStrict } from "./protocol/struct.js"
@@ -981,6 +986,7 @@ export async function pumpWithRecovery(input: {
     if (recovery.kind === "resume") {
       next.usageEstimate = { ...pumpedSession.usageEstimate }
       next.editToolCalls = new Map(pumpedSession.editToolCalls)
+      next.deferredNote = pumpedSession.deferredNote
       // mirroredTodos rides along via rememberMirroredTodos (per-OpenCode-
       // session, seeded in startSession) — no handoff needed here.
     }
@@ -2253,6 +2259,17 @@ export function deliverContinuationResults(
       `${pendingResults.length} pending for sessionId=${session.sessionId} ` +
       `pending={${[...session.pending.keys()].join(",")}}`,
   )
+  // Built once, so the note's carrier is chosen against the frames actually sent.
+  const completeEditReads = new Map<number, Uint8Array[]>()
+  for (const r of pendingResults) {
+    const pending = session.pending.get(r.execId)
+    const editRead = pending && !pending.bridged ? correlatedEditRead(session, pending, r) : undefined
+    const frames = editRead && buildCompleteEditReadMessages(r.execId, editRead.absolutePath, editRead.requestedPath)
+    if (frames) completeEditReads.set(r.execId, frames)
+  }
+  let note = joinNotes([session.deferredNote, ...trailingToolResults.map((r) => r.note)])
+  session.deferredNote = undefined
+  const noteCarrier = note === undefined ? undefined : findNoteCarrier(session, pendingResults, completeEditReads)
   for (const r of pendingResults) {
     const claim = sessionManager.claim(session.sessionId, r.execId)
     if ("kind" in claim) {
@@ -2268,6 +2285,7 @@ export function deliverContinuationResults(
     }
     const pending = claim.pending
     let frames: Uint8Array[] = []
+    let framesCarryNote = false
     let deliveredSwitchMode: { target: string; bridgeKind?: unknown } | undefined
     if (pending.resultField === ASK_QUESTION_RESULT_FIELD) {
       // A bridged Cursor AskQuestion. The host tool result carries the user's
@@ -2314,34 +2332,18 @@ export function deliverContinuationResults(
       }
     } else if (!pending.bridged) {
       try {
-        const shellResult =
-          pending.resultField === "shell_stream"
-          || pending.resultField === "shell_result"
-          || pending.resultField === "background_shell_spawn_result"
-            ? consumeCursorShellResult(r.toolCallId, r.output)
-            : undefined
-        const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
-        const correlatedEditCallId = pending.resultMetadata?.correlatedEditCallId
-        const requestedPath = pending.resultMetadata?.path
-        const correlatedEdit =
-          !r.error
-          && pending.resultField === "read_result"
-          && pending.toolName === "read"
-          && typeof correlatedEditCallId === "string"
-          && typeof requestedPath === "string"
-            ? session.editToolCalls?.get(correlatedEditCallId)
-            : undefined
-        if (correlatedEdit) {
-          const absolutePath = path.resolve(workspaceRoot, requestedPath as string)
-          if (absolutePath === path.resolve(workspaceRoot, correlatedEdit.path)) {
-            frames = buildCompleteEditReadMessages(r.execId, absolutePath, requestedPath as string) ?? []
-            if (frames.length > 0) {
-              correlatedEdit.completeRead = true
-              trace(
-                `continuation: upgraded authorized correlated edit read execId=${r.execId} ` +
-                  `path=${JSON.stringify(requestedPath)}`,
-              )
-            }
+        const shellResult = isShellResultField(pending.resultField)
+          ? consumeCursorShellResult(r.toolCallId, r.output)
+          : undefined
+        const editRead = correlatedEditRead(session, pending, r)
+        if (editRead) {
+          frames = completeEditReads.get(r.execId) ?? []
+          if (frames.length > 0) {
+            editRead.edit.completeRead = true
+            trace(
+              `continuation: upgraded authorized correlated edit read execId=${r.execId} ` +
+                `path=${JSON.stringify(editRead.requestedPath)}`,
+            )
           }
         }
         // A refused image commit is Cursor's own `permission_denied` variant,
@@ -2398,16 +2400,14 @@ export function deliverContinuationResults(
           })]
         }
         if (frames.length === 0) {
-          frames = buildExecClientMessages({
-            execId: r.execId,
-            resultField: pending.resultField,
-            output: shellResult?.output ?? r.output,
-            error: r.error,
-            toolName: pending.toolName ?? r.toolName,
-            resultMetadata: pending.resultMetadata,
-            shellOutcome: shellResult?.outcome,
-            workspaceRoot,
-          })
+          const input = continuationResultInput(session, pending, r, shellResult)
+          if (r === noteCarrier && note !== undefined) {
+            const built = buildExecClientMessagesWithNote(input, note)
+            frames = built.frames
+            framesCarryNote = built.noteCarried
+          } else {
+            frames = buildExecClientMessages(input)
+          }
         }
       } catch (error) {
         trace(`continuation: result encode FAILED execId=${r.execId} err=${(error as Error).message}`)
@@ -2420,6 +2420,10 @@ export function deliverContinuationResults(
       trace(`continuation: delivery stopped execId=${r.execId} reason=${outcome.reason}`)
       if (outcome.kind === "duplicate") continue
       return undefined
+    }
+    if (framesCarryNote) {
+      trace(`continuation: host note rode on execId=${r.execId} field=${pending.resultField}`)
+      note = undefined
     }
     if (deliveredSwitchMode) {
       const normalized = deliveredSwitchMode.target.toLowerCase()
@@ -2477,7 +2481,84 @@ export function deliverContinuationResults(
         `frames=${outcome.framesWritten} outLen=${r.output.length}`,
     )
   }
+  if (note !== undefined) {
+    session.deferredNote = note
+    trace(`continuation: no result could carry the host note; deferred to the next exec result noteLen=${note.length}`)
+  }
   return session
+}
+
+function isShellResultField(resultField: string): boolean {
+  return resultField === "shell_stream" || resultField === "shell_result" || resultField === "background_shell_spawn_result"
+}
+
+/** The authorized read inside Cursor's edit transaction, answered with the complete file. */
+function correlatedEditRead(
+  session: CursorSession,
+  pending: PendingExec,
+  r: ExtractedToolResult,
+): { edit: { path: string; completeRead?: boolean }; absolutePath: string; requestedPath: string } | undefined {
+  const callId = pending.resultMetadata?.correlatedEditCallId
+  const requestedPath = pending.resultMetadata?.path
+  if (r.error || pending.resultField !== "read_result" || pending.toolName !== "read") return undefined
+  if (typeof callId !== "string" || typeof requestedPath !== "string") return undefined
+  const edit = session.editToolCalls?.get(callId)
+  if (!edit) return undefined
+  const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
+  const absolutePath = path.resolve(workspaceRoot, requestedPath)
+  return absolutePath === path.resolve(workspaceRoot, edit.path) ? { edit, absolutePath, requestedPath } : undefined
+}
+
+function continuationResultInput(
+  session: CursorSession,
+  pending: PendingExec,
+  r: ExtractedToolResult,
+  shellResult: { output: string; outcome?: CursorShellOutcome } | undefined,
+): ToolResultInput {
+  return {
+    execId: r.execId,
+    resultField: pending.resultField,
+    output: shellResult?.output ?? r.output,
+    error: r.error,
+    toolName: pending.toolName ?? r.toolName,
+    resultMetadata: pending.resultMetadata,
+    shellOutcome: shellResult?.outcome,
+    workspaceRoot: workspaceRootFromRequestContext(session.requestContext),
+  }
+}
+
+/** The last result whose encoded shape will hold a host note. */
+function findNoteCarrier(
+  session: CursorSession,
+  results: readonly ExtractedToolResult[],
+  completeEditReads: ReadonlyMap<number, Uint8Array[]>,
+): ExtractedToolResult | undefined {
+  return [...results].reverse().find((r) => {
+    const pending = session.pending.get(r.execId)
+    if (!pending || !isExecResultPending(pending)) return false
+    // Cursor rewrites the complete-file read of an edit as the new file, and
+    // image saves have their own encoders.
+    if (completeEditReads.has(r.execId)) return false
+    if (
+      pending.toolName === CURSOR_IMAGE_SAVE_TOOL
+      && pending.resultField === "write_result"
+      && (!r.error || r.error.includes(IMAGE_PERMISSION_DENIED_PREFIX))
+    ) return false
+    const shellResult = isShellResultField(pending.resultField) ? peekCursorShellResult(r.toolCallId, r.output) : undefined
+    return resultCanCarryNote(continuationResultInput(session, pending, r, shellResult))
+  })
+}
+
+function isExecResultPending(pending: PendingExec): boolean {
+  return !pending.bridged
+    && pending.resultField !== ASK_QUESTION_RESULT_FIELD
+    && pending.resultField !== SWITCH_MODE_RESULT_FIELD
+    && pending.resultField !== CREATE_PLAN_RESULT_FIELD
+}
+
+function joinNotes(notes: ReadonlyArray<string | undefined>): string | undefined {
+  const present = notes.filter((note): note is string => !!note)
+  return present.length > 0 ? present.join("\n\n") : undefined
 }
 
 async function loadAvailableModels(): Promise<void> {
@@ -3263,6 +3344,9 @@ export async function pump(
       emitReasoning(((iu.thinking_delta as Record<string, unknown>).text as string) ?? "")
     } else if (iu?.turn_ended) {
       trace(`turn_ended raw wire fields: ${debugWalkTurnEnded(payload)}`)
+      if (session.deferredNote !== undefined) {
+        trace(`continuation: turn ended before an exec result could carry the host note noteLen=${session.deferredNote.length}`)
+      }
       const turnEnded = iu.turn_ended as Record<string, unknown>
       if (session.openCodeSessionId) {
         await persistConversationState(
@@ -4103,6 +4187,8 @@ type ExtractedToolResult = {
   toolName: string
   output: string
   error?: string
+  /** Host notes that trailed the step's results, applied after the result is parsed. */
+  note?: string
 }
 
 function extractToolResults(prompt: LanguageModelV3CallOptions["prompt"]): ExtractedToolResult[] {
@@ -4185,11 +4271,12 @@ export function extractTrailingToolResults(
   // means this is a fresh model call that merely carries tools in history.
   if (i === end - 1) return []
   const results = extractToolResults(prompt.slice(i + 1, end))
-  // A Run continuation only carries exec results, so the host notes ride on the
-  // last one; otherwise Cursor would never see e.g. a removed skill.
+  // A Run continuation only carries exec results, so the host notes ride on one
+  // of them; otherwise Cursor would never see e.g. a removed skill. Delivery
+  // picks the result whose typed shape can hold them.
   const last = results.at(-1)
   if (last && notes.length > 0) {
-    results[results.length - 1] = { ...last, output: [last.output, ...notes].filter(Boolean).join("\n\n") }
+    results[results.length - 1] = { ...last, note: notes.join("\n\n") }
   }
   return results
 }
@@ -4473,9 +4560,14 @@ export function extractPromptHistory(
   const toolResults = options?.toolResults ?? "omit"
   let trailingToolStart = prompt.length
   if (toolResults === "trailing") {
+    // A rebased continuation may end with host notes after the step's results.
+    let notesStart = prompt.length
+    while (notesStart > 0 && hostTailNote(prompt[notesStart - 1]!)) notesStart--
+    trailingToolStart = notesStart
     while (trailingToolStart > 0 && prompt[trailingToolStart - 1]?.role === "tool") {
       trailingToolStart--
     }
+    if (trailingToolStart === notesStart) trailingToolStart = prompt.length
   }
   for (let messageIndex = 0; messageIndex < prompt.length; messageIndex++) {
     const m = prompt[messageIndex]!
