@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Shell output reaches the model verbatim again. Lines such as `S=/tmp/x`, `#!/bin/sh`, branch names and diff lines were prefixed with the workspace root, and relative paths printed after a `cd` pointed at the wrong directory ([#54](https://github.com/oakimov/cursor-opencode-provider/pull/54) by [@nkoynov](https://github.com/nkoynov))
+
 ## [0.8.0] - 2026-10-04
 
 ### Changed
