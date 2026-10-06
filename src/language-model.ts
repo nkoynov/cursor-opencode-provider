@@ -44,6 +44,7 @@ import {
   remapCorrelatedEditWriteForCatalog,
   remapEditToolsForCatalog,
   buildCompleteEditReadMessages,
+  buildTerminalFileReadMessages,
   rejectPartialReadMutation,
   binaryWritePayload,
   CUSTOM_WEBFETCH_TOOL,
@@ -190,7 +191,7 @@ import {
   appendMidConversationMessage,
   resetContextEpochsForTests,
 } from "./context/epoch.js"
-import { workspaceRootFromRequestContext } from "./context/env.js"
+import { terminalsFolderFromRequestContext, workspaceRootFromRequestContext } from "./context/env.js"
 import {
   ensureOpencodeProjectDir,
   opencodeGlobalCacheDir,
@@ -217,6 +218,7 @@ import {
   consumeCursorShellResult,
   peekCursorShellResult,
   registerCursorShellCall,
+  sweepStaleTerminalFiles,
   type CursorShellOutcome,
 } from "./shell-timeout.js"
 import { analyzeReplayFrame, AttemptReplaySafety } from "./replay-safety.js"
@@ -3099,6 +3101,34 @@ export async function pump(
    * handshake read into an empty-file success. EACCES/EPERM and other stat
    * errors fall through to OpenCode so a genuine permission decision stands.
    */
+  /**
+   * Backgrounded shells write Cursor terminal files under the advertised
+   * `terminals_folder`, outside the workspace. Through OpenCode's read tool,
+   * every AwaitShell poll of one would ask for external-directory permission.
+   * An agent without a shell this turn has no terminals, and reads them through OpenCode.
+   */
+  const serveTerminalFileRead = async (parsed: ParsedExecRequest): Promise<"served" | "failed" | undefined> => {
+    if (parsed.toolName !== "read" || parsed.resultField !== "read_result") return undefined
+    const hasShell = (names: ReadonlySet<string>) => names.has("bash") || names.has("shell")
+    if (!hasShell(advertisedToolNameSet)) return undefined
+    // The advertised catalog can keep tools the host filtered this turn.
+    const permitted = session.permittedToolNames
+    if (permitted && permitted.size > 0 && !hasShell(permitted)) return undefined
+    const terminals = terminalsFolderFromRequestContext(session.requestContext)
+    const requested = opencodePathArg(parsed.args) ?? ""
+    if (!terminals || !requested || isUriReadTarget(requested)) return undefined
+    const absolutePath = resolveReadTargetPath(requested, workspaceRootFromRequestContext(session.requestContext))
+    if (path.dirname(absolutePath) !== terminals || !/^\d+\.txt$/.test(path.basename(absolutePath))) return undefined
+    const frames = await buildTerminalFileReadMessages(parsed.id, absolutePath, absolutePath, {
+      offset: typeof parsed.args.offset === "number" ? parsed.args.offset : undefined,
+      limit: typeof parsed.args.limit === "number" ? parsed.args.limit : undefined,
+    })
+    if (!frames) return undefined
+    if (!await writeExecFrames(frames, "answer a Cursor terminal file read")) return "failed"
+    trace(`exec: served terminal file read id=${parsed.id} path=${JSON.stringify(absolutePath)}`)
+    return "served"
+  }
+
   const rejectMissingReadTarget = (parsed: ParsedExecRequest): boolean => {
     if (parsed.toolName !== "read") return false
     const requested = opencodePathArg(parsed.args) ?? ""
@@ -3839,7 +3869,10 @@ export async function pump(
       } else {
         replaySafety.markBarrier("non-control-exec")
         const displayCallId = extractExecDisplayCallId(esm)
-        const parsed = parseExecServerMessage(esm, session.hostToolDialect)
+        const parsed = parseExecServerMessage(esm, session.hostToolDialect, {
+          terminalsFolder: terminalsFolderFromRequestContext(session.requestContext),
+          workspaceRoot: workspaceRootFromRequestContext(session.requestContext),
+        })
         // An edit's private prerequisite read is not the call's own request; its write is.
         if (displayCallId && !(parsed?.resultField === "read_result" && session.editToolCalls?.has(displayCallId))) {
           toolStep.resolved.add(displayCallId)
@@ -3914,6 +3947,13 @@ export async function pump(
           if (!session.allowTools) {
             const reason = "Tool calls are not available during this turn (summary/compaction)."
             if (!await rejectExec(parsed, reason, "allowTools=false")) return
+            continue
+          }
+          // Ahead of the catalog checks: an agent with a shell but no read tool polls these too.
+          const terminalRead = await serveTerminalFileRead(parsed)
+          if (terminalRead === "failed") return
+          if (terminalRead === "served") {
+            if (displayCallId) session.displayToolCalls.delete(displayCallId)
             continue
           }
           // Cursor writes a generated image with an ordinary write exec whose
@@ -4041,6 +4081,8 @@ export async function pump(
             || parsed.resultField === "background_shell_spawn_result"
           ) {
             registerCursorShellCall(tc.toolCallId, parsed.resultMetadata)
+            const terminalsFolder = parsed.resultMetadata?.terminals_folder
+            if (typeof terminalsFolder === "string") sweepStaleTerminalFiles(terminalsFolder)
           }
           // Keep the stream open; the result arrives on the next doStream call.
           sessionManager.registerPending(

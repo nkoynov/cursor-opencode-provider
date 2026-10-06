@@ -21,7 +21,11 @@ import {
 import {
   BACKGROUND_SHELL_MARKER,
   buildBackgroundShellCommand,
+  CURSOR_TIMEOUT_BACKGROUND,
+  openTerminalFile,
+  terminalTargetMetadata,
   type CursorShellOutcome,
+  type CursorTerminalTarget,
 } from "../shell-timeout.js"
 
 // Exec variant field number whose reply is the server-initiated request_context
@@ -791,28 +795,180 @@ export function buildCompleteEditReadMessages(
     const stat = fs.statSync(sourcePath)
     if (!stat.isFile() || stat.size > MAX_EDIT_SOURCE_BYTES) return undefined
     const content = fs.readFileSync(sourcePath, "utf8")
-    return [
-      encodeMessage("AgentClientMessage", {
-        exec_client_message: {
-          id: execId,
-          local_execution_time_ms: 0,
-          read_result: {
-            success: {
-              path: resultPath,
-              content,
-              total_lines: countLines(content),
-              file_size: stat.size,
-              truncated: false,
-              range_applied: false,
-            },
-          },
-        },
-      }),
-      buildExecStreamClose(execId),
-    ]
+    return encodeLocalReadSuccess(execId, {
+      path: resultPath,
+      content,
+      total_lines: countLines(content),
+      file_size: stat.size,
+      truncated: false,
+      range_applied: false,
+    })
   } catch {
     return undefined
   }
+}
+
+const TERMINAL_TAIL_BYTES = 1024 * 1024
+const TERMINAL_READ_CHUNK_BYTES = 1024 * 1024
+
+/**
+ * A Cursor terminal file. One past the read size limit (a long-lived dev
+ * server) keeps its header and its latest output, which is what AwaitShell
+ * and the model look for, instead of failing over to OpenCode's read tool.
+ * One that does not exist (yet) is `file_not_found`, as polling expects.
+ */
+export async function buildTerminalFileReadMessages(
+  execId: number,
+  sourcePath: string,
+  resultPath = sourcePath,
+  range: { offset?: number; limit?: number } = {},
+): Promise<Uint8Array[] | undefined> {
+  let fd: number
+  try {
+    // One descriptor for check and read: a separate check could be raced by swapping in a link out of the folder.
+    fd = openTerminalFile(sourcePath)
+  } catch (error) {
+    return (error as { code?: string }).code === "ENOENT"
+      ? buildReadRejectionMessages(execId, { file_not_found: { path: resultPath } })
+      : undefined
+  }
+  try {
+    const stat = fs.fstatSync(fd)
+    // The runner creates each terminal file by rename and never links it, so a second link leads outside the folder.
+    if (!stat.isFile() || stat.nlink !== 1) return undefined
+    // A running command keeps appending; describe the file as of this stat.
+    const whole = stat.size <= MAX_EDIT_SOURCE_BYTES
+    if (whole || range.offset !== undefined || range.limit !== undefined) {
+      const start = Math.max(0, (range.offset ?? 1) - 1)
+      const end = range.limit !== undefined ? start + range.limit : Infinity
+      const scan = await scanTerminalFile(fd, stat.size, start, end, whole ? Infinity : TERMINAL_TAIL_BYTES)
+      const notice = scan.cutInLine === undefined
+        ? ""
+        : `\n\n[Partial read: the content above stops at the ${TERMINAL_TAIL_BYTES}-byte limit, inside line ${scan.cutInLine}. ` +
+          "It is NOT the complete range requested.]"
+      return encodeLocalReadSuccess(execId, {
+        path: resultPath,
+        content: scan.content + notice,
+        total_lines: scan.lines,
+        file_size: stat.size,
+        truncated: scan.cutInLine !== undefined,
+        range_applied: readRangeApplied(range, scan.lines),
+      })
+    }
+    const { lines } = await scanTerminalFile(fd, stat.size, Infinity, Infinity, 0)
+    const slice = async (position: number, length: number): Promise<Buffer> => {
+      const buffer = Buffer.alloc(length)
+      return buffer.subarray(0, await readAt(fd, buffer, length, position))
+    }
+    // Header fields are quoted onto one line each, but a command or title can run to hundreds of KiB.
+    const headWindow = await slice(0, TERMINAL_TAIL_BYTES)
+    const headEnd = headWindow.subarray(0, 4).toString("utf8") === "---\n" ? headWindow.indexOf("\n---\n", 3) : -1
+    const head = headEnd === -1 ? "" : headWindow.subarray(0, headEnd + 5).toString("utf8")
+    const tailWindow = await slice(stat.size - TERMINAL_TAIL_BYTES, TERMINAL_TAIL_BYTES)
+    let skip = 0
+    while (skip < 3 && (tailWindow[skip]! & 0xc0) === 0x80) skip++
+    const tail = tailWindow.subarray(skip).toString("utf8")
+    const omitted = stat.size - Buffer.byteLength(head) - (tailWindow.length - skip)
+    return encodeLocalReadSuccess(execId, {
+      path: resultPath,
+      content: `${head}[${omitted} bytes of earlier output omitted]\n${tail}`,
+      total_lines: lines,
+      file_size: stat.size,
+      truncated: true,
+      range_applied: false,
+    })
+  } catch {
+    return undefined
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
+function readAt(fd: number, buffer: Buffer, length: number, position: number): Promise<number> {
+  return new Promise((resolve, reject) => {
+    fs.read(fd, buffer, 0, length, position, (error, read) => (error ? reject(error) : resolve(read)))
+  })
+}
+
+/**
+ * One pass over a terminal file's first `size` bytes: its line count (as {@link countLines}
+ * counts them), and lines `[start, end)` (0-based), at most `maxBytes` of them. `cutInLine` is
+ * the 1-based line the byte limit stopped in. It reads asynchronously, chunk by chunk, so a
+ * large file never holds up other Runs' streams.
+ */
+async function scanTerminalFile(
+  fd: number,
+  size: number,
+  start: number,
+  end: number,
+  maxBytes: number,
+): Promise<{ lines: number; content: string; cutInLine?: number }> {
+  const chunk = Buffer.alloc(Math.min(size, TERMINAL_READ_CHUNK_BYTES))
+  const parts: Buffer[] = []
+  let taken = 0
+  let cutInLine: number | undefined
+  // Copies chunk[from, to), which starts in 0-based line `line`.
+  const take = (from: number, to: number, line: number): void => {
+    if (cutInLine !== undefined) return
+    const cut = Math.min(to, from + (maxBytes - taken))
+    parts.push(Buffer.from(chunk.subarray(from, cut)))
+    taken += cut - from
+    if (cut === to) return
+    for (let i = from; i < cut; i++) if (chunk[i] === 0x0a) line++
+    cutInLine = line + 1
+  }
+  let newlines = 0
+  let position = 0
+  while (position < size) {
+    const read = await readAt(fd, chunk, Math.min(chunk.length, size - position), position)
+    if (read === 0) break
+    let from = newlines >= start && newlines < end ? 0 : -1
+    let fromLine = newlines
+    // A byte loop: `indexOf` per newline is many times slower on short lines.
+    for (let i = 0; i < read; i++) {
+      if (chunk[i] !== 0x0a) continue
+      newlines++
+      if (newlines === start && start < end) {
+        from = i + 1
+        fromLine = newlines
+      } else if (newlines === end && from !== -1) {
+        take(from, i + 1, fromLine)
+        from = -1
+      }
+    }
+    if (from !== -1 && from < read) take(from, read, fromLine)
+    position += read
+  }
+  const content = Buffer.concat(parts)
+  return {
+    lines: position === 0 ? 0 : newlines + 1,
+    content: (cutInLine === undefined ? content : withoutCutCharacter(content)).toString("utf8"),
+    ...(cutInLine !== undefined ? { cutInLine } : {}),
+  }
+}
+
+/** `bytes` without a UTF-8 character the byte limit cut short at its end. */
+function withoutCutCharacter(bytes: Buffer): Buffer {
+  for (let back = 1; back <= Math.min(4, bytes.length); back++) {
+    const byte = bytes[bytes.length - back]!
+    if ((byte & 0xc0) === 0x80) continue
+    const length = byte >= 0xf0 ? 4 : byte >= 0xe0 ? 3 : byte >= 0xc0 ? 2 : 1
+    return length > back ? bytes.subarray(0, bytes.length - back) : bytes
+  }
+  return bytes
+}
+
+function encodeLocalReadSuccess(execId: number, success: Record<string, unknown>): Uint8Array[] {
+  return [
+    encodeMessage("AgentClientMessage", {
+      exec_client_message: {
+        id: execId,
+        local_execution_time_ms: 0,
+        read_result: { success },
+      },
+    }),
+    buildExecStreamClose(execId),
+  ]
 }
 
 type WholeFileEditReplacement = {
@@ -1135,10 +1291,27 @@ export function rejectPartialReadMutation(parsed: ParsedExecRequest): void {
       : "Read the remaining file ranges, then use a targeted edit or Update File patch.")
 }
 
+/** Session facts some exec mappings need. */
+export type ExecParseContext = {
+  /** The `terminals_folder` advertised to Cursor; backgrounded shells write their terminal files there. */
+  terminalsFolder?: string
+  workspaceRoot?: string
+}
+
 export function parseExecServerMessage(
   msg: Record<string, unknown>,
   dialect: HostToolDialect = OPENCODE_1_TOOL_DIALECT,
+  context: ExecParseContext = {},
 ): ParsedExecRequest | undefined {
+  const terminalTarget = (workingDirectory: string, description?: string): CursorTerminalTarget | undefined =>
+    context.terminalsFolder
+      ? {
+          folder: context.terminalsFolder,
+          cwd: workingDirectory || context.workspaceRoot || "",
+          ...(description?.trim() ? { title: description } : {}),
+        }
+      : undefined
+
   const id = msg.id as number | undefined
   if (id === undefined) return undefined
 
@@ -1167,8 +1340,9 @@ export function parseExecServerMessage(
     const raw = (msg.background_shell_spawn_args as Record<string, unknown>) ?? {}
     const command = str(raw.command)
     const workingDirectory = str(raw.working_directory) ?? ""
+    const terminal = terminalTarget(workingDirectory, str(raw.description))
     const args: Record<string, unknown> = {}
-    if (command) args.command = buildBackgroundShellCommand(command)
+    if (command) args.command = buildBackgroundShellCommand(command, terminal)
     if (workingDirectory) args.workdir = workingDirectory
     return {
       id,
@@ -1180,6 +1354,7 @@ export function parseExecServerMessage(
         background_shell_spawn: true,
         command: command ?? "",
         working_directory: workingDirectory,
+        ...terminalTargetMetadata(terminal),
       },
       localError:
         raw.enable_write_shell_stdin_tool === true
@@ -1280,7 +1455,7 @@ export function parseExecServerMessage(
   )
   const rawArgs = (msg[execVariant] as Record<string, unknown>) ?? {}
   const resultMetadata = execVariant === "shell_stream_args" || execVariant === "shell_args"
-    ? shellStreamResultMetadata(rawArgs)
+    ? shellStreamResultMetadata(rawArgs, terminalTarget)
     : execVariant === "read_args" || execVariant === "pi_read_args"
       ? readRequestResultMetadata(rawArgs, mapped.args)
       : execVariant === "write_args" || execVariant === "pi_write_args"
@@ -1320,10 +1495,14 @@ export function parseExecServerMessage(
   }
 }
 
-function shellStreamResultMetadata(raw: Record<string, unknown>): Record<string, unknown> {
+function shellStreamResultMetadata(
+  raw: Record<string, unknown>,
+  terminalTarget: (workingDirectory: string, description?: string) => CursorTerminalTarget | undefined,
+): Record<string, unknown> {
   const timeout = num(raw.timeout) ?? 0
   const timeoutBehavior = num(raw.timeout_behavior) ?? 0
   const hardTimeout = num(raw.hard_timeout)
+  const workingDirectory = str(raw.working_directory) ?? ""
   // Cursor CLI: a nonzero timeout is used verbatim. A zero foreground timeout
   // defaults to 30s; zero with background/hard-timeout semantics means an
   // immediate soft handoff governed by the separate hard deadline.
@@ -1333,10 +1512,13 @@ function shellStreamResultMetadata(raw: Record<string, unknown>): Record<string,
   return {
     shell_stream: true,
     command: str(raw.command) ?? "",
-    working_directory: str(raw.working_directory) ?? "",
+    working_directory: workingDirectory,
     timeout_ms: effectiveTimeout,
     timeout_behavior: timeoutBehavior,
     ...(hardTimeout !== undefined && hardTimeout > 0 ? { hard_timeout_ms: hardTimeout } : {}),
+    ...(timeoutBehavior === CURSOR_TIMEOUT_BACKGROUND
+      ? terminalTargetMetadata(terminalTarget(workingDirectory, str(raw.description)))
+      : {}),
   }
 }
 
@@ -1443,6 +1625,7 @@ export function mapCursorArgsToOpencode(
       if (workdir) args.workdir = workdir
       const timeout = num(cleaned.timeout)
       if (timeout !== undefined) args.timeout = timeout
+      if (cleaned.background === true) args.background = true
       return { toolName: dialect.shellTool, args }
     }
     case "grep": {
