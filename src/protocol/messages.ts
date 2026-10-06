@@ -465,9 +465,57 @@ export function createMessageTypes(): protobuf.Root {
       { id: 14, name: "turn_ended", type: "TurnEnded" },
       { id: 16, name: "step_started", type: "StepStarted" },
       { id: 17, name: "step_completed", type: "StepCompleted" },
+      { id: 6, name: "user_message_appended", type: "UserMessageAppendedUpdate" },
+      { id: 23, name: "context_injection_state", type: "ContextInjectionStateUpdate" },
     ],
-    [{ name: "update", fields: ["text_delta", "tool_call_started", "tool_call_completed", "thinking_delta", "partial_tool_call", "heartbeat", "turn_ended", "step_started", "step_completed"] }],
+    [{
+      name: "update",
+      fields: [
+        "text_delta",
+        "tool_call_started",
+        "tool_call_completed",
+        "thinking_delta",
+        "partial_tool_call",
+        "heartbeat",
+        "turn_ended",
+        "step_started",
+        "step_completed",
+        "user_message_appended",
+        "context_injection_state",
+      ],
+    }],
   )
+
+  addType(root, "UserMessageAppendedUpdate", [
+    { id: 1, name: "user_message", type: "UserMessage" },
+  ])
+  addType(root, "ContextInjectionQueued", [])
+  addType(root, "ContextInjectionDelivered", [
+    { id: 1, name: "step", type: "int32" },
+    { id: 2, name: "delivery_batch_id", type: "string" },
+    { id: 3, name: "delivered_at_ms", type: "int64" },
+  ])
+  addType(root, "ContextInjectionQueuedForNextTurn", [])
+  addType(root, "ContextInjectionCancelled", [])
+  addType(root, "ContextInjectionRejected", [
+    { id: 1, name: "reason", type: "string" },
+  ])
+  addType(
+    root,
+    "ContextInjectionState",
+    [
+      { id: 1, name: "queued", type: "ContextInjectionQueued" },
+      { id: 2, name: "delivered", type: "ContextInjectionDelivered" },
+      { id: 3, name: "queued_for_next_turn", type: "ContextInjectionQueuedForNextTurn" },
+      { id: 4, name: "cancelled", type: "ContextInjectionCancelled" },
+      { id: 5, name: "rejected", type: "ContextInjectionRejected" },
+    ],
+    [{ name: "state", fields: ["queued", "delivered", "queued_for_next_turn", "cancelled", "rejected"] }],
+  )
+  addType(root, "ContextInjectionStateUpdate", [
+    { id: 1, name: "injection_id", type: "string" },
+    { id: 2, name: "state", type: "ContextInjectionState" },
+  ])
 
   // ── Exec channel ──
 
@@ -1641,6 +1689,28 @@ export function createMessageTypes(): protobuf.Root {
     { id: 3, name: "result", type: "AskQuestionResult" },
   ])
 
+  addType(root, "UserContextInjection", [
+    { id: 1, name: "user_message", type: "UserMessage" },
+    { id: 2, name: "request_context", type: "RequestContext" },
+  ])
+  addType(root, "SystemContextInjection", [
+    { id: 1, name: "producer", type: "string" },
+    { id: 2, name: "content", type: "string" },
+  ])
+  // Cursor CLI's mid-turn steer: the server queues the context and delivers it
+  // at the Run's next step boundary, reporting progress as context_injection_state.
+  addType(
+    root,
+    "InjectContextAction",
+    [
+      { id: 1, name: "injection_id", type: "string" },
+      { id: 2, name: "expected_run_id", type: "string" },
+      { id: 3, name: "user_context", type: "UserContextInjection" },
+      { id: 4, name: "system_context", type: "SystemContextInjection" },
+    ],
+    [{ name: "payload", fields: ["user_context", "system_context"] }],
+  )
+
   addType(
     root,
     "ConversationAction",
@@ -1649,6 +1719,7 @@ export function createMessageTypes(): protobuf.Root {
       { id: 2, name: "resume_action", type: "ResumeAction" },
       { id: 3, name: "cancel_action", type: "CancelAction" },
       { id: 8, name: "async_ask_question_completion_action", type: "AsyncAskQuestionCompletionAction" },
+      { id: 19, name: "inject_context_action", type: "InjectContextAction" },
     ],
     [{
       name: "action",
@@ -1657,6 +1728,7 @@ export function createMessageTypes(): protobuf.Root {
         "resume_action",
         "cancel_action",
         "async_ask_question_completion_action",
+        "inject_context_action",
       ],
     }],
   )

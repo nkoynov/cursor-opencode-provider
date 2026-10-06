@@ -458,6 +458,12 @@ describe("tool-call-bridge", () => {
     ).toBe("shell_1")
     expect(
       extractExecDisplayCallId({
+        id: 2,
+        shell_args: { command: "ls", tool_call_id: "shell_2" },
+      }),
+    ).toBe("shell_2")
+    expect(
+      extractExecDisplayCallId({
         id: 4,
         read_args: { path: "/x", tool_call_id: "read_1" },
       }),

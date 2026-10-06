@@ -124,6 +124,8 @@ export type PendingExec = {
   toolName?: string
   /** Original request fields required by a typed result message. */
   resultMetadata?: Record<string, unknown>
+  /** Cursor's tool_call_id for the exec; its tool_call_completed follows Cursor taking the result. */
+  displayCallId?: string
   /**
    * True when this pending entry was synthesized from a Cursor display-only
    * tool_call_* frame (no ExecServerMessage). Continuation must not write an
@@ -260,6 +262,20 @@ export type CursorSession = {
    * turn ends first.
    */
   deferredNote?: string
+  /** AgentRunRequest.run_id of the Run on `stream`; Cursor checks injections against it. */
+  runId?: string
+  /** Mid-turn user messages injected into this Run, in send order. */
+  steerInjections?: SteerInjection[]
+  /** User text of a follow-up Run that has not reached its first checkpoint; a resume must resend it. */
+  pendingFollowUp?: string
+  /**
+   * A steer call's results went to this Run after its last checkpoint; resuming that checkpoint would
+   * drop them. A checkpoint may already be in flight when they are written, so only one read after
+   * Cursor completed every `awaiting` call is known to hold them. `unconfirmed` results have no such
+   * completion, and keep the Run from resuming at all. Results delivered later in the step join it;
+   * `toolCallIds` are the OpenCode results a rebase must replay because no checkpoint holds them.
+   */
+  resultsAfterCheckpoint?: { awaiting: Set<string>; unconfirmed: boolean; toolCallIds: Set<string> }
   /** Monotonic synthetic exec ids for bridged (display-only) OpenCode tool calls. */
   nextBridgedExecId: number
   /** KV blob store: blob_id (hex) → data, for Cursor's out-of-band payload channel. */
@@ -320,7 +336,16 @@ export type CursorSession = {
   semanticDeadlineAt: number
   closeError: CursorProviderError | null
   closed: boolean
-  reopenWithUserMessage?: (text: string) => Promise<void>
+  reopenWithUserMessage?: (text: string, abortSignal?: AbortSignal) => Promise<void>
+}
+
+export type SteerInjection = {
+  id: string
+  text: string
+  /** Cursor's last answer; `sent` before one, `carried` when inherited from a Run that dropped. */
+  state: "sent" | "carried" | "queued" | "delivered" | "queued_for_next_turn" | "cancelled" | "rejected"
+  /** A checkpoint arrived after Cursor answered this injection, so it holds the message and the step. */
+  checkpointed?: boolean
 }
 
 type Tombstone = {
@@ -539,6 +564,7 @@ export class SessionManager {
     toolName?: string,
     bridged = false,
     resultMetadata?: Record<string, unknown>,
+    displayCallId?: string,
   ): void {
     this.registerSession(session)
     if (session.closed) throw new CursorProtocolError("Cannot register a pending exec on a closed Cursor session")
@@ -550,6 +576,7 @@ export class SessionManager {
       toolName,
       bridged,
       resultMetadata,
+      ...(displayCallId ? { displayCallId } : {}),
       state: "pending",
       registeredAt: now,
       hardDeadlineAt: now + session.policy.hardCapMs,
