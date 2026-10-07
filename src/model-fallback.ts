@@ -74,7 +74,7 @@ export function modelSwitchInBlob(data: Uint8Array, requestedModelId: string): M
         const b = block as { type?: unknown; from?: { model?: unknown }; to?: { model?: unknown } }
         if (b?.type !== "fallback" || typeof b.to?.model !== "string" || !b.to.model) continue
         const from = typeof b.from?.model === "string" ? b.from.model : undefined
-        if (from && sameModel(from, b.to.model)) continue
+        if ((from && sameModel(from, b.to.model)) || sameModel(requestedModelId, b.to.model)) continue
         return { ...(from ? { from } : {}), to: b.to.model, source: "fallback-block" }
       }
     } catch {
@@ -260,12 +260,22 @@ export function resetModelFallbackStopsForTests(): void {
 
 type Prompt = LanguageModelV3CallOptions["prompt"]
 
-function messageText(message: Prompt[number]): string {
-  if (typeof message.content === "string") return message.content
+function textParts(message: Prompt[number]): string[] {
+  if (typeof message.content === "string") return [message.content]
   return (message.content as unknown as Array<{ type?: string; text?: unknown }>)
     .filter((part) => part.type === "text" && typeof part.text === "string")
     .map((part) => part.text as string)
-    .join("")
+}
+
+function messageText(message: Prompt[number]): string {
+  return textParts(message).join("")
+}
+
+const TAG_BLOCK = /^<([a-z][\w-]*)(?:\s[^>]*)?>[\s\S]*<\/\1>$/i
+
+/** The user's own words: host plugins add tag blocks (an output-style `<system-reminder>`, notes) as text parts or messages. */
+function ownText(message: Prompt[number]): string {
+  return textParts(message).filter((text) => !TAG_BLOCK.test(text.trim())).join("").trim()
 }
 
 export type ModelFallbackReply = {
@@ -310,6 +320,7 @@ export function matchModelFallbackReply(
     message.role === "assistant" || message.role === "tool" || (message.role === "user" && isHostNote(message))
   while (turnStart > 0 && inTurn(prompt[turnStart - 1]!)) turnStart--
   while (turnStart > 0 && prompt[turnStart - 1]!.role === "user") turnStart--
-  const override = replies.length === 1 && isFallbackOverride(messageText(replies[0]!), stop.servedModel)
+  const said = replies.map(ownText).filter(Boolean)
+  const override = said.length === 1 && isFallbackOverride(said[0]!, stop.servedModel)
   return { stop, override, turnStart, stopIndex }
 }

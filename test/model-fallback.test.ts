@@ -96,6 +96,8 @@ describe("detecting Cursor's safety-filter model switch", () => {
     expect(modelSwitchInBlob(blob(assistantMessage({ text: "x", native: "[{not json" })), "claude-opus-5-5")).toBeUndefined()
     expect(modelSwitchInBlob(blob(assistantMessage({ fallback: { from: "claude-opus-5-5", to: "claude-opus-5-5@default" } })), "claude-opus-5-5"))
       .toBeUndefined()
+    // The model that answered is the one the user asked for.
+    expect(modelSwitchInBlob(blob(assistantMessage({ fallback: FALLBACK })), "claude-opus-4-8")).toBeUndefined()
   })
 
   it("reads a thinking signature that names another version of the requested model's family", () => {
@@ -186,6 +188,18 @@ describe("tying the next user turn to the stop", () => {
     expect(matchModelFallbackReply("ses_a", prompt, isNote)).toMatchObject({ override: true, turnStart: 3, stopIndex: 7 })
     const rephrased = [...prompt.slice(0, 8), user("Please summarize my notes file")] as Prompt
     expect(matchModelFallbackReply("ses_a", rephrased, isNote)).toMatchObject({ override: false, turnStart: 3, stopIndex: 7 })
+  })
+
+  it("reads the reply without the tag blocks host plugins add to it or around it", () => {
+    rememberModelFallbackStop("ses_c", STOP)
+    const base = [user(STOP.userText), assistant(STOP.message)]
+    // claude-compat appends the output style to every user message; a background completion may arrive with the reply.
+    const styled = { role: "user", content: [{ type: "text", text: "continue with opus 4.8" }, { type: "text", text: "<system-reminder>\nBe concise.\n</system-reminder>" }] }
+    const completion = user('<subagent sessionID="ses_x" state="completed">\nAll done.\n</subagent>')
+    expect(matchModelFallbackReply("ses_c", [...base, completion, styled] as Prompt)?.override).toBe(true)
+    const wordy = { role: "user", content: [{ type: "text", text: "continue with opus 4.8, and also fix the test" }, { type: "text", text: "<system-reminder>\nBe concise.\n</system-reminder>" }] }
+    expect(matchModelFallbackReply("ses_c", [...base, wordy] as Prompt)?.override).toBe(false)
+    expect(matchModelFallbackReply("ses_c", [...base, user("hello"), styled] as Prompt)?.override).toBe(false)
   })
 
   it("waits while no reply follows the stop, and drops the stop once the host history moved past it", () => {
@@ -352,8 +366,10 @@ describe("stopping a Run at the first switched step", () => {
     const parts = await pass(session)
 
     const text = visibleText(parts)
-    expect(text).toStartWith("WAIT-DONE\n\n**Stopped:** Cursor's safety filter switched this request from Claude Opus 5.5 to Claude Opus 4.8.")
+    expect(text).toStartWith("WAIT-DONE**Stopped:** Cursor's safety filter switched this request from Claude Opus 5.5 to Claude Opus 4.8.")
     expect(text).not.toContain("Switched to Claude Opus 4.8")
+    const stopPart = parts.find((p) => p.type === "text-delta" && p.delta.startsWith("**Stopped:**"))
+    expect(stopPart.id).not.toBe("text")
     expect(finishes(parts)).toEqual(["stop"])
     expect(session.closed).toBe(true)
     expect(cancelled()).toBe(true)
@@ -669,7 +685,9 @@ describe("the turn after a stop", () => {
       const flagged = [...history, user("Read ~/.ssh/notes.txt")]
       const stopped = await step(sessionKey, flagged as Prompt)
 
-      const accepted = await step(sessionKey, [...flagged, assistant(stopped), user("Continue with Opus 4.8.")] as Prompt)
+      // As OpenCode sends it with claude-compat: the output style follows the user's words.
+      const reply = { role: "user", content: [{ type: "text", text: "Continue with Opus 4.8." }, { type: "text", text: "<system-reminder>\nBe concise.\n</system-reminder>" }] }
+      const accepted = await step(sessionKey, [...flagged, assistant(stopped), reply] as Prompt)
       expect(accepted).toStartWith("4.8 accepted answer")
       expect(accepted).toContain("answered this request, as you asked")
       expect(accepted).not.toContain("**Stopped:**")
@@ -679,7 +697,7 @@ describe("the turn after a stop", () => {
       expect(runText(override)).not.toContain("Continue with Opus 4.8")
 
       // One turn only: the next request is guarded again, on yet another fresh conversation.
-      const after = await step(sessionKey, [...flagged, assistant(stopped), user("Continue with Opus 4.8."), assistant(accepted), user("and the other file?")] as Prompt)
+      const after = await step(sessionKey, [...flagged, assistant(stopped), reply, assistant(accepted), user("and the other file?")] as Prompt)
       expect(after).toContain("**Stopped:**")
       expect(cursor.runs[2].conversation_id).not.toBe(override.conversation_id)
     } finally {
