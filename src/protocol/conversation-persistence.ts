@@ -30,6 +30,8 @@ export type PersistedConversation = {
   hostNote?: string
   /** Early steers the last turn answered; OpenCode records them after that answer. */
   answeredSteers?: string[]
+  /** JSON-encoded ModelFallbackStop: the last turn stopped on a model switch and awaits the user's reply. */
+  modelFallbackStop?: string
 }
 
 type ConversationStore = {
@@ -100,7 +102,8 @@ function cloneConversation(value: PersistedConversation): PersistedConversation 
  * ConversationCache: schema_version=1, session_key=2, conversation_id=3,
  * updated_at=4, checkpoint=5, blobs=6, request_context=7, tool_catalog=8,
  * post_compaction_rebase=9, host_agent=10, system_prompt_hash=11,
- * turn_provenance_json=12, host_note=13, answered_steers=14 (repeated).
+ * turn_provenance_json=12, host_note=13, answered_steers=14 (repeated),
+ * model_fallback_stop_json=15.
  * Blob: id=1, data=2. Tool: name=1, description=2,
  * input_schema_json=3, source_name=4.
  *
@@ -225,6 +228,7 @@ function encodeCacheFile(value: PersistedConversation): {
   if (value.turnProvenance) writer.uint32(fieldTag(12, 2)).string(value.turnProvenance)
   if (value.hostNote) writer.uint32(fieldTag(13, 2)).string(value.hostNote)
   for (const steer of value.answeredSteers ?? []) writer.uint32(fieldTag(14, 2)).string(steer)
+  if (value.modelFallbackStop) writer.uint32(fieldTag(15, 2)).string(value.modelFallbackStop)
   return { protobufBytes: writer.finish(), requestContextBytes: requestContext.length }
 }
 
@@ -244,6 +248,7 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
   let turnProvenance: string | undefined
   let hostNote: string | undefined
   const answeredSteers: string[] = []
+  let modelFallbackStop: string | undefined
   while (reader.pos < reader.len) {
     const tag = reader.uint32()
     const wireType = tag & 7
@@ -304,6 +309,10 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
         if (wireType !== 2) throw new Error("invalid answered steer")
         answeredSteers.push(reader.string())
         break
+      case 15:
+        if (wireType !== 2) throw new Error("invalid model fallback stop")
+        modelFallbackStop = reader.string()
+        break
       default:
         reader.skipType(wireType)
     }
@@ -331,6 +340,7 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
     ...(turnProvenance ? { turnProvenance } : {}),
     ...(hostNote ? { hostNote } : {}),
     ...(answeredSteers.length > 0 ? { answeredSteers } : {}),
+    ...(modelFallbackStop ? { modelFallbackStop } : {}),
   }
 }
 

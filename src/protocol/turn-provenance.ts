@@ -116,6 +116,12 @@ export function trackTurnProvenance(sessionKey: string, conversationId: string):
   entryFor(sessionKey, conversationId)
 }
 
+/** The session moved to a new conversation id that continues the old one: its record moves along unchanged. */
+export function rebindTurnProvenance(sessionKey: string, fromId: string, toId: string): void {
+  const entry = provenanceBySession.get(sessionKey)
+  if (entry?.conversationId === fromId) entry.conversationId = toId
+}
+
 export function getTurnProvenance(sessionKey: string): TurnProvenance | undefined {
   const entry = provenanceBySession.get(sessionKey)
   if (!entry) return undefined
