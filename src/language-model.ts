@@ -1294,17 +1294,22 @@ function carryModelSwitchState(from: CursorSession, to: CursorSession): void {
   to.modelSwitchGuard.toolRuns = guard.toolRuns.map((run) => ({ ...run, inOpenStep: false }))
 }
 
+/** Debug: the block kinds Cursor stored for a step against how the provider showed its thinking. */
+function traceAssistantBlobShape(session: CursorSession, kv: Record<string, unknown>): void {
+  const data = (kv.set_blob_args as { blob_data?: Uint8Array } | undefined)?.blob_data
+  const shape = data ? assistantBlobShape(data) : undefined
+  if (!shape) return
+  trace(
+    `assistant blob: shape=${shape.join(",") || "-"} ` +
+      `streamedThinking=${takeThinkingKinds(session).join(",") || "-"}`,
+  )
+}
+
 /** A switch Cursor recorded in a stored assistant message; any assistant message also ends the open step. */
 function noteAssistantBlob(session: CursorSession, kv: Record<string, unknown>): void {
   const guard = session.modelSwitchGuard
   const data = (kv.set_blob_args as { blob_data?: Uint8Array } | undefined)?.blob_data
-  const shape = data ? assistantBlobShape(data) : undefined
-  if (shape) {
-    trace(
-      `assistant blob: shape=${shape.join(",") || "-"} ` +
-        `streamedThinking=${takeThinkingKinds(session).join(",") || "-"}`,
-    )
-  }
+  traceAssistantBlobShape(session, kv)
   if (!guard || !data || !isAssistantMessageBlob(data)) return
   const found = session.modelSwitch ? undefined : modelSwitchInBlob(data, session.requestedModelId ?? "")
   if (found) {
@@ -2637,6 +2642,7 @@ export async function drainSessionUntilTurnEnded(
 
       if (kv) {
         const handled = handleKvServerMessage(kv, session)
+        if (handled?.kind === "set") traceAssistantBlobShape(session, kv)
         if (!handled) {
           outcome = "busy"
           break
