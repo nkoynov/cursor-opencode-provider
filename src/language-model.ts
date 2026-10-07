@@ -4307,6 +4307,8 @@ export async function pump(
       )
       thinkingBlock.open = false
     } else if (iu?.turn_ended) {
+      // A Run reopened below for a follow-up starts its own model step.
+      endThinkingRun()
       trace(`turn_ended raw wire fields: ${debugWalkTurnEnded(payload)}`)
       keepUndeliveredHostNote(session)
       const turnEnded = iu.turn_ended as Record<string, unknown>
@@ -4446,6 +4448,7 @@ export async function pump(
       recordInjectionState(session, iu.context_injection_state as Record<string, unknown>)
     } else if (iu?.user_message_appended) {
       trace("steer: Cursor appended a user message to the Run")
+      endThinkingRun()
       if (textStarted) textSeparator = "\n\n"
     } else if (iu?.tool_call_started) {
       cacheDiagnostics.displayToolCalls++

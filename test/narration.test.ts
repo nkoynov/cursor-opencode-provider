@@ -24,6 +24,9 @@ const frame = (message: Record<string, unknown>): Frame => ({ flags: 0, payload:
 const thinking = (text: string) => frame({ interaction_update: { thinking_delta: { text, thinking_style: 1 } } })
 const thinkingCompleted = frame({ interaction_update: { thinking_completed: { thinking_duration_ms: 1200 } } })
 const textFrame = (text: string) => frame({ interaction_update: { text_delta: { text } } })
+const checkpointFrame = frame({
+  conversation_checkpoint_update: encodeMessage("ConversationStateStructure", { token_details: { used_tokens: 200, max_tokens: 1_000_000 } }),
+})
 const listed = (count: number) => frame({ interaction_update: { tool_requests_listed: { call_count: count } } })
 const shellCall = (id: number, callId: string, command: string) => [
   frame({ interaction_update: { tool_call_started: { call_id: callId, tool_call: { shell_tool_call: { args: { command, tool_call_id: callId } } } } } }),
@@ -73,8 +76,7 @@ describe("progress updates streamed as thinking", () => {
     resetFrozenRequestContextsForTests()
   })
 
-  function fakeRun(frames: Frame[]): CursorSession {
-    const queue = [...frames]
+  function fakeRun(frames: Frame[], queue: Frame[] = [...frames]): CursorSession {
     const iterator: AsyncIterator<Frame> = {
       next: () => {
         const next = queue.shift()
@@ -115,13 +117,16 @@ describe("progress updates streamed as thinking", () => {
     return session
   }
 
-  async function pass(frames: Frame[]) {
+  async function pass(frames: Frame[], prepare?: (session: CursorSession, queue: Frame[]) => void) {
     const parts: any[] = []
     const controller = {
       enqueue(part: unknown) { parts.push(part) },
       error(error: Error) { throw error },
     } as unknown as ReadableStreamDefaultController<any>
-    await pump(fakeRun(frames), controller, { textId: "text", reasoningId: "reasoning" })
+    const queue = [...frames]
+    const session = fakeRun(frames, queue)
+    prepare?.(session, queue)
+    await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
     return parts
   }
   const joined = (parts: any[], type: string) => parts.filter((p) => p.type === type).map((p) => p.delta).join("")
@@ -214,6 +219,34 @@ describe("progress updates streamed as thinking", () => {
     expect(open.size).toBe(0)
     expect(joined(parts, "reasoning-delta")).toBe("Need the MCP tools.\n\nNow run it.\n\n")
     expect(joined(parts, "text-delta")).toBe("Looking up the tools first.\n\nRunning the check.")
+  })
+
+  it("starts counting again in a Run the same step reopens", async () => {
+    let reopened = 0
+    const parts = await pass(
+      [
+        thinking("Plan the check.\n\n"),
+        thinkingCompleted,
+        thinking("Checking the workspace files"),
+        thinkingCompleted,
+        checkpointFrame,
+        frame({ interaction_update: { turn_ended: { input_tokens: 10, output_tokens: 2 } } }),
+      ],
+      (session, queue) => {
+        session.reopenWithUserMessage = async () => {
+          reopened++
+          queue.push(
+            thinking("Fresh reasoning in the follow-up.\n\n"),
+            thinkingCompleted,
+            textFrame("All files are present."),
+            frame({ interaction_update: { turn_ended: { input_tokens: 12, output_tokens: 3 } } }),
+          )
+        }
+      },
+    )
+    expect(reopened).toBe(1)
+    expect(joined(parts, "reasoning-delta")).toBe("Plan the check.\n\nFresh reasoning in the follow-up.\n\n")
+    expect(joined(parts, "text-delta")).toBe("Checking the workspace filesAll files are present.")
   })
 
   it("decodes thinking_completed and thinking_style", () => {
