@@ -3497,7 +3497,8 @@ export async function pump(
       carryToolStep()
       return true
     }
-    return !cursorListsToolRequests || toolStepComplete()
+    // Held calls count as received; the loop takes those that may join this step, then closes it.
+    return !cursorListsToolRequests || (toolStepComplete() && !hasDeferredToolExecs(order))
   }
   /** A step the ordering splits keeps Cursor's count, and the calls counted toward it, for the next pass. */
   const carryToolStep = (): void => {

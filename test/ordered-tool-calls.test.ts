@@ -226,6 +226,31 @@ describe("ordered tool calls", () => {
     expect(Date.now() - startedAt).toBeLessThan(1_000)
   })
 
+  it("runs the read-only calls held behind a state-changing call together", async () => {
+    const script = scriptedFrames([])
+    const session = fakeSession(script.frames)
+    const root = rootOf(session)
+    for (const name of ["a", "b", "c"]) fs.writeFileSync(path.join(root, name), name)
+    const target = path.join(root, "NOTES.md")
+    // The reads arrive while the edit's write is still to come, so they are held in the same pass.
+    for (const next of [
+      editStarted("edit", target),
+      editRead(1, "edit", target),
+      ...read(2, "ra", path.join(root, "a")),
+      ...read(3, "rb", path.join(root, "b")),
+      ...read(4, "rc", path.join(root, "c")),
+      listed(4),
+      editWrite(5, "edit", target),
+    ]) script.push(next)
+
+    expect(calls(await pumpOnce(session))).toEqual(["write#5"])
+    expect(session.toolCallOrder?.deferred.map((exec) => exec.execId)).toEqual([2, 3, 4])
+    deliverAll(session)
+    const second = await pumpOnce(session)
+    expect(calls(second)).toEqual(["read#2", "read#3", "read#4"])
+    expect(finishes(second)).toEqual(["tool-calls"])
+  })
+
   it("forgets a held exec that Cursor aborts", async () => {
     const script = scriptedFrames([...shell(1, "a", "touch a"), ...shell(2, "b", "touch b"), listed(2)])
     const session = fakeSession(script.frames)
