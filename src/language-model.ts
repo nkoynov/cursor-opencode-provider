@@ -1730,7 +1730,9 @@ async function startSession(
   const imageExtraction = resuming
     ? { images: [], hashes: [], candidateCount: 0, duplicateCount: 0, userImageCount: 0 }
     : await extractCursorPromptImages(
-        prompt as readonly unknown[],
+        (fallbackReply
+          ? prompt.filter((_, index) => index < fallbackReply.turnStart || index > fallbackReply.stopIndex)
+          : prompt) as readonly unknown[],
         lastUser as unknown as Record<string, unknown> | undefined,
         {
           supportsImages,
@@ -1986,7 +1988,8 @@ async function startSession(
     closeError: null,
     closed: false,
     requestedModelId: cursorModelId,
-    ...(liveTurn && sessionKey
+    // Every agent Run, including one that rebases a lost Run's tool results.
+    ...(sessionKey && allowTools && !isCompaction && !isolateHelper
       ? {
           modelSwitchGuard: {
             turnBase: conversationState,
@@ -1994,7 +1997,9 @@ async function startSession(
             stepBase: conversationState,
             stepOpen: false,
             toolRuns: [],
-            userText: fallbackReply?.override ? fallbackReply.stop.userText : liveTurn.text,
+            userText: fallbackReply?.override
+              ? fallbackReply.stop.userText
+              : (liveTurn?.text ?? (extractUserText(lastUser) || ".")),
             epochAtTurnStart,
           },
         }
