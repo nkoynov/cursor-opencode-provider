@@ -761,6 +761,8 @@ export async function bidiRunStream(
   let resending: Uint8Array[] | undefined
   const resendListeners = new Set<(resent: boolean) => void>()
   let streamGeneration = 0
+  // Read before this Run closes the session itself: Node destroys a closed session with no streams left.
+  let connectionLost = false
   let stream: http2.ClientHttp2Stream
   try {
     stream = openStream()
@@ -886,7 +888,7 @@ export async function bidiRunStream(
     }
     if (stream.rstCode === http2.constants.NGHTTP2_REFUSED_STREAM) return "stream refused"
     if (goawayLastStreamId !== undefined) return `GOAWAY lastStreamID=${goawayLastStreamId}`
-    if (session.destroyed) return "connection lost"
+    if (connectionLost) return "connection lost"
     return undefined
   }
   const resendOnNewConnection = async (reason: string) => {
@@ -904,6 +906,7 @@ export async function bidiRunStream(
     rawStreamError = undefined
     writable = true
     remotelyClosed = false
+    connectionLost = false
     let next: http2.ClientHttp2Stream | undefined
     try {
       session = await getSession(options.baseURL, sessionOptions)
@@ -1022,6 +1025,7 @@ export async function bidiRunStream(
     })
     target.on("error", (err: Error) => {
       if (replaced()) return
+      connectionLost ||= owner.destroyed
       rawStreamError = err
       writable = false
       trace(`h2 stream error: ${err?.name}: ${err?.message}`)
@@ -1029,6 +1033,7 @@ export async function bidiRunStream(
     })
     target.on("aborted", () => {
       if (replaced()) return
+      connectionLost ||= owner.destroyed
       writable = false
       rawStreamError ??= new CursorTransportError("Cursor Run stream aborted by remote", {
         transient: true,
@@ -1040,11 +1045,13 @@ export async function bidiRunStream(
     })
     target.on("end", () => {
       if (replaced()) return
+      connectionLost ||= owner.destroyed
       writable = false
       scheduleTerminalSettlement()
     })
     target.on("close", () => {
       if (replaced()) return
+      connectionLost ||= owner.destroyed
       writable = false
       remotelyClosed = !locallyClosed
       if (remotelyClosed) {
@@ -1119,6 +1126,7 @@ export async function bidiRunStream(
         let settled = false
         let target = stream
         let failLater: (() => void) | undefined
+        let timer: ReturnType<typeof setTimeout> | undefined
         const detach = () => {
           target.removeListener("drain", onDrain)
           target.removeListener("error", onError)
@@ -1155,15 +1163,18 @@ export async function bidiRunStream(
               : observedFailure() ?? new CursorRunInterruptedError("Cursor Run stream closed before drain"),
           )
         }
-        // While the Run may still go out on a new connection, that decision settles the wait.
+        // While the Run may still go out on a new connection, that decision settles the wait, and
+        // the new stream gets the whole drain window: the connect timeout bounds the reconnect.
         const mayResend = () => !locallyClosed && (unanswered !== undefined || resending !== undefined)
         const onError = (cause: Error) => {
-          if (mayResend()) failLater ??= () => failOnError(cause)
-          else failOnError(cause)
+          if (!mayResend()) return failOnError(cause)
+          clearTimeout(timer)
+          failLater ??= () => failOnError(cause)
         }
         const onClose = () => {
-          if (mayResend()) failLater ??= failOnClose
-          else failOnClose()
+          if (!mayResend()) return failOnClose()
+          clearTimeout(timer)
+          failLater ??= failOnClose
         }
         const onResend = (resent: boolean) => {
           if (settled) return
@@ -1171,17 +1182,21 @@ export async function bidiRunStream(
           detach()
           target = stream
           if (!backpressured) return finish()
+          armTimer()
           attach()
         }
-        const timer = setTimeout(() => {
-          streamFailure ??= new CursorTransportError(
-            `Cursor Run stream backpressure did not drain after ${drainTimeoutMs}ms`,
-            { transient: false, replaySafe: false, code: WRITE_DRAIN_TIMEOUT_CODE },
-          )
-          finish(streamFailure)
-          try { stream.destroy(streamFailure) } catch { /* already closing */ }
-        }, drainTimeoutMs)
-        timer.unref?.()
+        const armTimer = () => {
+          timer = setTimeout(() => {
+            streamFailure ??= new CursorTransportError(
+              `Cursor Run stream backpressure did not drain after ${drainTimeoutMs}ms`,
+              { transient: false, replaySafe: false, code: WRITE_DRAIN_TIMEOUT_CODE },
+            )
+            finish(streamFailure)
+            try { stream.destroy(streamFailure) } catch { /* already closing */ }
+          }, drainTimeoutMs)
+          timer.unref?.()
+        }
+        if (!resending) armTimer()
         attach()
       })
     },
