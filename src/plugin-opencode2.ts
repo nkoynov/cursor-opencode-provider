@@ -9,6 +9,7 @@ import { discoverModels, isCacheFresh, readCache, type ModelInfo } from "./model
 import { resolveAgentUrl } from "./agent-url.js"
 import { sessionActivity } from "./activity.js"
 import { notifyHostInterrupt } from "./host-interrupt.js"
+import { takeFinalFailure } from "./host-retry.js"
 import {
   announceHostSteer,
   forgetEarlySteers,
@@ -502,6 +503,18 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
             ...event.headers,
             "x-opencode-directory": encodeURIComponent(directory),
           }
+        },
+        { providerID: CURSOR_PROVIDER_ID },
+      ),
+    )
+
+    await track(
+      ctx.session.hook(
+        "retry",
+        (event) => {
+          if (!event.decision.retry || !takeFinalFailure(event.sessionID, event.error?.message)) return
+          trace(`retry: not retrying sessionID=${event.sessionID} attempt=${event.attempt}: ${event.error.message}`)
+          event.decision = { retry: false }
         },
         { providerID: CURSOR_PROVIDER_ID },
       ),
