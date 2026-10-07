@@ -2211,6 +2211,7 @@ export async function preparePriorSessionForFreshTurn(
     // Cancel path closed the session (encode/write failure). Caller opens a
     // fresh Run on the same conversation_id — better than mid-exec supersede
     // with stranded pending, but turn_ended may be missing.
+    keepUndeliveredHostNote(prior)
     return cancelled > 0 || settledBridged > 0 ? "settled-only" : "none"
   }
 
@@ -2227,8 +2228,10 @@ export async function preparePriorSessionForFreshTurn(
   })
   trace(`fresh turn: prior session ${prior.sessionId} drain outcome=${outcome}`)
   if (outcome === "turn-ended") return "drained"
-  if (cancelled > 0 || settledBridged > 0) return "settled-only"
-  return outcome === "timeout" || outcome === "interrupted" ? "settled-only" : "busy"
+  const settled = cancelled > 0 || settledBridged > 0 || outcome === "timeout" || outcome === "interrupted"
+  // The new Run supersedes a prior that never reached turn_ended.
+  if (settled) keepUndeliveredHostNote(prior)
+  return settled ? "settled-only" : "busy"
 }
 
 /**

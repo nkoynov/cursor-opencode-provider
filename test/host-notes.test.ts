@@ -562,6 +562,26 @@ describe("host notes a turn ends without delivering", () => {
 
     expect(await hostNoteAfterRestart(root, "ses_stopped")).toBe(NOTE)
   })
+
+  it("keeps an injected note Cursor did not deliver when a fresh turn supersedes a Run that never ends its turn", async () => {
+    root = fs.mkdtempSync(path.join("/tmp", "cursor-host-notes-"))
+    const prior = liveSession([])
+    prior.openCodeSessionId = "ses_superseded"
+    prior.runId = `run-${prior.sessionId}`
+    prior.steerInjections = [{ id: "note-1", text: NOTE, state: "queued", hostNote: true }]
+    prior.frames = {
+      next: async () => ({ done: false, value: { flags: 0x02, payload: new Uint8Array() } }),
+    } as CursorSession["frames"]
+    sessionManager.registerSession(prior)
+
+    expect(await preparePriorSessionForFreshTurn("ses_superseded", { timeoutMs: 1_000 })).toBe("settled-only")
+
+    const next = endsTurn(liveSession([]), root, "ses_superseded")
+    sessionManager.registerSession(next)
+    expect(await preparePriorSessionForFreshTurn("ses_superseded", { timeoutMs: 1_000 })).toBe("drained")
+
+    expect(await hostNoteAfterRestart(root, "ses_superseded")).toBe(NOTE)
+  })
 })
 
 describe("host notes injected into the held Run", () => {
