@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- On OpenCode 2.0, a Cursor background shell that finishes tells the model, as OpenCode's own background shells do: a `<shell>` note with the exit code and output reaches it at its next step, or starts a new turn if it had ended its turn, so it no longer has to keep its turn open and poll. No note is sent when the model already awaited the result.
 - Dynamic-catalog guidance names the namespace for host tools (`opencode`) and states that `cursor` holds only Cursor's built-in tools, so a first `skill` lookup no longer fails in the wrong namespace.
 - A SwitchMode handoff that starts a new host plan turn explicitly terminates the old Cursor Run before the host switch, preserving its checkpoint and preventing premature CreatePlan calls. Native planning guidance distinguishes direct functions from dynamic discovery; debug logs retain native discovery errors.
 - Dynamic tool definitions carry their exact invocation identity and complete outer envelope beside the inner argument schema, so discovery and shortened search results retain required outer call fields.

@@ -154,6 +154,7 @@ A prompt sent before those servers finish connecting will not see their tools. O
 | — | `credential.switched` clears the token cache and reloads models |
 | — | `editor.add({ sourceConnection })` binds inventory to the active Cursor connection |
 | — | `ctx.websearch.transform` publishes Exa results as `{url,title,content,time}` for OpenCode 2's native permission-gated `websearch` tool |
+| — | A Cursor background shell that ends posts OpenCode's `<shell>` completion note (as a `<system-update>`) through `session.synthetic`: the model gets it at the next step, or it starts a turn in an idle session. It is dropped when the model already read the finished terminal file |
 | Package root / `plugin` | OpenCode 2 `Host.resolve` loads `exports["./server"]` → this entry (`{ id, setup }`). The same module dual-exports `server: CursorPlugin` so OpenCode 1.18 still gets the classic plugin. |
 
 Generated-image saving uses the same handle-only `cursor_image_save` tool on classic and OpenCode 2.0. Classic/OCP surfaces raise `external_directory` then `edit` before the write. Stock OpenCode 2.0 has no public `ask`, so the 2.0 entrypoint still advertises the tool (`permission: "edit"` so agents that deny edits do not get it) and commits after containment; the id is opaque, so the model cannot write arbitrary files.

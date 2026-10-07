@@ -207,6 +207,7 @@ import {
   consumeCursorShellResult,
   registerCursorShellCall,
 } from "./shell-timeout.js"
+import { backgroundShellNoticesSupported, recordBackgroundShellRead } from "./background-shell-notice.js"
 import { analyzeReplayFrame, AttemptReplaySafety, describeFrameLayout } from "./replay-safety.js"
 import { readAllFieldsStrict } from "./protocol/struct.js"
 import {
@@ -2969,6 +2970,16 @@ export async function pump(
    * handshake read into an empty-file success. EACCES/EPERM and other stat
    * errors fall through to OpenCode so a genuine permission decision stands.
    */
+  const noteBackgroundShellRead = (parsed: ParsedExecRequest): void => {
+    const requested = opencodePathArg(parsed.args)
+    if (!requested || isUriReadTarget(requested)) return
+    const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
+    recordBackgroundShellRead(resolveReadTargetPath(requested, workspaceRoot), session.openCodeSessionId, {
+      offset: typeof parsed.args.offset === "number" ? parsed.args.offset : undefined,
+      limit: typeof parsed.args.limit === "number" ? parsed.args.limit : undefined,
+    })
+  }
+
   const rejectMissingReadTarget = (parsed: ParsedExecRequest): boolean => {
     if (parsed.toolName !== "read") return false
     const requested = opencodePathArg(parsed.args) ?? ""
@@ -3750,6 +3761,7 @@ export async function pump(
             }
             continue
           }
+          if (parsed.toolName === "read") noteBackgroundShellRead(parsed)
           // Cursor writes a generated image with an ordinary write exec whose
           // `file_bytes` are binary (Cursor CLI's agent does exactly this, then
           // reads the client's WriteResult back). OpenCode's `write` takes a
@@ -4472,6 +4484,9 @@ export function groundCheckpointTurnText(
   })
 }
 
+const BACKGROUND_SHELL_GUIDANCE =
+  "- Background shells report back: when a command started with `block_until_ms: 0`, or moved to the background after its `block_until_ms`, finishes, a `<shell …>` system update gives its exit code and output, and starts a new turn if yours has ended. Unless you need the result to continue, do not wait for it with AwaitShell, sleep, or repeated reads; keep working, or end your response and you will be resumed when it finishes."
+
 /**
  * Cursor's native UI interactions cannot be surfaced through the AI SDK.
  * Redirect only to OpenCode tools that are genuinely advertised this turn;
@@ -4506,6 +4521,7 @@ export function buildOpenCodeInteractionGuidance(
       "- A shell call requires `command`; a file path by itself is not a shell command. Use the advertised shell tool's current schema.",
       "- Send commands, including log-analysis scripts, only to the advertised `bash` or `shell` tool. File/search/list tools do not execute `command`; accepting an ignored argument is not successful execution.",
     )
+    if (backgroundShellNoticesSupported()) instructions.push(BACKGROUND_SHELL_GUIDANCE)
   }
 
   if (names.has("question")) {

@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach } from "bun:test"
+import { afterEach, describe, expect, test, beforeEach } from "bun:test"
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
@@ -29,6 +29,12 @@ import {
   resetHostAgentModeSwitchForTests,
 } from "../src/host-agent-mode.js"
 import { registerCursorShellCall } from "../src/shell-timeout.js"
+import {
+  BUSY_SETTLE_MS,
+  pollBackgroundShells,
+  resetBackgroundShellNotices,
+  watchBackgroundShell,
+} from "../src/background-shell-notice.js"
 import { stageCursorImage } from "../src/image-staging.js"
 import { hostPlansDir, opencode2PlanDir, setHostCacheDirOverride, setNativePlansDir } from "../src/context/paths.js"
 import { writeCache } from "../src/models.js"
@@ -614,6 +620,131 @@ describe("opencode2 setup", () => {
     resetHostAgentModeSwitchForTests()
     resetActiveCursorModesForTests()
     setNativePlansDir(undefined)
+    resetBackgroundShellNotices({ manualPolling: true })
+  })
+
+  afterEach(() => {
+    resetBackgroundShellNotices()
+  })
+
+  const finishedTerminalFile = (dir: string, output: string) => {
+    const file = join(dir, `${process.pid}.txt`)
+    writeFileSync(file, [
+      "---",
+      `pid: ${process.pid}`,
+      'cwd: "/tmp"',
+      'command: "sleep 90; echo done"',
+      "status: succeeded",
+      "started_at: 2026-10-07T10:00:00Z",
+      "running_for_ms: 90000    ",
+      "---",
+      `${output}`,
+      "---",
+      "exit_code: 0",
+      "elapsed_ms: 90000",
+      "ended_at: 2026-10-07T10:01:30Z",
+      "---",
+      "",
+    ].join("\n"))
+    return file
+  }
+
+  test("a Cursor background shell's end reaches its session through session.synthetic", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cursor-oc2-bg-"))
+    try {
+      const { ctx, hooks } = fakeContext()
+      const posted: any[] = []
+      ctx.session.synthetic = async (input: any) => void posted.push(input)
+      const cleanup = await setupPlugin(ctx)
+      const executionID = "cursor_bg_notice"
+      registerCursorShellCall(executionID, {
+        background_shell_spawn: true,
+        command: "sleep 90; echo done",
+        working_directory: "/tmp",
+      })
+      const file = finishedTerminalFile(dir, "done\n")
+      const raw = `__CURSOR_BACKGROUND_SHELL__${process.pid}:${file}\n`
+      await hooks.get("tool.execute.after")!({
+        tool: "shell",
+        sessionID: "ses_bg",
+        agent: "build",
+        messageID: "message",
+        id: executionID,
+        input: { command: "sleep 90; echo done" },
+        status: "completed",
+        result: { output: { output: raw, status: "completed", truncated: false }, content: [{ type: "text", text: raw }], metadata: {} },
+      })
+      const now = Date.now()
+      pollBackgroundShells(now)
+      expect(posted).toEqual([])
+      pollBackgroundShells(now + BUSY_SETTLE_MS)
+      expect(posted).toHaveLength(1)
+      expect(posted[0].sessionID).toBe("ses_bg")
+      expect(posted[0].description).toBe("sleep 90; echo done")
+      expect(posted[0].text).toStartWith(`<system-update>\n<shell id="${process.pid}" state="completed" command="sleep 90; echo done">`)
+      expect(posted[0].text).toContain(`finished with exit code 0 after 1m 30s.\nIts output (also in ${file}):\ndone\n</shell>`)
+      await cleanup()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("a foreground Cursor shell is not watched", async () => {
+    const { ctx, hooks } = fakeContext()
+    const posted: any[] = []
+    ctx.session.synthetic = async (input: any) => void posted.push(input)
+    const cleanup = await setupPlugin(ctx)
+    const executionID = "cursor_fg_shell"
+    registerCursorShellCall(executionID, { shell_stream: true, command: "true", working_directory: "/tmp", timeout_ms: 30_000 })
+    await hooks.get("tool.execute.after")!({
+      tool: "shell",
+      sessionID: "ses_fg",
+      agent: "build",
+      messageID: "message",
+      id: executionID,
+      input: { command: "true" },
+      status: "completed",
+      result: { output: { output: "", status: "completed", truncated: false }, content: [], metadata: { exit: 0 } },
+    })
+    pollBackgroundShells(Date.now() + BUSY_SETTLE_MS * 10)
+    expect(posted).toEqual([])
+    await cleanup()
+  })
+
+  test("a session's Stop, seen on the event stream, keeps a held note from starting a turn", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cursor-oc2-bg-"))
+    try {
+      const file = finishedTerminalFile(dir, "")
+      const posted: any[] = []
+      const notifier = async (input: any) => void posted.push(input)
+      watchBackgroundShell({ sessionID: "ses_stop", pid: process.pid, file, command: "make test", notifier })
+      const { ctx } = fakeContext([{ type: "session.execution.interrupted", data: { sessionID: "ses_stop", reason: "user" } }])
+      ctx.session.synthetic = notifier
+      const cleanup = await setupPlugin(ctx)
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      pollBackgroundShells(Date.now())
+      expect(posted).toHaveLength(1)
+      expect(posted[0].resume).toBe(false)
+      await cleanup()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("cleanup stops a setup posting notes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cursor-oc2-bg-"))
+    try {
+      const { ctx } = fakeContext([{ type: "session.execution.succeeded", data: { sessionID: "ses_gone" } }])
+      const posted: any[] = []
+      ctx.session.synthetic = async (input: any) => void posted.push(input)
+      const cleanup = await setupPlugin(ctx)
+      await cleanup()
+      watchBackgroundShell({ sessionID: "ses_gone", pid: process.pid, file: finishedTerminalFile(dir, ""), command: "x", notifier: ctx.session.synthetic })
+      pollBackgroundShells(Date.now() + BUSY_SETTLE_MS)
+      expect(posted).toEqual([])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   test("reloads the provider inventory from cache without writing opencode.json", async () => {

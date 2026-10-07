@@ -14,11 +14,19 @@ import {
 } from "./web-tools.js"
 import {
   captureCursorShellResult,
+  capturedCursorShellOutcome,
   cursorShellEnvForCommand,
   prepareCursorShellArgs,
   releaseCursorShellEnv,
   sanitizeRegisteredCursorShellOutput,
 } from "./shell-timeout.js"
+import {
+  forgetBackgroundShells,
+  noteSessionExecution,
+  registerBackgroundShellNotifier,
+  watchBackgroundShell,
+  type BackgroundShellNotifier,
+} from "./background-shell-notice.js"
 import { applyCursorProviderInventory, CURSOR_INTEGRATION_ID } from "./opencode2/catalog.js"
 import {
   applyCursorIntegration,
@@ -143,6 +151,9 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
     let disposeHostAgentModeSwitch: (() => void) | undefined
     trace(`opencode2 plugin: setup directory=${workspaceRoot}`)
     const hasShellEnvHook = typeof ctx.shell?.hook === "function"
+    const synthetic = ctx.session.synthetic
+    const shellNotifier: BackgroundShellNotifier | undefined = synthetic ? (note) => synthetic(note) : undefined
+    const disposeShellNotifier = shellNotifier && registerBackgroundShellNotifier(shellNotifier)
 
     if (typeof ctx.session.switchAgent === "function") {
       const switchAgent = ctx.session.switchAgent
@@ -389,6 +400,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
               metadata.output = sanitizeRegisteredCursorShellOutput(executionID, metadata.output)
             }
           }
+          if (shellNotifier) watchCursorBackgroundShell(executionID, event.sessionID, shellNotifier)
         } finally {
           releaseCursorShellEnv(executionID)
         }
@@ -554,6 +566,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
     return async () => {
       clearInterval(retry)
       unsubscribe?.()
+      disposeShellNotifier?.()
       disposeHostAgentModeSwitch?.()
       disposeNativePlansDir()
       trace(`opencode2 plugin: cleanup directory=${workspaceRoot}`)
@@ -577,6 +590,7 @@ function subscribeSessionActivity(
       for await (const event of stream as AsyncIterable<any>) {
         if (stopped) break
         applySessionActivity(event, onCredentialSwitch)
+        applyBackgroundShellLifecycle(event)
         onEvent?.()
       }
     })().catch(() => {})
@@ -586,6 +600,28 @@ function subscribeSessionActivity(
   } catch {
     return undefined
   }
+}
+
+const EXECUTION_PHASES = ["started", "succeeded", "failed", "interrupted"] as const
+type ExecutionPhase = (typeof EXECUTION_PHASES)[number]
+
+function applyBackgroundShellLifecycle(event: any): void {
+  const type = typeof event?.type === "string" ? event.type : ""
+  const payload = eventPayload(event)
+  const sessionID = payload?.sessionID ?? payload?.info?.id
+  if (typeof sessionID !== "string" || !sessionID) return
+  if (type === "session.deleted") {
+    forgetBackgroundShells(sessionID)
+    return
+  }
+  const phase = type.slice("session.execution.".length) as ExecutionPhase
+  if (type.startsWith("session.execution.") && EXECUTION_PHASES.includes(phase)) noteSessionExecution(sessionID, phase)
+}
+
+function watchCursorBackgroundShell(executionID: string, sessionID: string, notifier: BackgroundShellNotifier): void {
+  const outcome = capturedCursorShellOutcome(executionID)
+  if (outcome?.kind !== "backgrounded" || !outcome.logPath) return
+  watchBackgroundShell({ sessionID, pid: outcome.pid, file: outcome.logPath, command: outcome.command, notifier })
 }
 
 function applySessionActivity(event: any, onCredentialSwitch?: () => void): void {

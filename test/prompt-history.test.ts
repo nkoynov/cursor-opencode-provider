@@ -8,6 +8,7 @@ import {
 } from "../src/language-model.js"
 import { buildSeedConversationState } from "../src/protocol/request.js"
 import { resetHostAgentModeSwitchForTests, setHostAgentModeSwitch } from "../src/host-agent-mode.js"
+import { registerBackgroundShellNotifier, resetBackgroundShellNotices } from "../src/background-shell-notice.js"
 import { decodeMessage } from "../src/protocol/messages.js"
 
 describe("estimateTokens", () => {
@@ -54,6 +55,20 @@ describe("buildOpenCodeInteractionGuidance", () => {
     expect(guidance).toContain("on every invocation including each parallel call")
     expect(guidance).not.toContain("`plan_enter`")
     expect(guidance).not.toContain("`webfetch`")
+  })
+
+  it("says background shells report back only once the host can post their notes", () => {
+    resetBackgroundShellNotices({ manualPolling: true })
+    try {
+      const line = "Background shells report back"
+      expect(buildOpenCodeInteractionGuidance([{ name: "shell" }], false, "/workspace")).not.toContain(line)
+      const dispose = registerBackgroundShellNotifier(async () => {})
+      dispose()
+      expect(buildOpenCodeInteractionGuidance([{ name: "shell" }], false, "/workspace")).toContain(line)
+      expect(buildOpenCodeInteractionGuidance([{ name: "read" }], false, "/workspace")).not.toContain(line)
+    } finally {
+      resetBackgroundShellNotices()
+    }
   })
 
   it("gates native question and helper guidance independently by the canonical catalog", () => {

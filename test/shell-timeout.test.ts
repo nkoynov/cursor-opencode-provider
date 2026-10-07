@@ -146,6 +146,7 @@ describe("Cursor shell timeout translation", () => {
         workingDirectory: "/tmp",
         msToWait: 30_000,
         reason: 1,
+        logPath: "/tmp/cursor-opencode-shell.XYZ",
       },
     })
   })
@@ -267,6 +268,7 @@ describe("Cursor shell timeout translation", () => {
         workingDirectory: "/tmp",
         msToWait: 0,
         reason: 1,
+        logPath: "/tmp/cursor-opencode-bg.ABC123",
       },
     })
   })
