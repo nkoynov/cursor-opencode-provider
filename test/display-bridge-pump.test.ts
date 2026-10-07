@@ -1553,7 +1553,7 @@ describe("display-only ToolCall pump bridge", () => {
     expect(session.closed).toBe(true)
   })
 
-  it("emits checkpoint occupancy and preserves raw turn_ended counters", async () => {
+  it("splits checkpoint occupancy like turn_ended and preserves the raw counters", async () => {
     const parts: any[] = []
     const session = fakeSession(
       [
@@ -1584,14 +1584,10 @@ describe("display-only ToolCall pump bridge", () => {
 
     const finish = parts.find((part) => part.type === "finish")
     expect(finish).toBeDefined()
-    expect(finish!.usage.inputTokens.total).toBe(139)
-    expect(
-      finish!.usage.inputTokens.noCache
-        + finish!.usage.inputTokens.cacheRead
-        + finish!.usage.inputTokens.cacheWrite,
-    ).toBe(139)
-    expect(finish!.usage.inputTokens.cacheWrite).toBe(0)
-    expect(finish!.usage.outputTokens).toEqual({ total: 1, text: 1, reasoning: 0 })
+    // The Run's only finish: the parts match its turn_ended counts and still add up to occupancy.
+    expect(finish!.usage.inputTokens).toEqual({ total: 100, noCache: 85, cacheRead: 12, cacheWrite: 3 })
+    expect(finish!.usage.outputTokens).toEqual({ total: 40, text: 40, reasoning: 0 })
+    expect(finish!.usage.inputTokens.total + finish!.usage.outputTokens.total).toBe(140)
     expect(finish!.providerMetadata).toMatchObject({
       copilot: { totalNanoAiu: 0 },
       cursor: {
@@ -1651,6 +1647,31 @@ describe("progress-only continuation pump", () => {
     expect(reopenCalls).toBe(1)
     expect(parts.some((p) => p.type === "finish" && p.finishReason?.unified === "stop")).toBe(true)
     expect(session.closed).toBe(true)
+  })
+
+  it("settles the finish against both Cursor turns of a reopened Run", async () => {
+    const turnEnded = (input: number, output: number) => encodeMessage("AgentServerMessage", {
+      interaction_update: { turn_ended: { input_tokens: input, output_tokens: output } },
+    })
+    const parts: any[] = []
+    const session = fakeSession([textDeltaPayload("Checking the workspace"), turnEnded(300, 40)], [])
+    session.resumeCheckpoint = Uint8Array.of(1, 2, 3)
+    session.tokenDetails = { usedTokens: 1_000, maxTokens: 256_000 }
+    session.reopenWithUserMessage = async () => {
+      session.frames = iteratorFrom([textDeltaPayload("Done."), turnEnded(500, 60)])
+    }
+    const controller = {
+      enqueue(part: unknown) {
+        parts.push(part)
+      },
+      error() {},
+    } as unknown as ReadableStreamDefaultController<any>
+
+    await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
+
+    const finish = parts.find((part) => part.type === "finish")
+    expect(finish.usage.outputTokens.total).toBe(100)
+    expect(finish.usage.inputTokens).toEqual({ total: 900, noCache: 800, cacheRead: 100, cacheWrite: 0 })
   })
 
   it("does not reopen a complete answer that starts with a progress verb", async () => {
