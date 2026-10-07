@@ -370,6 +370,7 @@ describe("stopping a Run at the first switched step", () => {
     ])
     const session = fakeRun(script.frames, { turnBase })
     const sessionKey = session.openCodeSessionId!
+    const before = session.conversationId
 
     const parts = await pass(session)
 
@@ -383,9 +384,9 @@ describe("stopping a Run at the first switched step", () => {
     expect(cancelled()).toBe(true)
     // A fresh conversation continues from the checkpoint the turn started from.
     const next = peekConversationId(sessionKey)
-    expect(next).not.toBe(session.conversationId)
+    expect(next).not.toBe(before)
     expect(getCheckpoint(next)).toEqual(turnBase)
-    expect(getCheckpoint(session.conversationId)).toBeUndefined()
+    expect(getCheckpoint(before)).toBeUndefined()
     expect(peekModelFallbackStop(sessionKey)).toMatchObject({ servedModel: "claude-opus-4-8", checkpointHoldsTurn: false })
     const persisted = (await loadPersistedConversation(path.join(root, "cache"), sessionKey)).value
     expect(persisted?.conversationId).toBe(next)
@@ -740,6 +741,81 @@ describe("the turn after a stop", () => {
       const stopped = await step(sessionKey, flagged as Prompt)
       await step(sessionKey, [...flagged, assistant(stopped), user("no, do not continue with opus 4.8 — use the README instead")] as Prompt)
       expect(runText(cursor.runs[1])).toStartWith("no, do not continue with opus 4.8")
+    } finally {
+      cursor.restore()
+    }
+  })
+
+  async function stepParts(sessionKey: string, prompt: Prompt): Promise<any[]> {
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async () => { throw new Error("no network in this test") }) as unknown as typeof fetch
+    try {
+      const model = createCursor({ name: "cursor", accessToken: "token", agentBaseURL: "https://agentn.us.api5.cursor.sh", workspaceRoot: root })
+        .languageModel("claude-opus-5-5")
+      const result = await model.doStream({
+        prompt,
+        headers: { "x-opencode-session-id": sessionKey },
+        tools: [{ type: "function", name: "read", description: "Read a file", inputSchema: { type: "object", properties: {} } }],
+      } as LanguageModelV3CallOptions)
+      const reader = result.stream.getReader()
+      const parts: any[] = []
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        parts.push(value)
+      }
+      return parts
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  }
+  /** A turn whose read step Cursor marks as switched once the host returns the read's result. */
+  async function stoppedToolTurn(sessionKey: string) {
+    const file = path.join(root, "README.md")
+    fs.writeFileSync(file, "# demo\n")
+    const flagged = [SYSTEM, user("Read README.md")]
+    const first = await stepParts(sessionKey, flagged as Prompt)
+    const call = first.find((p) => p.type === "tool-call")
+    expect(call).toBeDefined()
+    const withResult = [
+      ...flagged,
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: call.toolCallId, toolName: "read", input: JSON.parse(call.input) }] },
+      { role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: "read", output: { type: "text", value: "# demo" } }] },
+    ]
+    const second = await stepParts(sessionKey, withResult as Prompt)
+    const stopped = second.filter((p) => p.type === "text-delta").map((p) => p.delta).join("")
+    expect(stopped).toContain("**Stopped:**")
+    return { prompt: [...withResult, assistant(stopped)], conversationId: peekConversationId(sessionKey) }
+  }
+  const readTurn = (callId: string) => [
+    { interaction_update: { tool_call_started: { call_id: callId, tool_call: { read_tool_call: { args: { path: path.join(root, "README.md") } } } } } },
+    { interaction_update: { tool_requests_listed: { call_count: 1 } } },
+    { exec_server_message: { id: 1, read_args: { path: path.join(root, "README.md"), tool_call_id: callId } } },
+    { kv_server_message: { id: 1, set_blob_args: { blob_id: createHash("sha256").update(callId).digest(), blob_data: blob(assistantMessage({ fallback: FALLBACK, toolCallIds: [callId] })) } } },
+    { conversation_checkpoint_update: encodeMessage("ConversationStateStructure", { token_details: { used_tokens: 999, max_tokens: 1_000_000 } }) },
+    { interaction_update: { turn_ended: { input_tokens: 1, output_tokens: 1 } } },
+  ]
+
+  it("keeps the next turn on the moved conversation after a stop in a tool step", async () => {
+    const cursor = fakeCursorRuns([readTurn("toolu_r1"), cleanTurn("ok")])
+    try {
+      const sessionKey = `ses_e2e_${++seq}`
+      const { prompt, conversationId } = await stoppedToolTurn(sessionKey)
+      await step(sessionKey, [...prompt, user("What is in package.json?")] as Prompt)
+      expect(cursor.runs[1].conversation_id).toBe(conversationId)
+    } finally {
+      cursor.restore()
+    }
+  })
+
+  it("still notices another model's answer after a stop", async () => {
+    const cursor = fakeCursorRuns([readTurn("toolu_r2"), cleanTurn("ok")])
+    try {
+      const sessionKey = `ses_e2e_${++seq}`
+      const { prompt, conversationId } = await stoppedToolTurn(sessionKey)
+      await step(sessionKey, [...prompt, user("Ask another model"), assistant("An answer from another provider."), user("Back to Cursor")] as Prompt)
+      expect(cursor.runs[1].conversation_id).not.toBe(conversationId)
+      expect(runText(cursor.runs[1])).toContain("An answer from another provider.")
     } finally {
       cursor.restore()
     }

@@ -3956,6 +3956,8 @@ export async function pump(
       detected.rollback,
       detected.holdsTurn ? undefined : (switchGuard?.epochAtTurnStart ?? null),
     )
+    // The stop text is recorded as this session's latest step, under the conversation it continues.
+    session.conversationId = conversationId
     const stop = {
       requestedModel,
       servedModel: detected.to,
