@@ -142,6 +142,7 @@ import {
 } from "./protocol/blob-store.js"
 import {
   bindConversationId,
+  hasConversationBinding,
   peekConversationId,
   resolveConversationGroupId,
 } from "./protocol/conversation-bind.js"
@@ -1311,11 +1312,14 @@ async function startSession(
   const sessionKey = opencodeSessionKey(callOptions)
   const isolateHelper = startOptions?.isolate === true
   const cacheDir = opencodeGlobalCacheDir()
+  // Memory or the restart snapshot knows which early steers the model answered; otherwise nothing does, unless nothing was answered yet.
+  let answeredSteersKnown = !!sessionKey && hasConversationBinding(sessionKey)
   if (sessionKey) {
     const restored = await hydrateConversationState(cacheDir, sessionKey).catch((error) => {
       trace(`conversation persistence: restore failed sessionKey=${sessionKey}: ${String(error)}`)
       return undefined
     })
+    if (restored) answeredSteersKnown = true
     if (restored?.postCompactionRebase) rememberPostCompactionRebase(sessionKey)
     if (restored?.hostNote) rememberUndeliveredHostNote(sessionKey, restored.hostNote)
     if (restored?.toolCatalog.length) restoreTurnToolCatalog(sessionKey, restored.toolCatalog)
@@ -1464,7 +1468,7 @@ async function startSession(
   const lastUser = [...prompt].reverse().find((message) => message.role === "user")
   // Title, summary and helper calls end with their own instruction, so only it is their request.
   const liveTurn = allowTools && !isCompaction && !isolateHelper
-    ? liveUserTurn(prompt, startOptions?.answeredSteers)
+    ? liveUserTurn(prompt, startOptions?.answeredSteers, !answeredSteersKnown && prompt.some((m) => m.role === "assistant"))
     : undefined
   let userText = recovery?.kind === "rebase" && !checkpointUnusable
     ? "Continue the interrupted turn from the conversation history above. Do not repeat completed work."
@@ -5703,15 +5707,19 @@ function userTurnStart(prompt: LanguageModelV3CallOptions["prompt"]): number {
   return start
 }
 
-/** All user messages since the model's last output: OpenCode 2 sends host notes as user messages, promoted along with the user's own. */
+/**
+ * All user messages since the model's last output: OpenCode 2 sends host notes as user messages, promoted along with the user's own.
+ * With `lastOnly` (nothing knows which steers were answered, so there is no checkpoint either) the replay marks the earlier ones "no reply".
+ */
 function liveUserTurn(
   prompt: LanguageModelV3CallOptions["prompt"],
   answered: ReadonlySet<number> = new Set(),
+  lastOnly = false,
 ): { start: number; text: string; answered: ReadonlySet<number> } | undefined {
-  const start = userTurnStart(prompt)
-  if (start === prompt.length) return undefined
+  if (prompt.at(-1)?.role !== "user") return undefined
+  const start = lastOnly ? prompt.length - 1 : userTurnStart(prompt)
   const texts = prompt.slice(start).flatMap((message, offset) => {
-    if (answered.has(start + offset)) return []
+    if (!lastOnly && answered.has(start + offset)) return []
     // Tool-result media reaches Cursor as history images; its caption is not part of the request.
     const note = hostTailNote(message)
     if (note && note.text === undefined) return []

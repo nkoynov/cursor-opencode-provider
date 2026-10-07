@@ -114,13 +114,12 @@ describe("the user turn of a fresh Run", () => {
     resetFrozenRequestContextsForTests()
   })
 
-  function newSession(options: { checkpointed?: boolean } = {}): string {
+  /** `bound`: this process already runs the session's conversation; `checkpointed`: and holds its checkpoint. */
+  function newSession(options: { bound?: boolean; checkpointed?: boolean } = {}): string {
     const sessionKey = `ses_live_turn_${++seq}`
     sessions.push(sessionKey)
-    if (options.checkpointed) {
-      restoreConversationBinding(sessionKey, `conv-${sessionKey}`)
-      setCheckpoint(`conv-${sessionKey}`, checkpoint())
-    }
+    if (options.bound || options.checkpointed) restoreConversationBinding(sessionKey, `conv-${sessionKey}`)
+    if (options.checkpointed) setCheckpoint(`conv-${sessionKey}`, checkpoint())
     return sessionKey
   }
 
@@ -199,7 +198,7 @@ describe("the user turn of a fresh Run", () => {
   })
 
   it("keeps the user's message and the note out of the replayed history of a Run without a checkpoint", async () => {
-    const run = await step(newSession(), [
+    const run = await step(newSession({ bound: true }), [
       { role: "system", content: "You are a coding agent." },
       user("hello"),
       assistant("Hi."),
@@ -254,7 +253,7 @@ describe("the user turn of a fresh Run", () => {
   })
 
   it("keeps an answered steer in the replay as a message with no reply", async () => {
-    const sessionKey = newSession()
+    const sessionKey = newSession({ bound: true })
     answeredEarly(sessionKey, STEER)
 
     const run = await step(sessionKey, [
@@ -298,6 +297,30 @@ describe("the user turn of a fresh Run", () => {
     expect(new Uint8Array(run.conversation_state)).toEqual(checkpoint())
     expect(userText(run)).toStartWith(QUESTION)
     expect(userText(run)).not.toContain(STEER)
+  })
+
+  it("after a restart that lost the snapshot, sends the last message and replays the earlier ones as no reply", async () => {
+    const run = await step(newSession(), [
+      user("What is 17 * 23?"),
+      assistant("391"),
+      user(STEER),
+      user(QUESTION),
+    ] as Prompt)
+
+    const { transcript, live } = splitTranscript(run)
+    expect(live).toStartWith(QUESTION)
+    expect(live).not.toContain(STEER)
+    expect(transcript).toContain(`[User, no reply]\n${STEER}`)
+  })
+
+  it("sends a note and the user's first message of a new session together", async () => {
+    const run = await step(newSession(), [
+      { role: "system", content: SYSTEM },
+      user(SYSTEM_UPDATE),
+      user(QUESTION),
+    ] as Prompt)
+
+    expect(splitTranscript(run).live).toStartWith(`${SYSTEM_UPDATE}\n\n${QUESTION}`)
   })
 
   it("still sends a user turn the restart snapshot would leave empty", async () => {
