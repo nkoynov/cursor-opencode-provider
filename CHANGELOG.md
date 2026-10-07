@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Grok 4.7's 500k variants (`Grok 4.7 High 500k` and the rest) run in max mode like the 1M variants, instead of failing with `Cursor API error (code=not_found)`: any context above the model's base window now selects max mode, not only 1m
+
 ## [0.8.1] - 2026-10-08
 
 ### Added

@@ -246,13 +246,22 @@ export function resolveCursorWireModelId(
   return typeof value === "string" && value.trim() ? value : fallback
 }
 
-/** True when resolved params select the long-context (1m) tier. */
-export function paramsImplyMaxMode(params: ModelParameterValue[]): boolean {
-  return params.some(
-    (parameter) =>
-      parameter.id === "context" &&
-      parseCursorContextLimit(parameter.value) === 1_000_000,
+/**
+ * True when resolved params select a long-context tier: 1m or larger, or any
+ * tier above the model's base window (Grok 4.7's 500k over 256k). Cursor
+ * serves those tiers only in max mode; without it Grok's 500k fails with
+ * `not_found`.
+ */
+export function paramsImplyMaxMode(
+  params: ModelParameterValue[],
+  model?: ModelInfo,
+): boolean {
+  const requested = parseCursorContextLimit(
+    params.find((parameter) => parameter.id === "context")?.value,
   )
+  if (requested === undefined) return false
+  const base = model?.maxContext
+  return requested >= 1_000_000 || (base !== undefined && requested > base)
 }
 
 /**
@@ -261,9 +270,9 @@ export function paramsImplyMaxMode(params: ModelParameterValue[]): boolean {
  */
 export function resolveVariantMaxMode(
   params: ModelParameterValue[],
-  opts: { picked?: ModelParameterValue[]; maxMode?: boolean } = {},
+  opts: { picked?: ModelParameterValue[]; maxMode?: boolean; model?: ModelInfo } = {},
 ): boolean {
-  return paramsImplyMaxMode(params) || (opts.picked === undefined && opts.maxMode === true)
+  return paramsImplyMaxMode(params, opts.model) || (opts.picked === undefined && opts.maxMode === true)
 }
 
 // Cursor encodes a model's context window as a variant parameter `id: "context"`
@@ -289,10 +298,6 @@ export function parseCursorContextLimit(value: unknown): number | undefined {
 function variantContextTokens(v: ModelVariant | undefined): number | undefined {
   const raw = v?.parameterValues.find((p) => p.id === "context")?.value
   return parseCursorContextLimit(raw)
-}
-
-function isLongContextVariant(v: ModelVariant): boolean {
-  return variantContextTokens(v) === 1_000_000
 }
 
 function positiveNumber(value: unknown): number | undefined {
@@ -458,6 +463,8 @@ export function resolveVariantParameters(
     v.parameterValues.find((p) => p.id === "effort" || p.id === "reasoning")?.value
   const isFast = (v: ModelVariant): boolean =>
     v.parameterValues.find((p) => p.id === "fast")?.value === "true"
+  const isLongContextVariant = (v: ModelVariant): boolean =>
+    paramsImplyMaxMode(v.parameterValues, model)
   const isMaxVariant = (v: ModelVariant): boolean =>
     v.isDefaultMax || isLongContextVariant(v)
 
@@ -500,7 +507,7 @@ export function resolveVariantParameters(
     }
   }
 
-  // 3. Max-mode hint → prefer the default max variant (1m context).
+  // 3. Max-mode hint → prefer the default max variant (the long-context tier).
   if (wantMax) {
     const max = scoped.find((v) => v.isDefaultMax) ?? scoped.find(isLongContextVariant)
     if (max) return buildRequestedModelParams(max.parameterValues, { maxMode: true })
