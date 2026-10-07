@@ -1281,9 +1281,11 @@ async function startSession(
   }
 
   const lastUser = [...prompt].reverse().find((message) => message.role === "user")
+  // Title, summary and helper calls end with their own instruction, so only it is their request.
+  const liveTurn = allowTools && !isCompaction && !isolateHelper ? liveUserTurn(prompt) : undefined
   let userText = recovery?.kind === "rebase" && !checkpointUnusable
     ? "Continue the interrupted turn from the conversation history above. Do not repeat completed work."
-    : (extractUserText(lastUser) || ".")
+    : ((liveTurn ? liveTurn.text : extractUserText(lastUser)) || ".")
   // After an approved SwitchMode, inject the Cursor CLI-shaped mode reminder
   // (same <system_reminder> contract the CLI uses after flipping unifiedMode).
   const startedWithCheckpoint = !!conversationState
@@ -1363,6 +1365,7 @@ async function startSession(
     // A foreign-history rebase replays every tool result: the other model's work
     // exists only in OpenCode history, never in a Cursor checkpoint.
     toolResults: isCompaction || foreignHistory || checkpointUnusable ? "all" : (recovery?.kind === "rebase" ? "trailing" : "omit"),
+    ...(liveTurn ? { liveTurnStart: liveTurn.start } : {}),
   })
 
   await loadAvailableModels()
@@ -4467,6 +4470,8 @@ export function extractPromptHistory(
   options?: {
     preserveTrailingUser?: boolean
     toolResults?: "omit" | "all" | "trailing"
+    /** First message of the Run's user turn (`liveUserTurn`); it and the rest are not history. */
+    liveTurnStart?: number
   },
 ): SeedHistoryMessage[] {
   const out: SeedHistoryMessage[] = []
@@ -4477,7 +4482,9 @@ export function extractPromptHistory(
       trailingToolStart--
     }
   }
-  for (let messageIndex = 0; messageIndex < prompt.length; messageIndex++) {
+  const liveTurnStart = options?.preserveTrailingUser ? undefined : options?.liveTurnStart
+  const historyEnd = liveTurnStart ?? prompt.length
+  for (let messageIndex = 0; messageIndex < historyEnd; messageIndex++) {
     const m = prompt[messageIndex]!
     if (m.role === "system") {
       if (typeof m.content === "string" && m.content.length > 0) {
@@ -4518,10 +4525,25 @@ export function extractPromptHistory(
     }
   }
   // Live user message is the Run action, not seed history.
-  if (!options?.preserveTrailingUser && out.length > 0 && out[out.length - 1]!.role === "user") {
+  if (!options?.preserveTrailingUser && liveTurnStart === undefined && out.length > 0 && out[out.length - 1]!.role === "user") {
     out.pop()
   }
   return out
+}
+
+/** All user messages since the model's last output: OpenCode 2 sends host notes as user messages, promoted along with the user's own. */
+function liveUserTurn(prompt: LanguageModelV3CallOptions["prompt"]): { start: number; text: string } | undefined {
+  let start = prompt.length
+  while (start > 0 && prompt[start - 1]!.role === "user") start--
+  if (start === prompt.length) return undefined
+  const texts = prompt.slice(start).flatMap((message) => {
+    // Tool-result media reaches Cursor as history images; its caption is not part of the request.
+    const note = hostTailNote(message)
+    if (note && note.text === undefined) return []
+    const text = extractUserText(message as unknown as Record<string, unknown>)
+    return text && text !== "." ? [text] : []
+  })
+  return { start, text: texts.join("\n\n") }
 }
 
 function formatSeedToolObservation(input: {

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A message OpenCode queues right before or after the user's own one (a finished background shell, subagent or task, a `<system-update>`) no longer replaces it: a Run sends every user message since the model's last reply, in OpenCode's order, where it sent only the last one, so on a Run with a Cursor checkpoint the user's question or the host note was lost, and without one the question was replayed as history while the note became the request ([#61](https://github.com/oakimov/cursor-opencode-provider/pull/61) by [@nkoynov](https://github.com/nkoynov))
+
 ## [0.8.0] - 2026-10-04
 
 ### Changed

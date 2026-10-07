@@ -281,6 +281,19 @@ describe("extractPromptHistory", () => {
     ])
   })
 
+  it("leaves out every message of the Run's user turn", () => {
+    const history = extractPromptHistory([
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+      { role: "assistant", content: [{ type: "text", text: "hello" }] },
+      { role: "user", content: [{ type: "text", text: "Is the build green?" }] },
+      { role: "user", content: [{ type: "text", text: '<shell id="sh_1" state="completed" command="make">\nok\n</shell>' }] },
+    ] as LanguageModelV3CallOptions["prompt"], { liveTurnStart: 2 })
+    expect(history).toEqual([
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello" },
+    ])
+  })
+
   const toolHistoryPrompt = [
       { role: "user", content: "do it" },
       {
