@@ -1,7 +1,16 @@
+import { statSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { trace } from "../debug.js"
 import { ensureOpencodeProjectDir } from "./paths.js"
+
+function isDirectory(dir: string): boolean {
+  try {
+    return statSync(dir).isDirectory()
+  } catch {
+    return false
+  }
+}
 
 export function buildEnv(workspaceRoot: string): Record<string, unknown> {
   const cwd = path.resolve(workspaceRoot)
@@ -25,6 +34,7 @@ export function buildEnv(workspaceRoot: string): Record<string, unknown> {
   // cwd. OpenCode 2.0's daemon is long-lived and often started from $HOME, so
   // process.cwd() would advertise the home folder to Cursor and the model would
   // treat that as its shell cwd. workspace_paths already uses `cwd` above.
+  const agentTranscriptsFolder = path.join(projectFolder, "agent-transcripts")
   const env = {
     os_version: osVersion,
     workspace_paths: [cwd],
@@ -34,7 +44,8 @@ export function buildEnv(workspaceRoot: string): Record<string, unknown> {
     time_zone: timeZone,
     project_folder: projectFolder,
     terminals_folder: path.join(projectFolder, "terminals"),
-    agent_transcripts_folder: path.join(projectFolder, "agent-transcripts"),
+    // Cursor sends the model here for past chats, which nothing on this side writes.
+    ...(isDirectory(agentTranscriptsFolder) ? { agent_transcripts_folder: agentTranscriptsFolder } : {}),
     process_working_directory: cwd,
     is_working_dir_home_dir: cwd === path.resolve(home),
   }
@@ -42,7 +53,7 @@ export function buildEnv(workspaceRoot: string): Record<string, unknown> {
     `buildEnv: workspace_paths=${JSON.stringify(env.workspace_paths)} ` +
       `project_folder=${env.project_folder} ` +
       `terminals_folder=${env.terminals_folder} ` +
-      `agent_transcripts_folder=${env.agent_transcripts_folder} ` +
+      `agent_transcripts_folder=${env.agent_transcripts_folder ?? "(omitted)"} ` +
       `process_working_directory=${env.process_working_directory}`,
   )
   return env

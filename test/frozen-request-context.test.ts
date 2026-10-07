@@ -22,7 +22,7 @@ import {
 } from "../src/protocol/conversation-bind.js"
 import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { resetConversationBlobsForTests } from "../src/protocol/blob-store.js"
-import { HOST_PATH_BRIDGE, setHostCacheDirOverride } from "../src/context/paths.js"
+import { HOST_PATH_BRIDGE, opencodeProjectDir, setHostCacheDirOverride } from "../src/context/paths.js"
 import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
 import {
   hydrateConversationState,
@@ -187,6 +187,39 @@ describe("frozen request_context", () => {
     expect(second.reused).toBe(true)
     const bytes2 = encodeRequestContext(second.context)
     expect(sha(bytes2)).toBe(sha(bytes1))
+  })
+
+  it("keeps a conversation's env when the agent-transcripts folder appears later", async () => {
+    const folder = path.join(opencodeProjectDir(root), "agent-transcripts")
+    await rm(folder, { recursive: true, force: true })
+    const first = await getOrBuildRequestContext("conv-freeze-transcripts", { workspaceRoot: root })
+    expect(first.context.env).not.toHaveProperty("agent_transcripts_folder")
+    const bytes1 = encodeRequestContext(first.context)
+
+    await mkdir(folder, { recursive: true })
+    try {
+      const second = await getOrBuildRequestContext("conv-freeze-transcripts", { workspaceRoot: root })
+      expect(second.reused).toBe(true)
+      expect(sha(encodeRequestContext(second.context))).toBe(sha(bytes1))
+
+      const fresh = await getOrBuildRequestContext("conv-freeze-transcripts-new", { workspaceRoot: root })
+      expect((fresh.context.env as Record<string, unknown>).agent_transcripts_folder).toBe(folder)
+    } finally {
+      await rm(folder, { recursive: true, force: true })
+    }
+  })
+
+  it("keeps agent_transcripts_folder in a base frozen by an earlier version", async () => {
+    const conversationId = "conv-freeze-legacy-transcripts"
+    const built = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
+    const legacyEnv = {
+      ...(built.context.env as Record<string, unknown>),
+      agent_transcripts_folder: "/legacy/agent-transcripts",
+    }
+    setFrozenRequestContext(conversationId, { ...built.context, env: legacyEnv })
+
+    const next = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
+    expect((next.context.env as Record<string, unknown>).agent_transcripts_folder).toBe("/legacy/agent-transcripts")
   })
 
   it("refresh forces a rebuild", async () => {
