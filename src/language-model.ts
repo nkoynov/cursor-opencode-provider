@@ -241,6 +241,7 @@ import {
   takeEarlySteers,
   type HostSteer,
 } from "./host-steer.js"
+import { backgroundShellNoticesSupported, recordBackgroundShellRead } from "./background-shell-notice.js"
 import { readAllFieldsStrict } from "./protocol/struct.js"
 import {
   cursorUsageCountersFromTurnEnded,
@@ -3532,6 +3533,16 @@ export async function pump(
     return "served"
   }
 
+  const noteBackgroundShellRead = (parsed: ParsedExecRequest): void => {
+    const requested = opencodePathArg(parsed.args)
+    if (!requested || isUriReadTarget(requested)) return
+    const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
+    recordBackgroundShellRead(resolveReadTargetPath(requested, workspaceRoot), session.openCodeSessionId, {
+      offset: typeof parsed.args.offset === "number" ? parsed.args.offset : undefined,
+      limit: typeof parsed.args.limit === "number" ? parsed.args.limit : undefined,
+    })
+  }
+
   const rejectMissingReadTarget = (parsed: ParsedExecRequest): boolean => {
     if (parsed.toolName !== "read") return false
     const requested = opencodePathArg(parsed.args) ?? ""
@@ -4364,6 +4375,7 @@ export async function pump(
             if (!await rejectExec(parsed, reason, "allowTools=false")) return
             continue
           }
+          if (parsed.toolName === "read") noteBackgroundShellRead(parsed)
           // Ahead of the catalog checks: an agent with a shell but no read tool polls these too.
           const terminalRead = await serveTerminalFileRead(parsed)
           if (terminalRead === "failed") return
@@ -5359,6 +5371,9 @@ export function groundCheckpointTurnText(
   })
 }
 
+const BACKGROUND_SHELL_GUIDANCE =
+  "- Background shells report back: when a command started with `block_until_ms: 0`, or moved to the background after its `block_until_ms`, finishes, a `<shell …>` system update gives its exit code and output, and starts a new turn if yours has ended. Unless you need the result to continue, do not wait for it with AwaitShell, sleep, or repeated reads; keep working, or end your response and you will be resumed when it finishes."
+
 /**
  * An epoch-advertised tool the host left out of this step. OpenCode 2 moves
  * tools between the direct list and Code Mode (MCP servers, plugin reloads),
@@ -5403,6 +5418,10 @@ export function buildOpenCodeInteractionGuidance(
   const subagents = extractHostSubagentCatalog(tools)
   const routes = resolveHostToolRoutes(tools, options.knownMcpServers)
   const via = (name: string) => dynamicToolRoute(routes, name)
+
+  if ((names.has("bash") || names.has("shell")) && backgroundShellNoticesSupported()) {
+    instructions.push(BACKGROUND_SHELL_GUIDANCE)
+  }
 
   if (names.has("question")) {
     // Cursor-native AskQuestion is translated into this tool (see
