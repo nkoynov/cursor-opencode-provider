@@ -178,6 +178,7 @@ import {
   unrecordedToolsNote,
   type ModelFallbackReply,
 } from "./model-fallback.js"
+import { assistantBlobShape, noteThinkingKind, takeThinkingKinds } from "./narration.js"
 import { initializeConversationPersistence } from "./protocol/conversation-persistence.js"
 import {
   resolveContinuationPolicy,
@@ -1293,10 +1294,22 @@ function carryModelSwitchState(from: CursorSession, to: CursorSession): void {
   to.modelSwitchGuard.toolRuns = guard.toolRuns.map((run) => ({ ...run, inOpenStep: false }))
 }
 
+/** Debug: the block kinds Cursor stored for a step against how the provider showed its thinking. */
+function traceAssistantBlobShape(session: CursorSession, kv: Record<string, unknown>): void {
+  const data = (kv.set_blob_args as { blob_data?: Uint8Array } | undefined)?.blob_data
+  const shape = data ? assistantBlobShape(data) : undefined
+  if (!shape) return
+  trace(
+    `assistant blob: shape=${shape.join(",") || "-"} ` +
+      `streamedThinking=${takeThinkingKinds(session).join(",") || "-"}`,
+  )
+}
+
 /** A switch Cursor recorded in a stored assistant message; any assistant message also ends the open step. */
 function noteAssistantBlob(session: CursorSession, kv: Record<string, unknown>): void {
   const guard = session.modelSwitchGuard
   const data = (kv.set_blob_args as { blob_data?: Uint8Array } | undefined)?.blob_data
+  traceAssistantBlobShape(session, kv)
   if (!guard || !data || !isAssistantMessageBlob(data)) return
   const found = session.modelSwitch ? undefined : modelSwitchInBlob(data, session.requestedModelId ?? "")
   if (found) {
@@ -2629,6 +2642,7 @@ export async function drainSessionUntilTurnEnded(
 
       if (kv) {
         const handled = handleKvServerMessage(kv, session)
+        if (handled?.kind === "set") traceAssistantBlobShape(session, kv)
         if (!handled) {
           outcome = "busy"
           break
@@ -3509,6 +3523,12 @@ export async function pump(
   // the cancel lands — controller.enqueue on a cancelled controller throws.
   // safeEnqueue swallows that throw and tracks the close so we stop pumping.
   let streamClosed = false
+  /** Thinking blocks since the model's last text or tool call. */
+  const thinkingBlock = { open: false, indexInStep: 0, chars: 0, narration: false }
+  const endThinkingRun = () => {
+    thinkingBlock.open = false
+    thinkingBlock.indexInStep = 0
+  }
   const switchGuard = session.modelSwitchGuard
   const passToolCallIds: string[] = []
   /** The first output of a model step: the checkpoint before it is where a switch in it rolls back to. */
@@ -3801,6 +3821,7 @@ export async function pump(
     if (reasoningStarted && !textStarted) {
       safeEnqueue({ type: "reasoning-end", id: reasoningId } as V3Part)
       reasoningStarted = false
+      reasoningId = crypto.randomUUID()
     }
     if (!textStarted) {
       safeEnqueue({ type: "text-start", id: textId } as V3Part)
@@ -3813,6 +3834,12 @@ export async function pump(
     if (!text) return
     openModelStep()
     replaySafety.markBarrier("visible-reasoning")
+    // Reasoning after text (a Cursor-side tool ran in between) gets its own spans.
+    if (textStarted) {
+      safeEnqueue({ type: "text-end", id: textId } as V3Part)
+      textStarted = false
+      textId = crypto.randomUUID()
+    }
     if (!reasoningStarted) {
       safeEnqueue({ type: "reasoning-start", id: reasoningId } as V3Part)
       reasoningStarted = true
@@ -4235,6 +4262,7 @@ export async function pump(
     }
 
     if (iu?.partial_tool_call || iu?.tool_call_started) openModelStep()
+    if (iu?.partial_tool_call || iu?.tool_call_started || iu?.text_delta || esm) endThinkingRun()
     if (iu?.text_delta) {
       const delta = iu.text_delta as Record<string, unknown>
       const text = (delta.text as string) ?? ""
@@ -4262,8 +4290,31 @@ export async function pump(
         continue
       }
     } else if (iu?.thinking_delta) {
-      emitReasoning(((iu.thinking_delta as Record<string, unknown>).text as string) ?? "")
+      const delta = iu.thinking_delta as Record<string, unknown>
+      const text = (delta.text as string) ?? ""
+      if (!thinkingBlock.open) {
+        thinkingBlock.open = true
+        thinkingBlock.chars = 0
+        thinkingBlock.indexInStep += 1
+        // Opus 5.5 sends at most one progress update per tool call, after its reasoning block.
+        thinkingBlock.narration = thinkingBlock.indexInStep > 1
+        noteThinkingKind(session, thinkingBlock.narration ? "N" : "R")
+        trace(
+          `thinking block start: index=${thinkingBlock.indexInStep} style=${delta.thinking_style ?? "-"} ` +
+            `as=${thinkingBlock.narration ? "text" : "reasoning"}`,
+        )
+      }
+      thinkingBlock.chars += text.length
+      if (thinkingBlock.narration) emitText(text)
+      else emitReasoning(text)
+    } else if (iu?.thinking_completed) {
+      trace(
+        `thinking block end: index=${thinkingBlock.indexInStep} open=${thinkingBlock.open} chars=${thinkingBlock.chars}`,
+      )
+      thinkingBlock.open = false
     } else if (iu?.turn_ended) {
+      // A Run reopened below for a follow-up starts its own model step.
+      endThinkingRun()
       trace(`turn_ended raw wire fields: ${debugWalkTurnEnded(payload)}`)
       keepUndeliveredHostNote(session)
       const turnEnded = iu.turn_ended as Record<string, unknown>
@@ -4403,6 +4454,7 @@ export async function pump(
       recordInjectionState(session, iu.context_injection_state as Record<string, unknown>)
     } else if (iu?.user_message_appended) {
       trace("steer: Cursor appended a user message to the Run")
+      endThinkingRun()
       if (textStarted) textSeparator = "\n\n"
     } else if (iu?.tool_call_started) {
       cacheDiagnostics.displayToolCalls++

@@ -35,6 +35,12 @@ export function createMessageTypes(): protobuf.Root {
 
   addType(root, "ThinkingDeltaUpdate", [
     { id: 1, name: "text", type: "string" },
+    // agent.v1 ThinkingStyle: 0 unspecified, 1 default, 2 codex, 3 gpt5.
+    { id: 2, name: "thinking_style", type: "uint32" },
+  ])
+
+  addType(root, "ThinkingCompletedUpdate", [
+    { id: 1, name: "thinking_duration_ms", type: "int32" },
   ])
 
   addType(root, "TurnEnded", [
@@ -469,6 +475,7 @@ export function createMessageTypes(): protobuf.Root {
       { id: 2, name: "tool_call_started", type: "ToolCallStarted" },
       { id: 3, name: "tool_call_completed", type: "ToolCallCompleted" },
       { id: 4, name: "thinking_delta", type: "ThinkingDeltaUpdate" },
+      { id: 5, name: "thinking_completed", type: "ThinkingCompletedUpdate" },
       { id: 7, name: "partial_tool_call", type: "PartialToolCall" },
       { id: 13, name: "heartbeat", type: "Heartbeat" },
       { id: 14, name: "turn_ended", type: "TurnEnded" },
@@ -485,6 +492,7 @@ export function createMessageTypes(): protobuf.Root {
         "tool_call_started",
         "tool_call_completed",
         "thinking_delta",
+        "thinking_completed",
         "partial_tool_call",
         "heartbeat",
         "turn_ended",
