@@ -178,13 +178,28 @@ export function toolExecMutates(toolName: string, args: Record<string, unknown>,
   return !readOnlyToolName(toolName)
 }
 
-const READ_ONLY_TOOL_VERB = /(?:^|[_.-])(?:get|list|search|read|fetch|find|query|describe|view|status|capabilities)(?:[_.-]|$)/
+const READ_ONLY_TOOL_WORDS = new Set([
+  "get", "list", "search", "read", "fetch", "find", "query", "describe", "view", "status", "capabilities",
+])
+const MUTATING_TOOL_WORDS = new Set([
+  "create", "update", "upsert", "delete", "remove", "save", "set", "add", "send", "post", "put", "patch",
+  "write", "edit", "move", "rename", "merge", "close", "start", "stop", "cancel", "run", "execute", "exec",
+  "mark", "resolve", "submit", "upload", "share", "unshare", "retire", "restore", "archive", "assign",
+  "apply", "launch", "schedule", "configure", "organize", "handoff", "fork", "interrupt", "respond",
+  "promote", "reorder", "discard", "prepare", "complete", "link", "unlink", "watch", "unwatch", "click",
+  "type", "press", "drag", "select", "scroll", "hover", "navigate", "resize", "record", "clone", "react",
+  "approve", "reject", "install", "deploy", "commit", "push", "reset", "kill", "insert", "replace", "clear",
+])
 
-/** Host and MCP tools by name: Claude Code trusts an MCP tool's `readOnlyHint`, which Cursor does not pass on. */
+/**
+ * Host and MCP tools by name: Claude Code trusts an MCP tool's `readOnlyHint`,
+ * which Cursor does not pass on. A name with a reading word and no writing word.
+ */
 export function readOnlyToolName(name: string): boolean {
   if (READ_ONLY_HOST_TOOLS.has(name)) return true
   if (/(?:^|_)delegate_task$/.test(name)) return true
-  return READ_ONLY_TOOL_VERB.test(name)
+  const words = name.toLowerCase().split(/[^a-z]+/)
+  return words.some((word) => READ_ONLY_TOOL_WORDS.has(word)) && !words.some((word) => MUTATING_TOOL_WORDS.has(word))
 }
 
 const READ_ONLY_COMMANDS = new Set([
@@ -220,8 +235,8 @@ function readOnlyInvocation(words: string[]): boolean {
   if (command === "git") return readOnlyGit(args)
   if (command === "find") return !args.some((arg) => /^-(?:delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls)$/.test(arg))
   if (command === "rg") return !args.some((arg) => arg.startsWith("--pre"))
-  if (command === "fd") return !args.some((arg) => /^(?:-x|-X|--exec|--exec-batch)$/.test(arg))
-  if (command === "sort") return !args.some((arg) => arg === "-o" || arg.startsWith("--output"))
+  if (command === "fd") return !args.some((arg) => /^(?:-[a-zA-Z]*[xX]|--exec)/.test(arg))
+  if (command === "sort") return !args.some((arg) => /^(?:-[a-zA-Z]*o|--output)/.test(arg))
   if (command === "uniq") return args.every((arg) => arg.startsWith("-"))
   if (command === "sed") return args.length >= 2 && args[0] === "-n" && /^['"]?(?:\d+|\$)(?:,(?:\d+|\$))?p['"]?$/.test(args[1]!)
   if (command === "command") return args[0] === "-v"

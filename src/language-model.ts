@@ -3499,9 +3499,9 @@ export async function pump(
     }
     return !cursorListsToolRequests || toolStepComplete()
   }
-  /** A step the ordering splits keeps Cursor's count for the next pass. */
+  /** A step the ordering splits keeps Cursor's count, and the calls counted toward it, for the next pass. */
   const carryToolStep = (): void => {
-    if (hasDeferredToolExecs(order) || (toolStep.listed !== undefined && !toolStepComplete())) {
+    if (hasDeferredToolExecs(order) || !toolStepComplete()) {
       session.carriedToolStep = { listed: toolStep.listed, resolved: toolStep.resolved }
     }
   }
@@ -4306,6 +4306,10 @@ export async function pump(
     }
 
     if (iu?.partial_tool_call || iu?.tool_call_started) openModelStep()
+    // Model output opens the next model step; a count carried from the last one no longer applies.
+    if ((iu?.text_delta || iu?.thinking_delta) && toolStep.hostCalls === 0 && !hasDeferredToolExecs(order)) {
+      toolStep = { listed: undefined, resolved: new Set(), hostCalls: 0 }
+    }
     if (iu?.text_delta) {
       const delta = iu.text_delta as Record<string, unknown>
       const text = (delta.text as string) ?? ""

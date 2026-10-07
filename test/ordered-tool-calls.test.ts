@@ -206,10 +206,14 @@ describe("ordered tool calls", () => {
     const session = fakeSession(script.frames)
     const root = rootOf(session)
     for (const name of ["a", "b"]) fs.writeFileSync(path.join(root, name), name)
+    // Live order: Cursor lists the count after the step's first execs.
     for (const next of [
-      listed(3),
+      started("lookup", { get_mcp_tools_tool_call: {} }),
+      listed(1),
+      frame({ interaction_update: { tool_call_completed: { call_id: "lookup", tool_call: { get_mcp_tools_tool_call: {} } } } }),
       ...shell(1, "mk", "mkdir -p out"),
       ...read(2, "ra", path.join(root, "a")),
+      listed(3),
       ...read(3, "rb", path.join(root, "b")),
     ]) script.push(next)
 
@@ -261,7 +265,15 @@ describe("tool call classification", () => {
     for (const name of ["linear_list_issues", "slack_slack_read_channel", "linear_get_issue", "t3-code-1_t3_thread_read", "t3-code-1_delegate_task", "skill"]) {
       expect(readOnlyToolName(name)).toBe(true)
     }
-    for (const name of ["execute", "linear_save_issue", "slack_slack_send_message", "t3-code-1_t3_thread_send", "linear_mark_notification"]) {
+    for (const name of [
+      "execute",
+      "linear_save_issue",
+      "slack_slack_send_message",
+      "t3-code-1_t3_thread_send",
+      "linear_mark_notification",
+      "linear_update_issue_status",
+      "database_find_or_create_record",
+    ]) {
       expect(readOnlyToolName(name)).toBe(false)
     }
     expect(displayToolCallMutates("mcp_tool_call", {}, "linear_save_issue")).toBe(true)
@@ -298,6 +310,9 @@ describe("tool call classification", () => {
       "git branch -D old",
       "git config user.email x",
       "rg --pre ./run foo",
+      "fd --exec=rm x",
+      "fd -xrm x",
+      "sort -uo out in",
       "",
     ]) {
       expect(readOnlyShellCommand(command)).toBe(false)
