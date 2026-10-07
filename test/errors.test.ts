@@ -41,6 +41,7 @@ describe("Cursor provider errors", () => {
       maxAttempts: 3,
       baseDelayMs: 500,
       maxDelayMs: 8_000,
+      capacityMaxAttempts: 6,
     })
     expect(() => resolveRetryPolicy({ maxAttempts: 0 })).toThrow()
     expect(() => resolveRetryPolicy({ maxAttempts: 11 })).toThrow()

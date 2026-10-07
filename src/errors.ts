@@ -151,11 +151,15 @@ export function sanitizeHostTerminalMessage(message: string): string {
 export class CursorRetryExhaustedError extends CursorProviderError {
   readonly attempts: number
 
-  constructor(attempts: number, last: CursorProviderError) {
+  constructor(attempts: number, last: CursorProviderError, elapsedMs?: number) {
     // Host-facing text must not contain OpenCode SessionRetry trigger words
-    // ("unavailable", "exhausted", …). Structured fields keep the real code.
+    // ("unavailable", "exhausted", "at capacity", "try again", …). Structured fields keep the real code.
+    const over = elapsedMs === undefined ? "" : ` over ${Math.round(elapsedMs / 1_000)} s`
     super(
-      `Cursor Run failed after ${attempts} attempts: ${sanitizeHostTerminalMessage(last.message)}`,
+      isCapacityFailure(last)
+        ? `Cursor has no capacity for this model right now (capacity_limit): a limit on Cursor's side, not on ` +
+          `your key. The Run was refused ${attempts} times${over}; send the message again later or pick another model.`
+        : `Cursor Run failed after ${attempts} attempts: ${sanitizeHostTerminalMessage(last.message)}`,
       {
         origin: last.origin,
         transient: false,
@@ -200,6 +204,15 @@ export function isTransientGrpcStatus(status: number | string): boolean {
     normalized === "resource_exhausted" ||
     normalized === "unavailable"
   )
+}
+
+const CAPACITY_CODES = new Set(["resource_exhausted", "unavailable", "8", "14"])
+
+/** Cursor refused the Run for capacity: gRPC resource_exhausted or unavailable, HTTP 429 or 503. */
+export function isCapacityFailure(error: CursorProviderError): boolean {
+  if (error.statusCode === 429 || error.statusCode === 503) return true
+  return [error.code, error.grpcStatus].some((value) =>
+    value !== undefined && CAPACITY_CODES.has(String(value).toLowerCase().replaceAll("-", "_")))
 }
 
 export function isAuthGrpcStatus(status: number | string): boolean {

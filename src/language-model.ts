@@ -178,6 +178,7 @@ import {
   CursorRetryExhaustedError,
   CursorServerError,
   CursorTransportError,
+  isCapacityFailure,
   isRejectedCredentialError,
   isTransientGrpcStatus,
   retrySuppressedError,
@@ -229,6 +230,7 @@ import {
   type CursorShellOutcome,
 } from "./shell-timeout.js"
 import { analyzeReplayFrame, AttemptReplaySafety } from "./replay-safety.js"
+import { noteCursorWaitEnded, noteCursorWaitStarted, semanticDeadlineAt } from "./cursor-waits.js"
 import {
   answeredEarlySteerTexts,
   clearEarlySteers,
@@ -282,6 +284,10 @@ const DEFAULT_RETRY_POLICY = {
 } as const
 const MAX_RETRY_ATTEMPTS = 10
 const MAX_RETRY_DELAY_MS = 30_000
+/** Attempts for a Run Cursor refuses for capacity: retries over about a minute with the default delays. */
+const DEFAULT_CAPACITY_MAX_ATTEMPTS = 6
+/** Capacity retries start this many times `baseDelayMs` above the normal backoff. */
+const CAPACITY_DELAY_FACTOR = 4
 const RUN_REQUEST_DECODE_FAILED = "CURSOR_RUN_REQUEST_DECODE_FAILED"
 const RUN_REQUEST_UNSUPPORTED = "CURSOR_RUN_REQUEST_UNSUPPORTED"
 const RUN_REPLY_FAILED = "CURSOR_RUN_REPLY_FAILED"
@@ -364,6 +370,8 @@ export type CursorRetryPolicy = {
   maxAttempts: number
   baseDelayMs: number
   maxDelayMs: number
+  /** Total attempts when Cursor refuses the Run for capacity. Default: `maxAttempts`. */
+  capacityMaxAttempts?: number
 }
 
 function retryInteger(name: string, value: unknown, fallback: number): number {
@@ -395,11 +403,21 @@ export function resolveRetryPolicy(options: CursorRetryOptions | undefined): Cur
   if (baseDelayMs > maxDelayMs) {
     throw new CursorProtocolError("Cursor retry baseDelayMs must be no greater than maxDelayMs")
   }
-  return { maxAttempts, baseDelayMs, maxDelayMs }
+  // An explicit maxAttempts caps every kind of retry.
+  const capacityMaxAttempts = options?.maxAttempts === undefined ? DEFAULT_CAPACITY_MAX_ATTEMPTS : maxAttempts
+  return { maxAttempts, baseDelayMs, maxDelayMs, capacityMaxAttempts }
 }
 
-function retryDelayMs(error: CursorProviderError, attempt: number, policy: CursorRetryPolicy): number {
+export function retryDelayMs(error: CursorProviderError, attempt: number, policy: CursorRetryPolicy): number {
   if (error.retryAfterMs !== undefined) return Math.min(MAX_RETRY_DELAY_MS, error.retryAfterMs)
+  if (isCapacityFailure(error)) {
+    // Cursor's capacity clears in seconds to minutes: keep at least half of each growing delay.
+    const ceiling = Math.min(
+      MAX_RETRY_DELAY_MS,
+      policy.baseDelayMs * CAPACITY_DELAY_FACTOR * 2 ** Math.max(0, attempt - 1),
+    )
+    return Math.floor(ceiling / 2 + Math.random() * (ceiling / 2))
+  }
   const ceiling = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** Math.max(0, attempt - 1))
   return Math.floor(Math.random() * ceiling)
 }
@@ -1063,14 +1081,19 @@ export async function pumpWithRecovery(input: {
     maxAttempts: (input.maxRecoveries ?? 1) + 1,
   }
   const maxRecoveries = retryPolicy.maxAttempts - 1
+  const capacityMaxRecoveries = (retryPolicy.capacityMaxAttempts ?? retryPolicy.maxAttempts) - 1
+  const startedAt = Date.now()
   let credentialRenewed = false
   input.onSession?.(session)
 
   const resumableCheckpoint = (pumpedSession: CursorSession) =>
     pumpedSession.resultsAfterCheckpoint ? undefined : pumpedSession.resumeCheckpoint
 
-  const reopen = async (pumpedSession: CursorSession, failure: CursorProviderError) => {
-    const checkpoint = resumableCheckpoint(pumpedSession)
+  const reopen = async (
+    pumpedSession: CursorSession,
+    failure: CursorProviderError,
+    checkpoint = resumableCheckpoint(pumpedSession),
+  ) => {
     const toolCallIds = pumpedSession.resultsAfterCheckpoint?.toolCallIds
     const recovery: CursorRunRecovery = failure.checkpointUnusable
       ? { kind: "rebase", reason: "checkpoint-unusable" }
@@ -1158,27 +1181,36 @@ export async function pumpWithRecovery(input: {
         continue
       }
       if (!failure.transient) throw failure
-      const checkpoint = resumableCheckpoint(pumpedSession)
+      // A replay-safe failure keeps the rebase path, in case the carried checkpoint is what failed.
+      const carried = !pumpedSession.resumeCheckpoint && !pumpedSession.resultsAfterCheckpoint && !failure.replaySafe
+        ? pumpedSession.carriedCheckpoint
+        : undefined
+      const checkpoint = resumableCheckpoint(pumpedSession) ?? carried
+      const capacity = isCapacityFailure(failure)
+      const recoveries = capacity ? capacityMaxRecoveries : maxRecoveries
       if (!failure.replaySafe && !checkpoint) {
         throw retrySuppressedError(
           failure,
           "after visible output or stateful server activity",
           attempt + 1,
-          maxRecoveries + 1,
+          recoveries + 1,
         )
       }
-      if (attempt >= maxRecoveries) {
-        throw new CursorRetryExhaustedError(attempt + 1, failure)
+      if (attempt >= recoveries) {
+        throw new CursorRetryExhaustedError(attempt + 1, failure, Date.now() - startedAt)
       }
+      const resuming = checkpoint
+        ? `resuming ${checkpoint.length}B checkpoint${carried ? " this Run resumed from" : ""}`
+        : "rebasing fresh Run"
       trace(
-        `Run interrupted: sessionId=${pumpedSession.sessionId} attempt=${attempt + 1}/${maxRecoveries} ` +
-          `err=${failure.message} — ${checkpoint ? `resuming ${checkpoint.length}B checkpoint` : "rebasing fresh Run"}`,
+        `Run interrupted: sessionId=${pumpedSession.sessionId} attempt=${attempt + 1}/${recoveries} ` +
+          `err=${failure.message} — ${resuming}`,
       )
       sessionManager.close(pumpedSession, "remote-error", failure)
       const delayMs = retryDelayMs(failure, attempt + 1, retryPolicy)
-      trace(`Run retry backoff: attempt=${attempt + 1}/${maxRecoveries} delayMs=${delayMs}`)
+      trace(`Run retry backoff: attempt=${attempt + 1}/${recoveries} delayMs=${delayMs}${capacity ? " (capacity)" : ""}`)
       await sleepForRetry(delayMs, input.abortSignal)
-      session = await reopen(pumpedSession, failure)
+      session = await reopen(pumpedSession, failure, checkpoint)
     } finally {
       stopSteers?.()
       sessionManager.endPump(pumpedSession, pumpOwner)
@@ -1786,6 +1818,7 @@ async function startSession(
     conversationId,
     cacheDir,
     resumeCheckpoint: undefined,
+    ...(resuming ? { carriedCheckpoint: Uint8Array.from(resumeRecovery!.checkpoint) } : {}),
     tokenDetails: priorTokenDetails,
     tokenDetailsFresh: false,
     cacheDiagnostics: {
@@ -2379,6 +2412,7 @@ export async function drainSessionUntilTurnEnded(
           if (session.cacheDiagnostics) session.cacheDiagnostics.checkpointUpdates++
           setCheckpoint(session.conversationId, bytes)
           session.resumeCheckpoint = Uint8Array.from(bytes)
+          session.carriedCheckpoint = undefined
           const tokenDetails = decodeConversationTokenDetails(bytes)
           if (tokenDetails) {
             if (session.cacheDiagnostics) session.cacheDiagnostics.tokenDetailUpdates++
@@ -3136,7 +3170,7 @@ async function writeWithBackpressureNow(
 async function nextFrameWithSemanticDeadline(
   session: CursorSession,
 ): Promise<IteratorResult<Frame>> {
-  const remainingMs = session.semanticDeadlineAt - Date.now()
+  const remainingMs = semanticDeadlineAt(session) - Date.now()
   if (remainingMs <= 0) {
     throw new CursorTransportError(
       `Cursor semantic-progress timeout after ${session.policy.semanticIdleMs}ms`,
@@ -3888,6 +3922,8 @@ export async function pump(
       sessionManager.recordSemanticProgress(session)
     }
     if (replayFrame.barrier) replaySafety.markBarrier(replayFrame.barrier)
+    // The provider answers some queries itself (a plan file, an image approval); replaying one would repeat it.
+    if (interactionQuery) session.carriedCheckpoint = undefined
     // Reseeding is allowed only while every frame so far was positively a
     // control frame. Anything else, including unknown top-level fields, may have
     // carried output or stateful activity.
@@ -3912,6 +3948,7 @@ export async function pump(
         cacheDiagnostics.checkpointUpdates++
         setCheckpoint(session.conversationId, bytes)
         session.resumeCheckpoint = Uint8Array.from(bytes)
+        session.carriedCheckpoint = undefined
         session.pendingFollowUp = undefined
         const results = session.resultsAfterCheckpoint
         if (results && !results.unconfirmed && results.awaiting.size === 0) session.resultsAfterCheckpoint = undefined
@@ -3943,6 +3980,7 @@ export async function pump(
       trace(`turn_ended raw wire fields: ${debugWalkTurnEnded(payload)}`)
       keepUndeliveredHostNote(session)
       const turnEnded = iu.turn_ended as Record<string, unknown>
+      session.carriedCheckpoint = undefined
       endingTurns.add(session)
       const injectionIds = (session.steerInjections ?? []).map((injection) => injection.id)
       const undelivered = (session.steerInjections ?? []).filter((injection) => injection.state !== "delivered")
@@ -4070,6 +4108,7 @@ export async function pump(
           const editToolCalls = session.editToolCalls ?? (session.editToolCalls = new Map())
           editToolCalls.set(callId, { path: editPath })
         }
+        if (display) noteCursorWaitStarted(session, callId, display.variant, display.args)
         const callIdLog = callId.replace(/\r?\n/g, "\\n")
         let wireFields = ""
         if (variant === "?") {
@@ -4096,6 +4135,7 @@ export async function pump(
       if (callId && session.displayToolCalls.has(callId)) toolStep.resolved.add(callId)
       if (callId) session.editToolCalls?.delete(callId)
       if (callId) session.resultsAfterCheckpoint?.awaiting.delete(callId)
+      if (callId) noteCursorWaitEnded(session, callId)
       // If exec already claimed this call_id, display map entry is gone — skip.
       if (!callId || !session.displayToolCalls.has(callId)) {
         if (callId) {
