@@ -178,6 +178,9 @@ import { systemInstructionsRuleText, type SystemInstructions } from "./context/b
 import { loadMergedConfig } from "./context/rules.js"
 import {
   buildDynamicCatalogRoutingInstruction,
+  buildHostToolRouteLines,
+  dynamicToolRoute,
+  resolveHostToolRoutes,
 } from "./context/dynamic-catalog.js"
 import {
   admitContextEpoch,
@@ -4279,6 +4282,8 @@ export function buildOpenCodeInteractionGuidance(
   if (names.size === 0) return undefined
   const instructions: string[] = []
   const subagents = extractHostSubagentCatalog(tools)
+  const routes = resolveHostToolRoutes(tools, options.knownMcpServers)
+  const via = (name: string) => dynamicToolRoute(routes, name)
 
   if (names.has("question")) {
     // Cursor-native AskQuestion is translated into this tool (see
@@ -4317,39 +4322,42 @@ export function buildOpenCodeInteractionGuidance(
     const read = names.has("todoread") ? "`todoread`" : undefined
     const tools =
       write && read ? `${write} / ${read}` : (write ?? read)!
+    const route = via(write ? "todowrite" : "todoread")
     instructions.push(
-      `- For task-list create/update/complete/cancel${read ? "/read" : ""}, call OpenCode ${tools}; do not use Cursor TodoWrite, and do not narrate Cursor-vs-OpenCode todo-tool differences.`,
+      `- For task-list create/update/complete/cancel${read ? "/read" : ""}, call OpenCode ${tools}${route}; do not use Cursor TodoWrite, and do not narrate Cursor-vs-OpenCode todo-tool differences.`,
     )
   }
   if (names.has(CUSTOM_WEBSEARCH_TOOL)) {
     instructions.push(
-      `- For web searches, call \`${CUSTOM_WEBSEARCH_TOOL}\`; do not use Cursor's native WebSearch interaction.`,
+      `- For web searches, call \`${CUSTOM_WEBSEARCH_TOOL}\`${via(CUSTOM_WEBSEARCH_TOOL)}; do not use Cursor's native WebSearch interaction.`,
     )
   }
   if (names.has(CUSTOM_WEBFETCH_TOOL)) {
     instructions.push(
-      `- To fetch a known URL, call \`${CUSTOM_WEBFETCH_TOOL}\`; do not use Cursor's native WebFetch interaction.`,
+      `- To fetch a known URL, call \`${CUSTOM_WEBFETCH_TOOL}\`${via(CUSTOM_WEBFETCH_TOOL)}; do not use Cursor's native WebFetch interaction.`,
     )
   }
   if (names.has(CUSTOM_LIST_MCP_RESOURCES_TOOL)) {
     instructions.push(
-      `- To list MCP resources, call \`${CUSTOM_LIST_MCP_RESOURCES_TOOL}\`; do not use Cursor's native resource-listing interaction.`,
+      `- To list MCP resources, call \`${CUSTOM_LIST_MCP_RESOURCES_TOOL}\`${via(CUSTOM_LIST_MCP_RESOURCES_TOOL)}; do not use Cursor's native resource-listing interaction.`,
     )
   }
   if (names.has(CUSTOM_READ_MCP_RESOURCE_TOOL)) {
     instructions.push(
-      `- To read an MCP resource, call \`${CUSTOM_READ_MCP_RESOURCE_TOOL}\`; do not use Cursor's native resource-reading interaction.`,
+      `- To read an MCP resource, call \`${CUSTOM_READ_MCP_RESOURCE_TOOL}\`${via(CUSTOM_READ_MCP_RESOURCE_TOOL)}; do not use Cursor's native resource-reading interaction.`,
     )
   }
   if (names.has("execute")) {
     const shell = names.has("shell") ? "`shell`" : names.has("bash") ? "`bash`" : undefined
+    const executeRoute = via("execute")
+    const execute = `- OpenCode \`execute\` is Code Mode JavaScript (\`code\`)${executeRoute && `, called${executeRoute}`}; it is not a shell.`
     instructions.push(
       shell
-        ? `- OpenCode \`execute\` is Code Mode JavaScript (\`code\`); it is not a shell. For OS commands, call OpenCode ${shell}. Do not pass \`command\` to \`execute\`.`
-        : "- OpenCode `execute` is Code Mode JavaScript (`code`); it is not a shell. Do not pass `command` to `execute`.",
+        ? `${execute} For OS commands, call OpenCode ${shell}. Do not pass \`command\` to \`execute\`.`
+        : `${execute} Do not pass \`command\` to \`execute\`.`,
     )
     instructions.push(
-      "- Call tools named in the direct list by their own names, even when a server instruction says to reach them through `execute`. Use `execute` only for tools that appear in the host Code Mode catalog and are absent from that list. Use the exact paths and signatures from that catalog or its `search` function, and call `execute` with `{ code }`.",
+      "- Call each host tool listed above through its route there, even when a server instruction says to reach it through `execute`. Use `execute` only for tools that appear in the host Code Mode catalog and are absent from that list. Use the exact paths and signatures from that catalog or its `search` function, and call `execute` with `{ code }`.",
     )
   }
   if (names.has("task") || names.has("subagent")) {
@@ -4401,11 +4409,11 @@ export function buildOpenCodeInteractionGuidance(
     )
   }
   return [
-    `OpenCode exposes these direct tools for this turn: ${[...names].map((name) => `\`${name}\``).join(", ")}.`,
+    ...buildHostToolRouteLines(tools, routes),
     `Workspace root: ${JSON.stringify(workspaceRoot)}. Resolve workspace paths against exactly this root; never invent an absolute prefix, and verify uncertain paths with an available tool before using them.`,
     subagents.executor
-      ? "Call only tools in that direct OpenCode list for ordinary host execution. Cursor-native Task/subagent requests are permitted because a compatible host executor is listed. Bridged Cursor interactions named below (AskQuestion, SwitchMode, CreatePlan, …) are not OpenCode/MCP catalog tools — raise them normally and do not narrate that they are missing."
-      : "Call only tools in that direct OpenCode list for ordinary host execution. Bridged Cursor interactions named below (AskQuestion, SwitchMode, CreatePlan, …) are not OpenCode/MCP catalog tools — raise them normally and do not narrate that they are missing. Other unlisted Cursor-native tools are not bridged; complete the work with the listed tools or explain the limitation without claiming a missing MCP tool.",
+      ? "Use only these host tools, each through its route above, for ordinary host execution. Cursor-native Task/subagent requests are permitted because a compatible host executor is listed. Bridged Cursor interactions named below (AskQuestion, SwitchMode, CreatePlan, …) are not OpenCode/MCP catalog tools — raise them normally and do not narrate that they are missing."
+      : "Use only these host tools, each through its route above, for ordinary host execution. Bridged Cursor interactions named below (AskQuestion, SwitchMode, CreatePlan, …) are not OpenCode/MCP catalog tools — raise them normally and do not narrate that they are missing. Other unlisted Cursor-native tools are not bridged; complete the work with the listed tools or explain the limitation without claiming a missing MCP tool.",
     ...(instructions.length > 0
       ? ["Use these OpenCode tools instead of equivalent Cursor-native UI interactions:"]
       : []),

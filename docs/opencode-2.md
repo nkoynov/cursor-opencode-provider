@@ -133,7 +133,7 @@ No extra configuration is needed. Declare MCP servers in `opencode.json` as usua
 
 Server names are normalized into tool namespaces (`my.docs` becomes `my_docs`). If names collide, an explicit `"codemode": true` prevents this plugin from moving that namespace. The `opencode` namespace is always left alone to preserve OpenCode's own tools; choose another MCP server name to use automatic direct placement.
 
-OpenCode's `<mcp_instructions>` still say to use `execute` for a server that left `codemode` unset, because that sentence reads the server config and not the tool option. The provider guidance tells Cursor to ignore that sentence for tools that are on the direct list. Discovery reloads replay the tool transform, so tools that connect after startup join the same catalog.
+OpenCode's `<mcp_instructions>` still say to use `execute` for a server that left `codemode` unset, because that sentence reads the server config and not the tool option. The provider guidance tells Cursor to call those tools through CallDynamicTool instead, under the namespace and tool name its catalog lists. Discovery reloads replay the tool transform, so tools that connect after startup join the same catalog.
 
 A prompt sent before those servers finish connecting will not see their tools. OpenCode connects MCP servers asynchronously and does not block startup on a slow server. The next turn in the same session includes the tools that have connected. That first-turn gap is expected host behavior, not a missing catalog placement.
 
