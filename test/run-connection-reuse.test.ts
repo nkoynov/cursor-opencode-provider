@@ -16,7 +16,16 @@ import {
 
 const ORIGIN = "https://agentn.reuse-test.cursor.sh"
 
-type Answer = "answer" | "refuse" | "goaway-unprocessed" | "goaway-processed" | "answer-then-drop" | "cancel"
+type Answer =
+  | "answer"
+  | "refuse"
+  | "goaway-unprocessed"
+  | "goaway-processed"
+  | "answer-then-drop"
+  | "cancel"
+  | "answer-then-hold"
+  | "hold"
+  | "hold-then-cancel"
 type ServerStream = { answer: Answer; connection: number; bytes: number }
 
 /** An h2c "Cursor" behind a TCP proxy that can cut a client connection before forwarding. */
@@ -25,6 +34,9 @@ async function startFakeCursor() {
   const streams: ServerStream[] = []
   const serverSessions = new Map<http2.Http2Session, number>()
   const clients = new Set<net.Socket>()
+  const clientsByConnection = new Map<number, net.Socket>()
+  const held: Array<() => void> = []
+  const muted = new Set<number>()
   let connections = 0
   let dropNextRequest: number | undefined
   const dropAll = () => {
@@ -60,18 +72,34 @@ async function startFakeCursor() {
       case "cancel":
         stream.close(http2.constants.NGHTTP2_CANCEL)
         break
+      case "answer-then-hold":
+        stream.respond({ ":status": 200, "content-type": "application/connect+proto" })
+        stream.write(encodeFrame(0x00, new Uint8Array([1, 2, 3])))
+        held.push(() => stream.write(encodeFrame(0x00, new Uint8Array([4, 5, 6]))))
+        break
+      case "hold":
+        held.push(() => {
+          stream.respond({ ":status": 200, "content-type": "application/connect+proto" })
+          stream.write(encodeFrame(0x00, new Uint8Array([1, 2, 3])))
+        })
+        break
+      case "hold-then-cancel":
+        held.push(() => stream.close(http2.constants.NGHTTP2_CANCEL))
+        break
     }
   })
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
   const serverPort = (server.address() as net.AddressInfo).port
 
   const proxy = net.createServer((client) => {
+    clientsByConnection.set(connections, client)
     connections++
     clients.add(client)
     const upstream = net.connect(serverPort, "127.0.0.1")
+    const connection = connections - 1
     let swallowing = false
     client.on("data", (chunk) => {
-      if (swallowing) return
+      if (swallowing || muted.has(connection)) return
       if (dropNextRequest !== undefined) {
         const afterMs = dropNextRequest
         dropNextRequest = undefined
@@ -101,6 +129,13 @@ async function startFakeCursor() {
      * stale one would be; meanwhile nothing more is read from it.
      */
     dropNextRequest(afterMs = 0) { dropNextRequest = afterMs },
+    dropConnection(index: number) { clientsByConnection.get(index)?.destroy() },
+    /** Stops forwarding what the client sends on a connection, so Cursor sees neither its pings nor its GOAWAY. */
+    muteClient(index: number) { muted.add(index) },
+    /** Answers, continues or cancels the streams held so far. */
+    release() {
+      for (const next of held.splice(0)) next()
+    },
     async close() {
       dropAll()
       await new Promise((resolve) => proxy.close(resolve))
@@ -293,5 +328,89 @@ describe("Run connection reuse", () => {
       ["answer", 0],
       ["refuse", 1],
     ])
+  })
+})
+
+describe("Run on a connection whose ping fails for another Run", () => {
+  /**
+   * Opens a Run without a ping on the cached connection; then Cursor stops receiving on it, so the next
+   * Run's ping times out.
+   */
+  async function runThenFailedPing(answer: Answer) {
+    await completedRun()
+    fake.answers.push(answer)
+    const sibling = await bidiRunStream("token", { baseURL: ORIGIN })
+    sibling.write(new Uint8Array([8]))
+    const frames = sibling.frames()[Symbol.asyncIterator]()
+    if (answer === "answer-then-hold") expect((await frames.next()).done).toBe(false)
+    else await until(() => fake.streams.length === 2)
+    const connection = await getSession(ORIGIN)
+    fake.muteClient(0)
+    setSystemTime(new Date(Date.now() + HTTP2_SESSION_LIVE_WINDOW_MS + 1_000))
+
+    const next = await bidiRunStream("token", { baseURL: ORIGIN, pingTimeoutMs: 100 })
+    next.write(new Uint8Array([9]))
+    expect((await nextFrame(next)).done).toBe(false)
+    expect(connection.closed).toBe(true)
+    expect(connection.destroyed).toBe(false)
+    return { sibling, frames, next }
+  }
+
+  it("keeps streaming a Run Cursor already answered", async () => {
+    const { sibling, frames, next } = await runThenFailedPing("answer-then-hold")
+    fake.release()
+
+    expect((await frames.next()).done).toBe(false)
+    expect(fake.connections).toBe(2)
+    expect(fake.streams.map((stream) => [stream.answer, stream.connection])).toEqual([
+      ["answer", 0],
+      ["answer-then-hold", 0],
+      ["answer", 1],
+    ])
+    sibling.end()
+    next.end()
+  })
+
+  it("leaves a Run Cursor has not answered yet on its connection instead of sending it again", async () => {
+    const { sibling, frames, next } = await runThenFailedPing("hold")
+    fake.release()
+
+    expect((await frames.next()).done).toBe(false)
+    expect(fake.streams.map((stream) => [stream.answer, stream.connection])).toEqual([
+      ["answer", 0],
+      ["hold", 0],
+      ["answer", 1],
+    ])
+    sibling.end()
+    next.end()
+  })
+
+  it("does not send that Run again when Cursor then cancels it", async () => {
+    const { frames, next } = await runThenFailedPing("hold-then-cancel")
+    fake.release()
+
+    expect(await failureOf(frames.next())).toBeInstanceOf(CursorProviderError)
+    await sleep(50)
+    expect(fake.streams.map((stream) => [stream.answer, stream.connection])).toEqual([
+      ["answer", 0],
+      ["hold-then-cancel", 0],
+      ["answer", 1],
+    ])
+    next.end()
+  })
+
+  it("sends that Run again when its connection then dies before Cursor answers", async () => {
+    const { sibling, frames, next } = await runThenFailedPing("hold")
+    fake.dropConnection(0)
+
+    expect((await frames.next()).done).toBe(false)
+    expect(fake.streams.map((stream) => [stream.answer, stream.connection, stream.bytes])).toEqual([
+      ["answer", 0, 6],
+      ["hold", 0, 6],
+      ["answer", 1, 6],
+      ["answer", 1, 6],
+    ])
+    sibling.end()
+    next.end()
   })
 })

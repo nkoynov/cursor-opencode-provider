@@ -345,6 +345,7 @@ const _http2Sessions = new Map<string, http2.ClientHttp2Session>()
 const _http2SessionCreatedAt = new WeakMap<http2.ClientHttp2Session, number>()
 const _http2SessionLastInboundAt = new WeakMap<http2.ClientHttp2Session, number>()
 const _http2SessionGoawayLastStreamId = new WeakMap<http2.ClientHttp2Session, number>()
+const _http2SessionTransportLost = new WeakSet<http2.ClientHttp2Session>()
 const _http2SessionListenerCleanup = new WeakMap<http2.ClientHttp2Session, () => void>()
 // Validation and connect work for the same origin shares one Promise.
 const _http2Connecting = new Map<string, Promise<http2.ClientHttp2Session>>()
@@ -460,14 +461,17 @@ function installSessionInvalidation(
   }
   const onSessionError = (error: Error) => {
     trace(`h2 session error: origin=${origin} err=${error.message}`)
+    _http2SessionTransportLost.add(session)
     dropSession(origin, session)
   }
   const onSocketEnd = () => {
     trace(`h2 socket ended: origin=${origin}`)
+    _http2SessionTransportLost.add(session)
     dropSession(origin, session)
   }
   const onSocketClose = () => {
     trace(`h2 socket closed: origin=${origin}`)
+    _http2SessionTransportLost.add(session)
     dropSession(origin, session)
   }
 
@@ -774,7 +778,8 @@ export async function bidiRunStream(
   let resending: Uint8Array[] | undefined
   const resendListeners = new Set<(resent: boolean) => void>()
   let streamGeneration = 0
-  // Read before this Run closes the session itself: Node destroys a closed session with no streams left.
+  // Set at the stream's first terminal event: Node and Bun destroy a closed session (this Run's own
+  // close, a GOAWAY, rotation or a failed ping) once its last stream ends, even one Cursor cancelled.
   let connectionLost = false
   let stream: http2.ClientHttp2Stream
   try {
@@ -1022,6 +1027,12 @@ export async function bidiRunStream(
     const generation = streamGeneration
     const owner = session
     const replaced = () => generation !== streamGeneration
+    let terminalSeen = false
+    const noteConnectionState = () => {
+      if (terminalSeen) return
+      terminalSeen = true
+      connectionLost = owner.destroyed || _http2SessionTransportLost.has(owner)
+    }
     target.on("response", (h: Record<string, unknown>) => {
       if (replaced()) return
       unanswered = undefined
@@ -1038,7 +1049,7 @@ export async function bidiRunStream(
     })
     target.on("error", (err: Error) => {
       if (replaced()) return
-      connectionLost ||= owner.destroyed
+      noteConnectionState()
       rawStreamError = err
       writable = false
       trace(`h2 stream error: ${err?.name}: ${err?.message}`)
@@ -1046,7 +1057,7 @@ export async function bidiRunStream(
     })
     target.on("aborted", () => {
       if (replaced()) return
-      connectionLost ||= owner.destroyed
+      noteConnectionState()
       writable = false
       rawStreamError ??= new CursorTransportError("Cursor Run stream aborted by remote", {
         transient: true,
@@ -1058,13 +1069,13 @@ export async function bidiRunStream(
     })
     target.on("end", () => {
       if (replaced()) return
-      connectionLost ||= owner.destroyed
+      noteConnectionState()
       writable = false
       scheduleTerminalSettlement()
     })
     target.on("close", () => {
       if (replaced()) return
-      connectionLost ||= owner.destroyed
+      noteConnectionState()
       writable = false
       remotelyClosed = !locallyClosed
       if (remotelyClosed) {
