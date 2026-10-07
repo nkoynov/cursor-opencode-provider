@@ -26,6 +26,7 @@
 - A message OpenCode queues right before or after the user's own one (a finished background shell, subagent or task, a `<system-update>`) no longer replaces it: a Run sends every user message since the model's last reply, in OpenCode's order, where it sent only the last one, so on a Run with a Cursor checkpoint the user's question or the host note was lost, and without one the question was replayed as history while the note became the request ([#N](https://github.com/oakimov/cursor-opencode-provider/pull/N) by [@nkoynov](https://github.com/nkoynov))
 - Cursor models now see OpenCode skills the way Cursor presents them (each skill's file path, read on demand), so they load matching skills without going through the dynamic tool catalog
 - Cursor models no longer call OpenCode tools by their own names as top-level tools, which Cursor refuses with "Tool not found" (seen with MCP tools and `execute`). The system guidance called every advertised tool a direct tool to call by name, but Cursor's top-level list has only its own tools plus GetDynamicTools / CallDynamicTool. It now lists which host tools Cursor's native tools run (`read` through Read, `edit` through StrReplace, …) and which are called through CallDynamicTool, with the namespace and tool name from Cursor's catalog
+- Cursor is no longer told that past chats are in an `agent-transcripts` folder nothing creates, so the model stops searching it; the folder is named only when it exists when a conversation starts
 
 ## [0.8.0] - 2026-10-04
 
