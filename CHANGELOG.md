@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- What Claude Opus 5.5 writes right before a tool call (for example the explanation before it asks you a question) shows as text again instead of disappearing into its thinking. Opus 5.5 returns that text as a progress-update thinking block, which Cursor streams like reasoning; a thinking block that follows a finished one before any text or tool call is now emitted as text
 - The first Cursor request after the provider starts no longer waits for every saved conversation to be decompressed and decoded (about 11 s, blocking the whole process, with a day of sessions): startup cleanup decodes only files last written more than 24 hours ago
 - An account-level refusal from Cursor (for example "Too many computers.") shows Cursor's own message instead of `Cursor API error (code=resource_exhausted)`, and is not retried, by the provider or by OpenCode
 - Session titles and other tool-less requests (plugin `generate` calls) no longer advertise the session's tools, and the host's instructions open the request with its message as the input, so the title model answers in one call instead of trying tools that are then refused. Compaction still advertises the session's tools

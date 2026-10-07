@@ -178,6 +178,7 @@ import {
   unrecordedToolsNote,
   type ModelFallbackReply,
 } from "./model-fallback.js"
+import { assistantBlobShape, noteThinkingKind, takeThinkingKinds } from "./narration.js"
 import { initializeConversationPersistence } from "./protocol/conversation-persistence.js"
 import {
   resolveContinuationPolicy,
@@ -3509,6 +3510,12 @@ export async function pump(
   // the cancel lands — controller.enqueue on a cancelled controller throws.
   // safeEnqueue swallows that throw and tracks the close so we stop pumping.
   let streamClosed = false
+  /** Thinking blocks since the model's last text or tool call. */
+  const thinkingBlock = { open: false, indexInStep: 0, chars: 0, narration: false }
+  const endThinkingRun = () => {
+    thinkingBlock.open = false
+    thinkingBlock.indexInStep = 0
+  }
   const switchGuard = session.modelSwitchGuard
   const passToolCallIds: string[] = []
   /** The first output of a model step: the checkpoint before it is where a switch in it rolls back to. */
@@ -4235,6 +4242,7 @@ export async function pump(
     }
 
     if (iu?.partial_tool_call || iu?.tool_call_started) openModelStep()
+    if (iu?.partial_tool_call || iu?.tool_call_started || iu?.text_delta || esm) endThinkingRun()
     if (iu?.text_delta) {
       const delta = iu.text_delta as Record<string, unknown>
       const text = (delta.text as string) ?? ""
@@ -4262,7 +4270,28 @@ export async function pump(
         continue
       }
     } else if (iu?.thinking_delta) {
-      emitReasoning(((iu.thinking_delta as Record<string, unknown>).text as string) ?? "")
+      const delta = iu.thinking_delta as Record<string, unknown>
+      const text = (delta.text as string) ?? ""
+      if (!thinkingBlock.open) {
+        thinkingBlock.open = true
+        thinkingBlock.chars = 0
+        thinkingBlock.indexInStep += 1
+        // Opus 5.5 sends at most one progress update per tool call, after its reasoning block.
+        thinkingBlock.narration = thinkingBlock.indexInStep > 1
+        noteThinkingKind(session, thinkingBlock.narration ? "N" : "R")
+        trace(
+          `thinking block start: index=${thinkingBlock.indexInStep} style=${delta.thinking_style ?? "-"} ` +
+            `as=${thinkingBlock.narration ? "text" : "reasoning"}`,
+        )
+      }
+      thinkingBlock.chars += text.length
+      if (thinkingBlock.narration) emitText(text)
+      else emitReasoning(text)
+    } else if (iu?.thinking_completed) {
+      trace(
+        `thinking block end: index=${thinkingBlock.indexInStep} open=${thinkingBlock.open} chars=${thinkingBlock.chars}`,
+      )
+      thinkingBlock.open = false
     } else if (iu?.turn_ended) {
       trace(`turn_ended raw wire fields: ${debugWalkTurnEnded(payload)}`)
       keepUndeliveredHostNote(session)
@@ -5169,7 +5198,17 @@ export async function pump(
           `setDataLen=${(kv.set_blob_args as any)?.blob_data?.length ?? "-"}`,
       )
       const handled = handleKvServerMessage(kv, session)
-      if (handled?.kind === "set") noteAssistantBlob(session, kv)
+      if (handled?.kind === "set") {
+        noteAssistantBlob(session, kv)
+        const blobData = (kv.set_blob_args as { blob_data?: Uint8Array } | undefined)?.blob_data
+        const shape = blobData ? assistantBlobShape(blobData) : undefined
+        if (shape) {
+          trace(
+            `assistant blob: shape=${shape.join(",") || "-"} ` +
+              `streamedThinking=${takeThinkingKinds(session).join(",") || "-"}`,
+          )
+        }
+      }
       // Content-as-id reads are answered by echoing the id back (`echoed`); only a
       // hash we cannot serve means the checkpoint references state we lost.
       if (handled?.kind === "get" && !handled.found && !handled.echoed) blobMiss = true
