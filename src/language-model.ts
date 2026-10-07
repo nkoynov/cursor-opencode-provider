@@ -13,7 +13,7 @@ import {
 import { trace, traceRequestContextPaths } from "./debug.js"
 import { isExchangeableApiKey } from "./auth.js"
 import { resolveBearerToken } from "./auth-renewal.js"
-import { buildRunRequest, buildHeartbeat, buildExecHeartbeat, buildCancelAction } from "./protocol/request.js"
+import { buildRunRequest, buildHeartbeat, buildExecHeartbeat, buildCancelAction, renderHistoryTranscript } from "./protocol/request.js"
 import { onHostInterrupt } from "./host-interrupt.js"
 import { decodeFramePayload } from "./protocol/framing.js"
 import { debugWalkTurnEnded, decodeMessage, encodeMessage } from "./protocol/messages.js"
@@ -1793,18 +1793,15 @@ async function startSession(
     // A Run without a checkpoint replays every call and result whole, as a
     // resumed Claude Code session does, so the model keeps what it read and does
     // not take its earlier work for undone. Only a replay over the context
-    // budget shortens its oldest inputs and results.
-    toolResults: isCompaction ? "all" : "transcript",
+    // budget shortens its oldest inputs and results. A Run with a checkpoint
+    // sends no history, so it skips the tool results.
+    toolResults: conversationState ? "omit" : isCompaction ? "all" : "transcript",
     trailingSteer: recovery?.kind === "rebase" && recovery.steer === true,
     ...(recovery?.kind === "rebase" && recovery.toolCallIds ? { keepToolCallIds: recovery.toolCallIds } : {}),
     ...(liveTurn ? { liveTurnStart: liveTurn.start, answeredSteers: liveTurn.answered } : {}),
     ...(fallbackReply ? { omit: { start: fallbackReply.turnStart, end: fallbackReply.stopIndex } } : {}),
-    ...(conversationState
-      ? {}
-      : {
-          maxChars: replayContextBudget({ modelInfo, cursorModelId, maxMode }).budget * ESTIMATED_CHARS_PER_TOKEN
-            - (systemPrompt?.length ?? 0) - userText.length,
-        }),
+    maxChars: replayContextBudget({ modelInfo, cursorModelId, maxMode }).budget * REPLAY_CHARS_PER_TOKEN
+      - (systemPrompt?.length ?? 0) - userText.length,
   })
 
   if (foreignHistory || checkpointUnusable || (!conversationState && !isCompaction && !ephemeralRun && history.some((entry) => entry.role !== "system"))) {
@@ -5928,11 +5925,9 @@ export function buildOpenCodeInteractionGuidance(
 }
 
 /** Rough char→token estimate for mid-turn usage before TurnEnded arrives. */
-const ESTIMATED_CHARS_PER_TOKEN = 4
-
 export function estimateTokens(chars: number): number {
   if (!Number.isFinite(chars) || chars <= 0) return 0
-  return Math.ceil(chars / ESTIMATED_CHARS_PER_TOKEN)
+  return Math.ceil(chars / 4)
 }
 
 /** Preserve exact request-local Cursor counters as diagnostics. */
@@ -6024,8 +6019,10 @@ export function extractPromptHistory(
   return collectPromptHistory(prompt, options, shorten)
 }
 
+/** Characters the history takes in the Run's user message, as `buildRunRequest` renders it. */
 function seedHistoryChars(history: readonly SeedHistoryMessage[]): number {
-  return history.reduce((sum, message) => sum + (message.role === "system" ? 0 : message.content.length), 0)
+  const transcript = renderHistoryTranscript(history)
+  return transcript ? transcript.length + 2 : 0
 }
 
 function collectPromptHistory(
@@ -6212,6 +6209,7 @@ function shortenTranscriptPart(
 ): string {
   if (text.length <= max) return text
   const short = `${text.slice(0, max)}\n[… ${text.length - max} more characters left out of this replay to fit the context window]`
+  if (short.length >= text.length) return text
   shortenable?.push({ key, savedChars: text.length - short.length })
   return shorten?.has(key) ? short : text
 }
@@ -6255,6 +6253,13 @@ function appendSeedHistory(
 /** Share of the target context a Run without a checkpoint may fill with its replay before compaction. */
 export const FOREIGN_HISTORY_REBASE_CONTEXT_SHARE = 0.8
 
+/**
+ * Cursor counts about two characters per token of a coding session's context
+ * (median 2.1, 1st percentile 1.7 over 18,514 context breakdowns), half of
+ * what `estimateTokens` assumes, so a replay is sized with this instead.
+ */
+export const REPLAY_CHARS_PER_TOKEN = 2
+
 /** Tokens a Run without a checkpoint may fill with its replay, of the target context `limit`. */
 export function replayContextBudget(input: {
   modelInfo: ModelInfo | undefined
@@ -6287,7 +6292,7 @@ export function assertForeignHistoryRebaseFits(input: {
   const chars = seedHistoryChars(input.history)
     + (input.systemPrompt?.length ?? 0)
     + input.userText.length
-  const tokens = estimateTokens(chars)
+  const tokens = Math.ceil(chars / REPLAY_CHARS_PER_TOKEN)
   if (tokens <= budget) return
   trace(
     `foreign-history rebase too large: model=${input.cursorModelId} estimatedTokens=${tokens} ` +

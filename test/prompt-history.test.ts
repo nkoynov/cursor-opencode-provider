@@ -480,8 +480,8 @@ describe("extractPromptHistory", () => {
     const transcript = (options: { maxChars?: number }) =>
       JSON.stringify(extractPromptHistory(prompt, { preserveTrailingUser: true, toolResults: "transcript", ...options }))
     const size = (options: { maxChars?: number }) =>
-      extractPromptHistory(prompt, { preserveTrailingUser: true, toolResults: "transcript", ...options })
-        .reduce((sum, entry) => sum + entry.content.length, 0)
+      renderHistoryTranscript(extractPromptHistory(prompt, { preserveTrailingUser: true, toolResults: "transcript", ...options }))!
+        .length + 2
 
     it("keeps every input and result whole while the history fits", () => {
       const whole = size({})
@@ -498,6 +498,18 @@ describe("extractPromptHistory", () => {
       expect(history).toContain("more characters left out of this replay to fit the context window]")
       for (const marker of ["middle-end", "content-end", "latest-end"]) expect(history).toContain(marker)
       expect(size({ maxChars: whole - 1_000 })).toBeLessThanOrEqual(whole - 1_000)
+    })
+
+    it("leaves a result alone when the note would make it longer", () => {
+      const barely = "y".repeat(TRANSCRIPT_TOOL_RESULT_CHARS + 50)
+      const history = JSON.stringify(extractPromptHistory([
+        { role: "user", content: "read" },
+        { role: "assistant", content: [{ type: "tool-call", toolCallId: "1", toolName: "read", input: {} }] },
+        { role: "tool", content: [{ type: "tool-result", toolCallId: "1", toolName: "read", output: { type: "text", value: barely } }] },
+        { role: "user", content: "next" },
+      ] as LanguageModelV3CallOptions["prompt"], { toolResults: "transcript", maxChars: 0 }))
+      expect(history).toContain(barely)
+      expect(history).not.toContain("left out of this replay")
     })
 
     it("shortens a long tool input in its turn and never the trailing live result", () => {
