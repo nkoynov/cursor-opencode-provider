@@ -559,8 +559,8 @@ describe("doStream with a mid-turn user message", () => {
     }
 
     expect(outcomes).toEqual({
-      delivered: { injected: ["also check 3.ts", NOTE], followUps: [] },
-      rejected: { injected: ["also check 3.ts", NOTE], followUps: ["also check 3.ts"] },
+      delivered: { injected: [NOTE, "also check 3.ts"], followUps: [] },
+      rejected: { injected: [NOTE, "also check 3.ts"], followUps: ["also check 3.ts"] },
     })
   })
 

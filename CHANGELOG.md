@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- A host note that arrives while a step's tools run (a background subagent's or shell's completion report, nested `AGENTS.md` instructions, other `<system-update>` notes) reaches the model as its own message after the step's results, as Claude Code delivers them, instead of being appended to the last result. Cursor moves a long result into an `agent-tools` file and shows the model a preview, so a report appended to a long search result was never seen
 - The first Cursor request after the provider starts no longer waits for every saved conversation to be decompressed and decoded (about 11 s, blocking the whole process, with a day of sessions): startup cleanup decodes only files last written more than 24 hours ago
 - An account-level refusal from Cursor (for example "Too many computers.") shows Cursor's own message instead of `Cursor API error (code=resource_exhausted)`, and is not retried, by the provider or by OpenCode
 - Session titles and other tool-less requests (plugin `generate` calls) no longer advertise the session's tools, and the host's instructions open the request with its message as the input, so the title model answers in one call instead of trying tools that are then refused. Compaction still advertises the session's tools

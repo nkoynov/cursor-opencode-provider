@@ -952,11 +952,10 @@ async function doStreamImpl(
     const results = session.supportsImages
       ? await decodeTrailingToolImages(trailingToolResults, callOptions.abortSignal)
       : trailingToolResults
-    if (steerMessages.length > 0) session = injectSteerMessages(session, steerMessages)
-    const resultsAfterCheckpoint = session && (steeredPrompt || session.resultsAfterCheckpoint)
+    const resultsAfterCheckpoint = steeredPrompt || session.resultsAfterCheckpoint
       ? resultsAwaitingCheckpoint(session, results)
       : undefined
-    if (session) session = deliverContinuationResults(session, results)
+    session = deliverContinuationResults(session, results, steerMessages)
     if (session && resultsAfterCheckpoint) session.resultsAfterCheckpoint = resultsAfterCheckpoint
     if (session) await refreshHeldSessionToolCatalog(session, callOptions)
   }
@@ -2833,6 +2832,7 @@ function buildSwitchModeContinuationFrame(
 export function deliverContinuationResults(
   session: CursorSession,
   trailingToolResults: ExtractedToolResult[],
+  steerMessages: readonly string[] = [],
 ): CursorSession | undefined {
   const pendingResults = trailingToolResults.filter(
     (r) => r.sessionId === session.sessionId && session.pending.has(r.execId),
@@ -2844,11 +2844,12 @@ export function deliverContinuationResults(
   )
   let note = joinNotes([session.deferredNote, ...trailingToolResults.map((r) => r.note)])
   session.deferredNote = undefined
-  const noteCarrier = note === undefined ? undefined : findNoteCarrier(session, pendingResults)
-  if (note !== undefined && !noteCarrier && session.runId) {
+  if (note !== undefined && session.runId) {
     if (!injectHostNote(session, note)) return undefined
     note = undefined
   }
+  if (steerMessages.length > 0 && !injectSteerMessages(session, steerMessages)) return undefined
+  const noteCarrier = note === undefined ? undefined : findNoteCarrier(session, pendingResults)
   for (const r of pendingResults) {
     const claim = sessionManager.claim(session.sessionId, r.execId)
     if ("kind" in claim) {
@@ -5617,9 +5618,10 @@ function injectHostSteer(session: CursorSession, steer: HostSteer): boolean {
 }
 
 /**
- * Queue a host note no result of the step can carry on the held Run before its results. Cursor adds
- * it as a user message after them, where OpenCode puts it for other providers, so the model reads it
- * before its next step instead of a turn later.
+ * Queue the step's host notes on the held Run before its results. Cursor adds them as a user message
+ * after the results, where OpenCode puts them for other providers and Claude Code puts its own. On a
+ * result, a note would go wherever Cursor moves a long output: into an `agent-tools` file the model
+ * sees only a preview of.
  */
 function injectHostNote(session: CursorSession, note: string): CursorSession | undefined {
   const injection: SteerInjection = { id: crypto.randomUUID(), text: note, state: "sent", hostNote: true }
@@ -5636,7 +5638,7 @@ function injectHostNote(session: CursorSession, note: string): CursorSession | u
   }
   ;(session.steerInjections ??= []).push(injection)
   trace(
-    `continuation: no result could carry the host note; injected into the Run runId=${session.runId} ` +
+    `continuation: host note injected into the Run runId=${session.runId} ` +
       `id=${injection.id} noteLen=${note.length}`,
   )
   return session
