@@ -9,6 +9,7 @@ import type {
   ToolAliasRegistry,
 } from "./protocol/tools.js"
 import type { CursorConversationTokenDetails } from "./protocol/token-details.js"
+import type { HostToolRun, ModelSwitch } from "./model-fallback.js"
 
 export type Frame = { flags: number; payload: Uint8Array }
 
@@ -143,6 +144,7 @@ export type ContinuationTerminalReason =
   | "process-disposed"
   | "superseded-by-new-run"
   | "open-session-cap-exceeded"
+  | "model-switch-stopped"
 
 export type SessionCloseReason =
   | ContinuationTerminalReason
@@ -319,6 +321,40 @@ export type CursorSession = {
   closeError: CursorProviderError | null
   closed: boolean
   reopenWithUserMessage?: (text: string) => Promise<void>
+  /** Cursor model id this Run asked for. */
+  requestedModelId?: string
+  /** Where an agent turn rolls back to if Cursor's safety filter switches the model, and what it already ran. */
+  modelSwitchGuard?: ModelSwitchGuard
+  /** A switch Cursor marked in this Run that the pump has not acted on yet. */
+  modelSwitch?: DetectedModelSwitch
+  /** The user accepted the other model for this turn, so a switch does not stop it. */
+  allowModelSwitch?: boolean
+  /** The model that answered an accepted switch. */
+  servedBySwitch?: string
+}
+
+export type ModelSwitchGuard = {
+  /** Checkpoint the turn's first Run started from. */
+  turnBase?: Uint8Array
+  /** Latest checkpoint Cursor sent, or the one the Run started from. */
+  latestCheckpoint?: Uint8Array
+  /** Checkpoint in effect when the current model step began. */
+  stepBase?: Uint8Array
+  /** A model step has produced output since Cursor last stored an assistant message. */
+  stepOpen: boolean
+  /** Host tool calls of the turn; `inOpenStep` ones belong to the step Cursor has not stored yet. */
+  toolRuns: Array<HostToolRun & { inOpenStep: boolean }>
+  /** The turn's request as the host sent it, before provider reminders. */
+  userText: string
+}
+
+export type DetectedModelSwitch = ModelSwitch & {
+  /** Checkpoint before the first switched step; undefined when there was none. */
+  rollback?: Uint8Array
+  /** The rollback checkpoint already holds the turn's request and its earlier steps. */
+  holdsTurn: boolean
+  toolsKept: HostToolRun[]
+  toolsSwitched: HostToolRun[]
 }
 
 type Tombstone = {

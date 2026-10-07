@@ -151,7 +151,25 @@ import {
   hydrateConversationState,
   hydrateTurnProvenance,
   persistConversationState,
+  rekeyConversation,
 } from "./protocol/conversation-state.js"
+import {
+  forgetModelFallbackStop,
+  isAssistantMessageBlob,
+  matchModelFallbackReply,
+  modelDisplayName,
+  modelFallbackAllowedByEnv,
+  modelFallbackStopMessage,
+  modelSwitchInBlob,
+  modelSwitchInNotice,
+  parseModelFallbackStop,
+  peekModelFallbackStop,
+  rememberModelFallbackStop,
+  resetModelFallbackStopsForTests,
+  serializeModelFallbackStop,
+  unrecordedToolsNote,
+  type ModelFallbackReply,
+} from "./model-fallback.js"
 import { initializeConversationPersistence } from "./protocol/conversation-persistence.js"
 import {
   resolveContinuationPolicy,
@@ -241,6 +259,10 @@ const sentHistoryImageHashesBySession = new Map<string, Set<string>>()
 const postCompactionRebaseBySession = new Set<string>()
 type PromptIdentity = { hostAgent?: string; systemPromptHash?: string }
 const promptIdentityBySession = new Map<string, PromptIdentity>()
+// Tool calls handed to the host in the pass that stopped on a model switch: their
+// results must not reopen the stopped turn.
+const toolCallsOfStoppedTurns = new Set<string>()
+const MAX_STOPPED_TURN_TOOL_CALLS = 256
 export const MAX_TURN_STATE_SESSIONS = 256
 const MAX_SENT_HISTORY_IMAGES_PER_SESSION = 256
 const DEFAULT_RETRY_POLICY = {
@@ -792,6 +814,10 @@ async function doStreamImpl(
   // false "orphaned tool results" errors after Cursor turn_ended and OpenCode
   // started the next step with old tools still in the prompt body.
   const trailingToolResults = extractTrailingToolResults(prompt)
+  if (trailingToolResults.length > 0 && trailingToolResults.every((r) => toolCallsOfStoppedTurns.has(r.toolCallId))) {
+    trace(`model switch: ${trailingToolResults.length} result(s) of the stopped turn — not continuing it`)
+    return { stream: stoppedTurnStream() }
+  }
   let session = findContinuationSession(trailingToolResults)
   // A call that must open a Run gets its credential before it changes any
   // session state (plan mode, finishing the prior held Run), so a login that
@@ -971,6 +997,7 @@ export async function pumpWithRecovery(input: {
           }
         : { kind: "rebase" }
     const next = await input.recover(recovery)
+    carryModelSwitchState(pumpedSession, next)
     if (recovery.kind === "resume") {
       next.usageEstimate = { ...pumpedSession.usageEstimate }
       next.editToolCalls = new Map(pumpedSession.editToolCalls)
@@ -1044,6 +1071,43 @@ export async function pumpWithRecovery(input: {
       sessionManager.endPump(pumpedSession, pumpOwner)
     }
   }
+}
+
+/** A recovery Run continues the same turn: same request, same tools run so far, same acceptance of a switch. */
+function carryModelSwitchState(from: CursorSession, to: CursorSession): void {
+  if (from.allowModelSwitch) to.allowModelSwitch = true
+  if (from.servedBySwitch) to.servedBySwitch = from.servedBySwitch
+  const guard = from.modelSwitchGuard
+  if (!guard || !to.modelSwitchGuard) return
+  to.modelSwitchGuard.turnBase = guard.turnBase
+  to.modelSwitchGuard.userText = guard.userText
+  to.modelSwitchGuard.toolRuns = guard.toolRuns.map((run) => ({ ...run, inOpenStep: false }))
+}
+
+/** A switch Cursor recorded in a stored assistant message; any assistant message also ends the open step. */
+function noteAssistantBlob(session: CursorSession, kv: Record<string, unknown>): void {
+  const guard = session.modelSwitchGuard
+  const data = (kv.set_blob_args as { blob_data?: Uint8Array } | undefined)?.blob_data
+  if (!guard || !data || !isAssistantMessageBlob(data)) return
+  const found = session.modelSwitch ? undefined : modelSwitchInBlob(data, session.requestedModelId ?? "")
+  if (found) {
+    const rollback = guard.stepBase
+    session.modelSwitch = {
+      ...found,
+      rollback,
+      holdsTurn: !!rollback && rollback !== guard.turnBase,
+      toolsKept: guard.toolRuns.filter((run) => !run.inOpenStep).map(({ toolName, input }) => ({ toolName, input })),
+      toolsSwitched: guard.toolRuns.filter((run) => run.inOpenStep).map(({ toolName, input }) => ({ toolName, input })),
+    }
+    trace(
+      `model switch: Cursor stored a step served by ${found.to}` +
+        `${found.from ? ` instead of ${found.from}` : ""} source=${found.source} ` +
+        `sessionId=${session.sessionId} conversationId=${session.conversationId} ` +
+        `rollback=${rollback?.length ?? 0}B stepOpen=${guard.stepOpen}`,
+    )
+  }
+  guard.stepOpen = false
+  for (const run of guard.toolRuns) run.inOpenStep = false
 }
 
 export type CursorRunRecovery =
@@ -1130,6 +1194,10 @@ async function startSession(
       return undefined
     })
     if (restored?.postCompactionRebase) rememberPostCompactionRebase(sessionKey)
+    if (restored?.modelFallbackStop && !peekModelFallbackStop(sessionKey)) {
+      const stop = parseModelFallbackStop(restored.modelFallbackStop)
+      if (stop) rememberModelFallbackStop(sessionKey, stop)
+    }
     if (restored?.toolCatalog.length) restoreTurnToolCatalog(sessionKey, restored.toolCatalog)
     if (restored?.hostAgent || restored?.systemPromptHash) {
       rememberPromptIdentity(sessionKey, {
@@ -1276,6 +1344,28 @@ async function startSession(
   let userText = recovery?.kind === "rebase" && !checkpointUnusable
     ? "Continue the interrupted turn from the conversation history above. Do not repeat completed work."
     : (extractUserText(lastUser) || ".")
+  const agentTurn = !!sessionKey && allowTools && !isCompaction && !ephemeralRun
+  // The reply to a turn stopped on a model switch. That stop already bound the
+  // conversation to the checkpoint before the switch, so only the request changes.
+  const fallbackReply: ModelFallbackReply | undefined = agentTurn && !recovery
+    ? matchModelFallbackReply(sessionKey!, prompt, (message) => hostTailNote(message) !== undefined)
+    : undefined
+  const turnRequest = fallbackReply?.override ? fallbackReply.stop.userText : (extractUserText(lastUser) || ".")
+  if (fallbackReply) {
+    const { stop } = fallbackReply
+    if (fallbackReply.override) {
+      userText = stop.checkpointHoldsTurn && conversationState
+        ? "Continue the request above from where it stopped. Do not repeat completed work."
+        : stop.userText || "."
+    }
+    const note = unrecordedToolsNote(stop.unrecordedTools)
+    if (note) userText = `${userText}\n\n${note}`
+    trace(
+      `model switch: reply to the stopped turn sessionKey=${sessionKey} ` +
+        `${fallbackReply.override ? `accepts ${stop.servedModel} once` : "is a new request"} ` +
+        `conversationId=${bound.conversationId} checkpoint=${conversationState?.length ?? 0}B`,
+    )
+  }
   // After an approved SwitchMode, inject the Cursor CLI-shaped mode reminder
   // (same <system_reminder> contract the CLI uses after flipping unifiedMode).
   const startedWithCheckpoint = !!conversationState
@@ -1369,6 +1459,7 @@ async function startSession(
     // A foreign-history rebase replays every tool result: the other model's work
     // exists only in OpenCode history, never in a Cursor checkpoint.
     toolResults: isCompaction || foreignHistory || checkpointUnusable ? "all" : (recovery?.kind === "rebase" ? "trailing" : "omit"),
+    ...(fallbackReply ? { omit: { start: fallbackReply.turnStart, end: fallbackReply.stopIndex } } : {}),
   })
 
   await loadAvailableModels()
@@ -1569,6 +1660,7 @@ async function startSession(
   try {
     await writeWithBackpressure(stream, reqBytes, "initial Run request")
     rememberSentHistoryImageHashes(sessionKey, imageExtraction.hashes)
+    if (sessionKey && fallbackReply) forgetModelFallbackStop(sessionKey, fallbackReply.stop)
   } catch (error) {
     stream.destroy()
     throw error
@@ -1650,6 +1742,20 @@ async function startSession(
     semanticDeadlineAt: Date.now() + continuationPolicy.semanticIdleMs,
     closeError: null,
     closed: false,
+    requestedModelId: cursorModelId,
+    ...(agentTurn
+      ? {
+          modelSwitchGuard: {
+            turnBase: conversationState,
+            latestCheckpoint: conversationState,
+            stepBase: conversationState,
+            stepOpen: false,
+            toolRuns: [],
+            userText: turnRequest,
+          },
+        }
+      : {}),
+    ...(fallbackReply?.override ? { allowModelSwitch: true } : {}),
   }
   sessionManager.registerSession(session)
 
@@ -2739,7 +2845,8 @@ export async function pump(
     }
     return replaySafety.applyTo(failure)
   }
-  const { textId, reasoningId } = ids
+  let { textId } = ids
+  const { reasoningId } = ids
   const advertisedToolNames = advertisedToolNamesFromDescriptors(session.toolDescriptors)
   const advertisedToolNameSet = new Set(
     advertisedToolNames.map((name) => resolveCustomWebToolAlias(name, session.toolAliases)),
@@ -2789,6 +2896,14 @@ export async function pump(
   // the cancel lands — controller.enqueue on a cancelled controller throws.
   // safeEnqueue swallows that throw and tracks the close so we stop pumping.
   let streamClosed = false
+  const switchGuard = session.modelSwitchGuard
+  const passToolCallIds: string[] = []
+  /** The first output of a model step: the checkpoint before it is where a switch in it rolls back to. */
+  const openModelStep = () => {
+    if (!switchGuard || switchGuard.stepOpen) return
+    switchGuard.stepOpen = true
+    switchGuard.stepBase = switchGuard.latestCheckpoint
+  }
   const safeEnqueue = (part: V3Part): boolean => {
     if (streamClosed) return false
     try {
@@ -2799,6 +2914,16 @@ export async function pump(
           session.conversationId,
           part as { type: string; delta?: unknown; toolCallId?: unknown },
         )
+      }
+      if (part.type === "tool-call" && switchGuard) {
+        openModelStep()
+        const call = part as { toolCallId?: unknown; toolName?: unknown; input?: unknown }
+        if (typeof call.toolCallId === "string") passToolCallIds.push(call.toolCallId)
+        switchGuard.toolRuns.push({
+          toolName: typeof call.toolName === "string" ? call.toolName : "tool",
+          input: typeof call.input === "string" ? call.input : "",
+          inOpenStep: true,
+        })
       }
       return true
     } catch (e) {
@@ -3026,6 +3151,7 @@ export async function pump(
   }
   const emitText = (text: string) => {
     if (!text) return
+    openModelStep()
     // A tool-less turn (title, summary, compaction) answers with text only,
     // but Cursor still narrates and tries tools first; those calls are refused.
     // Hold its text so the narration before a refused call can be dropped and
@@ -3060,6 +3186,7 @@ export async function pump(
   }
   const emitReasoning = (text: string) => {
     if (!text) return
+    openModelStep()
     replaySafety.markBarrier("visible-reasoning")
     if (!reasoningStarted) {
       safeEnqueue({ type: "reasoning-start", id: reasoningId } as V3Part)
@@ -3209,7 +3336,77 @@ export async function pump(
     })
   }
 
+  /**
+   * End the turn at the first step Cursor marked as served by another model:
+   * close the Run, move the session to a fresh conversation from the checkpoint
+   * before that step, and answer with what happened and the user's two choices.
+   */
+  const stopForModelSwitch = async (detected: NonNullable<CursorSession["modelSwitch"]>): Promise<void> => {
+    const sessionKey = session.openCodeSessionId!
+    const requestedModel = session.requestedModelId ?? detected.from ?? "the requested model"
+    const message = modelFallbackStopMessage({
+      requestedModel,
+      servedModel: detected.to,
+      toolsKept: detected.toolsKept,
+      toolsSwitched: detected.toolsSwitched,
+    })
+    sessionManager.close(session, "model-switch-stopped")
+    for (const id of passToolCallIds) {
+      toolCallsOfStoppedTurns.add(id)
+      if (toolCallsOfStoppedTurns.size > MAX_STOPPED_TURN_TOOL_CALLS) {
+        toolCallsOfStoppedTurns.delete(toolCallsOfStoppedTurns.values().next().value as string)
+      }
+    }
+    const previousId = session.conversationId
+    const conversationId = rekeyConversation(sessionKey, previousId, detected.rollback)
+    const stop = {
+      requestedModel,
+      servedModel: detected.to,
+      userText: switchGuard?.userText ?? "",
+      checkpointHoldsTurn: detected.holdsTurn,
+      unrecordedTools: detected.holdsTurn ? detected.toolsSwitched : [...detected.toolsKept, ...detected.toolsSwitched],
+      message,
+    }
+    rememberModelFallbackStop(sessionKey, stop)
+    trace(
+      `model switch: stopped the turn sessionKey=${sessionKey} served=${detected.to} source=${detected.source} ` +
+        `conversation ${previousId} → ${conversationId} rollback=${detected.rollback?.length ?? 0}B ` +
+        `holdsTurn=${detected.holdsTurn} toolsKept=${detected.toolsKept.length} toolsSwitched=${detected.toolsSwitched.length}`,
+    )
+    await persistConversationState(session.cacheDir ?? opencodeGlobalCacheDir(), {
+      sessionKey,
+      conversationId,
+      requestContext: session.requestContext,
+      toolCatalog: session.toolCatalog ?? [],
+      postCompactionRebase: session.postCompactionRebase,
+      hostAgent: session.hostAgent,
+      systemPromptHash: session.stableSystemPromptHash,
+      modelFallbackStop: serializeModelFallbackStop(stop),
+    }).catch((error) => {
+      trace(`conversation persistence: model switch save failed sessionKey=${sessionKey}: ${String(error)}`)
+    })
+    closeOpenSpans()
+    textId = crypto.randomUUID()
+    textBreakPending = true
+    emitVisibleText(message)
+    emitFinish(undefined, { unified: "stop", raw: undefined })
+  }
+  /** A switch blocks the turn unless the user accepted it or the env var allows switches. */
+  const takeModelSwitch = async (): Promise<boolean> => {
+    const detected = session.modelSwitch
+    if (!detected) return false
+    session.modelSwitch = undefined
+    if (switchGuard && session.openCodeSessionId && !session.allowModelSwitch && !modelFallbackAllowedByEnv()) {
+      await stopForModelSwitch(detected)
+      return true
+    }
+    if (session.allowModelSwitch) session.servedBySwitch = detected.to
+    trace(`model switch: allowed (${session.allowModelSwitch ? "accepted for this turn" : "not guarded"}) served=${detected.to}`)
+    return false
+  }
+
   while (true) {
+    if (session.modelSwitch && await takeModelSwitch()) return
     // Consumer cancelled / closed the ReadableStream. Stop reading Cursor
     // frames so a continuation doStream can resume the same iterator —
     // keeping the loop alive would discard frames the next pump needs.
@@ -3369,6 +3566,7 @@ export async function pump(
         cacheDiagnostics.checkpointUpdates++
         setCheckpoint(session.conversationId, bytes)
         session.resumeCheckpoint = Uint8Array.from(bytes)
+        if (switchGuard) switchGuard.latestCheckpoint = session.resumeCheckpoint
         const tokenDetails = decodeConversationTokenDetails(bytes)
         if (tokenDetails && !(planHandoffCancellationRequested && tokenDetails.usedTokens === 0
           && (session.tokenDetails?.usedTokens ?? 0) > 0)) {
@@ -3386,8 +3584,33 @@ export async function pump(
       }
     }
 
+    if (iu?.partial_tool_call || iu?.tool_call_started) openModelStep()
     if (iu?.text_delta) {
-      emitText(((iu.text_delta as Record<string, unknown>).text as string) ?? "")
+      const delta = iu.text_delta as Record<string, unknown>
+      const text = (delta.text as string) ?? ""
+      const notice = switchGuard ? modelSwitchInNotice(text, delta.is_server_notice === true) : undefined
+      if (!notice) {
+        emitText(text)
+      } else if (session.allowModelSwitch) {
+        session.servedBySwitch ??= notice.to
+        emitText(
+          `\n\n_${modelDisplayName(session.servedBySwitch)} answered this request, as you asked. ` +
+            `Your next request goes to ${modelDisplayName(session.requestedModelId ?? "the requested model")} again._`,
+        )
+      } else if (modelFallbackAllowedByEnv()) {
+        emitText(text)
+      } else {
+        // Cursor stored no marked step (or Anthropic content was missing): no step is known to be clean.
+        trace(`model switch: Cursor's end-of-turn notice names ${notice.to} with no marked step`)
+        session.modelSwitch ??= {
+          ...notice,
+          rollback: switchGuard!.turnBase,
+          holdsTurn: false,
+          toolsKept: [],
+          toolsSwitched: switchGuard!.toolRuns.map(({ toolName, input }) => ({ toolName, input })),
+        }
+        continue
+      }
     } else if (iu?.thinking_delta) {
       emitReasoning(((iu.thinking_delta as Record<string, unknown>).text as string) ?? "")
     } else if (iu?.turn_ended) {
@@ -3424,6 +3647,24 @@ export async function pump(
           // the valid turn_ended the user already received as assistant text.
           trace(`progress-only: continuation failed, finishing original turn: ${(error as Error).message}`)
         }
+      }
+      if (session.servedBySwitch && session.openCodeSessionId) {
+        // The accepted answer stays; a fresh conversation id keeps the next request from inheriting the switch.
+        const sessionKey = session.openCodeSessionId
+        const previousId = session.conversationId
+        const conversationId = rekeyConversation(sessionKey, previousId, checkpoint)
+        trace(`model switch: accepted turn ended served=${session.servedBySwitch} conversation ${previousId} → ${conversationId}`)
+        await persistConversationState(session.cacheDir ?? opencodeGlobalCacheDir(), {
+          sessionKey,
+          conversationId,
+          requestContext: session.requestContext,
+          toolCatalog: session.toolCatalog ?? [],
+          postCompactionRebase: session.postCompactionRebase,
+          hostAgent: session.hostAgent,
+          systemPromptHash: session.stableSystemPromptHash,
+        }).catch((error) => {
+          trace(`conversation persistence: accepted switch save failed sessionKey=${sessionKey}: ${String(error)}`)
+        })
       }
       emitFinish(
         turnEnded,
@@ -3670,6 +3911,7 @@ export async function pump(
         }
       } else {
         replaySafety.markBarrier("non-control-exec")
+        openModelStep()
         const displayCallId = extractExecDisplayCallId(esm)
         const parsed = parseExecServerMessage(esm, session.hostToolDialect)
         if (parsed) {
@@ -3981,6 +4223,7 @@ export async function pump(
         )
       }
     } else if (interactionQuery) {
+      openModelStep()
       // InteractionQuery is a must-reply channel, just like exec and KV. AI
       // SDK has no Cursor-specific UI callback, so answer immediately with the
       // policy from protocol/interactions.ts (AskQuestion bridge, CreatePlan
@@ -4231,6 +4474,7 @@ export async function pump(
           `setDataLen=${(kv.set_blob_args as any)?.blob_data?.length ?? "-"}`,
       )
       const handled = handleKvServerMessage(kv, session)
+      if (handled?.kind === "set") noteAssistantBlob(session, kv)
       // Content-as-id reads are answered by echoing the id back (`echoed`); only a
       // hash we cannot serve means the checkpoint references state we lost.
       if (handled?.kind === "get" && !handled.found && !handled.echoed) blobMiss = true
@@ -4284,6 +4528,22 @@ function normalizeCheckpointBytes(raw: unknown): Uint8Array | undefined {
 }
 
 // ── Prompt extraction ──
+
+/** Ends a host step with nothing in it. */
+function stoppedTurnStream(): ReadableStream<V3Part> {
+  return new ReadableStream<V3Part>({
+    start(controller) {
+      controller.enqueue({ type: "stream-start", warnings: [] } as V3Part)
+      controller.enqueue({
+        type: "finish",
+        finishReason: { unified: "stop", raw: undefined },
+        usage: emptyLanguageModelV3Usage(),
+        providerMetadata: { ...OPENCODE_DISPLAY_ONLY_COST_METADATA, cursor: { usageVersion: 3, occupancyOnly: true } },
+      } as V3Part)
+      controller.close()
+    },
+  })
+}
 
 type ExtractedToolResult = {
   toolCallId: string
@@ -4727,6 +4987,8 @@ export function extractPromptHistory(
   options?: {
     preserveTrailingUser?: boolean
     toolResults?: "omit" | "all" | "trailing"
+    /** Prompt indices left out entirely (a turn stopped on a model switch, through its stop text). */
+    omit?: { start: number; end: number }
   },
 ): SeedHistoryMessage[] {
   const out: SeedHistoryMessage[] = []
@@ -4738,6 +5000,7 @@ export function extractPromptHistory(
     }
   }
   for (let messageIndex = 0; messageIndex < prompt.length; messageIndex++) {
+    if (options?.omit && messageIndex >= options.omit.start && messageIndex <= options.omit.end) continue
     const m = prompt[messageIndex]!
     if (m.role === "system") {
       if (typeof m.content === "string" && m.content.length > 0) {
@@ -5163,6 +5426,8 @@ export function resetTurnStateForTests(): void {
   mirroredTodosBySession.clear()
   resetContextEpochsForTests()
   resetFrozenRequestContextsForTests()
+  toolCallsOfStoppedTurns.clear()
+  resetModelFallbackStopsForTests()
 }
 
 function extractUserText(lastUser: Record<string, unknown> | undefined): string {

@@ -36,6 +36,7 @@
 - After MCP tools appear mid-turn, the next user message reuses RequestContext instead of rebuilding it
 - A Cursor run that fails before showing any output can be retried automatically again: timing, tracing, and progress fields Cursor now sends on ordinary updates no longer mark every run unsafe to retry
 - The debug log's turn usage validation no longer reports `status=mismatch` when Cursor's context shrinks between steps
+- When Cursor's safety filter quietly answers with another model (Claude Opus 4.8 instead of the Opus 5.5 you picked), the turn stops at the first step Cursor marks as switched instead of going on with that model and a notice at the end. The reply says what happened and what already ran, nothing the other model wrote is kept (the next request continues from the checkpoint before the switch, on a fresh Cursor conversation), and you rephrase the request or reply `continue with opus 4.8` to let the other model answer it once. `CURSOR_ALLOW_MODEL_FALLBACK=1` keeps the previous behaviour
 
 ## [0.8.0] - 2026-10-04
 

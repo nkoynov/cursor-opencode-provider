@@ -304,6 +304,17 @@ export function endContextEpoch(previousConversationId: string, nextConversation
   if (nextConversationId) clearContextEpoch(nextConversationId)
 }
 
+/** Take a conversation's epoch out, to give it to an id that continues from the same checkpoint. */
+export function detachContextEpoch(conversationId: string): ContextEpoch | undefined {
+  const epoch = byConversationId.get(conversationId)
+  byConversationId.delete(conversationId)
+  return epoch
+}
+
+export function attachContextEpoch(conversationId: string, epoch: ContextEpoch): void {
+  touch({ ...epoch, conversationId })
+}
+
 export function resetContextEpochsForTests(): void {
   byConversationId.clear()
 }
