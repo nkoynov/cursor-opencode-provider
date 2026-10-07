@@ -9,6 +9,7 @@
 - Cursor SwitchMode into plan mode moves the session to OpenCode's `plan` agent once the turn ends (OpenCode 2.0, and 1.x without `plan_enter`)
 - In plan mode without a host `plan_exit`, CreatePlan shows the plan and asks through `question` whether to start implementing; Yes switches to the build agent and continues. Under the `plan` agent with `plan_exit`, CreatePlan writes the session plan file and runs that review instead; a host plan-stage tool receives the plan directly
 - `cursor-opencode-provider/image-save` accepts `ask: null` for hosts without a permission prompt (the image is written after containment only); a missing `ask` is still refused
+- A Run starts without the HTTP/2 health-check ping when its connection received data in the last 10 seconds, as Cursor CLI does, which saves a round trip to Cursor on most Runs. If that connection turns out to be dead before Cursor answers (reset, refused stream, or a GOAWAY that excludes the Run), the Run is sent once more on a new connection; once Cursor has answered it is never sent again
 
 ### Fixed
 
