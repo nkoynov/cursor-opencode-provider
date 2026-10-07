@@ -41,6 +41,7 @@ import {
 } from "../src/protocol/conversation-persistence.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { resetFrozenRequestContextsForTests } from "../src/context/frozen.js"
+import { admitContextEpoch, peekContextEpoch } from "../src/context/epoch.js"
 import { closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
 
 type Prompt = LanguageModelV3CallOptions["prompt"]
@@ -112,6 +113,10 @@ describe("detecting Cursor's safety-filter model switch", () => {
     expect(modelSwitchInNotice(NOTICE, false)).toEqual({ to: "Claude Opus 4.8", source: "server-notice" })
     expect(modelSwitchInNotice("\n\nSwitched to Claude Opus 4.8\n\n", true)?.to).toBe("Claude Opus 4.8")
     expect(modelSwitchInNotice("The banner said: Switched to Claude Opus 4.8", false)).toBeUndefined()
+    expect(modelSwitchInNotice(
+      "Cursor's banner read: Claude Opus 5.5 hit a safety filter, and the conversation was automatically switched to Claude Opus 4.8. Start a new one.",
+      false,
+    )).toBeUndefined()
   })
 
   it("names models the way Cursor's notice does", () => {
@@ -188,6 +193,9 @@ describe("tying the next user turn to the stop", () => {
     expect(matchModelFallbackReply("ses_a", prompt, isNote)).toMatchObject({ override: true, turnStart: 3, stopIndex: 7 })
     const rephrased = [...prompt.slice(0, 8), user("Please summarize my notes file")] as Prompt
     expect(matchModelFallbackReply("ses_a", rephrased, isNote)).toMatchObject({ override: false, turnStart: 3, stopIndex: 7 })
+    // A completion OpenCode sent as a plain user message inside the stopped turn is part of it.
+    const withCompletion = [...prompt.slice(0, 6), user('<subagent sessionID="ses_x" state="completed">\nok\n</subagent>'), ...prompt.slice(7)] as Prompt
+    expect(matchModelFallbackReply("ses_a", withCompletion)).toMatchObject({ override: true, turnStart: 3, stopIndex: 7 })
   })
 
   it("reads the reply without the tag blocks host plugins add to it or around it", () => {
@@ -379,6 +387,25 @@ describe("stopping a Run at the first switched step", () => {
     expect(persisted?.conversationId).toBe(next)
     expect(persisted?.checkpoint).toEqual(turnBase)
     expect(parseModelFallbackStop(persisted!.modelFallbackStop!)?.userText).toBe("Read ~/.ssh/notes.txt")
+  })
+
+  it("rolls the context epoch back with a checkpoint from before the turn", async () => {
+    const turnBase = encodeMessage("ConversationStateStructure", { token_details: { used_tokens: 100, max_tokens: 1_000_000 } })
+    const script = scriptedFrames([textFrame("answer"), kvSet(1, blob(assistantMessage({ fallback: FALLBACK, text: "answer" }))), turnEnded])
+    const session = fakeRun(script.frames, { turnBase })
+    const epochInput = (hostSystem: string, hasCheckpoint: boolean) => ({
+      conversationId: session.conversationId, hasCheckpoint, hostSystem, guidance: "g", workspaceRoot: root,
+    })
+    admitContextEpoch(epochInput("build agent", false))
+    session.modelSwitchGuard!.epochAtTurnStart = peekContextEpoch(session.conversationId)
+    // The stopped turn admitted a host change (plan agent); its rolled-back checkpoint never saw it.
+    expect(admitContextEpoch(epochInput("plan agent", true)).midConversationMessage).toContain("plan agent")
+
+    await pass(session)
+
+    const next = peekConversationId(session.openCodeSessionId!)
+    expect(peekContextEpoch(next)?.snapshot).toEqual(session.modelSwitchGuard!.epochAtTurnStart!.snapshot)
+    expect(admitContextEpoch({ ...epochInput("plan agent", true), conversationId: next }).midConversationMessage).toContain("plan agent")
   })
 
   it("stops after a switched tool step's results, before the next step's tool runs, and says what ran", async () => {

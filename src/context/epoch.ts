@@ -304,6 +304,12 @@ export function endContextEpoch(previousConversationId: string, nextConversation
   if (nextConversationId) clearContextEpoch(nextConversationId)
 }
 
+/** A copy of the conversation's epoch as it is now, to restore it with an older checkpoint. */
+export function peekContextEpoch(conversationId: string): ContextEpoch | undefined {
+  const epoch = byConversationId.get(conversationId)
+  return epoch ? structuredClone(epoch) : undefined
+}
+
 /** Take a conversation's epoch out, to give it to an id that continues from the same checkpoint. */
 export function detachContextEpoch(conversationId: string): ContextEpoch | undefined {
   const epoch = byConversationId.get(conversationId)

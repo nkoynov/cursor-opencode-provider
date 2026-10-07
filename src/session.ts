@@ -10,6 +10,7 @@ import type {
 } from "./protocol/tools.js"
 import type { CursorConversationTokenDetails } from "./protocol/token-details.js"
 import type { HostToolRun, ModelSwitch } from "./model-fallback.js"
+import type { ContextEpoch } from "./context/epoch.js"
 
 export type Frame = { flags: number; payload: Uint8Array }
 
@@ -346,6 +347,8 @@ export type ModelSwitchGuard = {
   toolRuns: Array<HostToolRun & { inOpenStep: boolean }>
   /** The turn's request as the host sent it, before provider reminders. */
   userText: string
+  /** The context epoch before this turn admitted its host context, for a rollback to before the turn. */
+  epochAtTurnStart?: ContextEpoch
 }
 
 export type DetectedModelSwitch = ModelSwitch & {

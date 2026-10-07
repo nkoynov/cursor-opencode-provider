@@ -201,6 +201,8 @@ import {
 import {
   admitContextEpoch,
   appendMidConversationMessage,
+  peekContextEpoch,
+  type ContextEpoch,
   resetContextEpochsForTests,
 } from "./context/epoch.js"
 import { workspaceRootFromRequestContext } from "./context/env.js"
@@ -1082,6 +1084,7 @@ function carryModelSwitchState(from: CursorSession, to: CursorSession): void {
   if (!guard || !to.modelSwitchGuard) return
   to.modelSwitchGuard.turnBase = guard.turnBase
   to.modelSwitchGuard.userText = guard.userText
+  to.modelSwitchGuard.epochAtTurnStart = guard.epochAtTurnStart
   to.modelSwitchGuard.toolRuns = guard.toolRuns.map((run) => ({ ...run, inOpenStep: false }))
 }
 
@@ -1411,6 +1414,7 @@ async function startSession(
   // message, which Cursor does not follow.
   let systemPrompt: string | undefined
   let systemInstructions: SystemInstructions | undefined
+  let epochAtTurnStart: ContextEpoch | undefined
   if (isCompaction || lifecycle) {
     // Ephemeral summary/title Runs — do not initialize a sticky Context Epoch.
     systemPrompt = startedWithCheckpoint
@@ -1423,6 +1427,7 @@ async function startSession(
       ?? [baseSystemPrompt, interactionGuidance].filter(Boolean).join("\n\n")
     if (ephemeralText) systemInstructions = { text: ephemeralText, authoritative: true }
   } else {
+    epochAtTurnStart = peekContextEpoch(conversationId)
     const admitted = admitContextEpoch({
       conversationId,
       hasCheckpoint: startedWithCheckpoint,
@@ -1753,6 +1758,7 @@ async function startSession(
             stepOpen: false,
             toolRuns: [],
             userText: turnRequest,
+            epochAtTurnStart,
           },
         }
       : {}),
@@ -3359,7 +3365,12 @@ export async function pump(
       }
     }
     const previousId = session.conversationId
-    const conversationId = rekeyConversation(sessionKey, previousId, detected.rollback)
+    const conversationId = rekeyConversation(
+      sessionKey,
+      previousId,
+      detected.rollback,
+      detected.holdsTurn ? undefined : (switchGuard?.epochAtTurnStart ?? null),
+    )
     const stop = {
       requestedModel,
       servedModel: detected.to,
