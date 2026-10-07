@@ -132,7 +132,7 @@ describe("accepting the other model once", () => {
   it("takes only the whole documented reply", () => {
     expect(fallbackOverridePhrase("claude-opus-4-8")).toBe("continue with opus 4.8")
     expect(fallbackOverridePhrase("Claude Opus 4.8")).toBe("continue with opus 4.8")
-    for (const reply of ["continue with opus 4.8", "Continue with Opus 4.8.", "`continue with opus 4.8`", "  continue  with opus 4.8 ", "continue with Claude Opus 4.8"]) {
+    for (const reply of ["continue with opus 4.8", "Continue with Opus 4.8.", "`continue with opus 4.8`", "`continue with opus 4.8`.", "\"Continue with Opus 4.8.\"", "  continue  with opus 4.8 ", "continue with Claude Opus 4.8"]) {
       expect(isFallbackOverride(reply, "claude-opus-4-8")).toBe(true)
     }
     for (const reply of ["continue", "yes", "please continue with opus 4.8", "continue with opus 4.8 and fix the test", "continue with opus 5.5", "use opus 4.8"]) {
@@ -735,6 +735,39 @@ describe("the turn after a stop", () => {
       const stopped = await step(sessionKey, flagged as Prompt)
       await step(sessionKey, [...flagged, assistant(stopped), user("no, do not continue with opus 4.8 — use the README instead")] as Prompt)
       expect(runText(cursor.runs[1])).toStartWith("no, do not continue with opus 4.8")
+    } finally {
+      cursor.restore()
+    }
+  })
+
+  it("stops a Run that rebases a lost Run's tool results too", async () => {
+    const cursor = fakeCursorRuns([switchedTurn("4.8 answer")])
+    try {
+      const sessionKey = `ses_e2e_${++seq}`
+      // The held Run that asked for this result is gone (a restart): the result rebases a fresh Run.
+      const text = await step(sessionKey, [
+        SYSTEM,
+        user("Read README.md"),
+        { role: "assistant", content: [{ type: "tool-call", toolCallId: "cursor_gone-run_1", toolName: "read", input: {} }] },
+        { role: "tool", content: [{ type: "tool-result", toolCallId: "cursor_gone-run_1", toolName: "read", output: { type: "text", value: "# demo" } }] },
+      ] as Prompt)
+      expect(text).toContain("**Stopped:**")
+      expect(peekModelFallbackStop(sessionKey)?.userText).toBe("Read README.md")
+    } finally {
+      cursor.restore()
+    }
+  })
+
+  it("does not send the stopped request's image with the rephrased one", async () => {
+    const cursor = fakeCursorRuns([switchedTurn("4.8 answer"), cleanTurn("ok")])
+    try {
+      const sessionKey = `ses_e2e_${++seq}`
+      const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7]).toString("base64")
+      const flagged = { role: "user", content: [{ type: "text", text: "What is in this picture?" }, { type: "file", mediaType: "image/png", data: `data:image/png;base64,${png}`, filename: "/w/shot.png" }] }
+      const stopped = await step(sessionKey, [SYSTEM, flagged] as Prompt)
+      expect(cursor.runs[0].action.user_message_action.user_message.selected_context?.selected_images ?? []).toHaveLength(1)
+      await step(sessionKey, [SYSTEM, flagged, assistant(stopped), user("What is in README.md?")] as Prompt)
+      expect(cursor.runs[1].action.user_message_action.user_message.selected_context?.selected_images ?? []).toHaveLength(0)
     } finally {
       cursor.restore()
     }

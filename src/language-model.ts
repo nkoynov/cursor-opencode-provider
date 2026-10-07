@@ -1502,7 +1502,9 @@ async function startSession(
   const imageExtraction = resuming
     ? { images: [], hashes: [], candidateCount: 0, duplicateCount: 0, userImageCount: 0 }
     : await extractCursorPromptImages(
-        prompt as readonly unknown[],
+        (fallbackReply
+          ? prompt.filter((_, index) => index < fallbackReply.turnStart || index > fallbackReply.stopIndex)
+          : prompt) as readonly unknown[],
         lastUser as unknown as Record<string, unknown> | undefined,
         {
           supportsImages,

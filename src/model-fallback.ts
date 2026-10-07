@@ -129,6 +129,7 @@ export function fallbackOverridePhrase(servedModel: string): string {
 function normalizeReply(text: string): string {
   return text
     .trim()
+    .replace(/[.!]+$/, "")
     .replace(/^[`"'“”]+|[`"'“”]+$/g, "")
     .replace(/[.!]+$/, "")
     .replace(/\s+/g, " ")
