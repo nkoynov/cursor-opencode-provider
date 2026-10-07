@@ -87,7 +87,7 @@ export function buildDynamicCatalogRoutingInstruction(options: {
     // Mirror OpenCode 1 SystemPrompt.skills / OC2 SkillInstructions.render.
     lines.push(
       "- Skills provide specialized instructions and workflows for specific tasks. " +
-        "Use the `skill` tool to load a skill when a task matches its description " +
+        "Use the `skill` tool through CallDynamicTool to load a skill when a task matches its description " +
         "(the host system prompt and `skill` tool carry names and descriptions). " +
         "A skill that is already present in the conversation as a `<skill_content>` block " +
         "does not need to be invoked again.",

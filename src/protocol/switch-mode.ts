@@ -409,7 +409,7 @@ export function cursorModeSystemReminder(
         ? `Plan mode is active. The user does not want execution yet -- you MUST NOT make edits, run non-readonly tools (including changing configs or making commits), or otherwise modify system state. This supersedes any conflicting instruction.
 
 1. Research enough to make an accurate plan.
-2. Before finishing, resolve decisions that would materially change the implementation path, touched files, architecture, user-visible behavior, data model, or validation strategy. If investigation cannot resolve one, ask clarifying questions in small batches (use the OpenCode \`question\` tool when available).
+2. Before finishing, resolve decisions that would materially change the implementation path, touched files, architecture, user-visible behavior, data model, or validation strategy. If investigation cannot resolve one, ask clarifying questions in small batches (with Cursor AskQuestion, which runs the OpenCode \`question\` tool, when available).
 3. Do not put choices in the plan for the user to resolve. The plan must present one recommended approach, not unresolved questions or "choose A or B" options.
 4. When ready, ${leavePlan}.
 5. Do not execute the plan until the user confirms it.`

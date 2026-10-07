@@ -58,7 +58,7 @@ describe("buildDynamicCatalogRoutingInstruction", () => {
     expect(line).toContain("including `skill` and MCP servers such as `context7`")
     expect(line).toContain("GetDynamicTools / CallDynamicTool")
     expect(line).toContain("before Grep/Shell fallbacks")
-    expect(line).toContain("Use the `skill` tool to load a skill when a task matches its description")
+    expect(line).toContain("Use the `skill` tool through CallDynamicTool to load a skill when a task matches its description")
     expect(line).toContain("does not need to be invoked again")
   })
 
