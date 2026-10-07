@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- Session titles and other tool-less requests (plugin `generate` calls) no longer advertise the session's tools, and the host's instructions open the request with its message as the input, so the title model answers in one call instead of trying tools that are then refused. Compaction still advertises the session's tools
 - Dynamic-catalog guidance names the namespace for host tools (`opencode`) and states that `cursor` holds only Cursor's built-in tools, so a first `skill` lookup no longer fails in the wrong namespace.
 - A SwitchMode handoff that starts a new host plan turn explicitly terminates the old Cursor Run before the host switch, preserving its checkpoint and preventing premature CreatePlan calls. Native planning guidance distinguishes direct functions from dynamic discovery; debug logs retain native discovery errors.
 - Dynamic tool definitions carry their exact invocation identity and complete outer envelope beside the inner argument schema, so discovery and shortened search results retain required outer call fields.

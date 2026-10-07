@@ -494,11 +494,12 @@ export function connectFrameError(payload: string): CursorProviderError {
 }
 
 /**
- * Cold-start race: OpenCode's title/lifecycle Run often arrives with tools=[]
- * before the real agent Run publishes the catalog. Materializing RequestContext
- * with tools=0 and later with the full set changes its bytes, forces a prompt-
- * cache rebuild, and incurs avoidable cost. A valid session-keyed lifecycle Run
- * therefore waits for the first real catalog; cancellation is the only escape.
+ * Cold-start race: a compaction Run can arrive with tools=[] before any agent
+ * Run of the session published the catalog (after a restart). Its RequestContext
+ * is carried into the rebased conversation, so materializing it with tools=0
+ * and later with the full set changes its bytes, forces a prompt-cache rebuild,
+ * and incurs avoidable cost. A valid session-keyed compaction Run therefore
+ * waits for the first real catalog; cancellation is the only escape.
  */
 type ToolCatalogWaiter = {
   resolve: (tools: OpencodeToolDef[]) => void
@@ -1276,6 +1277,7 @@ async function startSession(
   let userText = recovery?.kind === "rebase" && !checkpointUnusable
     ? "Continue the interrupted turn from the conversation history above. Do not repeat completed work."
     : (extractUserText(lastUser) || ".")
+  if (lifecycle) userText = textOnlyTurnText(baseSystemPrompt, userText)
   // After an approved SwitchMode, inject the Cursor CLI-shaped mode reminder
   // (same <system_reminder> contract the CLI uses after flipping unifiedMode).
   const startedWithCheckpoint = !!conversationState
@@ -4473,6 +4475,18 @@ export function groundCheckpointTurnText(
 }
 
 /**
+ * User turn of a text-only Run that is not compaction (a title, a plugin's
+ * generate call): the host's system prompt is its task, so the turn opens with
+ * it and the host's message follows as the input. As a RequestContext rule
+ * alone it loses to Cursor's agent prompt, and the model answers or acts on
+ * the input instead ("I'll help you…" titles).
+ */
+export function textOnlyTurnText(hostSystem: string | undefined, input: string): string {
+  const task = hostSystem?.trim()
+  return task ? `${task}\n\n<input>\n${input}\n</input>` : input
+}
+
+/**
  * Cursor's native UI interactions cannot be surfaced through the AI SDK.
  * Redirect only to OpenCode tools that are genuinely advertised this turn;
  * compaction keeps its dedicated summary prompt unchanged.
@@ -5067,16 +5081,20 @@ export async function resolveTurnToolState(input: {
   // the whole tools prefix. Prefer: keep the epoch's fullest catalog for
   // advertisement; compute allowTools from what actually arrived this turn.
   //
-  // A zero-tool call is never a smaller catalog — it is a lifecycle turn
-  // (compaction, title generation) that re-advertises the last real catalog.
+  // A zero-tool call is never a smaller catalog. Compaction re-advertises the
+  // last real catalog: its RequestContext seeds the rebased conversation. Any
+  // other zero-tool call (title, plugin generate) advertises none: it runs in
+  // a conversation of its own that never executes a tool, and an advertised
+  // catalog only makes the model try tools that are then refused, each a
+  // further model call.
   // New tool names (MCP connect) append at the tail without rewriting
   // descriptors already frozen. Equal name-sets and host shrinks keep the
   // frozen advertisement and its order — schema/description churn must not
   // retokenize tools, and inserting a name that sorts earlier than `z` must
   // not reshuffle the prefix.
   //
-  // On cold start the lifecycle Run may arrive before any catalog exists. For a
-  // valid session key, wait until a sibling doStream publishes the first real
+  // On cold start the compaction Run may arrive before any catalog exists. For
+  // a valid session key, wait until a sibling doStream publishes the first real
   // catalog; cancellation is the only escape.
   let advertisedTools: OpencodeToolDef[]
   if (incomingTools.length > 0) {
@@ -5105,7 +5123,7 @@ export async function resolveTurnToolState(input: {
     } else {
       advertisedTools = toolsInFixedOrder(incomingTools)
     }
-  } else if (sessionKey) {
+  } else if (sessionKey && isCompaction) {
     const cached = toolCatalogBySession.get(sessionKey)
       ?? await waitForSiblingToolCatalog(sessionKey, input.abortSignal)
     advertisedTools = cached

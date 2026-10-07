@@ -6,6 +6,7 @@ import {
   restoreTurnToolCatalog,
   resolveTurnConversationReset,
   resolveTurnToolState,
+  textOnlyTurnText,
 } from "../src/language-model.js"
 import {
   bindConversationId,
@@ -60,9 +61,9 @@ describe("compaction tool catalog", () => {
     })).toEqual({ advertisedTools: [], allowTools: false })
   })
 
-  it("keeps the catalog advertised on every lifecycle turn, not just compaction", async () => {
-    // Collapsing a title-generation turn to tools=0 changes the RequestContext
-    // shape and costs the whole prompt cache; execution stays refused instead.
+  it("advertises the catalog to compaction only, not to a title or other zero-tool turn", async () => {
+    // A title Run has a conversation of its own and never executes a tool; an
+    // advertised catalog only makes the model try tools that are refused.
     const tools = [{ name: "read", inputSchema: { type: "object" } }]
     restoreTurnToolCatalog("ses_restored_catalog", tools)
 
@@ -70,13 +71,13 @@ describe("compaction tool catalog", () => {
       sessionKey: "ses_restored_catalog",
       incomingTools: [],
       isCompaction: false,
-    })).toEqual({ advertisedTools: tools, allowTools: false })
+    })).toEqual({ advertisedTools: [], allowTools: false })
     expect(await resolveTurnToolState({
       sessionKey: "ses_restored_catalog",
       incomingTools: [],
       toolChoice: { type: "none" },
       isCompaction: false,
-    })).toEqual({ advertisedTools: tools, allowTools: false })
+    })).toEqual({ advertisedTools: [], allowTools: false })
     expect(await resolveTurnToolState({
       sessionKey: "ses_restored_catalog",
       incomingTools: [],
@@ -84,9 +85,17 @@ describe("compaction tool catalog", () => {
     })).toEqual({ advertisedTools: tools, allowTools: false })
   })
 
-  it("waits indefinitely for a sibling catalog on cold-start lifecycle turns", async () => {
+  it("does not wait for a catalog on a cold-start title turn", async () => {
+    expect(await resolveTurnToolState({
+      sessionKey: "ses_cold_title",
+      incomingTools: [],
+      isCompaction: false,
+    })).toEqual({ advertisedTools: [], allowTools: false })
+  })
+
+  it("waits indefinitely for a sibling catalog on cold-start compaction turns", async () => {
     // The production race exceeded one second. A timeout merely moves the race
-    // threshold, so assert that the lifecycle call remains blocked well beyond
+    // threshold, so assert that the compaction call remains blocked well beyond
     // the old 100 ms cutoff and resolves only when the real catalog arrives.
     const tools = [{ name: "bash" }, { name: "read" }]
     const sessionKey = "ses_cold_start"
@@ -95,7 +104,7 @@ describe("compaction tool catalog", () => {
     const lifecycle = resolveTurnToolState({
       sessionKey,
       incomingTools: [],
-      isCompaction: false,
+      isCompaction: true,
     }).then((state) => {
       settled = true
       return state
@@ -118,7 +127,7 @@ describe("compaction tool catalog", () => {
     const lifecycle = resolveTurnToolState({
       sessionKey: "ses_cancelled",
       incomingTools: [],
-      isCompaction: false,
+      isCompaction: true,
       abortSignal: abort.signal,
     })
 
@@ -341,6 +350,19 @@ describe("compaction tool catalog", () => {
     await expect(evicted).rejects.toThrow("tool-catalog wait cancelled")
     expect(resolveTurnConversationReset({ sessionKey: "oldest", isCompaction: false }))
       .toEqual({ reset: false })
+  })
+})
+
+describe("textOnlyTurnText", () => {
+  it("opens a text-only user turn with the host's task and keeps the message as its input", () => {
+    expect(textOnlyTurnText("  You are a title generator.\n", "get my latest Slack message")).toBe(
+      "You are a title generator.\n\n<input>\nget my latest Slack message\n</input>",
+    )
+  })
+
+  it("leaves the message alone without a host system prompt", () => {
+    expect(textOnlyTurnText(undefined, "hello")).toBe("hello")
+    expect(textOnlyTurnText("  ", "hello")).toBe("hello")
   })
 })
 
