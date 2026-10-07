@@ -198,6 +198,14 @@ export type CursorSession = {
   cacheDir?: string
   /** Latest eligible checkpoint emitted by this Run attempt. */
   resumeCheckpoint?: Uint8Array
+  /**
+   * The checkpoint a resumed Run started from, kept until the Run sends a newer
+   * one, asks the host for anything, or ends its turn: until then, resuming it
+   * again replays nothing the host acted on (Cursor CLI resumes the same way).
+   */
+  carriedCheckpoint?: Uint8Array
+  /** Cursor-side waits (AwaitShell) in flight: call id → how long the Run may stay silent. */
+  cursorWaits?: Map<string, number>
   /** Last checkpoint-derived context snapshot, independent of retry eligibility. */
   tokenDetails?: CursorConversationTokenDetails
   /** True only after this Run receives a checkpoint containing token details. */
@@ -637,6 +645,7 @@ export class SessionManager {
     const now = this.now()
     const key = this.key(session.sessionId, execId)
     this.tombstones.delete(key)
+    session.carriedCheckpoint = undefined
     session.pending.set(execId, {
       resultField,
       toolName,

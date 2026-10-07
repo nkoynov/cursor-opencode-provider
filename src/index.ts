@@ -5,9 +5,9 @@ import type { HostToolDialect } from "./protocol/tools.js"
 import type { AccessTokenProvider } from "./auth-renewal.js"
 
 export type CursorRetryOptions = {
-  /** Total attempts including the initial request. Default: 3. */
+  /** Total attempts including the initial request. Default: 3, or 6 when Cursor refuses the Run for capacity; set, it caps both. */
   maxAttempts?: number
-  /** Initial full-jitter backoff ceiling. Default: 500ms. */
+  /** Initial full-jitter backoff ceiling; capacity refusals start at four times this. Default: 500ms. */
   baseDelayMs?: number
   /** Exponential backoff ceiling. Default: 8000ms. */
   maxDelayMs?: number

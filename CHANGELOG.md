@@ -27,7 +27,9 @@
 - Cursor models now see OpenCode skills the way Cursor presents them (each skill's file path, read on demand), so they load matching skills without going through the dynamic tool catalog
 - Cursor models no longer call OpenCode tools by their own names as top-level tools, which Cursor refuses with "Tool not found" (seen with MCP tools and `execute`). The system guidance called every advertised tool a direct tool to call by name, but Cursor's top-level list has only its own tools plus GetDynamicTools / CallDynamicTool. It now lists which host tools Cursor's native tools run (`read` through Read, `edit` through StrReplace, …) and which are called through CallDynamicTool, with the namespace and tool name from Cursor's catalog
 - Cursor is no longer told that past chats are in an `agent-transcripts` folder nothing creates, so the model stops searching it; the folder is named only when it exists when a conversation starts
-
+- A Cursor AwaitShell sleep longer than two minutes no longer fails the turn: Cursor sends only heartbeats while it waits, and the stall deadline now lasts for the wait's `block_until_ms` (up to an hour). Before, the Run was cut at 120 s, resumed, cut again, and ended with "semantic-progress timeout … automatic retry unsafe"
+- A resumed Run that fails before Cursor sends a newer checkpoint resumes again from the one it started from, as Cursor CLI does, instead of ending the turn as unsafe to retry; once the Run asks the host for anything or answers an interaction, that checkpoint is no longer reused
+- A Run Cursor refuses for capacity (`resource_exhausted`, `unavailable`, HTTP 429/503) is retried over about a minute (six attempts, delays from 1–2 s doubling to 15–30 s, or Cursor's retry delay) instead of three attempts within about 1.5 s, which an Opus capacity shortage outlasted. The final error says the capacity is on Cursor's side, not a limit on the key. Network errors keep the fast retries
 ## [0.8.0] - 2026-10-04
 
 ### Changed
