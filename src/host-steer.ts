@@ -11,6 +11,8 @@ export type EarlySteer = HostSteer & {
 type HostSteerState = {
   listeners: Map<string, (steer: HostSteer) => boolean>
   injected: Map<string, EarlySteer[]>
+  /** Answered steers OpenCode promoted after the reply, ended by an empty step: they open the next user turn. */
+  settled?: Map<string, EarlySteer[]>
   queued: Map<string, HostSteer>
   announced: Set<string>
 }
@@ -27,6 +29,7 @@ const state: HostSteerState = globals[HOST_STEERS] ??= {
   queued: new Map(),
   announced: new Set(),
 }
+const settled = state.settled ??= new Map()
 
 function remember<K>(entries: Map<K, unknown> | Set<K>, key: K): void {
   while (entries.size > MAX_REMEMBERED) {
@@ -117,6 +120,32 @@ export function takeEarlySteers(
   return { remaining, taken }
 }
 
+export function settleEarlySteers(sessionID: string, steers: readonly EarlySteer[]): void {
+  settled.set(sessionID, [...(settled.get(sessionID) ?? []), ...steers].slice(-MAX_RECORDS_PER_SESSION))
+}
+
+/** Indices of the messages that carry a steer the model already answered, each matched once; forgets the settled ones. */
+export function takeAnsweredEarlySteers(
+  sessionID: string | undefined,
+  messages: ReadonlyArray<string | undefined>,
+): Set<number> {
+  const indices = new Set<number>()
+  if (!sessionID) return indices
+  const candidates = [
+    ...(settled.get(sessionID) ?? []),
+    ...(state.injected.get(sessionID) ?? []).filter((record) => record.answered),
+  ]
+  settled.delete(sessionID)
+  messages.forEach((message, index) => {
+    if (message === undefined) return
+    const match = candidates.findIndex((record) => carries(message, record.text))
+    if (match === -1) return
+    candidates.splice(match, 1)
+    indices.add(index)
+  })
+  return indices
+}
+
 /** A new user turn began, so no message injected before it can still come back. */
 export function clearEarlySteers(sessionID: string | undefined): void {
   if (sessionID) state.injected.delete(sessionID)
@@ -124,5 +153,6 @@ export function clearEarlySteers(sessionID: string | undefined): void {
 
 export function forgetEarlySteers(sessionID: string): void {
   state.injected.delete(sessionID)
+  settled.delete(sessionID)
   state.listeners.delete(sessionID)
 }

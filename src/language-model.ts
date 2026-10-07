@@ -229,6 +229,8 @@ import {
   listenForHostSteers,
   markEarlySteersAnswered,
   recordEarlySteer,
+  settleEarlySteers,
+  takeAnsweredEarlySteers,
   takeEarlySteers,
   type HostSteer,
 } from "./host-steer.js"
@@ -795,6 +797,7 @@ async function doStreamImpl(
     || (!options.accessToken && options.apiKey !== undefined && isExchangeableApiKey(options.apiKey))
   let prefetchedToken: string | undefined
   const requestedAt = Date.now()
+  let answeredSteers: ReadonlySet<number> | undefined
   // pumpWithRecovery owns the complete per-turn attempt budget.  Opening a
   // replacement session here must be a single attempt; otherwise setup retry
   // loops nest inside recovery and `maxAttempts` no longer caps total Runs.
@@ -806,7 +809,11 @@ async function doStreamImpl(
     const token = prefetched !== undefined && !forceRefresh
       ? prefetched
       : await resolveRunBearerToken(options, forceRefresh)
-    const opened = await startSession(modelId, token, callOptions, options, { ...startOptions, requestedAt })
+    const opened = await startSession(modelId, token, callOptions, options, {
+      ...startOptions,
+      requestedAt,
+      ...(answeredSteers ? { answeredSteers } : {}),
+    })
     cancelIfHostStoppedSince(opened)
     return opened
   }
@@ -915,6 +922,15 @@ async function doStreamImpl(
         // drain turn_ended) before opening the new Run so the checkpoint prefix
         // is preserved. registerSession will not close a prior Run that still
         // has real pending execs; a failed prepare leaves that Run held.
+        if (mayBeUserStep(callOptions)) {
+          answeredSteers = answeredSteersInUserTurn(sessionKey, prompt)
+          if (answeredSteers.size > 0) {
+            trace(
+              `fresh turn: ${answeredSteers.size} message(s) of the user turn hold a steer the model already ` +
+                `answered — left out of the Run's text`,
+            )
+          }
+        }
         clearEarlySteers(sessionKey)
         try {
           await preparePriorSessionForFreshTurn(sessionKey)
@@ -1273,7 +1289,13 @@ async function startSession(
   token: string,
   callOptions: LanguageModelV3CallOptions,
   options: CreateCursorOptions,
-  startOptions?: { recovery?: CursorRunRecovery; isolate?: boolean; requestedAt?: number },
+  startOptions?: {
+    recovery?: CursorRunRecovery
+    isolate?: boolean
+    requestedAt?: number
+    /** Prompt indices of early steers the model already answered (`answeredSteersInUserTurn`). */
+    answeredSteers?: ReadonlySet<number>
+  },
 ): Promise<CursorSession> {
   const continuationPolicy = resolveContinuationPolicy(options.continuation)
   const prompt = callOptions.prompt
@@ -1432,9 +1454,13 @@ async function startSession(
   }
 
   const lastUser = [...prompt].reverse().find((message) => message.role === "user")
+  // Title, summary and helper calls end with their own instruction, so only it is their request.
+  const liveTurn = allowTools && !isCompaction && !isolateHelper
+    ? liveUserTurn(prompt, startOptions?.answeredSteers)
+    : undefined
   let userText = recovery?.kind === "rebase" && !checkpointUnusable
     ? "Continue the interrupted turn from the conversation history above. Do not repeat completed work."
-    : (extractUserText(lastUser) || ".")
+    : ((liveTurn ? liveTurn.text : extractUserText(lastUser)) || ".")
   // After an approved SwitchMode, inject the Cursor CLI-shaped mode reminder
   // (same <system_reminder> contract the CLI uses after flipping unifiedMode).
   const startedWithCheckpoint = !!conversationState
@@ -1523,6 +1549,7 @@ async function startSession(
     toolResults: isCompaction || foreignHistory || checkpointUnusable ? "all" : "transcript",
     trailingSteer: recovery?.kind === "rebase" && recovery.steer === true,
     ...(recovery?.kind === "rebase" && recovery.toolCallIds ? { keepToolCallIds: recovery.toolCallIds } : {}),
+    ...(liveTurn ? { liveTurnStart: liveTurn.start, answeredSteers: liveTurn.answered } : {}),
   })
 
   await loadAvailableModels()
@@ -5149,6 +5176,7 @@ function answeredEarlySteersOnly(callOptions: LanguageModelV3CallOptions): boole
   if (!steer || steer.hostNote) return false
   const { taken } = takeEarlySteers(sessionKey, steer.messages, (record) => record.answered, true)
   if (taken.length === 0) return false
+  settleEarlySteers(sessionKey, taken)
   trace(
     `fresh turn: the model already answered ${taken.length} mid-step message(s) in its last turn ` +
       `inboxIDs=${taken.map((record) => record.inboxID).join(",")} — ending the step without a Run`,
@@ -5550,6 +5578,10 @@ export function extractPromptHistory(
     trailingSteer?: boolean
     /** With `trailing` or `transcript`, earlier results of the step that are replayed whole too. */
     keepToolCallIds?: ReadonlySet<string>
+    /** First message of the Run's user turn (`liveUserTurn`); it and the rest are not history. */
+    liveTurnStart?: number
+    /** Messages of the user turn holding a steer the model already answered: history, not the turn. */
+    answeredSteers?: ReadonlySet<number>
   },
 ): SeedHistoryMessage[] {
   const out: SeedHistoryMessage[] = []
@@ -5573,8 +5605,11 @@ export function extractPromptHistory(
     }
     if (trailingToolStart === notesStart) trailingToolStart = prompt.length
   }
-  const liveUserStart = liveUserMessageStart(prompt, options?.trailingSteer === true)
+  const liveTurnStart = options?.preserveTrailingUser ? undefined : options?.liveTurnStart
+  const liveUserStart = liveTurnStart ?? liveUserMessageStart(prompt, options?.trailingSteer === true)
   for (let messageIndex = 0; messageIndex < prompt.length; messageIndex++) {
+    const answeredSteer = options?.answeredSteers?.has(messageIndex) === true
+    if (liveTurnStart !== undefined && messageIndex >= liveTurnStart && !answeredSteer) continue
     const m = prompt[messageIndex]!
     if (m.role === "system") {
       if (typeof m.content === "string" && m.content.length > 0) {
@@ -5585,7 +5620,7 @@ export function extractPromptHistory(
     if (m.role === "user") {
       const text = extractUserText(m as unknown as Record<string, unknown>)
       if (!text || text === ".") continue
-      const unanswered = messageIndex < liveUserStart && !hostTailNote(m) && !repliedAfter(prompt, messageIndex)
+      const unanswered = (messageIndex < liveUserStart || answeredSteer) && !hostTailNote(m) && !repliedAfter(prompt, messageIndex)
       out.push(unanswered ? { role: "user", content: text, unanswered } : { role: "user", content: text })
       continue
     }
@@ -5622,7 +5657,7 @@ export function extractPromptHistory(
     }
   }
   // Live user message is the Run action, not seed history.
-  if (!options?.preserveTrailingUser && out.length > 0 && out[out.length - 1]!.role === "user") {
+  if (!options?.preserveTrailingUser && liveTurnStart === undefined && out.length > 0 && out[out.length - 1]!.role === "user") {
     out.pop()
   }
   return out
@@ -5647,6 +5682,40 @@ function repliedAfter(prompt: LanguageModelV3CallOptions["prompt"], index: numbe
     if (extractAssistantHistoryText(m as unknown as Record<string, unknown>, true)) return true
   }
   return false
+}
+
+function userTurnStart(prompt: LanguageModelV3CallOptions["prompt"]): number {
+  let start = prompt.length
+  while (start > 0 && prompt[start - 1]!.role === "user") start--
+  return start
+}
+
+/** All user messages since the model's last output: OpenCode 2 sends host notes as user messages, promoted along with the user's own. */
+function liveUserTurn(
+  prompt: LanguageModelV3CallOptions["prompt"],
+  answered: ReadonlySet<number> = new Set(),
+): { start: number; text: string; answered: ReadonlySet<number> } | undefined {
+  const start = userTurnStart(prompt)
+  if (start === prompt.length) return undefined
+  const texts = prompt.slice(start).flatMap((message, offset) => {
+    if (answered.has(start + offset)) return []
+    // Tool-result media reaches Cursor as history images; its caption is not part of the request.
+    const note = hostTailNote(message)
+    if (note && note.text === undefined) return []
+    const text = extractUserText(message as unknown as Record<string, unknown>)
+    return text && text !== "." ? [text] : []
+  })
+  return { start, text: texts.join("\n\n"), answered }
+}
+
+/** OpenCode stores an answered early steer after the reply and its empty step adds no assistant message, so it can open the user turn. */
+function answeredSteersInUserTurn(
+  sessionKey: string | undefined,
+  prompt: LanguageModelV3CallOptions["prompt"],
+): ReadonlySet<number> {
+  const start = userTurnStart(prompt)
+  const found = takeAnsweredEarlySteers(sessionKey, prompt.slice(start).map(plainUserText))
+  return new Set([...found].map((offset) => start + offset))
 }
 
 function formatSeedToolObservation(input: {

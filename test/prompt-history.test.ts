@@ -282,6 +282,19 @@ describe("extractPromptHistory", () => {
     ])
   })
 
+  it("leaves out every message of the Run's user turn", () => {
+    const history = extractPromptHistory([
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+      { role: "assistant", content: [{ type: "text", text: "hello" }] },
+      { role: "user", content: [{ type: "text", text: "Is the build green?" }] },
+      { role: "user", content: [{ type: "text", text: '<shell id="sh_1" state="completed" command="make">\nok\n</shell>' }] },
+    ] as LanguageModelV3CallOptions["prompt"], { liveTurnStart: 2 })
+    expect(history).toEqual([
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello" },
+    ])
+  })
+
   const toolHistoryPrompt = [
       { role: "user", content: "do it" },
       {
@@ -454,6 +467,23 @@ describe("extractPromptHistory", () => {
 
     expect(history.map((entry) => entry.content)).toContain("Also count the horses")
     expect(history.some((entry) => entry.unanswered)).toBe(false)
+  })
+
+  it("marks a steer the model answered early in the user turn, also when the Run is rebased", () => {
+    const prompt = [
+      { role: "user", content: [{ type: "text", text: "Read the notes" }] },
+      { role: "assistant", content: [{ type: "text", text: "One mentions a zebra. And 17 * 23 = 391." }] },
+      { role: "user", content: [{ type: "text", text: "Also, what is 17 * 23?" }] },
+      { role: "user", content: [{ type: "text", text: "<system-update>\nSkill repro is available.\n</system-update>" }] },
+    ] as LanguageModelV3CallOptions["prompt"]
+    const answeredSteers = new Set([2])
+
+    const fresh = extractPromptHistory(prompt, { toolResults: "transcript", liveTurnStart: 2, answeredSteers })
+    expect(fresh.slice(-1)).toEqual([{ role: "user", content: "Also, what is 17 * 23?", unanswered: true }])
+
+    const rebased = extractPromptHistory(prompt, { preserveTrailingUser: true, toolResults: "transcript", liveTurnStart: 2, answeredSteers })
+    expect(rebased.find((entry) => entry.content === "Also, what is 17 * 23?")?.unanswered).toBe(true)
+    expect(rebased.at(-1)?.content).toContain("Skill repro is available.")
   })
 })
 
