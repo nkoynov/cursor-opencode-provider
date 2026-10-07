@@ -401,7 +401,7 @@ export function cursorModeSystemReminder(
     ? "record the finished plan with Cursor CreatePlan. The host stage tool waits for the host plan review and does not return until the user accepts or declines. Do not call `plan_exit` to submit or skip that review, and do not implement until the tool returns success"
     : options.planExitAdvertised === false
       ? "record the finished plan (Cursor CreatePlan). Writing it needs no approval, and the user is then asked whether to start implementing; if they decline, refine the plan and record it again"
-      : "record the finished plan, then call OpenCode `plan_exit` so the user can approve leaving plan mode"
+      : "record the finished plan, then leave plan mode with Cursor SwitchMode (it runs OpenCode `plan_exit`) so the user can approve leaving plan mode"
 
   if (id === "plan" || id === "spec") {
     return wrapReminder(
@@ -409,7 +409,7 @@ export function cursorModeSystemReminder(
         ? `Plan mode is active. The user does not want execution yet -- you MUST NOT make edits, run non-readonly tools (including changing configs or making commits), or otherwise modify system state. This supersedes any conflicting instruction.
 
 1. Research enough to make an accurate plan.
-2. Before finishing, resolve decisions that would materially change the implementation path, touched files, architecture, user-visible behavior, data model, or validation strategy. If investigation cannot resolve one, ask clarifying questions in small batches (use the OpenCode \`question\` tool when available).
+2. Before finishing, resolve decisions that would materially change the implementation path, touched files, architecture, user-visible behavior, data model, or validation strategy. If investigation cannot resolve one, ask clarifying questions in small batches (with Cursor AskQuestion, which runs the OpenCode \`question\` tool, when available).
 3. Do not put choices in the plan for the user to resolve. The plan must present one recommended approach, not unresolved questions or "choose A or B" options.
 4. When ready, ${leavePlan}.
 5. Do not execute the plan until the user confirms it.`
