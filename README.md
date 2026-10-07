@@ -1,5 +1,7 @@
 # cursor-opencode-provider
 
+> **This is a fork** of [oakimov/cursor-opencode-provider](https://github.com/oakimov/cursor-opencode-provider): upstream plus fixes we needed for daily work with OpenCode 2 and T3 Code (steering mid-turn, background shells, recovery from Cursor stalls and capacity refusals, a stop on Cursor's silent model fallback, skills, titles, cost, and more). Each fix is listed under `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md). To use it, build this repository and point OpenCode's provider package at the build (`aisdk:file://<checkout>/dist/index.js`). Issues are welcome here; upstream is synced regularly.
+
 Use [Cursor](https://cursor.com) subscription models from [OpenCode](https://opencode.ai) and compatible coding agents by speaking Cursor's Connect-RPC agent protocol.
 
 This project is a custom **AI SDK provider** (`LanguageModelV3`) plus an **OpenCode plugin** that handles authentication and model discovery. Instead of calling a generic chat-completions API, it encodes and decodes Cursor's protobuf agent protocol over HTTP/2 to Cursor's agent backend.
