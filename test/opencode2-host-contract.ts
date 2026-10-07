@@ -225,6 +225,19 @@ export type HostPluginContext = {
       }
     }>
   }
+  readonly skill: {
+    readonly list: () => Promise<{
+      readonly location: { readonly directory: string }
+      readonly data: readonly {
+        readonly id: string
+        readonly name: string
+        readonly description?: string
+        readonly autoinvoke?: boolean
+        readonly path: string
+        readonly content: string
+      }[]
+    }>
+  }
   readonly mcp: {
     readonly transform: HostTransform<{
       list(): readonly [string, { type: "local" | "remote"; codemode?: boolean }][]

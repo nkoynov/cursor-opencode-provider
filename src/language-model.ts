@@ -1659,9 +1659,9 @@ async function startSession(
     conversationId,
     { workspaceRoot, tools: cursorTools, mergedConfig, systemInstructions },
   )
-  // Skills live in the host system prompt and `skill` tool. Do not scan disk or
-  // emit RequestContext `agent_skills` Mid-Conversation XML; host `<system-update>`
-  // is the catalog-change channel.
+  // RequestContext `agent_skills` mirrors the epoch's host skill catalog (with
+  // files from the host); no disk scan and no Mid-Conversation skill XML: host
+  // `<system-update>` is the catalog-change channel.
   const contextSubagents = Array.isArray(requestContext.custom_subagents)
     ? requestContext.custom_subagents
         .map((agent) => agent && typeof agent === "object" && typeof (agent as Record<string, unknown>).name === "string"

@@ -40,6 +40,7 @@ import { OPENCODE_2_TOOL_DIALECT } from "./protocol/tools.js"
 import { clearSessionTodos } from "./todo-store.js"
 import { markCompactionSession } from "./compaction-marker.js"
 import { getSessionDirectory, markSessionDirectory } from "./session-directory.js"
+import { rememberHostSkillFiles } from "./context/host-skills.js"
 import { trace } from "./debug.js"
 import {
   cancelPlanExecutionKickoff,
@@ -451,6 +452,17 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
       }),
     )
 
+    // Skill files for the RequestContext `agent_skills` (see context/host-skills.ts).
+    const rememberSkillFiles = async (directory: string) => {
+      if (!ctx.skill) return
+      try {
+        const listed = await ctx.skill.list()
+        rememberHostSkillFiles(directory, listed?.data ?? [])
+      } catch (error) {
+        trace(`model.request: skill.list failed: ${String(error)}`)
+      }
+    }
+
     // The session mark lives in module state, and OpenCode re-evaluates a local
     // plugin's module graph per Location, so the copy running the model may not
     // hold it. The header travels with the request (AI SDK
@@ -473,6 +485,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
           markSessionDirectory(event.sessionID, current)
           const directory = current ?? getSessionDirectory(event.sessionID) ?? ctx.location?.directory
           if (!directory) return
+          await rememberSkillFiles(directory)
           event.headers = {
             ...event.headers,
             "x-opencode-directory": encodeURIComponent(directory),

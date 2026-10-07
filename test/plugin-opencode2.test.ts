@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach } from "bun:test"
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import plugin from "../src/plugin-opencode2.js"
@@ -38,6 +38,7 @@ import { sessionActivity } from "../src/activity.js"
 import { forgetEarlySteers, listenForHostSteers } from "../src/host-steer.js"
 import { onHostInterrupt } from "../src/host-interrupt.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
+import { hostSkillFiles, resetHostSkillFilesForTests } from "../src/context/host-skills.js"
 import { writeCache } from "../src/models.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
 import { MODEL_CACHE_SCHEMA_VERSION } from "../src/shared.js"
@@ -1244,6 +1245,51 @@ describe("opencode2 setup", () => {
     expect(opencodeDirectoryHeader(event.headers)).toBe("/workspace")
     // The fallback is not a session fact; do not record it as one.
     expect(getSessionDirectory("s-missing")).toBeUndefined()
+  })
+
+  test("model.request records the host's skill files for RequestContext agent_skills", async () => {
+    clearSessionDirectories()
+    resetHostSkillFilesForTests()
+    const root = mkdtempSync(join(tmpdir(), "cursor-oc2-skills-"))
+    const file = join(root, "review", "SKILL.md")
+    mkdirSync(join(root, "review"))
+    writeFileSync(file, "---\nname: review\ndescription: Review code\n---\nReview.\n")
+    try {
+      const { ctx, hooks, sessionLocations } = fakeContext()
+      sessionLocations.set("s-skills", root)
+      ctx.skill = {
+        list: async () => ({
+          location: { directory: root },
+          data: [
+            { id: "review", name: "review", description: "Review code", path: file, content: "Review." },
+            { id: "opencode", name: "OpenCode", description: "Builtin", path: "/builtin/opencode.md", content: "x" },
+          ],
+        }),
+      }
+      await plugin.setup(ctx)
+
+      // A compaction can be the first request after a restart; its Run carries the catalog too.
+      await hooks.get("session.model.request")!({ ...modelRequest("s-skills"), kind: "compaction" })
+
+      expect([...(hostSkillFiles(root) ?? [])]).toEqual([["review", file]])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("model.request survives a failing skill list", async () => {
+    clearSessionDirectories()
+    resetHostSkillFilesForTests()
+    const { ctx, hooks, sessionLocations } = fakeContext()
+    sessionLocations.set("s-skills-fail", "/proj-skills")
+    ctx.skill = { list: async () => { throw new Error("boom") } }
+    await plugin.setup(ctx)
+
+    const event = modelRequest("s-skills-fail")
+    await hooks.get("session.model.request")!(event)
+
+    expect(opencodeDirectoryHeader(event.headers)).toBe("/proj-skills")
+    expect(hostSkillFiles("/proj-skills")).toBeUndefined()
   })
 
   test("model.request leaves other providers' headers alone", async () => {

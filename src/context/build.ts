@@ -15,6 +15,7 @@ import { collectProjectLayout } from "./layout.js"
 import { buildEnv } from "./env.js"
 import { ensureOpencodeProjectDir } from "./paths.js"
 import { holdCapabilityOverlay } from "./overlay.js"
+import { hostSkillFiles, hostSkillsForCursor } from "./host-skills.js"
 import { traceRequestContextPaths } from "../debug.js"
 
 export type BuildRequestContextInput = {
@@ -119,8 +120,8 @@ export const DYNAMIC_REQUEST_CONTEXT_KEYS = [
 export type DynamicRequestContextKey = typeof DYNAMIC_REQUEST_CONTEXT_KEYS[number]
 
 /**
- * The host system context (delivered as the system-instructions rule) already
- * carries these; never keep them on a frozen base.
+ * Derived from the system-instructions rule on every materialization (see
+ * `host-skills.ts`); never kept on a frozen base.
  */
 export const HOST_DUPLICATED_REQUEST_CONTEXT_KEYS = [
   "agent_skills",
@@ -176,7 +177,7 @@ export async function buildRequestContext(
     git_status_info_complete: true,
   }
   const base = withSystemInstructions(workspace, input.systemInstructions)
-  const ctx = materializeRequestContext(base, dynamic)
+  const ctx = materializeRequestContext(base, dynamic, hostSkillFiles(workspaceRoot))
 
   traceRequestContextPaths("buildRequestContext", ctx)
   return ctx
@@ -253,16 +254,26 @@ export async function buildDynamicRequestContext(
   return buildDynamicRequestContextFromDiscovery(input, workspaceRoot, config)
 }
 
-/** Keep expensive workspace state frozen while replacing every live capability field. */
+/**
+ * Keep expensive workspace state frozen while replacing every live capability
+ * field. `skillFiles` (host skill id → SKILL.md) turns the skill catalog in the
+ * system-instructions rule into Cursor's `agent_skills`.
+ */
 export function materializeRequestContext(
   base: Record<string, unknown>,
   dynamic: Record<string, unknown>,
+  skillFiles?: ReadonlyMap<string, string>,
 ): Record<string, unknown> {
   const context = structuredClone(base)
   stripHostDuplicatedRequestContextFields(context)
   for (const key of DYNAMIC_REQUEST_CONTEXT_KEYS) delete context[key]
   for (const key of DYNAMIC_REQUEST_CONTEXT_KEYS) {
     if (Object.hasOwn(dynamic, key)) context[key] = structuredClone(dynamic[key])
+  }
+  const skills = hostSkillsForCursor(systemInstructionsRuleText(context), skillFiles)
+  if (skills.length > 0) {
+    context.agent_skills = skills
+    context.agent_skills_info_complete = true
   }
   return context
 }

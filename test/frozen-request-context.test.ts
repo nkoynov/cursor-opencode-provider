@@ -6,6 +6,7 @@ import { createHash } from "node:crypto"
 import { buildRequestContextResult } from "../src/protocol/tools.js"
 import { decodeMessage } from "../src/protocol/messages.js"
 import { SYSTEM_INSTRUCTIONS_RULE_PATH } from "../src/context/build.js"
+import { rememberHostSkillFiles, resetHostSkillFilesForTests } from "../src/context/host-skills.js"
 import {
   clearFrozenRequestContext,
   getFrozenRequestContext,
@@ -385,6 +386,95 @@ describe("frozen request_context", () => {
     expect(added.context).toBe(first.context)
 
     await rm(skillDir, { recursive: true, force: true })
+  })
+
+  describe("agent_skills from the host skill catalog", () => {
+    const catalog = (ids: string[]) => [
+      "Host prompt",
+      "Skills provide specialized instructions and workflows for specific tasks.",
+      "<available_skills>",
+      ...ids.flatMap((id) => ["  <skill>", `    <id>${id}</id>`, `    <name>${id}</name>`, `    <description>Use for ${id}.</description>`, "  </skill>"]),
+      "</available_skills>",
+    ].join("\n")
+    let skillRoot: string
+    const file = (id: string) => path.join(skillRoot, id, "SKILL.md")
+
+    beforeEach(async () => {
+      resetHostSkillFilesForTests()
+      skillRoot = path.join(root, ".skills-fixture")
+      for (const id of ["alpha", "beta"]) {
+        await mkdir(path.dirname(file(id)), { recursive: true })
+        await writeFile(file(id), `---\nname: ${id}\ndescription: Use for ${id}.\n---\nBody.\n`)
+      }
+    })
+
+    it("advertises cataloged skills that have a file, with path and description only", async () => {
+      rememberHostSkillFiles(root, [
+        { id: "alpha", path: file("alpha") },
+        { id: "beta", path: file("beta") },
+        { id: "opencode", path: "/builtin/opencode.md" },
+      ])
+      const conversationId = "conv-agent-skills"
+      const systemInstructions = { text: catalog(["alpha", "opencode", "unlisted-file"]), authoritative: true }
+      const first = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, systemInstructions })
+      expect(first.context.agent_skills).toEqual([{ full_path: file("alpha"), description: "Use for alpha." }])
+      expect(first.context.agent_skills_info_complete).toBe(true)
+      expect(getFrozenRequestContext(conversationId)?.agent_skills).toBeUndefined()
+
+      const again = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, systemInstructions })
+      expect(again.reused).toBe(true)
+      expect(again.context).toBe(first.context)
+      const wire = decodeMessage<any>("AgentClientMessage", encodeRequestContext(again.context))
+      // The decoder fills proto defaults: an empty content was never sent.
+      expect(wire.exec_client_message.request_context_result.success.request_context.agent_skills)
+        .toEqual([{ full_path: file("alpha"), content: "", description: "Use for alpha." }])
+    })
+
+    it("follows the frozen rule's catalog, not a recovered epoch's live text", async () => {
+      rememberHostSkillFiles(root, [
+        { id: "alpha", path: file("alpha") },
+        { id: "beta", path: file("beta") },
+      ])
+      const conversationId = "conv-agent-skills-epoch"
+      await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        systemInstructions: { text: catalog(["alpha"]), authoritative: true },
+      })
+      const recovered = await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        systemInstructions: { text: catalog(["alpha", "beta"]), authoritative: false },
+      })
+      expect((recovered.context.agent_skills as Array<{ full_path: string }>).map((s) => s.full_path))
+        .toEqual([file("alpha")])
+    })
+
+    it("sends no agent_skills without a catalog or without known files", async () => {
+      const noFiles = await getOrBuildRequestContext("conv-agent-skills-nofiles", {
+        workspaceRoot: root,
+        systemInstructions: { text: catalog(["alpha"]), authoritative: true },
+      })
+      expect(noFiles.context.agent_skills).toBeUndefined()
+      expect(noFiles.context.agent_skills_info_complete).toBeUndefined()
+
+      rememberHostSkillFiles(root, [{ id: "alpha", path: file("alpha") }])
+      const noCatalog = await getOrBuildRequestContext("conv-agent-skills-nocatalog", {
+        workspaceRoot: root,
+        systemInstructions: { text: "Host prompt without skills", authoritative: true },
+      })
+      expect(noCatalog.context.agent_skills).toBeUndefined()
+    })
+
+    it("drops a skill once the host no longer registers its file", async () => {
+      rememberHostSkillFiles(root, [{ id: "alpha", path: file("alpha") }])
+      const conversationId = "conv-agent-skills-removed"
+      const systemInstructions = { text: catalog(["alpha"]), authoritative: true }
+      const first = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, systemInstructions })
+      expect(first.context.agent_skills).toHaveLength(1)
+      rememberHostSkillFiles(root, [])
+      const after = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, systemInstructions })
+      expect(after.reused).toBe(false)
+      expect(after.context.agent_skills).toBeUndefined()
+    })
   })
 
   describe("system-instructions rule", () => {

@@ -20,6 +20,7 @@ import {
 import { applyCursorIntegration } from "../src/opencode2/integration.js"
 import { exposeDirectMcpTools, rememberDirectMcpNamespaces } from "../src/opencode2/mcp-direct.js"
 import { registerTodoTools } from "../src/opencode2/todo-tools.js"
+import { rememberHostSkillFiles } from "../src/context/host-skills.js"
 import type { HostModelInfo, HostPluginContext, HostProviderEditor, HostProviderInfo } from "./opencode2-host-contract.js"
 
 declare const ctx: HostPluginContext
@@ -86,6 +87,10 @@ void (() =>
   ctx.mcp.transform((hostEditor) => {
     rememberDirectMcpNamespaces(new Set(), hostEditor.list())
   }))
+void (async () => {
+  const listed = await ctx.skill.list()
+  rememberHostSkillFiles("/repo", listed.data)
+})
 
 void (async () => {
   const connection = await ctx.integration.connection.active("cursor")

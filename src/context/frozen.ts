@@ -7,6 +7,7 @@ import {
   type BuildRequestContextInput,
 } from "./build.js"
 import { clearContextEpoch, endContextEpoch, resetContextEpochsForTests } from "./epoch.js"
+import { hostSkillFiles } from "./host-skills.js"
 import {
   clearOverlayHold,
   resetOverlayHoldsForTests,
@@ -204,7 +205,7 @@ export async function getOrBuildRequestContext(
       const dynamic = await buildDynamicRequestContext(scoped)
       const materialized = rememberMaterialized(
         conversationId,
-        materializeRequestContext(base, dynamic),
+        materializeRequestContext(base, dynamic, hostSkillFiles(input.workspaceRoot)),
       )
       trace(
         `request_context: materialized conversationId=${conversationId} ` +
