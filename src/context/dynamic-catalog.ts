@@ -1,5 +1,4 @@
 import { APPLY_PATCH_TOOL } from "../protocol/apply-patch.js"
-import { CURSOR_PLAN_STAGE_TOOL } from "../protocol/create-plan.js"
 import { CURSOR_IMAGE_SAVE_TOOL } from "../protocol/generate-image.js"
 import {
   cursorCatalogToolIdentity,
@@ -121,7 +120,6 @@ function cursorNativeToolRoutes(tools: readonly OpencodeToolDef[]): Map<string, 
   route(extractHostSubagentCatalog([...tools]).executor, "Task")
   route("plan_enter", "SwitchMode")
   route("plan_exit", "SwitchMode")
-  route(CURSOR_PLAN_STAGE_TOOL, "CreatePlan")
   route(CURSOR_IMAGE_SAVE_TOOL, "GenerateImage")
   // Cursor edit/write requests become apply_patch only when the host withholds that tool.
   const patched = [

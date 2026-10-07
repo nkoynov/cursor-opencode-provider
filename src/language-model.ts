@@ -4291,7 +4291,7 @@ export function buildOpenCodeInteractionGuidance(
     // the model from treating a question as impossible when it reaches for its
     // native interaction first.
     instructions.push(
-      "- When user input is required, call the OpenCode `question` tool. Cursor-native AskQuestion requests are also accepted and answered through it.",
+      "- When user input is required, use Cursor-native AskQuestion; the provider asks it through the OpenCode `question` tool.",
     )
   }
   // CreatePlan is a Cursor InteractionQuery (#7), not an OpenCode/MCP catalog
@@ -4306,12 +4306,12 @@ export function buildOpenCodeInteractionGuidance(
   )
   if (names.has("plan_enter")) {
     instructions.push(
-      "- To enter plan mode, call the OpenCode `plan_enter` tool. Cursor-native SwitchMode requests for plan/spec are also accepted and answered through it.",
+      "- To enter plan mode, use Cursor-native SwitchMode with target plan or spec; the provider runs the OpenCode `plan_enter` tool for it.",
     )
   }
   if (names.has("plan_exit")) {
     instructions.push(
-      "- To leave plan mode, call the OpenCode `plan_exit` tool. Cursor-native SwitchMode for any non-plan target (agent, build, chat, debug, edit, background, multitask, triage, project, …) is also accepted and answered through it; the provider then injects the Cursor CLI-shaped mode reminder for that target.",
+      "- To leave plan mode, use Cursor-native SwitchMode with any non-plan target (agent, build, chat, debug, edit, background, multitask, triage, project, …); the provider runs the OpenCode `plan_exit` tool for it, then injects the Cursor CLI-shaped mode reminder for that target.",
     )
   }
   // Prefer host todos whenever advertised. Keep guidance terse — spelling out
@@ -4348,12 +4348,12 @@ export function buildOpenCodeInteractionGuidance(
     )
   }
   if (names.has("execute")) {
-    const shell = names.has("shell") ? "`shell`" : names.has("bash") ? "`bash`" : undefined
+    const shellTool = hostToolDialectFromTools(tools).shellTool
     const executeRoute = via("execute")
     const execute = `- OpenCode \`execute\` is Code Mode JavaScript (\`code\`)${executeRoute && `, called${executeRoute}`}; it is not a shell.`
     instructions.push(
-      shell
-        ? `${execute} For OS commands, call OpenCode ${shell}. Do not pass \`command\` to \`execute\`.`
+      routes.native.has(shellTool)
+        ? `${execute} For OS commands, use Cursor Shell (OpenCode \`${shellTool}\`). Do not pass \`command\` to \`execute\`.`
         : `${execute} Do not pass \`command\` to \`execute\`.`,
     )
     instructions.push(
@@ -4387,15 +4387,15 @@ export function buildOpenCodeInteractionGuidance(
   if (names.has("write")) {
     instructions.push(
       names.has("edit")
-        ? "- For file changes, use OpenCode `edit` for targeted changes to existing files and `write` to create files or intentionally replace complete contents; do not use shell, Python, or heredocs to change file content while these tools are available."
-        : "- Use OpenCode `write` for file-content changes; do not use shell, Python, or heredocs to change file content while it is available.",
+        ? "- For file changes, use Cursor StrReplace (OpenCode `edit`) for targeted changes to existing files and Cursor Write (OpenCode `write`) to create files or intentionally replace complete contents; do not use shell, Python, or heredocs to change file content while these tools are available."
+        : "- For file-content changes, use Cursor Write (OpenCode `write`); do not use shell, Python, or heredocs to change file content while it is available.",
     )
   } else if (names.has("apply_patch")) {
     // This host withheld `edit`/`write` and offers `apply_patch` instead. Native
     // Cursor write/edit requests are translated into it, so say so rather than
     // leaving the turn with no file-editing guidance at all.
     instructions.push(
-      "- Use OpenCode `apply_patch` for file-content changes; do not use shell, Python, or heredocs to change file content while it is available. Cursor-native write and edit requests are accepted and converted to `apply_patch` automatically.",
+      "- For file-content changes, use Cursor StrReplace and Write; the provider converts them to OpenCode `apply_patch` automatically. Do not use shell, Python, or heredocs to change file content while it is available.",
     )
   }
   if (hostToolDialectFromTools(tools).filePathKey === "path") {
@@ -4415,7 +4415,7 @@ export function buildOpenCodeInteractionGuidance(
       ? "Use only these host tools, each through its route above, for ordinary host execution. Cursor-native Task/subagent requests are permitted because a compatible host executor is listed. Bridged Cursor interactions named below (AskQuestion, SwitchMode, CreatePlan, …) are not OpenCode/MCP catalog tools — raise them normally and do not narrate that they are missing."
       : "Use only these host tools, each through its route above, for ordinary host execution. Bridged Cursor interactions named below (AskQuestion, SwitchMode, CreatePlan, …) are not OpenCode/MCP catalog tools — raise them normally and do not narrate that they are missing. Other unlisted Cursor-native tools are not bridged; complete the work with the listed tools or explain the limitation without claiming a missing MCP tool.",
     ...(instructions.length > 0
-      ? ["Use these OpenCode tools instead of equivalent Cursor-native UI interactions:"]
+      ? ["How to reach host tools and bridged Cursor interactions this turn:"]
       : []),
     ...instructions,
     "Emit the actual tool call and wait for its result; never merely claim or summarize that a tool was used.",

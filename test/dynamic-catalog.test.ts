@@ -142,9 +142,10 @@ describe("resolveHostToolRoutes", () => {
     expect(Object.fromEntries(interactions.native)).toEqual({
       plan_enter: "SwitchMode",
       plan_exit: "SwitchMode",
-      cursor_plan_stage: "CreatePlan",
       cursor_image_save: "GenerateImage",
     })
+    // CreatePlan runs the stage tool only in bridged plan mode, which the frozen guidance cannot follow.
+    expect(interactions.dynamic.get("cursor_plan_stage")).toEqual({ namespace: "opencode", toolName: "cursor_plan_stage" })
   })
 })
 

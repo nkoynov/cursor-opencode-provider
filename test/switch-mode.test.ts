@@ -278,7 +278,15 @@ describe("cursorModeSystemReminder", () => {
     })!
     expect(reminder).toContain("waits for the host plan review")
     expect(reminder).toContain("Do not call `plan_exit` to submit or skip")
-    expect(reminder).not.toContain("call OpenCode `plan_exit` so the user can approve")
+    expect(reminder).not.toContain("so the user can approve leaving plan mode")
+  })
+
+  it("points an unstaged plan at SwitchMode, which runs plan_exit", () => {
+    const reminder = cursorModeSystemReminder("plan", { planExitAdvertised: true })!
+    expect(reminder).toContain(
+      "then leave plan mode with Cursor SwitchMode (it runs OpenCode `plan_exit`) so the user can approve leaving plan mode",
+    )
+    expect(reminder).not.toContain("call OpenCode `plan_exit`")
   })
 
   it("hands a bridged plan back to Agent mode when plan_enter is restored", () => {
@@ -507,7 +515,7 @@ describe("SwitchMode over a held-open Run without host plan tools", () => {
     // actually reach — the provider asks for execution approval right after it.
     expect(reminder).toContain("record the finished plan (Cursor CreatePlan)")
     expect(reminder).toContain("asked whether to start implementing")
-    expect(reminder).not.toContain("call OpenCode `plan_exit`")
+    expect(reminder).not.toContain("`plan_exit`")
     expect(await flushHostAgentModeSwitch(session.openCodeSessionId, {
       cursorSessionID: session.sessionId,
       terminal: true,
