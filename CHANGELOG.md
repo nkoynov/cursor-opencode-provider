@@ -36,6 +36,7 @@
 - After MCP tools appear mid-turn, the next user message reuses RequestContext instead of rebuilding it
 - A Cursor run that fails before showing any output can be retried automatically again: timing, tracing, and progress fields Cursor now sends on ordinary updates no longer mark every run unsafe to retry
 - The debug log's turn usage validation no longer reports `status=mismatch` when Cursor's context shrinks between steps
+- Cursor is no longer told that past chats are in an `agent-transcripts` folder nothing creates, so the model stops searching it; the folder is named only when it exists when a conversation starts
 
 ## [0.8.0] - 2026-10-04
 
