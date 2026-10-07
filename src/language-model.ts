@@ -1437,7 +1437,7 @@ async function startSession(
     maxMode: hintMaxMode,
   })
 
-  if (foreignHistory || checkpointUnusable || (!conversationState && !isCompaction && !ephemeralRun && history.length > 0)) {
+  if (foreignHistory || checkpointUnusable || (!conversationState && !isCompaction && !ephemeralRun && history.some((entry) => entry.role !== "system"))) {
     assertForeignHistoryRebaseFits({
       modelInfo,
       cursorModelId,
@@ -4608,7 +4608,8 @@ export function assertForeignHistoryRebaseFits(input: {
   const limit = input.maxMode
     ? (input.modelInfo?.maxContextForMaxMode ?? documented?.maxContextForMaxMode ?? 1_000_000)
     : (input.modelInfo?.maxContext ?? documented?.maxContext ?? 200_000)
-  const chars = input.history.reduce((sum, message) => sum + message.content.length, 0)
+  // `system` entries are the system prompt itself, which is counted once below.
+  const chars = input.history.reduce((sum, message) => sum + (message.role === "system" ? 0 : message.content.length), 0)
     + (input.systemPrompt?.length ?? 0)
     + input.userText.length
   const tokens = estimateTokens(chars)
