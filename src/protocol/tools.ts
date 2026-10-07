@@ -242,6 +242,16 @@ export function resolveToolServerIdentity(
   return { server: defaultServer, toolName: opencodeName, opencodeName }
 }
 
+/** Namespace and tool name under which Cursor's dynamic catalog lists an advertised tool. */
+export function cursorCatalogToolIdentity(
+  tool: OpencodeToolDef,
+  providerIdentifier = "opencode",
+  knownMcpServers: Iterable<string> = [],
+): ToolServerIdentity {
+  const id = resolveToolServerIdentity(tool.sourceName ?? tool.name, providerIdentifier, knownMcpServers)
+  return tool.sourceName ? { ...id, toolName: tool.name } : id
+}
+
 /**
  * Convert opencode's per-turn tool list into Cursor `McpToolDefinition`
  * entries for session exec remap / bridges. These are not sent on
@@ -402,18 +412,17 @@ export function toolsToMcpDescriptors(
   // server. Same-set host reorder is resolved by `resolveTurnToolState`
   // before encode so this walk stays epoch-stable.
   for (const t of tools) {
-    const id = resolveToolServerIdentity(t.sourceName ?? t.name, providerIdentifier, knownMcpServers)
+    const id = cursorCatalogToolIdentity(t, providerIdentifier, knownMcpServers)
     let list = byServer.get(id.server)
     if (!list) {
       list = []
       byServer.set(id.server, list)
     }
-    const toolName = t.sourceName ? t.name : id.toolName
     list.push(
       namesOnly
-        ? { tool_name: toolName }
+        ? { tool_name: id.toolName }
         : {
-            tool_name: toolName,
+            tool_name: id.toolName,
             description: t.description ?? "",
             input_schema: encodeJsonAsValue(normalizeInputSchema(t.inputSchema)),
           },

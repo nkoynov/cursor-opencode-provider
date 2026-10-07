@@ -38,7 +38,7 @@ describe("buildOpenCodeInteractionGuidance", () => {
       { name: "todowrite" },
       { name: "todoread" },
     ], false, "/workspace/project")
-    expect(guidance).toContain("OpenCode `question` tool")
+    expect(guidance).toContain("use Cursor-native AskQuestion; the provider asks it through the OpenCode `question` tool")
     expect(guidance).toContain("OpenCode `todowrite` / `todoread`")
     expect(guidance).toContain("do not use Cursor TodoWrite")
     expect(guidance).toContain("do not narrate Cursor-vs-OpenCode todo-tool differences")
@@ -135,9 +135,9 @@ describe("buildOpenCodeInteractionGuidance", () => {
       { name: "custom_webfetch" },
     ], false, "/workspace/project")
     expect(guidance).toContain("OpenCode `plan_enter` tool")
-    expect(guidance).toContain("Cursor-native SwitchMode requests for plan/spec")
+    expect(guidance).toContain("use Cursor-native SwitchMode with target plan or spec")
     expect(guidance).toContain("OpenCode `plan_exit` tool")
-    expect(guidance).toContain("Cursor-native SwitchMode for any non-plan target")
+    expect(guidance).toContain("use Cursor-native SwitchMode with any non-plan target")
     expect(guidance).toContain("Cursor-native CreatePlan is accepted as a Cursor interaction")
     expect(guidance).toContain("`custom_websearch`")
     expect(guidance).toContain("`custom_webfetch`")
@@ -167,8 +167,8 @@ describe("buildOpenCodeInteractionGuidance", () => {
       { name: "bash" },
       { name: "read" },
     ], false, "/workspace/project")
-    expect(guidance).toContain("these direct tools for this turn: `bash`, `read`")
-    expect(guidance).toContain("Call only tools in that direct OpenCode list")
+    expect(guidance).toContain("- Through Cursor's native tools: `bash` (Shell), `read` (Read).")
+    expect(guidance).toContain("Use only these host tools, each through its route above")
     expect(guidance).toContain("not an OpenCode or MCP catalog tool")
     expect(guidance).toContain("do not narrate that they are missing")
     expect(guidance).toContain("without claiming a missing MCP tool")
@@ -215,11 +215,11 @@ describe("buildOpenCodeInteractionGuidance", () => {
       { name: "shell" },
       { name: "read" },
     ], false, "/workspace/project")
-    expect(withShell).toContain("OpenCode `execute` is Code Mode JavaScript (`code`)")
-    expect(withShell).toContain("it is not a shell")
-    expect(withShell).toContain("call OpenCode `shell`")
+    expect(withShell).toContain("OpenCode `execute` is Code Mode JavaScript (`code`), called through CallDynamicTool (namespace `opencode`); it is not a shell.")
+    expect(withShell).toContain("For OS commands, use Cursor Shell (OpenCode `shell`).")
     expect(withShell).toContain("Do not pass `command` to `execute`")
-    expect(withShell).toContain("Call tools named in the direct list by their own names, even when a server instruction says to reach them through `execute`")
+    expect(withShell).toContain("Call each host tool listed above through its route there, even when a server instruction says to reach it through `execute`")
+    expect(withShell).not.toContain("by their own names")
     expect(withShell).toContain("Use `execute` only for tools that appear in the host Code Mode catalog")
     expect(withShell).toContain("exact paths and signatures from that catalog or its `search` function")
     expect(withShell).toContain("call `execute` with `{ code }`")
@@ -229,14 +229,20 @@ describe("buildOpenCodeInteractionGuidance", () => {
       { name: "execute" },
       { name: "bash" },
     ], false, "/workspace/project")
-    expect(withBash).toContain("call OpenCode `bash`")
+    expect(withBash).toContain("For OS commands, use Cursor Shell (OpenCode `bash`).")
+
+    const withBoth = buildOpenCodeInteractionGuidance([
+      { name: "execute" },
+      { name: "shell" },
+      { name: "bash" },
+    ], false, "/workspace/project")
+    expect(withBoth).toContain("For OS commands, use Cursor Shell (OpenCode `bash`).")
 
     const executeOnly = buildOpenCodeInteractionGuidance([
       { name: "execute" },
     ], false, "/workspace/project")
     expect(executeOnly).toContain("Do not pass `command` to `execute`")
-    expect(executeOnly).not.toContain("call OpenCode `shell`")
-    expect(executeOnly).not.toContain("call OpenCode `bash`")
+    expect(executeOnly).not.toContain("Cursor Shell")
     expect(executeOnly).toContain("host Code Mode catalog")
 
     const withoutExecute = buildOpenCodeInteractionGuidance([
@@ -252,8 +258,8 @@ describe("buildOpenCodeInteractionGuidance", () => {
       { name: "write" },
     ], false, "/workspace/project")
 
-    expect(guidance).toContain("OpenCode `edit` for targeted changes")
-    expect(guidance).toContain("`write` to create files")
+    expect(guidance).toContain("use Cursor StrReplace (OpenCode `edit`) for targeted changes")
+    expect(guidance).toContain("Cursor Write (OpenCode `write`) to create files")
     expect(guidance).toContain("do not use shell, Python, or heredocs")
     expect(guidance).toContain("Never use a read result as complete file content")
     expect(guidance).toContain("output is capped, partial")
@@ -340,6 +346,66 @@ describe("buildOpenCodeInteractionGuidance", () => {
     ], false, "/workspace/project", { knownMcpServers: ["context7"] })
     expect(aliased).toContain("MCP servers such as `context7`")
     expect(aliased).toContain("GetDynamicTools / CallDynamicTool")
+  })
+
+  it("never presents a dynamic-catalog tool as a top-level tool", () => {
+    const tools = [
+      { name: "edit" },
+      { name: "execute" },
+      { name: "read", inputSchema: { type: "object", properties: { path: { type: "string" } } } },
+      { name: "shell" },
+      { name: "skill" },
+      { name: "t3-code-abc_t3_thread_read" },
+      { name: "linear_list_issues" },
+      { name: "todowrite" },
+      { name: "custom_websearch", sourceName: "websearch" },
+      { name: "custom_webfetch", sourceName: "webfetch" },
+      { name: "write" },
+    ]
+    const guidance = buildOpenCodeInteractionGuidance(tools, false, "/workspace/project", {
+      knownMcpServers: ["servers"],
+    })!
+    expect(guidance).not.toContain("direct tools")
+    expect(guidance).not.toContain("direct list")
+    expect(guidance).toContain("None of these names is a Cursor top-level tool, so never call one by its own name as a top-level tool:")
+    expect(guidance).toContain("- Through Cursor's native tools: `edit` (StrReplace), `read` (Read), `shell` (Shell), `write` (Write).")
+    expect(guidance).toContain(
+      "- Through CallDynamicTool with namespace `opencode` and the tool name shown: `execute`, `skill`, " +
+        "`t3-code-abc_t3_thread_read`, `linear_list_issues`, `todowrite`, `custom_websearch`, `custom_webfetch`.",
+    )
+    expect(guidance).toContain("call OpenCode `todowrite` through CallDynamicTool (namespace `opencode`); do not use Cursor TodoWrite")
+    expect(guidance).toContain("call `custom_websearch` through CallDynamicTool (namespace `opencode`); do not use Cursor's native WebSearch")
+    expect(guidance).toContain("call `custom_webfetch` through CallDynamicTool (namespace `opencode`); do not use Cursor's native WebFetch")
+    expect(buildOpenCodeInteractionGuidance(tools, false, "/workspace/project", { knownMcpServers: ["servers"] })).toBe(guidance)
+  })
+
+  it("names the Cursor tool for every bridged host tool it tells the model to use", () => {
+    const guidance = buildOpenCodeInteractionGuidance([
+      { name: "question" },
+      { name: "plan_enter" },
+      { name: "plan_exit" },
+      { name: "cursor_plan_stage" },
+      { name: "apply_patch" },
+      { name: "read" },
+      { name: "execute" },
+      { name: "shell" },
+    ], false, "/workspace/project")!
+    expect(guidance).not.toMatch(/call (the )?OpenCode `(question|plan_enter|plan_exit|shell|bash|edit|write|apply_patch)`/)
+    expect(guidance).not.toMatch(/[Uu]se OpenCode `/)
+    expect(guidance).toContain("- Through Cursor's native tools: `question` (AskQuestion), `plan_enter` (SwitchMode), `plan_exit` (SwitchMode), `apply_patch` (StrReplace, Write), `read` (Read), `shell` (Shell).")
+    expect(guidance).toContain("namespace `opencode` and the tool name shown: `cursor_plan_stage`, `execute`.")
+    expect(guidance).toContain("use Cursor StrReplace and Write; the provider converts them to OpenCode `apply_patch` automatically")
+    expect(guidance).toContain("How to reach host tools and bridged Cursor interactions this turn:")
+  })
+
+  it("names a configured MCP server's namespace and bare tool names", () => {
+    const guidance = buildOpenCodeInteractionGuidance([
+      { name: "read" },
+      { name: "context7_query-docs" },
+      { name: "custom_list_mcp_resources" },
+    ], false, "/workspace/project", { knownMcpServers: ["context7"] })!
+    expect(guidance).toContain("- Through CallDynamicTool with namespace `context7` and the tool name shown: `query-docs`.")
+    expect(guidance).toContain("call `custom_list_mcp_resources` through CallDynamicTool (namespace `opencode`)")
   })
 })
 

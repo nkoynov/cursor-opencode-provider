@@ -36,6 +36,7 @@
 - After MCP tools appear mid-turn, the next user message reuses RequestContext instead of rebuilding it
 - A Cursor run that fails before showing any output can be retried automatically again: timing, tracing, and progress fields Cursor now sends on ordinary updates no longer mark every run unsafe to retry
 - The debug log's turn usage validation no longer reports `status=mismatch` when Cursor's context shrinks between steps
+- Cursor models no longer call OpenCode tools by their own names as top-level tools, which Cursor refuses with "Tool not found" (seen with MCP tools and `execute`). The system guidance called every advertised tool a direct tool to call by name, but Cursor's top-level list has only its own tools plus GetDynamicTools / CallDynamicTool. It now lists which host tools Cursor's native tools run (`read` through Read, `edit` through StrReplace, …) and which are called through CallDynamicTool, with the namespace and tool name from Cursor's catalog
 
 ## [0.8.0] - 2026-10-04
 

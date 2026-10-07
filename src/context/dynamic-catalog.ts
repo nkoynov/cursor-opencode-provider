@@ -1,4 +1,12 @@
-import { resolveToolServerIdentity } from "../protocol/tools.js"
+import { APPLY_PATCH_TOOL } from "../protocol/apply-patch.js"
+import { CURSOR_IMAGE_SAVE_TOOL } from "../protocol/generate-image.js"
+import {
+  cursorCatalogToolIdentity,
+  extractHostSubagentCatalog,
+  hostToolDialectFromTools,
+  resolveToolServerIdentity,
+  type OpencodeToolDef,
+} from "../protocol/tools.js"
 
 /**
  * Issue #29: Cursor keeps OpenCode `skill` and MCP tools off its native
@@ -84,11 +92,97 @@ export function buildDynamicCatalogRoutingInstruction(options: {
     // Mirror OpenCode 1 SystemPrompt.skills / OC2 SkillInstructions.render.
     lines.push(
       "- Skills provide specialized instructions and workflows for specific tasks. " +
-        "Use the `skill` tool to load a skill when a task matches its description " +
+        "Use the `skill` tool through CallDynamicTool to load a skill when a task matches its description " +
         "(the host system prompt and `skill` tool carry names and descriptions). " +
         "A skill that is already present in the conversation as a `<skill_content>` block " +
         "does not need to be invoked again.",
     )
   }
   return lines.join("\n")
+}
+
+export type DynamicToolTarget = { namespace: string; toolName: string }
+
+/** Cursor's top-level list has only its own tools, so a host tool is reached through a native bridge or CallDynamicTool. */
+export type HostToolRoutes = {
+  native: ReadonlyMap<string, string>
+  dynamic: ReadonlyMap<string, DynamicToolTarget>
+}
+
+function cursorNativeToolRoutes(tools: readonly OpencodeToolDef[]): Map<string, string> {
+  const names = new Set(tools.map((tool) => tool.name))
+  const routes = new Map<string, string>()
+  const route = (name: string | undefined, cursorTool: string) => {
+    if (name && names.has(name)) routes.set(name, cursorTool)
+  }
+  route(hostToolDialectFromTools(tools).shellTool, "Shell")
+  route("read", "Read")
+  route("write", "Write")
+  route("edit", "StrReplace")
+  route("glob", "Glob")
+  route("grep", "Grep")
+  route("question", "AskQuestion")
+  route(extractHostSubagentCatalog([...tools]).executor, "Task")
+  route("plan_enter", "SwitchMode")
+  route("plan_exit", "SwitchMode")
+  route(CURSOR_IMAGE_SAVE_TOOL, "GenerateImage")
+  // Cursor edit/write requests become apply_patch only when the host withholds that tool.
+  const patched = [
+    ...(names.has("edit") ? [] : ["StrReplace"]),
+    ...(names.has("write") ? [] : ["Write"]),
+  ]
+  if (patched.length > 0) route(APPLY_PATCH_TOOL, patched.join(", "))
+  return routes
+}
+
+export function resolveHostToolRoutes(
+  tools: readonly OpencodeToolDef[],
+  knownMcpServers: Iterable<string> = [],
+): HostToolRoutes {
+  const native = cursorNativeToolRoutes(tools)
+  const known = [...knownMcpServers]
+  const dynamic = new Map<string, DynamicToolTarget>()
+  for (const tool of tools) {
+    if (native.has(tool.name)) continue
+    const { server, toolName } = cursorCatalogToolIdentity(tool, DEFAULT_TOOL_SERVER, known)
+    dynamic.set(tool.name, { namespace: server, toolName })
+  }
+  return { native, dynamic }
+}
+
+export function dynamicToolRoute(routes: HostToolRoutes, name: string): string {
+  const target = routes.dynamic.get(name)
+  if (!target) return ""
+  const tool = target.toolName === name ? "" : `, tool \`${target.toolName}\``
+  return ` through CallDynamicTool (namespace \`${target.namespace}\`${tool})`
+}
+
+export function buildHostToolRouteLines(
+  tools: readonly OpencodeToolDef[],
+  routes: HostToolRoutes,
+): string[] {
+  const native: string[] = []
+  const namespaces = new Map<string, string[]>()
+  for (const tool of tools) {
+    const cursorTool = routes.native.get(tool.name)
+    if (cursorTool) {
+      native.push(`\`${tool.name}\` (${cursorTool})`)
+      continue
+    }
+    const target = routes.dynamic.get(tool.name)
+    if (!target) continue
+    const group = namespaces.get(target.namespace) ?? []
+    group.push(`\`${target.toolName}\``)
+    namespaces.set(target.namespace, group)
+  }
+  const lines = [
+    "OpenCode host tools for this turn. None of these names is a Cursor top-level tool, so never call one by its own name as a top-level tool:",
+  ]
+  if (native.length > 0) lines.push(`- Through Cursor's native tools: ${native.join(", ")}.`)
+  for (const [namespace, names] of namespaces) {
+    lines.push(
+      `- Through CallDynamicTool with namespace \`${namespace}\` and the tool name shown: ${names.join(", ")}.`,
+    )
+  }
+  return lines
 }

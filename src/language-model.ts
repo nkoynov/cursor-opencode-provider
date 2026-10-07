@@ -179,6 +179,9 @@ import { systemInstructionsRuleText, type SystemInstructions } from "./context/b
 import { loadMergedConfig, type OpencodeJson } from "./context/rules.js"
 import {
   buildDynamicCatalogRoutingInstruction,
+  buildHostToolRouteLines,
+  dynamicToolRoute,
+  resolveHostToolRoutes,
 } from "./context/dynamic-catalog.js"
 import {
   admitContextEpoch,
@@ -4496,6 +4499,8 @@ export function buildOpenCodeInteractionGuidance(
   if (names.size === 0) return undefined
   const instructions: string[] = []
   const subagents = extractHostSubagentCatalog(tools)
+  const routes = resolveHostToolRoutes(tools, options.knownMcpServers)
+  const via = (name: string) => dynamicToolRoute(routes, name)
   const planEntryHandoff = !names.has("plan_enter") && hostAgentModeSwitchKind() === "resumes"
   const bridgedInteractions = names.has("question")
     ? "AskQuestion, SwitchMode, CreatePlan"
@@ -4504,7 +4509,7 @@ export function buildOpenCodeInteractionGuidance(
   if (names.has("bash") || names.has("shell")) {
     instructions.push(
       "- A shell call requires `command`; a file path by itself is not a shell command. Use the advertised shell tool's current schema.",
-      "- Send commands, including log-analysis scripts, only to the advertised `bash` or `shell` tool. File/search/list tools do not execute `command`; accepting an ignored argument is not successful execution.",
+      "- Send commands, including log-analysis scripts, only to the advertised `bash` or `shell` tool, through Cursor Shell. File/search/list tools do not execute `command`; accepting an ignored argument is not successful execution.",
     )
   }
 
@@ -4514,7 +4519,7 @@ export function buildOpenCodeInteractionGuidance(
     // the model from treating a question as impossible when it reaches for its
     // native interaction first.
     instructions.push(
-      "- When user input is required, call the OpenCode `question` tool. Cursor-native AskQuestion requests are also accepted and answered through it.",
+      "- When user input is required, use Cursor-native AskQuestion; the provider asks it through the OpenCode `question` tool.",
     )
   } else {
     instructions.push(
@@ -4539,7 +4544,7 @@ export function buildOpenCodeInteractionGuidance(
   )
   if (names.has("plan_enter")) {
     instructions.push(
-      "- To enter plan mode, call the OpenCode `plan_enter` tool. Cursor-native SwitchMode requests for plan/spec are also accepted and answered through it.",
+      "- To enter plan mode, use Cursor-native SwitchMode with target plan or spec; the provider runs the OpenCode `plan_enter` tool for it.",
     )
   } else {
     // Without `plan_enter`, SwitchMode is the only way in. It is a Cursor-native
@@ -4558,7 +4563,7 @@ export function buildOpenCodeInteractionGuidance(
   }
   if (names.has("plan_exit")) {
     instructions.push(
-      "- To leave plan mode, call the OpenCode `plan_exit` tool. Cursor-native SwitchMode for any non-plan target (agent, build, chat, debug, edit, background, multitask, triage, project, …) is also accepted and answered through it; the provider then injects the Cursor CLI-shaped mode reminder for that target.",
+      "- To leave plan mode, use Cursor-native SwitchMode with any non-plan target (agent, build, chat, debug, edit, background, multitask, triage, project, …); the provider runs the OpenCode `plan_exit` tool for it, then injects the Cursor CLI-shaped mode reminder for that target.",
     )
   }
   // Prefer host todos whenever advertised. Keep guidance terse — spelling out
@@ -4569,39 +4574,42 @@ export function buildOpenCodeInteractionGuidance(
     const read = names.has("todoread") ? "`todoread`" : undefined
     const tools =
       write && read ? `${write} / ${read}` : (write ?? read)!
+    const route = via(write ? "todowrite" : "todoread")
     instructions.push(
-      `- For task-list create/update/complete/cancel${read ? "/read" : ""}, call OpenCode ${tools}; do not use Cursor TodoWrite, and do not narrate Cursor-vs-OpenCode todo-tool differences.`,
+      `- For task-list create/update/complete/cancel${read ? "/read" : ""}, call OpenCode ${tools}${route}; do not use Cursor TodoWrite, and do not narrate Cursor-vs-OpenCode todo-tool differences.`,
     )
   }
   if (names.has(CUSTOM_WEBSEARCH_TOOL)) {
     instructions.push(
-      `- For web searches, call \`${CUSTOM_WEBSEARCH_TOOL}\`; do not use Cursor's native WebSearch interaction.`,
+      `- For web searches, call \`${CUSTOM_WEBSEARCH_TOOL}\`${via(CUSTOM_WEBSEARCH_TOOL)}; do not use Cursor's native WebSearch interaction.`,
     )
   }
   if (names.has(CUSTOM_WEBFETCH_TOOL)) {
     instructions.push(
-      `- To fetch a known URL, call \`${CUSTOM_WEBFETCH_TOOL}\`; do not use Cursor's native WebFetch interaction.`,
+      `- To fetch a known URL, call \`${CUSTOM_WEBFETCH_TOOL}\`${via(CUSTOM_WEBFETCH_TOOL)}; do not use Cursor's native WebFetch interaction.`,
     )
   }
   if (names.has(CUSTOM_LIST_MCP_RESOURCES_TOOL)) {
     instructions.push(
-      `- To list MCP resources, call \`${CUSTOM_LIST_MCP_RESOURCES_TOOL}\`; do not use Cursor's native resource-listing interaction.`,
+      `- To list MCP resources, call \`${CUSTOM_LIST_MCP_RESOURCES_TOOL}\`${via(CUSTOM_LIST_MCP_RESOURCES_TOOL)}; do not use Cursor's native resource-listing interaction.`,
     )
   }
   if (names.has(CUSTOM_READ_MCP_RESOURCE_TOOL)) {
     instructions.push(
-      `- To read an MCP resource, call \`${CUSTOM_READ_MCP_RESOURCE_TOOL}\`; do not use Cursor's native resource-reading interaction.`,
+      `- To read an MCP resource, call \`${CUSTOM_READ_MCP_RESOURCE_TOOL}\`${via(CUSTOM_READ_MCP_RESOURCE_TOOL)}; do not use Cursor's native resource-reading interaction.`,
     )
   }
   if (names.has("execute")) {
-    const shell = names.has("shell") ? "`shell`" : names.has("bash") ? "`bash`" : undefined
+    const shellTool = hostToolDialectFromTools(tools).shellTool
+    const executeRoute = via("execute")
+    const execute = `- OpenCode \`execute\` is Code Mode JavaScript (\`code\`)${executeRoute && `, called${executeRoute}`}; it is not a shell.`
     instructions.push(
-      shell
-        ? `- OpenCode \`execute\` is Code Mode JavaScript (\`code\`); it is not a shell. For OS commands, call OpenCode ${shell}. Do not pass \`command\` to \`execute\`.`
-        : "- OpenCode `execute` is Code Mode JavaScript (`code`); it is not a shell. Do not pass `command` to `execute`.",
+      routes.native.has(shellTool)
+        ? `${execute} For OS commands, use Cursor Shell (OpenCode \`${shellTool}\`). Do not pass \`command\` to \`execute\`.`
+        : `${execute} Do not pass \`command\` to \`execute\`.`,
     )
     instructions.push(
-      "- Call tools named in the direct list by their own names, even when a server instruction says to reach them through `execute`. Use `execute` only for tools that appear in the host Code Mode catalog and are absent from that list. Use the exact paths and signatures from that catalog or its `search` function, and call `execute` with `{ code }`.",
+      "- Call each host tool listed above through its route there, even when a server instruction says to reach it through `execute`. Use `execute` only for tools that appear in the host Code Mode catalog and are absent from that list. Use the exact paths and signatures from that catalog or its `search` function, and call `execute` with `{ code }`.",
     )
   }
   if (names.has("task") || names.has("subagent")) {
@@ -4635,15 +4643,15 @@ export function buildOpenCodeInteractionGuidance(
   if (names.has("write")) {
     instructions.push(
       names.has("edit")
-        ? "- For file changes, use OpenCode `edit` for targeted changes to existing files and `write` to create files or intentionally replace complete contents; do not use shell, Python, or heredocs to change file content while these tools are available."
-        : "- Use OpenCode `write` for file-content changes; do not use shell, Python, or heredocs to change file content while it is available.",
+        ? "- For file changes, use Cursor StrReplace (OpenCode `edit`) for targeted changes to existing files and Cursor Write (OpenCode `write`) to create files or intentionally replace complete contents; do not use shell, Python, or heredocs to change file content while these tools are available."
+        : "- For file-content changes, use Cursor Write (OpenCode `write`); do not use shell, Python, or heredocs to change file content while it is available.",
     )
   } else if (names.has("apply_patch")) {
     // This host withheld `edit`/`write` and offers `apply_patch` instead. Native
     // Cursor write/edit requests are translated into it, so say so rather than
     // leaving the turn with no file-editing guidance at all.
     instructions.push(
-      "- Use OpenCode `apply_patch` for file-content changes; do not use shell, Python, or heredocs to change file content while it is available. Cursor-native write and edit requests are accepted and converted to `apply_patch` automatically.",
+      "- For file-content changes, use Cursor StrReplace and Write; the provider converts them to OpenCode `apply_patch` automatically. Do not use shell, Python, or heredocs to change file content while it is available.",
     )
   }
   if (hostToolDialectFromTools(tools).filePathKey === "path") {
@@ -4657,13 +4665,13 @@ export function buildOpenCodeInteractionGuidance(
     )
   }
   return [
-    `OpenCode exposes these direct tools for this turn: ${[...names].map((name) => `\`${name}\``).join(", ")}.`,
+    ...buildHostToolRouteLines(tools, routes),
     `Workspace root: ${JSON.stringify(workspaceRoot)}. Resolve workspace paths against exactly this root; never invent an absolute prefix, and verify uncertain paths with an available tool before using them.`,
     subagents.executor
-      ? `Call only tools in that direct OpenCode list for ordinary host execution. Cursor-native Task/subagent requests are permitted because a compatible host executor is listed. Bridged Cursor interactions named below (${bridgedInteractions}) are not OpenCode/MCP catalog tools — raise them normally and do not narrate that they are missing.`
-      : `Call only tools in that direct OpenCode list for ordinary host execution. Bridged Cursor interactions named below (${bridgedInteractions}) are not OpenCode/MCP catalog tools — raise them normally and do not narrate that they are missing. Other unlisted Cursor-native tools are not bridged; complete the work with the listed tools or explain the limitation without claiming a missing MCP tool.`,
+      ? `Use only these host tools, each through its route above, for ordinary host execution. Cursor-native Task/subagent requests are permitted because a compatible host executor is listed. Bridged Cursor interactions named below (${bridgedInteractions}) are not OpenCode/MCP catalog tools — raise them normally and do not narrate that they are missing.`
+      : `Use only these host tools, each through its route above, for ordinary host execution. Bridged Cursor interactions named below (${bridgedInteractions}) are not OpenCode/MCP catalog tools — raise them normally and do not narrate that they are missing. Other unlisted Cursor-native tools are not bridged; complete the work with the listed tools or explain the limitation without claiming a missing MCP tool.`,
     ...(instructions.length > 0
-      ? ["Use these OpenCode tools instead of equivalent Cursor-native UI interactions:"]
+      ? ["How to reach host tools and bridged Cursor interactions this turn:"]
       : []),
     ...instructions,
     "When using CallDynamicTool, write the discovered `namespace` and `toolName` FIRST, before `arguments`, on every invocation including each parallel call. All three are required outer fields. The discovered inputSchema describes only the inner arguments object; it is not the whole call. Check the outer identity before submitting a long command or script. Native Cursor tools use their own schemas, not the CallDynamicTool envelope.",
