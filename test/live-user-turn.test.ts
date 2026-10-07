@@ -6,7 +6,7 @@ import os from "node:os"
 import path from "node:path"
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
-import { resetTurnStateForTests } from "../src/language-model.js"
+import { resetTurnStateForTests, restoreTurnToolCatalog } from "../src/language-model.js"
 import { sessionManager } from "../src/session.js"
 import { forgetEarlySteers, recordEarlySteer } from "../src/host-steer.js"
 import { encodeFrame } from "../src/protocol/framing.js"
@@ -124,7 +124,7 @@ describe("the user turn of a fresh Run", () => {
   }
 
   /** Run one step; returns the Run request Cursor got, if the step opened one. */
-  async function step(sessionKey: string, prompt: Prompt, options: { toolsAllowed?: boolean } = {}): Promise<any> {
+  async function step(sessionKey: string, prompt: Prompt, options: { toolsAllowed?: boolean; tools?: [] } = {}): Promise<any> {
     const realFetch = globalThis.fetch
     globalThis.fetch = (async () => { throw new Error("no network in this test") }) as unknown as typeof fetch
     try {
@@ -138,7 +138,7 @@ describe("the user turn of a fresh Run", () => {
       const result = await model.doStream({
         prompt,
         headers: { "x-opencode-session-id": sessionKey },
-        tools: [{ type: "function", name: "read", description: "Read a file", inputSchema: { type: "object", properties: {} } }],
+        tools: options.tools ?? [{ type: "function", name: "read", description: "Read a file", inputSchema: { type: "object", properties: {} } }],
         ...(options.toolsAllowed === false ? { toolChoice: { type: "none" } } : {}),
       } as LanguageModelV3CallOptions)
       const reader = result.stream.getReader()
@@ -222,7 +222,20 @@ describe("the user turn of a fresh Run", () => {
       user("Generate a title for this conversation."),
     ] as Prompt, { toolsAllowed: false })
 
-    expect(splitTranscript(run).live).toStartWith("Generate a title for this conversation.")
+    expect(splitTranscript(run).live).toBe("Write a short title.\n\n<input>\nGenerate a title for this conversation.\n</input>")
+  })
+
+  it("sends a title call without the session's tools, its task opening the user turn", async () => {
+    const sessionKey = newSession()
+    restoreTurnToolCatalog(sessionKey, [{ name: "read", description: "Read a file", inputSchema: { type: "object", properties: {} } }])
+    const run = await step(sessionKey, [
+      { role: "system", content: "You are a title generator." },
+      user("get my latest Slack message"),
+    ] as Prompt, { tools: [] })
+
+    const requestContext = run.action.user_message_action.request_context
+    expect(requestContext.mcp_meta_tool_options?.mcp_descriptors ?? []).toEqual([])
+    expect(userText(run)).toBe("You are a title generator.\n\n<input>\nget my latest Slack message\n</input>")
   })
 
   it("does not send again a steer the model answered early when a note follows it", async () => {

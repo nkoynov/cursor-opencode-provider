@@ -164,9 +164,9 @@ Every completed Run emits `turn usage validation:`. Begin with `status`:
   category breakdown is internally consistent.
 - `status=mismatch` is a provider accounting bug **for the usage that was
   sent**. Occupancy finishes (tool-call and TurnEnded/stop) validate against
-  occupancy-shaped counters (`output=1`, `cacheRead=prior`); aggregate
-  TurnEnded request ratios live on `finish:` / `cache diagnosis:` and are not
-  required to equal the occupancy prefix ratio. Preserve the complete line and
+  the split they send (`occupancyStepUsage`); aggregate TurnEnded request
+  ratios live on `finish:` / `cache diagnosis:` and are not required to equal
+  it. Preserve the complete line and
   the preceding checkpoint/TurnEnded lines before changing cache behavior.
 
 Important fields:
@@ -175,23 +175,25 @@ Important fields:
 |---|---|
 | `source=checkpoint-current-run` | Current Run supplied fresh `tokenDetails`; preferred. |
 | `source=checkpoint-previous-turn` | No fresh details arrived, so the last snapshot is retained and marked stale in provider metadata. |
-| `source=occupancy-checkpoint-current-run` | Tool-call finish published the current Run's occupancy snapshot (display-only, `$0`). |
+| `source=occupancy-checkpoint-current-run` | Tool-call finish published the current Run's occupancy snapshot. |
 | `source=occupancy-checkpoint-previous-turn` | Tool-call finish published the prior checkpoint occupancy because this Run has not yet received token details. |
 | `source=intermediate-zero` | Tool-call finish with no known checkpoint occupancy. Standard usage remains zero. |
 | `source=unavailable` | No checkpoint has ever supplied token details. Standard usage remains zero rather than pretending aggregate TurnEnded usage is context occupancy. |
 | `cursor=used/max(percent)` | Cursor's authoritative context occupancy. |
 | `rawTotal` | Aggregate `TurnEnded` input + output. This is request work, not necessarily current context occupancy. |
 | `sentTotal` | AI SDK input + output sent to OpenCode. With token details, this must equal Cursor `usedTokens`. |
-| `rawCachedRatio` | For occupancy validation counters: `(prior usedTokens) / usedTokens`. TurnEnded request cache ratios are on `finish:` / cache diagnosis, not this field. |
-| `sentCachedRatio` | Occupancy `cacheRead` / sent input. Should match `rawCachedRatio` when validation uses occupancy-shaped counters. |
+| `rawCachedRatio` | For occupancy finishes: the sent split's cached share. TurnEnded request cache ratios are on `finish:` / cache diagnosis, not this field. |
+| `sentCachedRatio` | Occupancy `cacheRead + cacheWrite` / sent input. Equals `rawCachedRatio` on occupancy finishes. |
 | `breakdownMatch` | Whether Cursor's category totals agree with `usedTokens`. |
 
 `finish:` is a compact duplicate of the final AI SDK and raw counters. Tool-call
 boundaries should show `source=occupancy-checkpoint-*` when a snapshot exists
-(or `intermediate-zero` with no snapshot); the final `TurnEnded` should settle
-the billed occupancy exactly once. On occupancy finishes, `rawCacheRead` /
-`occupancyPrefixCache` are the prior-turn checkpoint prefix estimate — not
-Cursor's TurnEnded `cache_read` (that only appears on `reason=stop`).
+(or `intermediate-zero` with no snapshot); the final `TurnEnded` moves part of
+its occupancy between `v3CacheRead` and the other parts so the Run's output,
+cache writes and uncached input reach the TurnEnded counts. On occupancy
+finishes, `rawCacheRead` / `occupancyPrefixCache` are the previous finish's
+occupancy (the Run's checkpoint occupancy at its first finish) — not Cursor's
+TurnEnded `cache_read` (that only appears on `reason=stop`).
 
 ### 4. Interpret the cache diagnosis
 
@@ -203,8 +205,8 @@ rawReadRatio = rawCacheRead / rawInput
 rawWriteRatio = rawCacheWrite / rawInput
 ```
 
-Captured Cursor Runs commonly report `rawCacheWrite=0`. This is an upstream
-value, not evidence that the provider dropped writes.
+Some Cursor Runs report `rawCacheWrite=0` and count new input as uncached. This
+is an upstream value, not evidence that the provider dropped writes.
 
 | Field | Interpretation |
 |---|---|

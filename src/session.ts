@@ -11,6 +11,7 @@ import type {
 import type { CursorConversationTokenDetails } from "./protocol/token-details.js"
 import type { HostToolRun, ModelSwitch } from "./model-fallback.js"
 import type { ContextEpoch } from "./context/epoch.js"
+import type { OccupancyUsageLedger } from "./usage.js"
 
 export type Frame = { flags: number; payload: Uint8Array }
 
@@ -213,6 +214,8 @@ export type CursorSession = {
   tokenDetails?: CursorConversationTokenDetails
   /** True only after this Run receives a checkpoint containing token details. */
   tokenDetailsFresh?: boolean
+  /** What this Run's finishes have sent as usage; created at its first finish. */
+  usageLedger?: OccupancyUsageLedger
   /**
    * Run-lifetime cache evidence. Cursor exposes only aggregate cache counters at
    * TurnEnded, so retain the inputs and protocol activity needed to explain

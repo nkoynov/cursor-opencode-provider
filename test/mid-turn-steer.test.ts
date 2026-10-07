@@ -391,6 +391,31 @@ describe("doStream with a mid-turn user message", () => {
     ])
   })
 
+  it("settles the finish against both Cursor turns when a steer goes out as a follow-up Run", async () => {
+    const held = heldReads("rejected-usage")
+    held.resumeCheckpoint = new Uint8Array([1])
+    held.tokenDetails = { usedTokens: 1_000, maxTokens: 256_000 }
+    const ended = (output: number) => () => serverFrame({ turn_ended: { input_tokens: 400, cache_read: 400, output_tokens: output } })
+    held.reopenWithUserMessage = async () => {
+      serve(held, [() => serverFrame({ text_delta: { text: "ok" } }), ended(50)])
+    }
+    serve(held, [
+      () => injectionState(injections(held.writes)[0].injection_id, { rejected: { reason: "run_mismatch" } }),
+      completed("call_1"),
+      completed("call_2"),
+      () => serverFrame({ text_delta: { text: "Both files say alpha." } }),
+      checkpoint,
+      ended(30),
+    ])
+
+    const { parts } = await streamSteer(held, steer("rejected-usage", user("also check 3.ts")))
+
+    const finish = parts.at(-1) as any
+    expect(finish.type).toBe("finish")
+    expect(finish.usage.outputTokens.total).toBe(80)
+    expect(finish.usage.inputTokens.total + finish.usage.outputTokens.total).toBe(1_000)
+  })
+
   it("fails the turn instead of sending a follow-up from a checkpoint older than the results, and drops it", async () => {
     const held = heldReads("stale")
     setCheckpoint(held.conversationId, new Uint8Array([1]))
