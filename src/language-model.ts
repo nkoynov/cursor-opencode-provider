@@ -1495,7 +1495,8 @@ async function startSession(
   const oneShotReminders = [
     modeReminder,
     kickoffWarning ? `<system_reminder>${kickoffWarning}</system_reminder>` : undefined,
-    startedWithCheckpoint ? undeliveredHostNote : undefined,
+    // The note stays in the prompt, so the user turn holds it when the step that kept it left no assistant message.
+    startedWithCheckpoint && undeliveredHostNote && !userText.includes(undeliveredHostNote) ? undeliveredHostNote : undefined,
   ].filter((part): part is string => !!part)
 
   // `systemPrompt` is the host system context composed for a seed Run (kept for

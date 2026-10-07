@@ -13,10 +13,11 @@ import { encodeFrame } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { resetCheckpointsForTests, setCheckpoint } from "../src/protocol/checkpoint.js"
 import { resetConversationBindingsForTests, restoreConversationBinding } from "../src/protocol/conversation-bind.js"
-import { deletePersistedConversation, resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
+import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
 import { persistConversationState } from "../src/protocol/conversation-state.js"
-import { opencodeGlobalCacheDir } from "../src/context/paths.js"
+import { opencodeGlobalCacheDir, setHostCacheDirOverride } from "../src/context/paths.js"
 import { resetFrozenRequestContextsForTests } from "../src/context/frozen.js"
+import { systemInstructionsRule } from "../src/context/build.js"
 import { closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
 
 type Prompt = LanguageModelV3CallOptions["prompt"]
@@ -25,6 +26,7 @@ const QUESTION = "Is cursor cli better than open code"
 const TASK_NOTE = '<task id="ses_bg" state="completed">\n<summary>Background task completed: run the tests</summary>\n<task_result>\nAll 12 tests pass.\n</task_result>\n</task>'
 const SYSTEM_UPDATE = "<system-update>\nThe available tools have changed.\n</system-update>"
 const STEER = "Also check the README"
+const SYSTEM = "You are a coding agent."
 
 const user = (text: string) => ({ role: "user", content: [{ type: "text", text }] })
 const assistant = (text: string) => ({ role: "assistant", content: [{ type: "text", text }] })
@@ -92,11 +94,13 @@ describe("the user turn of a fresh Run", () => {
 
   beforeAll(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-live-turn-"))
+    setHostCacheDirOverride(path.join(root, "cache"))
     cursor = fakeCursorRuns()
   })
 
   afterAll(() => {
     cursor.restore()
+    setHostCacheDirOverride(undefined)
     fs.rmSync(root, { recursive: true, force: true })
   })
 
@@ -266,13 +270,13 @@ describe("the user turn of a fresh Run", () => {
     expect(transcript).toContain(`[User, no reply]\n${STEER}`)
   })
 
-  /** The turn that answered `steers` ended and saved its snapshot; then the provider restarted. */
-  async function answeredBeforeRestart(sessionKey: string, steers: string[]): Promise<void> {
+  /** The last turn ended and saved its snapshot; then the provider restarted. */
+  async function savedBeforeRestart(sessionKey: string, saved: { answeredSteers?: string[]; hostNote?: string }): Promise<void> {
     await persistConversationState(opencodeGlobalCacheDir(), {
       sessionKey,
       conversationId: `conv-${sessionKey}`,
-      requestContext: { rules_info_complete: true },
-      answeredSteers: steers,
+      requestContext: { rules_info_complete: true, rules: [systemInstructionsRule(SYSTEM)] },
+      ...saved,
     })
     resetConversationPersistenceForTests()
     resetConversationBindingsForTests()
@@ -282,40 +286,49 @@ describe("the user turn of a fresh Run", () => {
 
   it("does not send again an answered steer after a restart", async () => {
     const sessionKey = newSession({ checkpointed: true })
-    try {
-      await answeredBeforeRestart(sessionKey, [STEER])
+    await savedBeforeRestart(sessionKey, { answeredSteers: [STEER] })
 
-      const run = await step(sessionKey, [
-        user("Read the docs"),
-        assistant("Read them, and the README too."),
-        user(STEER),
-        user(QUESTION),
-      ] as Prompt)
+    const run = await step(sessionKey, [
+      user("Read the docs"),
+      assistant("Read them, and the README too."),
+      user(STEER),
+      user(QUESTION),
+    ] as Prompt)
 
-      expect(new Uint8Array(run.conversation_state)).toEqual(checkpoint())
-      expect(userText(run)).toStartWith(QUESTION)
-      expect(userText(run)).not.toContain(STEER)
-    } finally {
-      await deletePersistedConversation(opencodeGlobalCacheDir(), sessionKey)
-    }
+    expect(new Uint8Array(run.conversation_state)).toEqual(checkpoint())
+    expect(userText(run)).toStartWith(QUESTION)
+    expect(userText(run)).not.toContain(STEER)
   })
 
   it("still sends a user turn the restart snapshot would leave empty", async () => {
     const sessionKey = newSession({ checkpointed: true })
-    try {
-      await answeredBeforeRestart(sessionKey, [STEER, QUESTION])
+    await savedBeforeRestart(sessionKey, { answeredSteers: [STEER, QUESTION] })
 
-      const run = await step(sessionKey, [
-        user("Read the docs"),
-        assistant("Read them, and the README too."),
-        user(STEER),
-        user(QUESTION),
-      ] as Prompt)
+    const run = await step(sessionKey, [
+      user("Read the docs"),
+      assistant("Read them, and the README too."),
+      user(STEER),
+      user(QUESTION),
+    ] as Prompt)
 
-      expect(userText(run)).toStartWith(`${STEER}\n\n${QUESTION}`)
-    } finally {
-      await deletePersistedConversation(opencodeGlobalCacheDir(), sessionKey)
-    }
+    expect(userText(run)).toStartWith(`${STEER}\n\n${QUESTION}`)
+  })
+
+  it("sends an undelivered host note once when the user turn holds it too", async () => {
+    const sessionKey = newSession({ checkpointed: true })
+    await savedBeforeRestart(sessionKey, { hostNote: SYSTEM_UPDATE })
+
+    const run = await step(sessionKey, [
+      { role: "system", content: SYSTEM },
+      user("hello"),
+      assistant("Hi."),
+      user(SYSTEM_UPDATE),
+      user(QUESTION),
+    ] as Prompt)
+
+    const text = userText(run)
+    expect(text).toStartWith(`${SYSTEM_UPDATE}\n\n${QUESTION}`)
+    expect(occurrences(text, SYSTEM_UPDATE)).toBe(1)
   })
 
   it("still sends a steer the model has not answered", async () => {
