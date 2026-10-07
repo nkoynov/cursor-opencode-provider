@@ -1669,6 +1669,7 @@ async function startSession(
   const maxMode = resolveVariantMaxMode(parameterValues, {
     picked,
     maxMode: hintMaxMode,
+    model: modelInfo,
   })
 
   if (foreignHistory || checkpointUnusable || (!conversationState && !isCompaction && !ephemeralRun && history.some((entry) => entry.role !== "system"))) {
