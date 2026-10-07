@@ -1589,7 +1589,7 @@ async function startSession(
     maxMode: hintMaxMode,
   })
 
-  if (foreignHistory || checkpointUnusable) {
+  if (foreignHistory || checkpointUnusable || (!conversationState && !isCompaction && !ephemeralRun && history.length > 0)) {
     assertForeignHistoryRebaseFits({
       modelInfo,
       cursorModelId,
@@ -5623,9 +5623,10 @@ function appendSeedHistory(
 export const FOREIGN_HISTORY_REBASE_CONTEXT_SHARE = 0.8
 
 /**
- * A foreign-history rebase replays the full host history. When that cannot fit,
- * fail before opening a Run with an error hosts classify as context overflow
- * (HTTP 413 + "prompt is too long"), so the host compacts and retries.
+ * A Run without a checkpoint replays the host history (in full for a
+ * foreign-history rebase). When that cannot fit, fail before opening a Run
+ * with an error hosts classify as context overflow (HTTP 413 + "prompt is too
+ * long"), so the host compacts and retries.
  */
 export function assertForeignHistoryRebaseFits(input: {
   modelInfo: ModelInfo | undefined
