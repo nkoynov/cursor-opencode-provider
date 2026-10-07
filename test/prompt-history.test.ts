@@ -461,7 +461,66 @@ describe("extractPromptHistory", () => {
     })
   })
 
-  it("keeps every call and result for a transcript, shortening only the earlier results", () => {
+  describe("transcript budget", () => {
+    const early = `early-start ${"e".repeat(TRANSCRIPT_TOOL_RESULT_CHARS + 3_000)} early-end`
+    const middle = `middle-start ${"m".repeat(TRANSCRIPT_TOOL_RESULT_CHARS + 3_000)} middle-end`
+    const content = `content-start ${"c".repeat(TRANSCRIPT_TOOL_RESULT_CHARS + 3_000)} content-end`
+    const latest = `latest-start ${"l".repeat(TRANSCRIPT_TOOL_RESULT_CHARS + 3_000)} latest-end`
+    const prompt = [
+      { role: "user", content: "read a" },
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: "1", toolName: "read", input: { path: "a" } }] },
+      { role: "tool", content: [{ type: "tool-result", toolCallId: "1", toolName: "read", output: { type: "text", value: early } }] },
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: "2", toolName: "write", input: { path: "b", content } }] },
+      { role: "tool", content: [{ type: "tool-result", toolCallId: "2", toolName: "read", output: { type: "text", value: middle } }] },
+      { role: "assistant", content: [{ type: "text", text: "Read both." }] },
+      { role: "user", content: "read c" },
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: "3", toolName: "read", input: { path: "c" } }] },
+      { role: "tool", content: [{ type: "tool-result", toolCallId: "3", toolName: "read", output: { type: "text", value: latest } }] },
+    ] as LanguageModelV3CallOptions["prompt"]
+    const transcript = (options: { maxChars?: number }) =>
+      JSON.stringify(extractPromptHistory(prompt, { preserveTrailingUser: true, toolResults: "transcript", ...options }))
+    const size = (options: { maxChars?: number }) =>
+      renderHistoryTranscript(extractPromptHistory(prompt, { preserveTrailingUser: true, toolResults: "transcript", ...options }))!
+        .length + 2
+
+    it("keeps every input and result whole while the history fits", () => {
+      const whole = size({})
+      const history = transcript({ maxChars: whole })
+      for (const marker of ["early-end", "middle-end", "content-end", "latest-end"]) expect(history).toContain(marker)
+      expect(history).not.toContain("left out of this replay")
+    })
+
+    it("shortens the oldest inputs and results first, only as far as needed", () => {
+      const whole = size({})
+      const history = transcript({ maxChars: whole - 1_000 })
+      expect(history).toContain("early-start")
+      expect(history).not.toContain("early-end")
+      expect(history).toContain("more characters left out of this replay to fit the context window]")
+      for (const marker of ["middle-end", "content-end", "latest-end"]) expect(history).toContain(marker)
+      expect(size({ maxChars: whole - 1_000 })).toBeLessThanOrEqual(whole - 1_000)
+    })
+
+    it("leaves a result alone when the note would make it longer", () => {
+      const barely = "y".repeat(TRANSCRIPT_TOOL_RESULT_CHARS + 50)
+      const history = JSON.stringify(extractPromptHistory([
+        { role: "user", content: "read" },
+        { role: "assistant", content: [{ type: "tool-call", toolCallId: "1", toolName: "read", input: {} }] },
+        { role: "tool", content: [{ type: "tool-result", toolCallId: "1", toolName: "read", output: { type: "text", value: barely } }] },
+        { role: "user", content: "next" },
+      ] as LanguageModelV3CallOptions["prompt"], { toolResults: "transcript", maxChars: 0 }))
+      expect(history).toContain(barely)
+      expect(history).not.toContain("left out of this replay")
+    })
+
+    it("shortens a long tool input in its turn and never the trailing live result", () => {
+      const history = transcript({ maxChars: 0 })
+      for (const marker of ["early-end", "middle-end", "content-end"]) expect(history).not.toContain(marker)
+      expect(history).toContain("content-start")
+      expect(history).toContain("latest-end")
+    })
+  })
+
+  it("keeps every call and result for a transcript, shortening only the earlier results over the budget", () => {
     const long = "x".repeat(TRANSCRIPT_TOOL_RESULT_CHARS + 500)
     const prompt = [
       { role: "user", content: "do it" },
@@ -485,12 +544,14 @@ describe("extractPromptHistory", () => {
       },
     ] as LanguageModelV3CallOptions["prompt"]
 
-    const history = extractPromptHistory(prompt, { preserveTrailingUser: true, toolResults: "transcript" })
+    const history = extractPromptHistory(prompt, { preserveTrailingUser: true, toolResults: "transcript", maxChars: 3_000 })
     expect(history[1]).toEqual({
       role: "assistant",
       content: 'Running it.\n[called shell] {"command":"echo charlie > third.txt"}',
     })
-    expect(history[2]!.content).toContain(`${"x".repeat(TRANSCRIPT_TOOL_RESULT_CHARS)}\n[… 500 more characters]`)
+    expect(history[2]!.content).toContain(
+      `${"x".repeat(TRANSCRIPT_TOOL_RESULT_CHARS)}\n[… 500 more characters left out of this replay to fit the context window]`,
+    )
     expect(history[3]).toEqual({ role: "assistant", content: "DONE" })
     expect(history.at(-2)).toEqual({ role: "assistant", content: '[called read] {"path":"third.txt"}' })
     expect(history.at(-1)!.content.endsWith(`:\n${long}`)).toBe(true)

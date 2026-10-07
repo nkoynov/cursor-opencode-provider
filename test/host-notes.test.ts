@@ -449,7 +449,7 @@ describe("host notes on held-Run exec results", () => {
     ] as Prompt, { toolResults: "transcript" })
 
     const transcript = renderHistoryTranscript(history)!
-    expect(transcript).toContain("more characters]")
+    expect(transcript).toContain(longRead)
     expect(transcript).toContain(`[User]\n${NOTE}\n\n[Assistant]\nRead it.`)
   })
 

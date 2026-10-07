@@ -172,6 +172,13 @@ Cursor skips building its root prompt, so the rule, `custom_subagents` and MCP
 instructions are gone for the rest of the conversation. A Run without a
 checkpoint sends an empty `ConversationStateStructure` and opens its user
 message with a `<conversation_history>` transcript (`renderHistoryTranscript`).
+The transcript keeps every tool call input and result whole, as a resumed
+Claude Code session resends its whole transcript; only when it would pass 80%
+of the context are the oldest ones shortened (with a note in place), and when
+even that does not fit the Run fails with a 413 so the host compacts. The
+replay is sized at 1.75 characters per token (`REPLAY_CHARS_PER_TOKEN`, the
+1st percentile of how Cursor counts coding sessions; the median is 2.1), not
+with `estimateTokens`' four.
 Merged `opencode.json` (`loadMergedConfig`) is still read for MCP server ids,
 plugin lists, and interaction guidance.
 

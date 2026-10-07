@@ -268,13 +268,24 @@ describe("foreign-history rebase", () => {
 
   it("passes when the rebased history fits the model context", () => {
     expect(() => assertForeignHistoryRebaseFits({
-      modelInfo: { id: "m", maxContext: 1_000, variants: [] },
+      modelInfo: { id: "m", maxContext: 2_000, variants: [] },
       cursorModelId: "m",
       maxMode: false,
-      history: [{ role: "user", content: "x".repeat(3_000) }],
+      history: [{ role: "user", content: "x".repeat(1_500) }],
       systemPrompt: "system",
       userText: "next",
     })).not.toThrow()
+  })
+
+  it("sizes the replay at 1.75 characters per token, as Cursor counts dense coding sessions", () => {
+    expect(() => assertForeignHistoryRebaseFits({
+      modelInfo: { id: "m", maxContext: 2_000, variants: [] },
+      cursorModelId: "m",
+      maxMode: false,
+      history: [{ role: "user", content: "x".repeat(3_000) }],
+      systemPrompt: undefined,
+      userText: "next",
+    })).toThrow(/prompt is too long/)
   })
 
   it("raises a host-recognised context overflow when it does not fit", () => {
@@ -298,11 +309,11 @@ describe("foreign-history rebase", () => {
 
   it("counts the system prompt once, not again as a history entry", () => {
     expect(() => assertForeignHistoryRebaseFits({
-      modelInfo: { id: "m", maxContext: 1_000, variants: [] },
+      modelInfo: { id: "m", maxContext: 2_000, variants: [] },
       cursorModelId: "m",
       maxMode: false,
-      history: [{ role: "system", content: "s".repeat(2_000) }, { role: "user", content: "x".repeat(1_000) }],
-      systemPrompt: "s".repeat(2_000),
+      history: [{ role: "system", content: "s".repeat(1_500) }, { role: "user", content: "x".repeat(500) }],
+      systemPrompt: "s".repeat(1_500),
       userText: "next",
     })).not.toThrow()
   })
