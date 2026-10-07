@@ -53,6 +53,7 @@ export type CursorShellOutcome =
       workingDirectory: string
       msToWait: number
       reason: 1
+      logPath?: string
     }
 
 type CursorShellEnvWrap = {
@@ -834,6 +835,7 @@ function parseSoftBackgroundOutcome(
           workingDirectory: policy?.workingDirectory || policy?.terminal?.cwd || "",
           msToWait: policy?.timeoutMs ?? 0,
           reason: 1,
+          logPath: background.values[1],
         },
       }
     }
@@ -873,6 +875,7 @@ function parseBackgroundSpawnOutcome(
       workingDirectory: policy?.workingDirectory || policy?.terminal?.cwd || "",
       msToWait: 0,
       reason: 1,
+      logPath: match.values[1],
     },
   }
 }
@@ -970,6 +973,10 @@ export function peekCursorShellResult(
 }
 
 /** Consume the structured result, with an inline fallback when no plugin hook ran. */
+export function capturedCursorShellOutcome(toolCallId: string): CursorShellOutcome | undefined {
+  return outcomes.get(toolCallId)
+}
+
 export function consumeCursorShellResult(
   toolCallId: string,
   output: string,

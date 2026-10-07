@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "bun:test"
+import { describe, it, expect, afterEach, beforeEach } from "bun:test"
 import { spawn, spawnSync } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
@@ -10,12 +10,22 @@ import { sessionManager, type CursorSession, type Frame } from "../src/session.j
 import {
   buildBackgroundShellCommand,
   buildSoftBackgroundCommand,
+  captureCursorShellResult,
+  capturedCursorShellOutcome,
   consumeCursorShellResult,
   registerCursorShellCall,
   resetCursorShellCalls,
   shellPolicyFromMetadata,
   sweepStaleTerminalFiles,
 } from "../src/shell-timeout.js"
+import {
+  noteSessionExecution,
+  pollBackgroundShells,
+  registerBackgroundShellNotifier,
+  resetBackgroundShellNotices,
+  watchBackgroundShell,
+  type BackgroundShellNote,
+} from "../src/background-shell-notice.js"
 
 const roots: string[] = []
 function tempDir(): string {
@@ -616,6 +626,67 @@ describe("soft-background shell into a Cursor terminal file", () => {
   })
 })
 
+describe("completion notes from Cursor terminal files", () => {
+  const notes: BackgroundShellNote[] = []
+  const notifier = async (note: BackgroundShellNote) => void notes.push(note)
+  beforeEach(() => {
+    resetBackgroundShellNotices({ manualPolling: true })
+    notes.length = 0
+    registerBackgroundShellNotifier(notifier)
+  })
+  afterEach(() => resetBackgroundShellNotices())
+
+  const watchOutcome = (callID: string, sessionID: string, stdout: string) => {
+    captureCursorShellResult(callID, stdout)
+    const outcome = capturedCursorShellOutcome(callID)
+    if (outcome?.kind !== "backgrounded" || !outcome.logPath) throw new Error(`not backgrounded: ${stdout}`)
+    watchBackgroundShell({ sessionID, pid: outcome.pid, file: outcome.logPath, command: outcome.command, notifier })
+    noteSessionExecution(sessionID, "succeeded")
+    return { pid: outcome.pid, file: outcome.logPath }
+  }
+
+  it("reports a background spawn's exit code and output", async () => {
+    const folder = tempDir()
+    const command = "printf 'a\\nb\\n'; exit 3"
+    registerCursorShellCall("cursor_note_spawn", { background_shell_spawn: true, command, working_directory: "/w", terminals_folder: folder, terminal_cwd: "/w" })
+    const { pid, file } = watchOutcome("cursor_note_spawn", "ses_spawn", run(buildBackgroundShellCommand(command, { folder, cwd: "/w" })))
+    expect(file).toBe(path.join(folder, `${pid}.txt`))
+    pollBackgroundShells()
+    expect(notes).toEqual([])
+    await finished(file)
+    pollBackgroundShells()
+    expect(notes).toHaveLength(1)
+    expect(notes[0]!.sessionID).toBe("ses_spawn")
+    expect(notes[0]!.text).toContain(`<shell id="${pid}" state="completed" command="printf 'a\\nb\\n'; exit 3">`)
+    expect(notes[0]!.text).toMatch(new RegExp(`Background shell ${pid} failed with exit code 3 after \\d+s\\.\\nIts output \\(also in ${file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\):\\na\\nb\\n</shell>`))
+    expect(notes[0]!.metadata.exit).toBe(3)
+  })
+
+  it("reports a soft-background command once it ends after its window", async () => {
+    const folder = tempDir()
+    const metadata = { shell_stream: true, command: "printf 'start\\n'; sleep 1; printf 'end\\n'", working_directory: "", timeout_ms: 300, timeout_behavior: 2, terminals_folder: folder, terminal_cwd: "/w" }
+    registerCursorShellCall("cursor_note_soft", metadata)
+    const { pid, file } = watchOutcome("cursor_note_soft", "ses_soft", run(buildSoftBackgroundCommand(shellPolicyFromMetadata(metadata)!)))
+    await finished(file)
+    pollBackgroundShells()
+    expect(notes).toHaveLength(1)
+    expect(notes[0]!.text).toContain(`Background shell ${pid} finished with exit code 0 after 1s.`)
+    expect(notes[0]!.text).toContain("start\nend\n</shell>")
+  })
+
+  it("reports a command its hard timeout stopped after the handoff as cancelled", async () => {
+    const folder = tempDir()
+    const metadata = { shell_stream: true, command: "trap 'exit 0' TERM; printf 'start\\n'; sleep 5 >/dev/null 2>&1 & wait", working_directory: "", timeout_ms: 200, timeout_behavior: 2, hard_timeout_ms: 1500, terminals_folder: folder, terminal_cwd: "/w" }
+    registerCursorShellCall("cursor_note_hard", metadata)
+    const { pid, file } = watchOutcome("cursor_note_hard", "ses_hard", run(buildSoftBackgroundCommand(shellPolicyFromMetadata(metadata)!)))
+    await finished(file)
+    pollBackgroundShells()
+    expect(notes).toHaveLength(1)
+    expect(notes[0]!.text).toContain(`state="cancelled"`)
+    expect(notes[0]!.text).toMatch(new RegExp(`Background shell ${pid} was stopped after \\d+s \\(exit code 0\\)\\.`))
+  }, 15_000)
+})
+
 describe("exec mapping", () => {
   const context = { terminalsFolder: "/cache/terminals", workspaceRoot: "/w" }
 
@@ -710,6 +781,7 @@ describe("terminal file reads", () => {
     variant = "read_args",
     definitions = READ_AND_SHELL,
     permitted?: string[],
+    openCodeSessionId?: string,
   ) {
     const writes: Uint8Array[] = []
     const parts: any[] = []
@@ -718,6 +790,7 @@ describe("terminal file reads", () => {
       encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: { input_tokens: 1, output_tokens: 1 } } }),
     ], writes, root, folder, definitions)
     if (permitted) session.permittedToolNames = new Set(permitted)
+    if (openCodeSessionId) session.openCodeSessionId = openCodeSessionId
     await pump(session, {
       enqueue(part: unknown) { parts.push(part) },
       error(error: Error) { throw error },
@@ -727,6 +800,37 @@ describe("terminal file reads", () => {
       .filter((result) => result !== undefined)
     return { results, toolCalls: parts.filter((part) => part.type === "tool-call") }
   }
+
+  it("a session's read of its finished terminal file stands in for the completion note", async () => {
+    resetBackgroundShellNotices({ manualPolling: true })
+    try {
+      const notes: BackgroundShellNote[] = []
+      const notifier = async (note: BackgroundShellNote) => void notes.push(note)
+      registerBackgroundShellNotifier(notifier)
+      const root = tempDir()
+      const folder = tempDir()
+      const header = (status: string) => `---\npid: ${process.pid}\ncwd: "/w"\ncommand: "make"\nstatus: ${status.padEnd(9)}\nstarted_at: 2026-10-07T10:00:00Z\nrunning_for_ms: 0        \n---\n`
+      const footer = "\n---\nexit_code: 0\nelapsed_ms: 2000\nended_at: 2026-10-07T10:00:02Z\n---\n"
+      const done = path.join(folder, `${process.pid}.txt`)
+      fs.writeFileSync(done, `${header("succeeded")}ok\n${footer}`)
+      watchBackgroundShell({ sessionID: "ses_read", pid: process.pid, file: done, command: "make", notifier })
+      noteSessionExecution("ses_read", "succeeded")
+      await readThroughPump(root, folder, { path: path.relative(root, done) }, "read_args", READ_AND_SHELL, undefined, "ses_other")
+      await readThroughPump(root, folder, { path: done }, "read_args", READ_AND_SHELL, undefined, "ses_read")
+      pollBackgroundShells(Date.now() + 60_000)
+      expect(notes).toEqual([])
+
+      fs.writeFileSync(done, `${header("running")}ok\n`)
+      watchBackgroundShell({ sessionID: "ses_read", pid: process.pid, file: done, command: "make", notifier })
+      noteSessionExecution("ses_read", "succeeded")
+      await readThroughPump(root, folder, { path: done }, "read_args", READ_AND_SHELL, undefined, "ses_read")
+      fs.writeFileSync(done, `${header("succeeded")}ok\n${footer}`)
+      pollBackgroundShells(Date.now() + 60_000)
+      expect(notes).toHaveLength(1)
+    } finally {
+      resetBackgroundShellNotices()
+    }
+  })
 
   it("answers a read of a terminal file itself, with the requested line range", async () => {
     const root = tempDir()

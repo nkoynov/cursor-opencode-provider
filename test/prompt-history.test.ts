@@ -8,6 +8,7 @@ import {
   TRANSCRIPT_TOOL_RESULT_CHARS,
 } from "../src/language-model.js"
 import { buildSeedConversationState, renderHistoryTranscript } from "../src/protocol/request.js"
+import { registerBackgroundShellNotifier, resetBackgroundShellNotices } from "../src/background-shell-notice.js"
 import { decodeMessage } from "../src/protocol/messages.js"
 
 describe("estimateTokens", () => {
@@ -37,6 +38,20 @@ describe("buildOpenCodeInteractionGuidance", () => {
     expect(guidance).toContain("Emit the actual tool call")
     expect(guidance).not.toContain("`plan_enter`")
     expect(guidance).not.toContain("`webfetch`")
+  })
+
+  it("says background shells report back only once the host can post their notes", () => {
+    resetBackgroundShellNotices({ manualPolling: true })
+    try {
+      const line = "Background shells report back"
+      expect(buildOpenCodeInteractionGuidance([{ name: "shell" }], false, "/workspace")).not.toContain(line)
+      const dispose = registerBackgroundShellNotifier(async () => {})
+      dispose()
+      expect(buildOpenCodeInteractionGuidance([{ name: "shell" }], false, "/workspace")).toContain(line)
+      expect(buildOpenCodeInteractionGuidance([{ name: "read" }], false, "/workspace")).not.toContain(line)
+    } finally {
+      resetBackgroundShellNotices()
+    }
   })
 
   it("tells a staged plan to follow the host approval call", () => {
