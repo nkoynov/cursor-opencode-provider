@@ -1077,6 +1077,7 @@ export async function pumpWithRecovery(input: {
 function carryModelSwitchState(from: CursorSession, to: CursorSession): void {
   if (from.allowModelSwitch) to.allowModelSwitch = true
   if (from.servedBySwitch) to.servedBySwitch = from.servedBySwitch
+  if (from.modelSwitch) to.modelSwitch ??= from.modelSwitch
   const guard = from.modelSwitchGuard
   if (!guard || !to.modelSwitchGuard) return
   to.modelSwitchGuard.turnBase = guard.turnBase
@@ -3386,8 +3387,9 @@ export async function pump(
       trace(`conversation persistence: model switch save failed sessionKey=${sessionKey}: ${String(error)}`)
     })
     closeOpenSpans()
+    // Its own text part, so the host shows it apart from any text of the switched step.
     textId = crypto.randomUUID()
-    textBreakPending = true
+    textBreakPending = false
     emitVisibleText(message)
     emitFinish(undefined, { unified: "stop", raw: undefined })
   }
