@@ -1114,7 +1114,7 @@ async function doStreamImpl(
           trace(`pull: pump threw (cleaning up): ${(e as Error).message}`)
           // A Run the host stopped is drained and closed by its cancel.
           if (!activeSession.hostInterrupted) sessionManager.close(activeSession)
-          recordFinalFailure(activeSession.openCodeSessionId, e)
+          recordFinalFailure(opencodeSessionKey(callOptions), e)
           try {
             controller.error(e instanceof Error ? e : new Error(String(e)))
           } catch {
