@@ -12,6 +12,9 @@
 
 ### Fixed
 
+- A Cursor AwaitShell sleep longer than two minutes no longer fails the turn: Cursor sends only heartbeats while it waits, and the stall deadline now lasts for the wait's `block_until_ms` (up to an hour). Before, the Run was cut at 120 s, resumed, cut again, and ended with "semantic-progress timeout … automatic retry unsafe"
+- A resumed Run that fails before Cursor sends a newer checkpoint resumes again from the one it started from, as Cursor CLI does, instead of ending the turn as unsafe to retry; once the Run asks the host for anything or answers an interaction, that checkpoint is no longer reused
+- A Run Cursor refuses for capacity (`resource_exhausted`, `unavailable`, HTTP 429/503) is retried over about a minute (six attempts, delays from 1–2 s doubling to 15–30 s, or Cursor's retry delay) instead of three attempts within about 1.5 s, which an Opus capacity shortage outlasted. The final error says the capacity is on Cursor's side, not a limit on the key. Network errors keep the fast retries
 - Dynamic-catalog guidance names the namespace for host tools (`opencode`) and states that `cursor` holds only Cursor's built-in tools, so a first `skill` lookup no longer fails in the wrong namespace.
 - A SwitchMode handoff that starts a new host plan turn explicitly terminates the old Cursor Run before the host switch, preserving its checkpoint and preventing premature CreatePlan calls. Native planning guidance distinguishes direct functions from dynamic discovery; debug logs retain native discovery errors.
 - Dynamic tool definitions carry their exact invocation identity and complete outer envelope beside the inner argument schema, so discovery and shortened search results retain required outer call fields.
