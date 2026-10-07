@@ -106,15 +106,24 @@ describe("tool-result images", () => {
       { type: "file-data", mediaType: "image/png", data: png },
       // OpenCode 1 synthetic attachments carry the bytes on `url`, not `data`.
       { type: "file", mediaType: "image/png", url: `data:image/png;base64,${png}`, filename: "oc1.png" },
+      // OpenCode 1 toModelOutput keeps attachments as `type: "media"`.
+      { type: "media", mediaType: "image/png", data: png, filename: "oc1-media.png" },
+      // OpenCode 2 host/MCP projection uses `mime` + `uri`.
+      { type: "file", mime: "image/png", uri: `data:image/png;base64,${png}`, filename: "oc2.png" },
       { type: "file", mediaType: "application/pdf", data: png },
       { type: "file", mediaType: "image/png", data: "not base64!" },
       { type: "text", text: "Image read successfully" },
     ])
-    expect(images.map((image) => image.filename)).toEqual(["badge.png", "image-2", "oc1.png"])
+    expect(images.map((image) => image.filename)).toEqual([
+      "badge.png",
+      "image-2",
+      "oc1.png",
+      "oc1-media.png",
+      "oc2.png",
+    ])
     expect(images.every((image) => image.mimeType === "image/png" && image.data.length === 9)).toBe(true)
-    expect(hashes).toHaveLength(3)
-    expect(hashes[0]).toBe(hashes[1])
-    expect(hashes[0]).toBe(hashes[2])
+    expect(hashes).toHaveLength(5)
+    expect(new Set(hashes).size).toBe(1)
   })
 })
 

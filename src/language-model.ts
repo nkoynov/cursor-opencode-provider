@@ -765,6 +765,27 @@ async function doStreamImpl(
     // Write pending results onto the held-open Run. A dead stream closes the
     // session and returns undefined so we fall through to history rebase
     // instead of pumping a connection that can no longer accept writes.
+    const tailMedia = trailingToolResults.reduce((n, r) => n + (r.media?.length ?? 0), 0)
+    const roles = prompt.slice(Math.max(0, prompt.length - 4)).map((m) => {
+      if (!Array.isArray(m.content)) return `${m.role}:scalar`
+      const kinds = m.content.map((p) => {
+        const part = p as unknown as Record<string, unknown>
+        if (part.type === "tool-result") {
+          const out = part.output as Record<string, unknown> | undefined
+          const value = out?.value
+          const nonText = Array.isArray(value)
+            ? value.filter((item) => item && typeof item === "object" && (item as { type?: string }).type !== "text").length
+            : 0
+          return `tool-result(${part.toolName},${typeof out?.type === "string" ? out.type : "?"},mediaish=${nonText})`
+        }
+        return String(part.type ?? "?")
+      })
+      return `${m.role}:[${kinds.join(",")}]`
+    })
+    trace(
+      `continuation: prompt-tail mediaParts=${tailMedia} supportsImages=${session.supportsImages} ` +
+        `roles=${roles.join(" | ")}`,
+    )
     const results = session.supportsImages
       ? await decodeTrailingToolImages(session, trailingToolResults, callOptions.abortSignal)
       : trailingToolResults
