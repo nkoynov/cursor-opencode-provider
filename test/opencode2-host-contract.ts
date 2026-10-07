@@ -198,6 +198,14 @@ export type HostPluginContext = {
         baseURL?: string
         headers: Record<string, string>
       }
+      retry: {
+        readonly sessionID: string
+        readonly agent: string
+        readonly model: { providerID: string; id: string; variant?: string }
+        readonly error: { readonly type: string; readonly message: string }
+        readonly attempt: number
+        decision: { retry: false } | { retry: true; delay: number }
+      }
     }>
     readonly get: (input: { sessionID: string }) => Promise<{
       readonly id: string

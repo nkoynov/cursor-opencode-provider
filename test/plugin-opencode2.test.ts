@@ -13,7 +13,8 @@ import {
 } from "../src/opencode2/integration.js"
 import { resetAuthRenewalState } from "../src/auth-renewal.js"
 import { decodeJwtExpiryMs } from "../src/auth.js"
-import { CursorAuthError } from "../src/errors.js"
+import { CursorAuthError, CursorRetryExhaustedError, CursorServerError } from "../src/errors.js"
+import { recordFinalFailure, resetFinalFailuresForTests } from "../src/host-retry.js"
 import { clearCompactionSessions, isCompactionSession, markCompactionSession } from "../src/compaction-marker.js"
 import {
   clearSessionDirectories,
@@ -1643,6 +1644,38 @@ describe("opencode2 setup", () => {
     }
     await hooks.get("session.title")!(event)
     expect(event.options.opencodeCompaction).toBe(false)
+  })
+
+  test("retry: OpenCode does not retry a step the provider ended for good", async () => {
+    resetFinalFailuresForTests()
+    const { ctx, hooks } = fakeContext()
+    await plugin.setup(ctx)
+    const failure = new CursorRetryExhaustedError(6, new CursorServerError("Cursor API error (code=resource_exhausted)", {
+      transient: true, replaySafe: true, code: "resource_exhausted",
+    }))
+    const retry = (sessionID: string, message: string, providerID = "cursor"): any => ({
+      sessionID,
+      agent: "build",
+      model: { providerID, id: "claude-opus-5-5-1m" },
+      error: { type: "provider.internal", message },
+      attempt: 2,
+      decision: { retry: true, delay: 2_000 },
+    })
+
+    recordFinalFailure("s-final", failure)
+    const other = retry("s-final", failure.message, "anthropic")
+    await hooks.get("session.retry")!(other)
+    expect(other.decision).toEqual({ retry: true, delay: 2_000 })
+    const stalled = retry("s-final", "Cursor semantic-progress timeout after 120000ms; automatic retry unsafe (attempt 1/3)")
+    await hooks.get("session.retry")!(stalled)
+    expect(stalled.decision).toEqual({ retry: true, delay: 2_000 })
+
+    const final = retry("s-final", failure.message)
+    await hooks.get("session.retry")!(final)
+    expect(final.decision).toEqual({ retry: false })
+    const unrecorded = retry("s-other", failure.message)
+    await hooks.get("session.retry")!(unrecorded)
+    expect(unrecorded.decision).toEqual({ retry: true, delay: 2_000 })
   })
 })
 

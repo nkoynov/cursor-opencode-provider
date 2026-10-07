@@ -204,6 +204,7 @@ import {
   sanitizeHostTerminalMessage,
   toCursorProviderError,
 } from "./errors.js"
+import { recordFinalFailure } from "./host-retry.js"
 import { readCache, cacheFilePath, resolveVariantParameters, resolveVariantMaxMode, extractCursorVariantParameters, resolveCursorWireModelId, type ModelInfo } from "./models.js"
 import { getFrozenRequestContext, getOrBuildRequestContext } from "./context/frozen.js"
 import { systemInstructionsRuleText, type SystemInstructions } from "./context/build.js"
@@ -591,10 +592,12 @@ export function connectFrameError(payload: string): CursorProviderError {
     if (customMessage !== undefined) {
       // An account-level refusal ("Too many computers.", usage caps): retrying only adds refused
       // requests, and OpenCode retries any text saying "try again".
-      return new CursorServerError(
+      const refusal = new CursorServerError(
         `Cursor refused the request: ${sanitizeHostTerminalMessage(customMessage).replace(/\btry again\b/gi, "retry")}`,
         { transient: false, replaySafe: false, code },
       )
+      refusal.hostRetryUseless = true
+      return refusal
     }
     return new CursorServerError(`Cursor API error (code=${code})`, {
       transient: isTransientGrpcStatus(code) || hasRetryInfo,
@@ -1111,6 +1114,7 @@ async function doStreamImpl(
           trace(`pull: pump threw (cleaning up): ${(e as Error).message}`)
           // A Run the host stopped is drained and closed by its cancel.
           if (!activeSession.hostInterrupted) sessionManager.close(activeSession)
+          recordFinalFailure(opencodeSessionKey(callOptions), e)
           try {
             controller.error(e instanceof Error ? e : new Error(String(e)))
           } catch {

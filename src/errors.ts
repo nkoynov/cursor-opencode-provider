@@ -31,6 +31,8 @@ export class CursorProviderError extends Error {
    * Recovery must reseed a new conversation instead of resuming that checkpoint.
    */
   checkpointUnusable?: boolean
+  /** Another attempt by the host cannot succeed soon (account refusal, capacity after our own backoff). */
+  hostRetryUseless?: boolean
   readonly statusCode?: number
   readonly grpcStatus?: number | string
   readonly rstCode?: number
@@ -174,6 +176,7 @@ export class CursorRetryExhaustedError extends CursorProviderError {
     )
     this.name = "CursorRetryExhaustedError"
     this.attempts = attempts
+    this.hostRetryUseless = isCapacityFailure(last)
   }
 }
 
