@@ -110,8 +110,13 @@ function signatureModel(signature: string): string | undefined {
 const NOTICE_SWITCH = /hit a safety filter, and the conversation was automatically switched to ([^\n]+?)\.(?:\s|$)/
 const NOTICE_HEADING = /^\s*Switched to ([^\n]+?)\s*$/m
 
-/** The switch Cursor's end-of-turn notice ("Switched to Claude Opus 4.8 …") announces. */
+/**
+ * The switch Cursor's end-of-turn notice ("Switched to Claude Opus 4.8 …") announces. Cursor sends
+ * it as one text delta of its own; without the server-notice flag only a delta that opens with its
+ * heading counts, so the model quoting the sentence does not.
+ */
 export function modelSwitchInNotice(text: string, isServerNotice: boolean): ModelSwitch | undefined {
+  if (!isServerNotice && !/^\s*Switched to /.test(text)) return undefined
   const to = NOTICE_SWITCH.exec(text)?.[1] ?? (isServerNotice ? NOTICE_HEADING.exec(text)?.[1] : undefined)
   return to ? { to: to.trim(), source: "server-notice" } : undefined
 }
@@ -317,7 +322,8 @@ export function matchModelFallbackReply(
   if (replies.length === 0) return undefined
   let turnStart = stopIndex
   const inTurn = (message: Prompt[number]) =>
-    message.role === "assistant" || message.role === "tool" || (message.role === "user" && isHostNote(message))
+    message.role === "assistant" || message.role === "tool"
+    || (message.role === "user" && (isHostNote(message) || !ownText(message)))
   while (turnStart > 0 && inTurn(prompt[turnStart - 1]!)) turnStart--
   while (turnStart > 0 && prompt[turnStart - 1]!.role === "user") turnStart--
   const said = replies.map(ownText).filter(Boolean)

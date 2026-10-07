@@ -4,7 +4,7 @@ import {
   setFrozenRequestContext,
   transferFrozenRequestContext,
 } from "../context/frozen.js"
-import { attachContextEpoch, detachContextEpoch } from "../context/epoch.js"
+import { attachContextEpoch, detachContextEpoch, type ContextEpoch } from "../context/epoch.js"
 import {
   hasConversationBinding,
   isActiveConversationBinding,
@@ -163,6 +163,11 @@ export function rekeyConversation(
   sessionKey: string,
   fromId: string,
   checkpoint: Uint8Array | undefined,
+  /**
+   * The epoch as it was when `checkpoint` was made, when that predates the conversation's current
+   * one; `null` when it is not known, so the next Run reasserts the host context.
+   */
+  checkpointEpoch?: ContextEpoch | null,
 ): string {
   const toId = crypto.randomUUID()
   const epoch = detachContextEpoch(fromId)
@@ -171,7 +176,8 @@ export function rekeyConversation(
     restoreConversationBlobs(toId, snapshotConversationBlobs(fromId))
     setCheckpoint(toId, checkpoint)
     // The checkpoint already holds the system context; keep its rule instead of reasserting it.
-    if (epoch) attachContextEpoch(toId, epoch)
+    const kept = checkpointEpoch === undefined ? epoch : checkpointEpoch
+    if (kept) attachContextEpoch(toId, kept)
   }
   clearCheckpoint(fromId)
   clearConversationBlobs(fromId)
