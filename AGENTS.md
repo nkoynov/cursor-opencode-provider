@@ -167,6 +167,11 @@ untyped falls to `manuallyAttached`), and `RequestContext.system_prompt_override
 (#53) is ignored; the `global` rule is followed and costs the tokens of its
 text. So no `system` entry is seeded (`system` history entries are dropped
 too), and the provider does not read instruction or skill files itself.
+Prior turns are not seeded there either: with any client-seeded root message
+Cursor skips building its root prompt, so the rule, `custom_subagents` and MCP
+instructions are gone for the rest of the conversation. A Run without a
+checkpoint sends an empty `ConversationStateStructure` and opens its user
+message with a `<conversation_history>` transcript (`renderHistoryTranscript`).
 Merged `opencode.json` (`loadMergedConfig`) is still read for MCP server ids,
 plugin lists, and interaction guidance.
 

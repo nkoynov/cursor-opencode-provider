@@ -5,6 +5,8 @@ import type { CursorImageInput } from "../image-input.js"
 export type SeedHistoryMessage = {
   role: "system" | "user" | "assistant"
   content: string
+  /** A user message with no reply after it; OpenCode records a steer the model answered early after that answer. */
+  unanswered?: boolean
 }
 
 export type RunRequestInput = {
@@ -65,6 +67,9 @@ const HISTORY_PREAMBLE =
   "Cursor's copy of this conversation was lost, so the host replays it here. It is the real conversation " +
   "between you and the user so far: the tool calls listed were run and returned the results shown " +
   "(older results are shortened). Continue from it and do not redo work it shows as done."
+const NO_REPLY_PREAMBLE =
+  "A user message marked \"no reply\" has no answer after it: if what you wrote before it already answers it, " +
+  "it reached you while you were still working, so do not answer it again."
 
 /**
  * Prior turns of a Run without a checkpoint, as text that opens its user
@@ -74,10 +79,15 @@ const HISTORY_PREAMBLE =
 export function renderHistoryTranscript(history: readonly SeedHistoryMessage[] | undefined): string | undefined {
   const entries = (history ?? []).filter((entry) => entry.content && entry.role !== "system")
   if (entries.length === 0) return undefined
+  const label = (entry: SeedHistoryMessage) =>
+    entry.role === "assistant" ? "Assistant" : entry.unanswered ? "User, no reply" : "User"
   const body = entries
-    .map((entry) => `[${entry.role === "user" ? "User" : "Assistant"}]\n${entry.content.replaceAll(HISTORY_CLOSE, "</conversation-history>")}`)
+    .map((entry) => `[${label(entry)}]\n${entry.content.replaceAll(HISTORY_CLOSE, "</conversation-history>")}`)
     .join("\n\n")
-  return `${HISTORY_OPEN}\n${HISTORY_PREAMBLE}\n\n${body}\n${HISTORY_CLOSE}`
+  const preamble = entries.some((entry) => entry.unanswered)
+    ? `${HISTORY_PREAMBLE} ${NO_REPLY_PREAMBLE}`
+    : HISTORY_PREAMBLE
+  return `${HISTORY_OPEN}\n${preamble}\n\n${body}\n${HISTORY_CLOSE}`
 }
 
 /**

@@ -12,8 +12,10 @@ import {
   pump,
   pumpWithRecovery,
   resetTurnStateForTests,
+  TRANSCRIPT_TOOL_RESULT_CHARS,
 } from "../src/language-model.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
+import { renderHistoryTranscript } from "../src/protocol/request.js"
 import { resetCursorShellCalls } from "../src/shell-timeout.js"
 import { resetConversationBindingsForTests, restoreConversationBinding } from "../src/protocol/conversation-bind.js"
 import { getCheckpoint, resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
@@ -431,6 +433,24 @@ describe("host notes on held-Run exec results", () => {
     expect(JSON.stringify(history)).toContain("Wrote file successfully.")
     // System messages reach Cursor through the context epoch, not the seed history.
     expect(history.slice(-2)).toEqual([{ role: "user", content: NOTE }, { role: "system", content: LATER_NOTE }])
+  })
+
+  it("replays an earlier step's note whole in the transcript of a Run without a checkpoint", () => {
+    const live = liveSession([])
+    const longRead = `Read file /repo/pkg/a.ts, lines 1-400\n${"1: x\n".repeat(TRANSCRIPT_TOOL_RESULT_CHARS)}`
+    const history = extractPromptHistory([
+      ...step(
+        { role: "assistant", content: [{ type: "tool-call", toolCallId: `cursor_${live.sessionId}_1`, toolName: "read", input: {} }] } as Prompt[number],
+        toolResult(live, 1, "read", longRead),
+        hostNote(NOTE),
+      ),
+      { role: "assistant", content: [{ type: "text", text: "Read it." }] },
+      { role: "user", content: [{ type: "text", text: "Now edit it" }] },
+    ] as Prompt, { toolResults: "transcript" })
+
+    const transcript = renderHistoryTranscript(history)!
+    expect(transcript).toContain("more characters]")
+    expect(transcript).toContain(`[User]\n${NOTE}\n\n[Assistant]\nRead it.`)
   })
 
   it("keeps a deferred note when the held Run is resumed after an interruption", async () => {

@@ -5573,6 +5573,7 @@ export function extractPromptHistory(
     }
     if (trailingToolStart === notesStart) trailingToolStart = prompt.length
   }
+  const liveUserStart = liveUserMessageStart(prompt, options?.trailingSteer === true)
   for (let messageIndex = 0; messageIndex < prompt.length; messageIndex++) {
     const m = prompt[messageIndex]!
     if (m.role === "system") {
@@ -5583,7 +5584,9 @@ export function extractPromptHistory(
     }
     if (m.role === "user") {
       const text = extractUserText(m as unknown as Record<string, unknown>)
-      if (text && text !== ".") out.push({ role: "user", content: text })
+      if (!text || text === ".") continue
+      const unanswered = messageIndex < liveUserStart && !hostTailNote(m) && !repliedAfter(prompt, messageIndex)
+      out.push(unanswered ? { role: "user", content: text, unanswered } : { role: "user", content: text })
       continue
     }
     if (m.role === "assistant") {
@@ -5623,6 +5626,27 @@ export function extractPromptHistory(
     out.pop()
   }
   return out
+}
+
+/** First message of the request this Run answers: the last user message, or a steered step's trailing ones. */
+function liveUserMessageStart(prompt: LanguageModelV3CallOptions["prompt"], trailingSteer: boolean): number {
+  let start = prompt.length
+  while (start > 0 && hostTailNote(prompt[start - 1]!)) start--
+  if (!trailingSteer) return prompt[start - 1]?.role === "user" ? start - 1 : start
+  while (start > 0 && (hostTailNote(prompt[start - 1]!) || plainUserText(prompt[start - 1]!) !== undefined)) start--
+  return start
+}
+
+/** Whether the model answered after this message, skipping host notes and empty assistant messages. */
+function repliedAfter(prompt: LanguageModelV3CallOptions["prompt"], index: number): boolean {
+  for (let i = index + 1; i < prompt.length; i++) {
+    const m = prompt[i]!
+    if (hostTailNote(m)) continue
+    if (m.role === "tool") return true
+    if (m.role !== "assistant") return false
+    if (extractAssistantHistoryText(m as unknown as Record<string, unknown>, true)) return true
+  }
+  return false
 }
 
 function formatSeedToolObservation(input: {

@@ -401,6 +401,60 @@ describe("extractPromptHistory", () => {
     expect(history.at(-2)).toEqual({ role: "assistant", content: '[called read] {"path":"third.txt"}' })
     expect(history.at(-1)!.content.endsWith(`:\n${long}`)).toBe(true)
   })
+
+  it("marks a steer OpenCode recorded after the reply that answered it", () => {
+    const prompt = [
+      { role: "user", content: [{ type: "text", text: "Read the notes" }] },
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: "1", toolName: "read", input: "{}" }] },
+      { role: "tool", content: [{ type: "tool-result", toolCallId: "1", toolName: "read", output: { type: "text", value: "zebra" } }] },
+      { role: "assistant", content: [{ type: "text", text: "One note mentions a zebra. And 17 * 23 = 391." }] },
+      { role: "user", content: [{ type: "text", text: "Also, what is 17 * 23?" }] },
+      { role: "assistant", content: [] },
+      { role: "user", content: [{ type: "text", text: "<system-update>\nSkill repro is available.\n</system-update>" }] },
+      { role: "user", content: [{ type: "text", text: "What is the capital of France?" }] },
+    ] as LanguageModelV3CallOptions["prompt"]
+
+    const history = extractPromptHistory(prompt, { toolResults: "transcript" })
+
+    expect(history.filter((entry) => entry.unanswered)).toEqual([
+      { role: "user", content: "Also, what is 17 * 23?", unanswered: true },
+    ])
+    expect(history.at(-1)).toEqual({ role: "user", content: "<system-update>\nSkill repro is available.\n</system-update>" })
+  })
+
+  it("does not mark messages the model answered afterwards or the live request", () => {
+    const prompt = [
+      { role: "user", content: [{ type: "text", text: "Read the notes" }] },
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: "1", toolName: "read", input: "{}" }] },
+      { role: "tool", content: [{ type: "tool-result", toolCallId: "1", toolName: "read", output: { type: "text", value: "zebra" } }] },
+      { role: "user", content: [{ type: "text", text: "Also count the horses" }] },
+      { role: "assistant", content: [{ type: "text", text: "No horses." }] },
+      { role: "user", content: [{ type: "text", text: "Thanks" }] },
+      { role: "user", content: [{ type: "text", text: "<system-update>\nSkill repro is available.\n</system-update>" }] },
+    ] as LanguageModelV3CallOptions["prompt"]
+
+    for (const options of [
+      { toolResults: "transcript" as const },
+      { preserveTrailingUser: true, toolResults: "transcript" as const },
+    ]) {
+      expect(extractPromptHistory(prompt, options).some((entry) => entry.unanswered)).toBe(false)
+    }
+  })
+
+  it("does not mark a steered step's trailing messages when the Run is rebased", () => {
+    const prompt = [
+      { role: "user", content: [{ type: "text", text: "Read the notes" }] },
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: "1", toolName: "read", input: "{}" }] },
+      { role: "tool", content: [{ type: "tool-result", toolCallId: "1", toolName: "read", output: { type: "text", value: "zebra" } }] },
+      { role: "user", content: [{ type: "text", text: "Also count the horses" }] },
+      { role: "user", content: [{ type: "text", text: "And the cows" }] },
+    ] as LanguageModelV3CallOptions["prompt"]
+
+    const history = extractPromptHistory(prompt, { preserveTrailingUser: true, toolResults: "transcript", trailingSteer: true })
+
+    expect(history.map((entry) => entry.content)).toContain("Also count the horses")
+    expect(history.some((entry) => entry.unanswered)).toBe(false)
+  })
 })
 
 describe("buildSeedConversationState", () => {
@@ -425,6 +479,19 @@ describe("renderHistoryTranscript", () => {
   it("is undefined without prior turns", () => {
     expect(renderHistoryTranscript([{ role: "system", content: "sys" }])).toBeUndefined()
     expect(renderHistoryTranscript(undefined)).toBeUndefined()
+  })
+
+  it("labels a user message with no reply and explains the label only then", () => {
+    const marked = renderHistoryTranscript([
+      { role: "user", content: "Read the notes" },
+      { role: "assistant", content: "One note mentions a zebra. And 17 * 23 = 391." },
+      { role: "user", content: "Also, what is 17 * 23?", unanswered: true },
+    ])!
+    expect(marked).toContain('A user message marked "no reply" has no answer after it')
+    expect(marked.endsWith("[User, no reply]\nAlso, what is 17 * 23?\n</conversation_history>")).toBe(true)
+
+    const plain = renderHistoryTranscript([{ role: "user", content: "hi" }])!
+    expect(plain).not.toContain("no reply")
   })
 })
 
