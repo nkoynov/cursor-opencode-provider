@@ -2,18 +2,21 @@ import { trace } from "../debug.js"
 import {
   getFrozenRequestContext,
   setFrozenRequestContext,
+  transferFrozenRequestContext,
 } from "../context/frozen.js"
+import { attachContextEpoch, detachContextEpoch } from "../context/epoch.js"
 import {
   hasConversationBinding,
   isActiveConversationBinding,
   restoreConversationBinding,
 } from "./conversation-bind.js"
 import {
+  clearConversationBlobs,
   compactConversationBlobs,
   restoreConversationBlobs,
   snapshotConversationBlobs,
 } from "./blob-store.js"
-import { getCheckpoint, setCheckpoint } from "./checkpoint.js"
+import { clearCheckpoint, getCheckpoint, setCheckpoint } from "./checkpoint.js"
 import type { OpencodeToolDef } from "./tools.js"
 import {
   getTurnProvenance,
@@ -38,6 +41,7 @@ export async function hydrateConversationState(
   hostAgent?: string
   systemPromptHash?: string
   hostNote?: string
+  modelFallbackStop?: string
 } | undefined> {
   if (hasConversationBinding(sessionKey)) return undefined
   const loaded = await loadPersistedConversation(cacheDir, sessionKey)
@@ -68,6 +72,7 @@ export async function hydrateConversationState(
     ...(persisted.hostAgent ? { hostAgent: persisted.hostAgent } : {}),
     ...(persisted.systemPromptHash ? { systemPromptHash: persisted.systemPromptHash } : {}),
     ...(persisted.hostNote ? { hostNote: persisted.hostNote } : {}),
+    ...(persisted.modelFallbackStop ? { modelFallbackStop: persisted.modelFallbackStop } : {}),
   }
 }
 
@@ -102,6 +107,7 @@ export async function persistConversationState(
     runInProgress?: boolean
     hostNote?: string
     answeredSteers?: string[]
+    modelFallbackStop?: string
   },
 ): Promise<void> {
   // A newer Run may have reset/superseded this conversation while its final
@@ -133,6 +139,7 @@ export async function persistConversationState(
     systemPromptHash: input.systemPromptHash,
     hostNote: input.hostNote,
     ...(input.answeredSteers?.length ? { answeredSteers: [...input.answeredSteers] } : {}),
+    ...(input.modelFallbackStop ? { modelFallbackStop: input.modelFallbackStop } : {}),
     ...(provenance?.conversationId === input.conversationId
       ? { turnProvenance: serializeTurnProvenance(provenance) }
       : {}),
@@ -146,6 +153,30 @@ export async function persistConversationState(
           (blobCompaction.fallbackReason ? ` compactionFallback=${blobCompaction.fallbackReason}` : "")
         : `blobs=${blobs.length}`),
   )
+}
+
+/**
+ * Move a session to a fresh Cursor conversation that continues from `checkpoint`
+ * (or starts empty without one), so nothing Cursor tied to the old id carries over.
+ */
+export function rekeyConversation(
+  sessionKey: string,
+  fromId: string,
+  checkpoint: Uint8Array | undefined,
+): string {
+  const toId = crypto.randomUUID()
+  const epoch = detachContextEpoch(fromId)
+  transferFrozenRequestContext(fromId, toId)
+  if (checkpoint?.length) {
+    restoreConversationBlobs(toId, snapshotConversationBlobs(fromId))
+    setCheckpoint(toId, checkpoint)
+    // The checkpoint already holds the system context; keep its rule instead of reasserting it.
+    if (epoch) attachContextEpoch(toId, epoch)
+  }
+  clearCheckpoint(fromId)
+  clearConversationBlobs(fromId)
+  restoreConversationBinding(sessionKey, toId)
+  return toId
 }
 
 export async function clearPersistedConversationState(

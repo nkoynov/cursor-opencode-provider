@@ -29,6 +29,8 @@ export function createMessageTypes(): protobuf.Root {
 
   addType(root, "TextDeltaUpdate", [
     { id: 1, name: "text", type: "string" },
+    // Cursor's own notice in the answer stream, e.g. its safety-filter model switch.
+    { id: 2, name: "is_server_notice", type: "bool" },
   ])
 
   addType(root, "ThinkingDeltaUpdate", [
