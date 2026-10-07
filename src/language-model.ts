@@ -1715,19 +1715,6 @@ async function startSession(
       })
     }
   }
-  const history = extractPromptHistory(prompt, {
-    preserveTrailingUser: recovery?.kind === "rebase" && !checkpointUnusable,
-    // A foreign-history rebase replays every tool result: the other model's work
-    // exists only in OpenCode history, never in a Cursor checkpoint. Other Runs
-    // without a checkpoint keep each call and a shortened result, so the model
-    // does not take its earlier work for undone.
-    toolResults: isCompaction || foreignHistory || checkpointUnusable ? "all" : "transcript",
-    trailingSteer: recovery?.kind === "rebase" && recovery.steer === true,
-    ...(recovery?.kind === "rebase" && recovery.toolCallIds ? { keepToolCallIds: recovery.toolCallIds } : {}),
-    ...(liveTurn ? { liveTurnStart: liveTurn.start, answeredSteers: liveTurn.answered } : {}),
-    ...(fallbackReply ? { omit: { start: fallbackReply.turnStart, end: fallbackReply.stopIndex } } : {}),
-  })
-
   await loadAvailableModels()
 
   // Resolve the region-specific Run stream origin once per process (memoized
@@ -1799,6 +1786,25 @@ async function startSession(
     picked,
     maxMode: hintMaxMode,
     model: modelInfo,
+  })
+
+  const history = extractPromptHistory(prompt, {
+    preserveTrailingUser: recovery?.kind === "rebase" && !checkpointUnusable,
+    // A Run without a checkpoint replays every call and result whole, as a
+    // resumed Claude Code session does, so the model keeps what it read and does
+    // not take its earlier work for undone. Only a replay over the context
+    // budget shortens its oldest inputs and results.
+    toolResults: isCompaction ? "all" : "transcript",
+    trailingSteer: recovery?.kind === "rebase" && recovery.steer === true,
+    ...(recovery?.kind === "rebase" && recovery.toolCallIds ? { keepToolCallIds: recovery.toolCallIds } : {}),
+    ...(liveTurn ? { liveTurnStart: liveTurn.start, answeredSteers: liveTurn.answered } : {}),
+    ...(fallbackReply ? { omit: { start: fallbackReply.turnStart, end: fallbackReply.stopIndex } } : {}),
+    ...(conversationState
+      ? {}
+      : {
+          maxChars: replayContextBudget({ modelInfo, cursorModelId, maxMode }).budget * ESTIMATED_CHARS_PER_TOKEN
+            - (systemPrompt?.length ?? 0) - userText.length,
+        }),
   })
 
   if (foreignHistory || checkpointUnusable || (!conversationState && !isCompaction && !ephemeralRun && history.some((entry) => entry.role !== "system"))) {
@@ -5922,9 +5928,11 @@ export function buildOpenCodeInteractionGuidance(
 }
 
 /** Rough char→token estimate for mid-turn usage before TurnEnded arrives. */
+const ESTIMATED_CHARS_PER_TOKEN = 4
+
 export function estimateTokens(chars: number): number {
   if (!Number.isFinite(chars) || chars <= 0) return 0
-  return Math.ceil(chars / 4)
+  return Math.ceil(chars / ESTIMATED_CHARS_PER_TOKEN)
 }
 
 /** Preserve exact request-local Cursor counters as diagnostics. */
@@ -5958,35 +5966,73 @@ export function cursorTurnEndedProviderMetadata(
   }
 }
 
-/** Characters of an earlier tool result a history transcript keeps; the trailing live results stay whole. */
+/** Characters a shortened tool call input or result keeps in a history transcript. */
 export const TRANSCRIPT_TOOL_RESULT_CHARS = 2_000
 const TRANSCRIPT_TOOL_INPUT_CHARS = 2_000
+
+type PromptHistoryOptions = {
+  preserveTrailingUser?: boolean
+  toolResults?: "omit" | "all" | "trailing" | "transcript"
+  /** The step's results are followed by mid-turn user messages as well as host notes. */
+  trailingSteer?: boolean
+  /** With `trailing` or `transcript`, earlier results of the step that are never shortened either. */
+  keepToolCallIds?: ReadonlySet<string>
+  /** First message of the Run's user turn (`liveUserTurn`); it and the rest are not history. */
+  liveTurnStart?: number
+  /** Messages of the user turn holding a steer the model already answered: history, not the turn. */
+  answeredSteers?: ReadonlySet<number>
+  /** Prompt indices left out entirely (a turn stopped on a model switch, through its stop text). */
+  omit?: { start: number; end: number }
+  /** With `transcript`, the characters the non-system history may take; the oldest inputs and results are shortened to fit. */
+  maxChars?: number
+}
+
+/** A transcript tool input or result that may be shortened, keyed `messageIndex:partIndex`. */
+type ShortenableHistoryPart = { key: string; savedChars: number }
 
 /**
  * Prior prompt turns for a Run without a checkpoint. Tool results must
  * never be replayed as assistant-authored prose: that teaches the model to
  * counterfeit `Tool result (...)` text instead of emitting a real tool call.
  * They are user-role OpenCode-host observations. `all` keeps every result
- * whole (compaction, foreign history) and `transcript` shortens results before
- * the trailing live ones; both name each call in its assistant entry.
- * `trailing` keeps only the trailing results, `omit` none.
+ * whole (compaction) and `transcript` keeps every call input and result whole
+ * until the history exceeds `maxChars`, then shortens the oldest ones before the
+ * trailing live results until it fits; both name each call in its assistant
+ * entry. `trailing` keeps only the trailing results, `omit` none.
  */
 export function extractPromptHistory(
   prompt: LanguageModelV3CallOptions["prompt"],
-  options?: {
-    preserveTrailingUser?: boolean
-    toolResults?: "omit" | "all" | "trailing" | "transcript"
-    /** The step's results are followed by mid-turn user messages as well as host notes. */
-    trailingSteer?: boolean
-    /** With `trailing` or `transcript`, earlier results of the step that are replayed whole too. */
-    keepToolCallIds?: ReadonlySet<string>
-    /** First message of the Run's user turn (`liveUserTurn`); it and the rest are not history. */
-    liveTurnStart?: number
-    /** Messages of the user turn holding a steer the model already answered: history, not the turn. */
-    answeredSteers?: ReadonlySet<number>
-    /** Prompt indices left out entirely (a turn stopped on a model switch, through its stop text). */
-    omit?: { start: number; end: number }
-  },
+  options?: PromptHistoryOptions,
+): SeedHistoryMessage[] {
+  if (options?.toolResults !== "transcript") return collectPromptHistory(prompt, options)
+  const shortenable: ShortenableHistoryPart[] = []
+  const full = collectPromptHistory(prompt, options, undefined, shortenable)
+  const chars = seedHistoryChars(full)
+  const excess = chars - (options.maxChars ?? Number.POSITIVE_INFINITY)
+  if (excess <= 0) return full
+  const shorten = new Set<string>()
+  let saved = 0
+  for (const part of shortenable) {
+    if (saved >= excess) break
+    shorten.add(part.key)
+    saved += part.savedChars
+  }
+  trace(
+    `history transcript: ${chars} chars over the ${options.maxChars} budget — shortened the oldest ` +
+      `${shorten.size} of ${shortenable.length} long tool inputs/results (${saved} chars)`,
+  )
+  return collectPromptHistory(prompt, options, shorten)
+}
+
+function seedHistoryChars(history: readonly SeedHistoryMessage[]): number {
+  return history.reduce((sum, message) => sum + (message.role === "system" ? 0 : message.content.length), 0)
+}
+
+function collectPromptHistory(
+  prompt: LanguageModelV3CallOptions["prompt"],
+  options: PromptHistoryOptions | undefined,
+  shorten?: ReadonlySet<string>,
+  shortenable?: ShortenableHistoryPart[],
 ): SeedHistoryMessage[] {
   const out: SeedHistoryMessage[] = []
   const toolResults = options?.toolResults ?? "omit"
@@ -6030,9 +6076,15 @@ export function extractPromptHistory(
       continue
     }
     if (m.role === "assistant") {
+      const transcript = toolResults === "transcript"
       const text = extractAssistantHistoryText(
         m as unknown as Record<string, unknown>,
-        toolResults === "all" || toolResults === "transcript",
+        toolResults === "all" || transcript,
+        (partIndex, input) => {
+          if (!transcript) return shortenForTranscript(input, TRANSCRIPT_TOOL_INPUT_CHARS)
+          const key = `${messageIndex}:${partIndex}`
+          return shortenTranscriptPart(key, input, TRANSCRIPT_TOOL_INPUT_CHARS, shorten, shortenable)
+        },
       )
       if (text) appendSeedHistory(out, "assistant", text)
       continue
@@ -6043,18 +6095,20 @@ export function extractPromptHistory(
       if (keptOnly && !options?.keepToolCallIds?.size) continue
       const earlier = toolResults === "transcript" && messageIndex < trailingToolStart
       const results: string[] = []
-      for (const part of m.content) {
+      for (const [partIndex, part] of m.content.entries()) {
         const p = part as unknown as Record<string, unknown>
         if (p.type !== "tool-result") continue
         const toolName = typeof p.toolName === "string" && p.toolName ? p.toolName : "tool"
         const toolCallId = typeof p.toolCallId === "string" ? p.toolCallId : ""
         if (keptOnly && !options?.keepToolCallIds?.has(toolCallId)) continue
         const result = toolResultOutputToText(p.output)
-        const shorten = earlier && !options?.keepToolCallIds?.has(toolCallId)
+        const output = earlier && !options?.keepToolCallIds?.has(toolCallId)
+          ? shortenTranscriptPart(`${messageIndex}:${partIndex}`, result.text, TRANSCRIPT_TOOL_RESULT_CHARS, shorten, shortenable)
+          : result.text
         results.push(formatSeedToolObservation({
           toolName,
           toolCallId,
-          output: shorten ? shortenForTranscript(result.text, TRANSCRIPT_TOOL_RESULT_CHARS) : result.text,
+          output,
           isError: result.isError,
         }))
       }
@@ -6148,19 +6202,37 @@ function shortenForTranscript(text: string, max: number): string {
   return `${text.slice(0, max)}\n[… ${text.length - max} more characters]`
 }
 
-function extractAssistantHistoryText(msg: Record<string, unknown>, withToolCalls = false): string {
+/** Whole unless `shorten` names it; a long part is offered to `shortenable` either way. */
+function shortenTranscriptPart(
+  key: string,
+  text: string,
+  max: number,
+  shorten: ReadonlySet<string> | undefined,
+  shortenable: ShortenableHistoryPart[] | undefined,
+): string {
+  if (text.length <= max) return text
+  const short = `${text.slice(0, max)}\n[… ${text.length - max} more characters left out of this replay to fit the context window]`
+  shortenable?.push({ key, savedChars: text.length - short.length })
+  return shorten?.has(key) ? short : text
+}
+
+function extractAssistantHistoryText(
+  msg: Record<string, unknown>,
+  withToolCalls = false,
+  formatInput: (partIndex: number, input: string) => string = (_, input) => shortenForTranscript(input, TRANSCRIPT_TOOL_INPUT_CHARS),
+): string {
   const content = msg.content
   if (typeof content === "string") return content
   if (!Array.isArray(content)) return ""
   const texts: string[] = []
-  for (const part of content) {
+  for (const [partIndex, part] of content.entries()) {
     const p = part as Record<string, unknown>
     if (p.type === "text" && typeof p.text === "string" && p.text.length > 0) {
       texts.push(p.text)
     } else if (withToolCalls && p.type === "tool-call") {
       const name = typeof p.toolName === "string" && p.toolName ? p.toolName : "tool"
       const input = typeof p.input === "string" ? p.input : (JSON.stringify(p.input) ?? "")
-      texts.push(`[called ${name}] ${shortenForTranscript(input, TRANSCRIPT_TOOL_INPUT_CHARS)}`)
+      texts.push(`[called ${name}] ${formatInput(partIndex, input)}`)
     }
   }
   return texts.join("\n")
@@ -6180,14 +6252,27 @@ function appendSeedHistory(
   out.push({ role, content })
 }
 
-/** Share of the target context a foreign-history rebase may fill before compaction. */
+/** Share of the target context a Run without a checkpoint may fill with its replay before compaction. */
 export const FOREIGN_HISTORY_REBASE_CONTEXT_SHARE = 0.8
 
+/** Tokens a Run without a checkpoint may fill with its replay, of the target context `limit`. */
+export function replayContextBudget(input: {
+  modelInfo: ModelInfo | undefined
+  cursorModelId: string
+  maxMode: boolean
+}): { limit: number; budget: number } {
+  const documented = getDocumentedCursorModelContext(input.cursorModelId)
+  const limit = input.maxMode
+    ? (input.modelInfo?.maxContextForMaxMode ?? documented?.maxContextForMaxMode ?? 1_000_000)
+    : (input.modelInfo?.maxContext ?? documented?.maxContext ?? 200_000)
+  return { limit, budget: Math.floor(limit * FOREIGN_HISTORY_REBASE_CONTEXT_SHARE) }
+}
+
 /**
- * A Run without a checkpoint replays the host history (in full for a
- * foreign-history rebase). When that cannot fit, fail before opening a Run
- * with an error hosts classify as context overflow (HTTP 413 + "prompt is too
- * long"), so the host compacts and retries.
+ * A Run without a checkpoint replays the host history. When that cannot fit
+ * even with its oldest tool inputs and results shortened, fail before opening
+ * a Run with an error hosts classify as context overflow (HTTP 413 + "prompt
+ * is too long"), so the host compacts and retries.
  */
 export function assertForeignHistoryRebaseFits(input: {
   modelInfo: ModelInfo | undefined
@@ -6197,16 +6282,12 @@ export function assertForeignHistoryRebaseFits(input: {
   systemPrompt: string | undefined
   userText: string
 }): void {
-  const documented = getDocumentedCursorModelContext(input.cursorModelId)
-  const limit = input.maxMode
-    ? (input.modelInfo?.maxContextForMaxMode ?? documented?.maxContextForMaxMode ?? 1_000_000)
-    : (input.modelInfo?.maxContext ?? documented?.maxContext ?? 200_000)
+  const { limit, budget } = replayContextBudget(input)
   // `system` entries are the system prompt itself, which is counted once below.
-  const chars = input.history.reduce((sum, message) => sum + (message.role === "system" ? 0 : message.content.length), 0)
+  const chars = seedHistoryChars(input.history)
     + (input.systemPrompt?.length ?? 0)
     + input.userText.length
   const tokens = estimateTokens(chars)
-  const budget = Math.floor(limit * FOREIGN_HISTORY_REBASE_CONTEXT_SHARE)
   if (tokens <= budget) return
   trace(
     `foreign-history rebase too large: model=${input.cursorModelId} estimatedTokens=${tokens} ` +

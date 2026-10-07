@@ -66,7 +66,7 @@ const HISTORY_CLOSE = "</conversation_history>"
 const HISTORY_PREAMBLE =
   "Cursor's copy of this conversation was lost, so the host replays it here. It is the real conversation " +
   "between you and the user so far: the tool calls listed were run and returned the results shown " +
-  "(older results are shortened). Continue from it and do not redo work it shows as done."
+  "(a call or result that says so was shortened to fit). Continue from it and do not redo work it shows as done."
 const NO_REPLY_PREAMBLE =
   "A user message marked \"no reply\" has no answer after it: if what you wrote before it already answers it, " +
   "it reached you while you were still working, so do not answer it again."

@@ -215,6 +215,35 @@ describe("the user turn of a fresh Run", () => {
     expect(transcript).not.toContain("no reply")
   })
 
+  /** Two reads whose results are `earlyChars` and `laterChars` long, then the user's question. */
+  const readsPrompt = (earlyChars: number, laterChars: number) => [
+    { role: "system", content: SYSTEM },
+    user("Read a and b"),
+    { role: "assistant", content: [{ type: "tool-call", toolCallId: "call_a", toolName: "read", input: { path: "a" } }] },
+    { role: "tool", content: [{ type: "tool-result", toolCallId: "call_a", toolName: "read", output: { type: "text", value: `a-start ${"a".repeat(earlyChars)} a-end` } }] },
+    { role: "assistant", content: [{ type: "tool-call", toolCallId: "call_b", toolName: "read", input: { path: "b" } }] },
+    { role: "tool", content: [{ type: "tool-result", toolCallId: "call_b", toolName: "read", output: { type: "text", value: `b-start ${"b".repeat(laterChars)} b-end` } }] },
+    assistant("Read both."),
+    user(QUESTION),
+  ] as Prompt
+
+  it("replays every earlier tool result whole on a Run without a checkpoint", async () => {
+    const { transcript } = splitTranscript(await step(newSession({ bound: true }), readsPrompt(50_000, 50_000)))
+    expect(transcript).toContain("a-end")
+    expect(transcript).toContain("b-end")
+    expect(transcript).not.toContain("left out of this replay")
+  })
+
+  it("shortens only the oldest tool result when the replay would exceed the context budget", async () => {
+    // cursor-test has the 200K default context, so the replay may take 80% of it: ~640K characters.
+    const { transcript } = splitTranscript(await step(newSession({ bound: true }), readsPrompt(400_000, 300_000)))
+    expect(transcript).toContain("a-start")
+    expect(transcript).not.toContain("a-end")
+    expect(transcript).toContain("more characters left out of this replay to fit the context window]")
+    expect(transcript).toContain("b-end")
+    expect(transcript.length).toBeLessThan(640_000)
+  })
+
   it("leaves a call without tools, such as a title, to its own last message", async () => {
     const run = await step(newSession(), [
       { role: "system", content: "Write a short title." },
