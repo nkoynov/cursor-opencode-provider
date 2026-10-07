@@ -340,6 +340,8 @@ Primary modes and hidden/internal agents are never selected unless OpenCode expl
 
 When the model requests several tool calls in one step (for example three subagents "in parallel"), Cursor sends each exec request as soon as that call is generated and then reports how many calls the step requested (`tool_requests_listed`). The provider emits all of them in one AI SDK step and ends it when the count is reached, so OpenCode runs them at the same time and returns their results together. Until Cursor has reported a count in the current process, each call still ends its own step.
 
+Only calls that cannot change anything run together, as in Claude Code: reads, searches, web fetches, subagents, waits, MCP tools whose name says they read (`get`, `list`, `search`, `read`, …) and shell lines made only of known read-only commands (`git status`, `rg`, `ls`, …). An edit, a write, any other shell command or MCP tool starts only after every call the model wrote before it has finished, and the calls written after it wait for it, so a commit written after an edit sees the edit. The order is the model's (Cursor's `tool_call_started`), not the order the execs arrive in: an edit's write arrives after Cursor has its read, often after the next call's exec. Each such call is its own AI SDK step.
+
 ## Package exports
 
 | Import path | Export |
