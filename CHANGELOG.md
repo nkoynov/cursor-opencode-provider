@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- OpenCode 2's session cost is close to Cursor's list price instead of several times higher: each step's context snapshot is split like a cached model call (previous context as cache read, growth as cache write), and the Run's last step settles against Cursor's own token counters. The total per step, which OpenCode compacts on, is unchanged
 - Dynamic-catalog guidance names the namespace for host tools (`opencode`) and states that `cursor` holds only Cursor's built-in tools, so a first `skill` lookup no longer fails in the wrong namespace.
 - A SwitchMode handoff that starts a new host plan turn explicitly terminates the old Cursor Run before the host switch, preserving its checkpoint and preventing premature CreatePlan calls. Native planning guidance distinguishes direct functions from dynamic discovery; debug logs retain native discovery errors.
 - Dynamic tool definitions carry their exact invocation identity and complete outer envelope beside the inner argument schema, so discovery and shortened search results retain required outer call fields.

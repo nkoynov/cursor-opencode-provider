@@ -210,14 +210,18 @@ import {
 import { analyzeReplayFrame, AttemptReplaySafety, describeFrameLayout } from "./replay-safety.js"
 import { readAllFieldsStrict } from "./protocol/struct.js"
 import {
+  carryTurnEndedCounters,
   cursorUsageCountersFromTurnEnded,
   emptyLanguageModelV3Usage,
   formatCursorCacheDiagnostics,
   formatCursorTokenCategories,
   formatTurnUsageValidation,
-  occupancyUsageFromTokenDetails,
+  newOccupancyUsageLedger,
+  occupancyGrowthPart,
+  occupancyStepUsage,
   occupancyValidationCounters,
   OPENCODE_DISPLAY_ONLY_COST_METADATA,
+  replacementOccupancyUsageLedger,
   turnEndedCounter,
 } from "./usage.js"
 
@@ -971,6 +975,12 @@ export async function pumpWithRecovery(input: {
           }
         : { kind: "rebase" }
     const next = await input.recover(recovery)
+    if (pumpedSession.usageLedger) {
+      next.usageLedger = replacementOccupancyUsageLedger(
+        pumpedSession.usageLedger,
+        next.cacheDiagnostics?.priorTokenDetails ?? next.tokenDetails,
+      )
+    }
     if (recovery.kind === "resume") {
       next.usageEstimate = { ...pumpedSession.usageEstimate }
       next.editToolCalls = new Map(pumpedSession.editToolCalls)
@@ -3079,13 +3089,11 @@ export async function pump(
     const est = session.usageEstimate
     // OpenCode TUI/GUI replace each assistant message's tokens (they do not
     // sum occupancy) and the TUI footer requires tokens.output > 0. Cost is
-    // added per step-finish. Emit checkpoint occupancy snapshots at tool-call
-    // boundaries with a $0 Copilot cost override, then one more occupancy
-    // snapshot at TurnEnded/stop. Held-Run TurnEnded counters are cumulative
-    // across every tool step, but this finish only spans the last generation
-    // slice — putting output_tokens/reasoning there makes host tok/s
-    // (generated/stepElapsed) absurd. Keep exact request counters under
-    // providerMetadata.cursor.*Raw. Char/4 usageEstimate stays traces-only.
+    // added per step-finish. Every finish is a checkpoint occupancy snapshot
+    // whose split prices that step (see occupancyStepUsage); the TurnEnded one
+    // also settles the Run against Cursor's cumulative counters. Keep exact
+    // request counters under providerMetadata.cursor.*Raw. Char/4
+    // usageEstimate stays traces-only.
     const tokenDetails = session.tokenDetails
     const occupancyDetails =
       tokenDetails && tokenDetails.usedTokens > 0 ? tokenDetails : undefined
@@ -3094,18 +3102,19 @@ export async function pump(
         ? "checkpoint-current-run"
         : "checkpoint-previous-turn"
       : undefined
+    const counters = te ? cursorUsageCountersFromTurnEnded(te) : undefined
+    const ledger = session.usageLedger ??= newOccupancyUsageLedger(cacheDiagnostics.priorTokenDetails)
+    const previousOccupancy = ledger.previousOccupancy
     const usage = settledUsage ?? (
       occupancyDetails
-        ? occupancyUsageFromTokenDetails(
-            occupancyDetails,
-            session.cacheDiagnostics?.priorTokenDetails,
-          )
+        ? occupancyStepUsage(occupancyDetails, ledger, {
+            ...(counters ? { turnEnded: counters } : {}),
+            growth: occupancyGrowthPart(cacheDiagnostics.modelId),
+          })
         : emptyLanguageModelV3Usage()
     )
-    const counters = te ? cursorUsageCountersFromTurnEnded(te) : undefined
     // TurnEnded stays a real (non-occupancyOnly) finish so hosts that collapse
     // tool-boundary occupancy still keep one context snapshot for the sidebar.
-    // Copilot $0 avoids billing the occupancy-shaped counters as a new prompt.
     const providerMetadata = te
       ? {
           ...OPENCODE_DISPLAY_ONLY_COST_METADATA,
@@ -3131,11 +3140,9 @@ export async function pump(
       : "intermediate-zero"
     // Occupancy finishes never see Cursor TurnEnded cache_read. usageEstimate.cacheRead
     // stays 0 for the whole Run, so logging it as rawCacheRead falsely reports 0% on
-    // every tool-call step. Prefer the V3 occupancy partition (prior prefix → cacheRead)
+    // every tool-call step. Prefer the V3 occupancy partition (previous finish → cacheRead)
     // and label the estimate separately from billed TurnEnded counters.
-    const occupancyPrefixCache = occupancyDetails
-      ? (session.cacheDiagnostics?.priorTokenDetails?.usedTokens ?? 0)
-      : undefined
+    const occupancyPrefixCache = occupancyDetails ? previousOccupancy : undefined
     const rawIn = te
       ? turnEndedCounter(te, "input_tokens")
       : occupancyDetails
@@ -3162,15 +3169,12 @@ export async function pump(
           : occupancySource}`,
     )
     // Validate the usage we actually send. Occupancy finishes (tool-call and
-    // TurnEnded/stop) use prior-prefix cacheRead — never compare that against
+    // TurnEnded/stop) split occupancy for cost — never compare that against
     // aggregate TurnEnded request cache ratios (false mismatch). Raw request
     // counters stay on `finish:` and cache diagnosis only.
     if (occupancyDetails) {
       trace(formatTurnUsageValidation(
-        occupancyValidationCounters(
-          occupancyDetails,
-          session.cacheDiagnostics?.priorTokenDetails,
-        ),
+        occupancyValidationCounters(usage),
         usage,
         occupancyDetails,
         contextSource,
@@ -3418,6 +3422,10 @@ export async function pump(
             ),
           )
           assistantText = ""
+          carryTurnEndedCounters(
+            session.usageLedger ??= newOccupancyUsageLedger(cacheDiagnostics.priorTokenDetails),
+            cursorUsageCountersFromTurnEnded(turnEnded),
+          )
           continue
         } catch (error) {
           // Cursor already completed this turn. A failed nudge must not discard

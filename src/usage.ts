@@ -1,4 +1,5 @@
 import type { LanguageModelV3Usage } from "@ai-sdk/provider"
+import { getCursorModelCost } from "./pricing.js"
 import { currentCursorTokenBreakdown } from "./protocol/token-details.js"
 import type {
   CursorContextUsageSource,
@@ -342,49 +343,152 @@ export function emptyLanguageModelV3Usage(): LanguageModelV3Usage {
  * OpenCode TUI/GUI replace each assistant message's `tokens` (they do not sum
  * occupancy). The TUI footer picks the last assistant with `tokens.output > 0`.
  * Session cost, however, adds every step-finish. Checkpoint occupancy is
- * therefore sent as a snapshot with `output=1` so the footer accepts it, and
- * callers attach {@link OPENCODE_DISPLAY_ONLY_COST_METADATA} so getUsage
- * reports $0 instead of billing the snapshot as a new prompt.
+ * therefore sent as a snapshot with `output=1` so the footer accepts it.
+ * OpenCode 1.x's getUsage reads this Copilot override and reports $0 for the
+ * step; OpenCode 2.0 ignores it and prices the snapshot's split, which
+ * {@link occupancyStepUsage} chooses for that.
  */
 export const OPENCODE_DISPLAY_ONLY_COST_METADATA = {
   copilot: { totalNanoAiu: 0 },
 } as const
 
-/**
- * Counters that mirror {@link occupancyUsageFromTokenDetails} for
- * {@link formatTurnUsageValidation}. Always validate occupancy finishes —
- * including TurnEnded/stop — against these, not against aggregate TurnEnded
- * request counters. Request cache ratios stay on `finish:` / cache diagnosis.
- */
-export function occupancyValidationCounters(
-  details: CursorConversationTokenDetails,
+/** OpenCode prices cache writes at the model's cache-write rate, which is 0 where Cursor publishes none. */
+export function occupancyGrowthPart(modelId: string | undefined): "cacheWrite" | "noCache" {
+  const cost = modelId ? getCursorModelCost(modelId) : undefined
+  return cost && cost.cache_write === undefined ? "noCache" : "cacheWrite"
+}
+
+/** What one Cursor Run's finishes have sent, for {@link occupancyStepUsage}. */
+export type OccupancyUsageLedger = {
+  /** Occupancy of the Run's previous finish; at the start, its checkpoint's. */
+  previousOccupancy: number
+  noCache: number
+  cacheWrite: number
+  output: number
+  /** TurnEnded counters of earlier Cursor turns this Run continued past without a finish. */
+  carried: CursorUsageCounters
+  /** What the finishes had sent when the last carried turn ended. */
+  carriedSent: { noCache: number; cacheWrite: number; output: number }
+}
+
+export function newOccupancyUsageLedger(
   prior?: CursorConversationTokenDetails,
-): CursorUsageCounters {
-  const used = Math.max(0, Math.trunc(details.usedTokens))
+): OccupancyUsageLedger {
   return {
-    inputTokens: used,
-    outputTokens: used > 0 ? 1 : 0,
-    // Cursor can shrink the context between checkpoints; the prior prefix
-    // cannot be larger than what is in context now.
-    cacheRead: Math.min(used, Math.max(0, Math.trunc(prior?.usedTokens ?? 0))),
+    previousOccupancy: Math.max(0, Math.trunc(prior?.usedTokens ?? 0)),
+    noCache: 0,
     cacheWrite: 0,
-    reasoningTokens: 0,
+    output: 0,
+    carried: { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 },
+    carriedSent: { noCache: 0, cacheWrite: 0, output: 0 },
   }
 }
 
-export function occupancyUsageFromTokenDetails(
-  details: CursorConversationTokenDetails,
+export function carryTurnEndedCounters(
+  ledger: OccupancyUsageLedger,
+  counters: CursorUsageCounters,
+): void {
+  ledger.carried = {
+    inputTokens: ledger.carried.inputTokens + counters.inputTokens,
+    outputTokens: ledger.carried.outputTokens + counters.outputTokens,
+    cacheRead: ledger.carried.cacheRead + counters.cacheRead,
+    cacheWrite: ledger.carried.cacheWrite + counters.cacheWrite,
+    reasoningTokens: ledger.carried.reasoningTokens + counters.reasoningTokens,
+  }
+  ledger.carriedSent = { noCache: ledger.noCache, cacheWrite: ledger.cacheWrite, output: ledger.output }
+}
+
+/**
+ * Ledger for the Run that replaces an interrupted one: it keeps the carried
+ * turns and what was sent for them, not the interrupted Run's own finishes,
+ * whose counters never arrived.
+ */
+export function replacementOccupancyUsageLedger(
+  interrupted: OccupancyUsageLedger,
   prior?: CursorConversationTokenDetails,
+): OccupancyUsageLedger {
+  return {
+    ...newOccupancyUsageLedger(prior),
+    ...interrupted.carriedSent,
+    carried: { ...interrupted.carried },
+    carriedSent: { ...interrupted.carriedSent },
+  }
+}
+
+/**
+ * Usage for one occupancy finish. Its parts always add up to Cursor's
+ * occupancy, which OpenCode 2 reads back as the prompt size that triggers
+ * auto-compaction, and their split prices the step the way Cursor bills a
+ * model call: the previous finish's occupancy as a cache read, the growth
+ * since as a cache write (`growth: "noCache"` for models without a
+ * cache-write rate), one output token. With the Run's TurnEnded counters, the
+ * finish also moves tokens between cacheRead and the other parts so that the
+ * Run's output, cache writes and uncached input reach Cursor's own counts as
+ * far as this finish's occupancy allows. Cursor's cache misses and its output
+ * only show up there.
+ */
+export function occupancyStepUsage(
+  details: CursorConversationTokenDetails,
+  ledger: OccupancyUsageLedger,
+  options: { turnEnded?: CursorUsageCounters; growth?: "cacheWrite" | "noCache" } = {},
 ): LanguageModelV3Usage {
   const used = Math.max(0, Math.trunc(details.usedTokens))
   if (used <= 0) return emptyLanguageModelV3Usage()
-  return buildLanguageModelV3UsageFromCounters(
-    occupancyValidationCounters(details, prior),
-    {
-      contextTotalTokens: used,
-      priorContextTokens: prior?.usedTokens,
+  const part = { noCache: 0, cacheRead: 0, cacheWrite: 0, output: 1 }
+  // Cursor can shrink the context between checkpoints; the previous prefix
+  // cannot be larger than what is in context now.
+  part.cacheRead = Math.min(ledger.previousOccupancy, used - 1)
+  part[options.growth ?? "cacheWrite"] = used - 1 - part.cacheRead
+  const turnEnded = options.turnEnded
+  const total = (key: keyof CursorUsageCounters) =>
+    ledger.carried[key] + Math.max(0, Math.trunc(turnEnded?.[key] ?? 0))
+  const input = total("inputTokens")
+  if (turnEnded && input > 0) {
+    const cacheWrite = Math.min(total("cacheWrite"), input)
+    const target = {
+      output: total("outputTokens"),
+      cacheWrite,
+      noCache: Math.max(0, input - Math.min(total("cacheRead"), input) - cacheWrite),
+    }
+    const over = (key: keyof typeof target) => ledger[key] + part[key] - target[key]
+    // Models differ in whether Cursor counts new input as cache writes or uncached input,
+    // so the two only add up to the Run's fresh input together.
+    const freshOver = () => over("cacheWrite") + over("noCache")
+    const move = (from: keyof typeof part, to: keyof typeof part, amount: number) => {
+      const moved = Math.max(0, Math.min(amount, part[from] - (from === "output" ? 1 : 0)))
+      part[from] -= moved
+      part[to] += moved
+    }
+    for (const key of ["output", "cacheWrite", "noCache"] as const) move(key, "cacheRead", over(key))
+    for (const key of ["cacheWrite", "noCache"] as const) move(key, "cacheRead", freshOver())
+    // OpenCode only counts a step whose input is non-zero as a measured prompt.
+    move("cacheRead", "output", Math.min(-over("output"), part.noCache + part.cacheRead + part.cacheWrite - 1))
+    for (const key of ["cacheWrite", "noCache"] as const) move("cacheRead", key, Math.min(-over(key), -freshOver()))
+  }
+  ledger.previousOccupancy = used
+  ledger.noCache += part.noCache
+  ledger.cacheWrite += part.cacheWrite
+  ledger.output += part.output
+  return {
+    inputTokens: {
+      total: part.noCache + part.cacheRead + part.cacheWrite,
+      noCache: part.noCache,
+      cacheRead: part.cacheRead,
+      cacheWrite: part.cacheWrite,
     },
-  )
+    outputTokens: { total: part.output, text: part.output, reasoning: 0 },
+  }
+}
+
+/** The usage an occupancy finish sends, as counters for {@link formatTurnUsageValidation}. */
+export function occupancyValidationCounters(usage: LanguageModelV3Usage): CursorUsageCounters {
+  return {
+    inputTokens: usageCount(usage.inputTokens.total),
+    outputTokens: usageCount(usage.outputTokens.total),
+    cacheRead: usageCount(usage.inputTokens.cacheRead),
+    cacheWrite: usageCount(usage.inputTokens.cacheWrite),
+    reasoningTokens: usageCount(usage.outputTokens.reasoning),
+  }
 }
 
 /** Project nested V3 usage into the common flat AI-SDK counter shape. */
