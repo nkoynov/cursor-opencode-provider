@@ -154,7 +154,7 @@ describe("mid-turn user message after a complete step", () => {
     expect(steered.messages).toEqual(["also check 3.ts\nand 4.ts"])
   })
 
-  it("keeps host notes on the results and each message separate", () => {
+  it("keeps each message and host note separate, in prompt order", () => {
     heldReads("ordered")
     const steered = extractLiveSteerResults(
       steer("ordered", user("also check 3.ts"), user(NOTE), user("then stop")),
@@ -162,7 +162,8 @@ describe("mid-turn user message after a complete step", () => {
       MODEL,
     )!
     expect(steered.messages).toEqual(["also check 3.ts", "then stop"])
-    expect(steered.results.at(-1)!.note).toBe(NOTE)
+    expect(steered.injections).toEqual([{ text: "also check 3.ts" }, { text: NOTE, hostNote: true }, { text: "then stop" }])
+    expect(steered.results.at(-1)!.note).toBeUndefined()
   })
 
   it("takes a completed result that only looks like OpenCode's interrupted-tool error for a result", () => {
@@ -562,6 +563,24 @@ describe("doStream with a mid-turn user message", () => {
       delivered: { injected: [NOTE, "also check 3.ts"], followUps: [] },
       rejected: { injected: [NOTE, "also check 3.ts"], followUps: ["also check 3.ts"] },
     })
+  })
+
+  it("injects messages and host notes in prompt order, ahead of the step's results", async () => {
+    const held = heldReads("interleaved")
+    serve(held, [
+      () => injectionState(injections(held.writes)[0].injection_id, { delivered: { step: 2 } }),
+      () => injectionState(injections(held.writes)[1].injection_id, { delivered: { step: 2 } }),
+      () => injectionState(injections(held.writes)[2].injection_id, { delivered: { step: 2 } }),
+      turnEnded,
+    ])
+
+    await streamSteer(held, steer("interleaved", user("also check 3.ts"), user(NOTE), user("then stop")))
+
+    const messages = clientMessages(held.writes)
+    expect(injections(held.writes).map((action) => action.user_context.user_message.text)).toEqual(["also check 3.ts", NOTE, "then stop"])
+    expect(messages.findIndex((message) => message.exec_client_message))
+      .toBeGreaterThan(messages.findLastIndex((message) => message.conversation_action))
+    expect(JSON.stringify(execMessages(held.writes))).not.toContain("system-update")
   })
 
   it("sends no follow-up for a delivered message", async () => {
