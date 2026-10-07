@@ -3,7 +3,7 @@ import { encodeFrame, streamFrames } from "../protocol/framing.js"
 import { createCursorChecksumHeader } from "../protocol/checksum.js"
 import { getDeviceIds } from "../protocol/device-id.js"
 import { resolveClientVersion } from "../protocol/client-version.js"
-import { trace } from "../debug.js"
+import { errorMessage, trace } from "../debug.js"
 import {
   CursorLocalCancellationError,
   CursorProtocolError,
@@ -15,6 +15,7 @@ import {
 } from "../errors.js"
 import { withAbortDeadline } from "../deadline.js"
 import http2 from "node:http2"
+import type { Duplex } from "node:stream"
 import type { TLSSocket } from "node:tls"
 import { openProxiedTlsSocket, proxyEndpoint, resolveHttpsProxyUrl } from "./https-proxy.js"
 
@@ -342,6 +343,8 @@ function cursorRunGrpcError(
 // connection opened to the default agent host — and vice versa.
 const _http2Sessions = new Map<string, http2.ClientHttp2Session>()
 const _http2SessionCreatedAt = new WeakMap<http2.ClientHttp2Session, number>()
+const _http2SessionLastInboundAt = new WeakMap<http2.ClientHttp2Session, number>()
+const _http2SessionGoawayLastStreamId = new WeakMap<http2.ClientHttp2Session, number>()
 const _http2SessionListenerCleanup = new WeakMap<http2.ClientHttp2Session, () => void>()
 // Validation and connect work for the same origin shares one Promise.
 const _http2Connecting = new Map<string, Promise<http2.ClientHttp2Session>>()
@@ -354,6 +357,8 @@ const DEFAULT_SESSION_PING_TIMEOUT_MS = 5_000
 const DEFAULT_READ_IDLE_MS = 120_000
 const WRITE_DRAIN_TIMEOUT_CODE = "CURSOR_WRITE_DRAIN_TIMEOUT"
 export const HTTP2_SESSION_MAX_AGE_MS = 15 * 60_000
+// Cursor CLI pings an agent connection before use only after 10 s without a response or ping reply.
+export const HTTP2_SESSION_LIVE_WINDOW_MS = 10_000
 
 export function shouldReuseHttp2Session(
   state: { destroyed: boolean; closed: boolean },
@@ -361,6 +366,25 @@ export function shouldReuseHttp2Session(
   now = Date.now(),
 ): boolean {
   return !state.destroyed && !state.closed && now - createdAt < HTTP2_SESSION_MAX_AGE_MS
+}
+
+/** Whether a session that last received data at `lastInboundAt` can skip its health-check ping. */
+export function receivedRecently(lastInboundAt: number | undefined, now = Date.now()): boolean {
+  if (lastInboundAt === undefined) return false
+  const idleMs = now - lastInboundAt
+  return idleMs >= 0 && idleMs < HTTP2_SESSION_LIVE_WINDOW_MS
+}
+
+// Wall-clock time on purpose: a machine that slept counts the sleep as idle time.
+function noteSessionInbound(session: http2.ClientHttp2Session): void {
+  _http2SessionLastInboundAt.set(session, Date.now())
+}
+
+let _testConnection: ((origin: string) => Duplex) | undefined
+
+/** Test hook: open direct (non-proxy) Run connections over the given socket instead of TLS. */
+export function routeHttp2ConnectionsForTests(createConnection?: (origin: string) => Duplex): void {
+  _testConnection = createConnection
 }
 
 /** Resolve the HTTP/2 connect origin for a Run stream (exported for tests). */
@@ -430,6 +454,7 @@ function installSessionInvalidation(
   }
   const onSessionGoaway = (errorCode: number, lastStreamID: number) => {
     trace(`h2 session GOAWAY: origin=${origin} errorCode=${errorCode} lastStreamID=${lastStreamID}`)
+    _http2SessionGoawayLastStreamId.set(session, lastStreamID)
     // Existing streams may drain, but future Runs must use a fresh session.
     dropSession(origin, session)
   }
@@ -572,6 +597,7 @@ function connectSession(origin: string): Promise<http2.ClientHttp2Session> {
       // The TLS socket (if any) is owned by the HTTP/2 session from here on.
       tunnelSocket = undefined
       _http2SessionCreatedAt.set(session, Date.now())
+      noteSessionInbound(session)
       _http2Sessions.set(origin, session)
       trace(`h2 session connected: origin=${origin}`)
       resolve(session)
@@ -603,6 +629,9 @@ function connectSession(origin: string): Promise<http2.ClientHttp2Session> {
           session = http2.connect(origin, {
             createConnection: () => tlsSocket,
           })
+        } else if (_testConnection) {
+          const createTestConnection = _testConnection
+          session = http2.connect(origin, { createConnection: () => createTestConnection(origin) })
         } else {
           session = http2.connect(origin)
         }
@@ -625,6 +654,16 @@ export function getSession(
   baseURL: string,
   options: { pingTimeoutMs?: number } = {},
 ): Promise<http2.ClientHttp2Session> {
+  return acquireSession(baseURL, options).then((lease) => lease.session)
+}
+
+/** `verified`: the session was just connected or answered a ping, rather than reused on recent traffic alone. */
+type SessionLease = { session: http2.ClientHttp2Session; verified: boolean }
+
+function acquireSession(
+  baseURL: string,
+  options: { pingTimeoutMs?: number },
+): Promise<SessionLease> {
   const origin = resolveAgentOrigin(baseURL)
   const pingTimeoutMs = timeoutMs(
     "Cursor provider pingTimeoutMs",
@@ -632,7 +671,18 @@ export function getSession(
     DEFAULT_SESSION_PING_TIMEOUT_MS,
   )
   const inflight = _http2Connecting.get(origin)
-  if (inflight) return inflight
+  if (inflight) return inflight.then((session) => ({ session, verified: true }))
+
+  const cached = _http2Sessions.get(origin)
+  const lastInboundAt = cached && _http2SessionLastInboundAt.get(cached)
+  if (
+    cached
+    && shouldReuseHttp2Session(cached, _http2SessionCreatedAt.get(cached) ?? 0)
+    && receivedRecently(lastInboundAt)
+  ) {
+    trace(`h2 cached session reused without ping: origin=${origin} idleMs=${Date.now() - lastInboundAt!}`)
+    return Promise.resolve({ session: cached, verified: false })
+  }
 
   const promise = (async () => {
     const existing = _http2Sessions.get(origin)
@@ -647,6 +697,7 @@ export function getSession(
           await validateCachedSession(existing, pingTimeoutMs)
           if (_http2Sessions.get(origin) === existing && !existing.destroyed && !existing.closed) {
             trace(`h2 cached session ping ok: origin=${origin}`)
+            noteSessionInbound(existing)
             return existing
           }
         } catch (error) {
@@ -662,7 +713,7 @@ export function getSession(
     if (_http2Connecting.get(origin) === promise) _http2Connecting.delete(origin)
   }
   promise.then(cleanup, cleanup)
-  return promise
+  return promise.then((session) => ({ session, verified: true }))
 }
 
 export async function bidiRunStream(
@@ -681,8 +732,9 @@ export async function bidiRunStream(
     options.readIdleMs,
     DEFAULT_READ_IDLE_MS,
   )
-  const [session, clientVersion] = await Promise.all([
-    getSession(options.baseURL, { pingTimeoutMs: options.pingTimeoutMs }),
+  const sessionOptions = { pingTimeoutMs: options.pingTimeoutMs }
+  const [lease, clientVersion] = await Promise.all([
+    acquireSession(options.baseURL, sessionOptions),
     resolveClientVersion(),
   ])
   const headers = {
@@ -698,9 +750,30 @@ export async function bidiRunStream(
     "user-agent": "connect-es/1.6.1",
   }
 
-  const stream = session.request(headers as unknown as http2.OutgoingHttpHeaders, {
+  let session = lease.session
+  const openStream = () => session.request(headers as unknown as http2.OutgoingHttpHeaders, {
     endStream: false,
   })
+  // A Run on a session reused without its ping keeps its frames until Cursor answers, so it can
+  // be sent once more on a new connection if that session turns out dead.
+  let unanswered: Uint8Array[] | undefined = lease.verified ? undefined : []
+  // Frames written while that new connection opens.
+  let resending: Uint8Array[] | undefined
+  const resendListeners = new Set<(resent: boolean) => void>()
+  let streamGeneration = 0
+  // Read before this Run closes the session itself: Node destroys a closed session with no streams left.
+  let connectionLost = false
+  let stream: http2.ClientHttp2Stream
+  try {
+    stream = openStream()
+  } catch (error) {
+    if (!unanswered) throw error
+    trace(`h2 Run stream did not open on a session reused without ping (${errorMessage(error)}) — reconnecting`)
+    dropSession(origin, session)
+    unanswered = undefined
+    session = await getSession(options.baseURL, sessionOptions)
+    stream = openStream()
+  }
 
   let writable = true
   let locallyClosed = false
@@ -801,14 +874,79 @@ export async function bidiRunStream(
     if (waiter) waiter.resolve(frame)
     else inboundFrames.push(frame)
   }
+  const notifyResend = (resent: boolean) => {
+    const listeners = [...resendListeners]
+    resendListeners.clear()
+    for (const listener of listeners) listener(resent)
+  }
+  // Why Cursor cannot have taken the Run: it refused the stream, or the connection died before
+  // Cursor answered and no GOAWAY said the stream might still be processed.
+  const notTakenByCursor = (): string | undefined => {
+    const goawayLastStreamId = _http2SessionGoawayLastStreamId.get(session)
+    if (goawayLastStreamId !== undefined && stream.id !== undefined && goawayLastStreamId >= stream.id) {
+      return undefined
+    }
+    if (stream.rstCode === http2.constants.NGHTTP2_REFUSED_STREAM) return "stream refused"
+    if (goawayLastStreamId !== undefined) return `GOAWAY lastStreamID=${goawayLastStreamId}`
+    if (connectionLost) return "connection lost"
+    return undefined
+  }
+  const resendOnNewConnection = async (reason: string) => {
+    const frames = unanswered ?? []
+    unanswered = undefined
+    resending = frames
+    streamGeneration++
+    if (inboundReaderStarted) stream.removeListener("data", onInboundChunk)
+    trace(
+      `h2 Run stream failed before Cursor answered on a session reused without ping (${reason}) — ` +
+        `sending it again on a new connection (${frames.length} frame(s))`,
+    )
+    // A refused stream leaves the connection serving other Runs, so it is only taken out of the cache.
+    dropSession(origin, session)
+    rawStreamError = undefined
+    writable = true
+    remotelyClosed = false
+    connectionLost = false
+    let next: http2.ClientHttp2Stream | undefined
+    try {
+      session = await getSession(options.baseURL, sessionOptions)
+      if (!locallyClosed && !terminalEvent && !streamFailure) next = openStream()
+    } catch (error) {
+      rawStreamError = error
+      writable = false
+    }
+    resending = undefined
+    if (!next) {
+      notifyResend(false)
+      scheduleTerminalSettlement()
+      return
+    }
+    stream = next
+    attachStreamListeners(next)
+    if (inboundReaderStarted) {
+      next.on("data", onInboundChunk)
+      armReadIdleWatchdog()
+    }
+    for (const frame of frames) backpressured = !next.write(frame)
+    notifyResend(true)
+  }
   const settleObservedTerminal = () => {
     terminalSettlementScheduled = false
-    if (terminalEvent) return
+    if (terminalEvent || resending) return
     if (locallyClosed) {
       finishInbound()
       stopInboundReader()
       settleTerminal({ kind: "local-close" })
       return
+    }
+    if (unanswered) {
+      const reason = streamFailure ? undefined : notTakenByCursor()
+      if (reason) {
+        void resendOnNewConnection(reason)
+        return
+      }
+      unanswered = undefined
+      notifyResend(false)
     }
     const failure = observedFailure()
     finishInbound(failure)
@@ -847,6 +985,7 @@ export async function bidiRunStream(
   }
   const onInboundChunk = (chunk: Buffer | Uint8Array) => {
     armReadIdleWatchdog()
+    noteSessionInbound(session)
     if (inboundEnded || inboundFailure) return
     pendingChunks.push(new Uint8Array(chunk))
     const merged = mergeBuffers(pendingChunks)
@@ -866,51 +1005,70 @@ export async function bidiRunStream(
   // Capture the HTTP/2 response status/headers and any stream-level error.
   // Without this, a non-200 or RST_STREAM surfaces as a silent clean end
   // (frames() just stops) — which looks exactly like "no response, no error".
-  stream.on("response", (h: Record<string, unknown>) => {
-    responseHeaders = h
-    responseStatus = h[":status"] !== undefined ? Number(h[":status"]) : 0
-    trace(`h2 response: status=${responseStatus} headers=${JSON.stringify(stripPseudo(h))}`)
-  })
-  stream.on("trailers", (h: Record<string, unknown>) => {
-    responseTrailers = h
-    trace(`h2 trailers: ${JSON.stringify(stripPseudo(h))}`)
-  })
-  stream.on("error", (err: Error) => {
-    rawStreamError = err
-    writable = false
-    trace(`h2 stream error: ${err?.name}: ${err?.message}`)
-    scheduleTerminalSettlement()
-  })
-  stream.on("aborted", () => {
-    writable = false
-    rawStreamError ??= new CursorTransportError("Cursor Run stream aborted by remote", {
-      transient: true,
-      replaySafe: true,
-      rstCode: stream.rstCode,
-      code: "ERR_HTTP2_STREAM_CANCEL",
+  const attachStreamListeners = (target: http2.ClientHttp2Stream): void => {
+    const generation = streamGeneration
+    const owner = session
+    const replaced = () => generation !== streamGeneration
+    target.on("response", (h: Record<string, unknown>) => {
+      if (replaced()) return
+      unanswered = undefined
+      noteSessionInbound(owner)
+      responseHeaders = h
+      responseStatus = h[":status"] !== undefined ? Number(h[":status"]) : 0
+      trace(`h2 response: status=${responseStatus} headers=${JSON.stringify(stripPseudo(h))}`)
     })
-    scheduleTerminalSettlement()
-  })
-  stream.on("end", () => {
-    writable = false
-    scheduleTerminalSettlement()
-  })
-  stream.on("close", () => {
-    writable = false
-    remotelyClosed = !locallyClosed
-    if (remotelyClosed) {
-      dropSession(origin, session)
-      // Stop assigning sibling Runs to a connection that remotely lost one
-      // of its streams. close() drains existing streams without destroying
-      // them; the next Run opens a fresh HTTP/2 session.
-      try { session.close() } catch { /* already closed */ }
-    }
-    trace(
-      `h2 stream closed (status=${responseStatus}, local=${locallyClosed}, ` +
-        `err=${rawStreamError instanceof Error ? rawStreamError.message : "none"})`,
-    )
-    scheduleTerminalSettlement()
-  })
+    target.on("trailers", (h: Record<string, unknown>) => {
+      if (replaced()) return
+      noteSessionInbound(owner)
+      responseTrailers = h
+      trace(`h2 trailers: ${JSON.stringify(stripPseudo(h))}`)
+    })
+    target.on("error", (err: Error) => {
+      if (replaced()) return
+      connectionLost ||= owner.destroyed
+      rawStreamError = err
+      writable = false
+      trace(`h2 stream error: ${err?.name}: ${err?.message}`)
+      scheduleTerminalSettlement()
+    })
+    target.on("aborted", () => {
+      if (replaced()) return
+      connectionLost ||= owner.destroyed
+      writable = false
+      rawStreamError ??= new CursorTransportError("Cursor Run stream aborted by remote", {
+        transient: true,
+        replaySafe: true,
+        rstCode: target.rstCode,
+        code: "ERR_HTTP2_STREAM_CANCEL",
+      })
+      scheduleTerminalSettlement()
+    })
+    target.on("end", () => {
+      if (replaced()) return
+      connectionLost ||= owner.destroyed
+      writable = false
+      scheduleTerminalSettlement()
+    })
+    target.on("close", () => {
+      if (replaced()) return
+      connectionLost ||= owner.destroyed
+      writable = false
+      remotelyClosed = !locallyClosed
+      if (remotelyClosed) {
+        dropSession(origin, owner)
+        // Stop assigning sibling Runs to a connection that remotely lost one
+        // of its streams. close() drains existing streams without destroying
+        // them; the next Run opens a fresh HTTP/2 session.
+        try { owner.close() } catch { /* already closed */ }
+      }
+      trace(
+        `h2 stream closed (status=${responseStatus}, local=${locallyClosed}, ` +
+          `err=${rawStreamError instanceof Error ? rawStreamError.message : "none"})`,
+      )
+      scheduleTerminalSettlement()
+    })
+  }
+  attachStreamListeners(stream)
 
   if (abortSignal) {
     abortHandler = () => {
@@ -933,7 +1091,14 @@ export async function bidiRunStream(
 
   return {
     write(msg: Uint8Array) {
-      if (!writable || remotelyClosed || stream.closed || stream.destroyed) {
+      const failing = !writable || remotelyClosed || stream.closed || stream.destroyed
+      const resendQueue = resending ?? (failing ? unanswered : undefined)
+      if (resendQueue && !locallyClosed && !terminalEvent) {
+        // Goes out with the rest of the Run if it is sent again, and is dropped with it otherwise.
+        resendQueue.push(encodeFrame(0x00, msg))
+        return true
+      }
+      if (failing) {
         if (locallyClosed) {
           throw new CursorLocalCancellationError("Cursor Run stream is closed locally")
         }
@@ -942,6 +1107,7 @@ export async function bidiRunStream(
       const frame = encodeFrame(0x00, msg)
       try {
         const accepted = stream.write(frame)
+        unanswered?.push(frame)
         backpressured = !accepted
         return accepted
       } catch (cause) {
@@ -958,13 +1124,26 @@ export async function bidiRunStream(
       const drainTimeoutMs = timeoutMs("Cursor write drain timeout", timeout, timeout)
       return new Promise<void>((resolve, reject) => {
         let settled = false
+        let target = stream
+        let failLater: (() => void) | undefined
+        let timer: ReturnType<typeof setTimeout> | undefined
+        const detach = () => {
+          target.removeListener("drain", onDrain)
+          target.removeListener("error", onError)
+          target.removeListener("close", onClose)
+          resendListeners.delete(onResend)
+        }
+        const attach = () => {
+          target.once("drain", onDrain)
+          target.once("error", onError)
+          target.once("close", onClose)
+          if (unanswered || resending) resendListeners.add(onResend)
+        }
         const finish = (error?: CursorProviderError) => {
           if (settled) return
           settled = true
           clearTimeout(timer)
-          stream.removeListener("drain", onDrain)
-          stream.removeListener("error", onError)
-          stream.removeListener("close", onClose)
+          detach()
           if (error) reject(error)
           else resolve()
         }
@@ -972,30 +1151,53 @@ export async function bidiRunStream(
           backpressured = false
           finish()
         }
-        const onError = (cause: Error) => {
+        const failOnError = (cause: Error) => {
           streamFailure ??= toTransportError(cause, "Cursor Run stream drain failed")
           streamFailure.replaySafe = false
           finish(streamFailure)
         }
-        const onClose = () => {
+        const failOnClose = () => {
           finish(
             locallyClosed
               ? new CursorLocalCancellationError("Cursor Run stream closed locally during drain")
               : observedFailure() ?? new CursorRunInterruptedError("Cursor Run stream closed before drain"),
           )
         }
-        const timer = setTimeout(() => {
-          streamFailure ??= new CursorTransportError(
-            `Cursor Run stream backpressure did not drain after ${drainTimeoutMs}ms`,
-            { transient: false, replaySafe: false, code: WRITE_DRAIN_TIMEOUT_CODE },
-          )
-          finish(streamFailure)
-          try { stream.destroy(streamFailure) } catch { /* already closing */ }
-        }, drainTimeoutMs)
-        timer.unref?.()
-        stream.once("drain", onDrain)
-        stream.once("error", onError)
-        stream.once("close", onClose)
+        // While the Run may still go out on a new connection, that decision settles the wait, and
+        // the new stream gets the whole drain window: the connect timeout bounds the reconnect.
+        const mayResend = () => !locallyClosed && (unanswered !== undefined || resending !== undefined)
+        const onError = (cause: Error) => {
+          if (!mayResend()) return failOnError(cause)
+          clearTimeout(timer)
+          failLater ??= () => failOnError(cause)
+        }
+        const onClose = () => {
+          if (!mayResend()) return failOnClose()
+          clearTimeout(timer)
+          failLater ??= failOnClose
+        }
+        const onResend = (resent: boolean) => {
+          if (settled) return
+          if (!resent) return (failLater ?? failOnClose)()
+          detach()
+          target = stream
+          if (!backpressured) return finish()
+          armTimer()
+          attach()
+        }
+        const armTimer = () => {
+          timer = setTimeout(() => {
+            streamFailure ??= new CursorTransportError(
+              `Cursor Run stream backpressure did not drain after ${drainTimeoutMs}ms`,
+              { transient: false, replaySafe: false, code: WRITE_DRAIN_TIMEOUT_CODE },
+            )
+            finish(streamFailure)
+            try { stream.destroy(streamFailure) } catch { /* already closing */ }
+          }, drainTimeoutMs)
+          timer.unref?.()
+        }
+        if (!resending) armTimer()
+        attach()
       })
     },
     end() {
@@ -1051,6 +1253,7 @@ export async function bidiRunStream(
       }
     },
     isClosed() {
+      if (resending) return locallyClosed
       return remotelyClosed || locallyClosed || stream.closed || stream.destroyed
     },
     onTerminal(listener) {

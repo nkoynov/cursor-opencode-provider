@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- A Run starts without the HTTP/2 health-check ping when its connection received data in the last 10 seconds, as Cursor CLI does, which saves a round trip to Cursor on most Runs. If that connection turns out to be dead before Cursor answers (reset, refused stream, or a GOAWAY that excludes the Run), the Run is sent once more on a new connection; once Cursor has answered it is never sent again
+
 ### Fixed
 
 - OpenCode 2 plugin `generate.text` calls (memory recall, summaries) complete instead of waiting forever for a tool catalog ([#40](https://github.com/oakimov/cursor-opencode-provider/pull/40) by [@nkoynov](https://github.com/nkoynov))

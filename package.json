@@ -77,7 +77,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
     "test": "bun test",
-    "test:node-http2": "bun run build && node test/node-http2-cleanup.mjs",
+    "test:node-http2": "bun run build && node test/node-http2-cleanup.mjs && node test/node-http2-resend.mjs",
     "test:watch": "bun test --watch",
     "generate:pricing": "bun run scripts/generate-cursor-pricing.ts",
     "generate:pricing:check": "bun run scripts/generate-cursor-pricing.ts -- --check",
