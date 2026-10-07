@@ -21,6 +21,7 @@ import type { OpencodeToolDef } from "./tools.js"
 import {
   getTurnProvenance,
   parseTurnProvenance,
+  rebindTurnProvenance,
   restoreTurnProvenance,
   serializeTurnProvenance,
 } from "./turn-provenance.js"
@@ -162,6 +163,8 @@ export function rekeyConversation(
   clearCheckpoint(fromId)
   clearConversationBlobs(fromId)
   restoreConversationBinding(sessionKey, toId)
+  // What this provider emitted last stays the reference for telling another model's answer apart.
+  rebindTurnProvenance(sessionKey, fromId, toId)
   return toId
 }
 

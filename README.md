@@ -398,7 +398,7 @@ Project `instructions` may reference absolute or `~/` paths (OpenCode parity). S
   - Cursor stores a step only after its tool results, so the tool calls of the first switched step have already run when it is marked. The message lists them, and the next request is told that they ran.
   - Text of the switched step streams before Cursor marks it, so it stays visible above the message, though it is not kept.
   - Accepting the other model sends the stopped request's text again; files attached to it are not.
-  - The reply is read as the override only when it is the user's only message after the stop: a directory change sent with it makes it a new request. If the reply's first Run has to be restarted before any output (a refused or dropped connection), the reply is handled as an ordinary message, so the stopped request may be replayed with it.
+  - The reply is read as the override only when it is the user's only message after the stop: a directory change sent with it makes it a new request. If the reply's first Run has to be restarted before any output (a refused or dropped connection), the reply is handled as an ordinary message, so the stopped request may be replayed with it. A host completion that arrives with the override reply is not passed on, and a switch Cursor marks in a step whose pending tool a new user turn cancels is not caught.
 
 ## Changelog
 
