@@ -152,10 +152,34 @@ describe("buildRequestContext", () => {
       expect(env.project_folder).toBe(expectedProject)
       expect(env.project_folder).not.toBe(path.resolve(root))
       expect(env.terminals_folder).toBe(path.join(expectedProject, "terminals"))
-      expect(env.agent_transcripts_folder).toBe(path.join(expectedProject, "agent-transcripts"))
+      expect(env).not.toHaveProperty("agent_transcripts_folder")
       const fsOpts = ctx.mcp_file_system_options as Record<string, unknown>
       expect(fsOpts.workspace_project_dir).toBe(expectedProject)
       expect(workspaceRootFromRequestContext(ctx)).toBe(path.resolve(root))
+      const decoded = decodeMessage("RequestContext", encodeMessage("RequestContext", ctx)) as Record<string, unknown>
+      expect((decoded.env as Record<string, unknown>).agent_transcripts_folder ?? "").toBe("")
+    } finally {
+      if (prevCache === undefined) delete process.env.XDG_CACHE_HOME
+      else process.env.XDG_CACHE_HOME = prevCache
+      await rm(cacheRoot, { recursive: true, force: true })
+    }
+  })
+
+  it("advertises the agent-transcripts folder only when it exists", async () => {
+    const prevCache = process.env.XDG_CACHE_HOME
+    const cacheRoot = path.join(os.tmpdir(), `cursor-ctx-transcripts-${process.pid}-${Date.now()}`)
+    process.env.XDG_CACHE_HOME = cacheRoot
+    try {
+      const folder = path.join(opencodeProjectDir(root), "agent-transcripts")
+      await mkdir(path.dirname(folder), { recursive: true })
+      await writeFile(folder, "not a folder")
+      const withFile = await buildRequestContext({ workspaceRoot: root })
+      expect(withFile.env).not.toHaveProperty("agent_transcripts_folder")
+
+      await rm(folder)
+      await mkdir(folder)
+      const withFolder = await buildRequestContext({ workspaceRoot: root })
+      expect((withFolder.env as Record<string, unknown>).agent_transcripts_folder).toBe(folder)
     } finally {
       if (prevCache === undefined) delete process.env.XDG_CACHE_HOME
       else process.env.XDG_CACHE_HOME = prevCache

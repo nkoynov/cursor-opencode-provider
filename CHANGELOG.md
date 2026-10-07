@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Cursor is no longer told that past chats are in an `agent-transcripts` folder nothing creates, so the model stops searching it; the folder is named only when it exists when a conversation starts
+
 ## [0.8.1] - 2026-10-08
 
 ### Added
