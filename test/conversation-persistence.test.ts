@@ -1,8 +1,8 @@
 import { afterAll, beforeEach, describe, expect, it } from "bun:test"
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { gunzipSync } from "node:zlib"
+import { gunzipSync, gzipSync } from "node:zlib"
 import {
   conversationCacheDirectoryPath,
   conversationCacheFilePath,
@@ -398,6 +398,25 @@ describe("conversation restart persistence", () => {
       .toBe("conversation-parent")
     expect((await getPersistedConversation(root, "ses_child"))?.conversationId)
       .toBe("conversation-child")
+  })
+
+  it("decodes at startup only files last written more than the TTL ago", async () => {
+    const root = await cacheRoot()
+    const now = Date.now()
+    const recent = conversationCacheFilePath(root, "ses_recent_unreadable")
+    const old = conversationCacheFilePath(root, "ses_old_unreadable")
+    await mkdir(conversationCacheDirectoryPath(root), { recursive: true })
+    // Valid gzip around an undecodable payload: only a full decode can tell it's invalid.
+    await writeFile(recent, gzipSync(Buffer.from("not a protobuf record")))
+    await writeFile(old, gzipSync(Buffer.from("not a protobuf record")))
+    const oldSeconds = (now - CONVERSATION_CACHE_TTL_MS - 60_000) / 1_000
+    await utimes(old, oldSeconds, oldSeconds)
+
+    await initializeConversationPersistence(root, now)
+
+    expect((await stat(recent)).isFile()).toBe(true)
+    await expect(stat(old)).rejects.toMatchObject({ code: "ENOENT" })
+    expect((await loadPersistedConversation(root, "ses_recent_unreadable")).status).toBe("invalid")
   })
 
   it("discards a corrupt session record and uses private permissions for its replacement", async () => {

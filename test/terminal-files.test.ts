@@ -647,7 +647,8 @@ describe("completion notes from Cursor terminal files", () => {
 
   it("reports a background spawn's exit code and output", async () => {
     const folder = tempDir()
-    const command = "printf 'a\\nb\\n'; exit 3"
+    // The pause keeps the command running through the poll that must find no note yet.
+    const command = "sleep 0.5; printf 'a\\nb\\n'; exit 3"
     registerCursorShellCall("cursor_note_spawn", { background_shell_spawn: true, command, working_directory: "/w", terminals_folder: folder, terminal_cwd: "/w" })
     const { pid, file } = watchOutcome("cursor_note_spawn", "ses_spawn", run(buildBackgroundShellCommand(command, { folder, cwd: "/w" })))
     expect(file).toBe(path.join(folder, `${pid}.txt`))
@@ -657,7 +658,7 @@ describe("completion notes from Cursor terminal files", () => {
     pollBackgroundShells()
     expect(notes).toHaveLength(1)
     expect(notes[0]!.sessionID).toBe("ses_spawn")
-    expect(notes[0]!.text).toContain(`<shell id="${pid}" state="completed" command="printf 'a\\nb\\n'; exit 3">`)
+    expect(notes[0]!.text).toContain(`<shell id="${pid}" state="completed" command="sleep 0.5; printf 'a\\nb\\n'; exit 3">`)
     expect(notes[0]!.text).toMatch(new RegExp(`Background shell ${pid} failed with exit code 3 after \\d+s\\.\\nIts output \\(also in ${file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\):\\na\\nb\\n</shell>`))
     expect(notes[0]!.metadata.exit).toBe(3)
   })
