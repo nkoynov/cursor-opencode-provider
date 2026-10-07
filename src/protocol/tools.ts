@@ -27,6 +27,7 @@ import {
   type CursorShellOutcome,
   type CursorTerminalTarget,
 } from "../shell-timeout.js"
+import type { HostToolRefusal } from "../tool-error-envelope.js"
 
 // Exec variant field number whose reply is the server-initiated request_context
 // probe (ExecServerMessage #10 → ExecClientMessage #10). request/result share a
@@ -1513,6 +1514,8 @@ export function parseExecServerMessage(
         ? writeRequestResultMetadata(rawArgs, mapped.args)
       : execVariant === "grep_args"
         ? grepRequestResultMetadata(rawArgs)
+      : execVariant === "ls_args" || execVariant === "delete_args"
+        ? { path: str(rawArgs.path) ?? "" }
         : undefined
   if (
     resultMetadata
@@ -2023,6 +2026,8 @@ export type ToolResultInput = {
   workspaceRoot?: string
   /** Images the host tool returned; see `execResultImages` for which results carry them. */
   images?: readonly CursorImageInput[]
+  /** The host refused the call before running it; `error` holds the reason. */
+  refusal?: HostToolRefusal
 }
 
 /**
@@ -2053,7 +2058,7 @@ const FILE_CONTENT_RESULTS = new Set(["read_result", "pi_read_result"])
 export function resultCanCarryNote(input: ToolResultInput): boolean {
   const resultField = input.resultField || "mcp_result"
   if (resultField === "shell_stream") return true
-  const typed = buildTypedExecResult(
+  const typed = refusedExecResult(resultField, input) ?? buildTypedExecResult(
     resultField,
     input.output,
     input.error,
@@ -2075,8 +2080,15 @@ function attachResultNote(
   typed: Record<string, unknown>,
   note: string,
 ): Record<string, unknown> | undefined {
-  const { success, error, failure } = typed as Record<string, Record<string, unknown> | undefined>
+  const { success, error, failure, rejected, permission_denied: denied } =
+    typed as Record<string, Record<string, unknown> | undefined>
   if (error && typeof error.error === "string") return { ...typed, error: { ...error, error: appendNote(error.error, note) } }
+  if (rejected && typeof rejected.reason === "string") {
+    return { ...typed, rejected: { ...rejected, reason: appendNote(rejected.reason, note) } }
+  }
+  if (denied && typeof denied.error === "string") {
+    return { ...typed, permission_denied: { ...denied, error: appendNote(denied.error, note) } }
+  }
   if (failure) return { ...typed, failure: { ...failure, stderr: appendNote(failure.stderr, note) } }
   if (!success || FILE_CONTENT_RESULTS.has(resultField)) return undefined
   if (Array.isArray(success.content)) {
@@ -2117,7 +2129,12 @@ function encodeExecResult(input: ToolResultInput, note?: string): { frames: Uint
   const frames: Uint8Array[] = []
   let noteCarried = false
 
-  if (resultField === "shell_stream") {
+  if (resultField === "shell_stream" && input.refusal && input.error) {
+    noteCarried = note !== undefined
+    const reason = note === undefined ? input.error : appendNote(input.error, note)
+    // Cursor's own client answers a refused command with this one event: no start, no exit.
+    frames.push(encodeShellStream(input.execId, undefined, shellRefusal(input.refusal, reason, input.resultMetadata)))
+  } else if (resultField === "shell_stream") {
     noteCarried = note !== undefined
     // Real clients always emit Start → Stdout/Stderr* → Exit (capture/tests).
     frames.push(encodeShellStream(input.execId, undefined, { start: {} }))
@@ -2160,7 +2177,7 @@ function encodeExecResult(input: ToolResultInput, note?: string): { frames: Uint
       id: input.execId,
       local_execution_time_ms: input.executionTimeMs ?? 0,
     }
-    const typed = buildTypedExecResult(
+    const typed = refusedExecResult(resultField, input) ?? buildTypedExecResult(
       resultField,
       input.output,
       input.error,
@@ -3040,6 +3057,68 @@ export function unwrapReadOutput(output: string): string {
   return raw.join("\n")
 }
 
+function shellRefusal(
+  refusal: HostToolRefusal,
+  reason: string,
+  resultMetadata: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  const command = str(resultMetadata?.command) ?? ""
+  const workingDirectory = str(resultMetadata?.working_directory) ?? ""
+  return refusal === "permission_denied"
+    ? { permission_denied: { command, working_directory: workingDirectory, error: reason } }
+    : { rejected: { command, working_directory: workingDirectory, reason } }
+}
+
+// The refusal arm Cursor's own executors answer a blocked call with; results without one keep their `error` arm.
+function refusedExecResult(resultField: string, input: ToolResultInput): Record<string, unknown> | undefined {
+  const { refusal, error: reason, resultMetadata } = input
+  if (!refusal || !reason) return undefined
+  const denied = refusal === "permission_denied"
+  const filePath = resolveToolPath(str(resultMetadata?.path) ?? "", toolResultRoot(input.workspaceRoot))
+  switch (resultField) {
+    case "shell_result":
+    case "background_shell_spawn_result":
+      return shellRefusal(refusal, reason, resultMetadata)
+    case "write_result":
+      return denied
+        ? {
+            permission_denied: {
+              path: filePath,
+              directory: filePath ? path.dirname(filePath) : "",
+              operation: "write",
+              error: reason,
+              is_readonly: false,
+            },
+          }
+        : { rejected: { path: filePath, reason } }
+    // ReadPermissionDenied and LsResult carry no message, so both refusals keep the reason here.
+    case "read_result":
+    case "ls_result":
+      return { rejected: { path: filePath, reason } }
+    case "delete_result":
+      return denied
+        ? { permission_denied: { path: filePath, client_visible_error: reason, is_readonly: false } }
+        : { rejected: { path: filePath, reason } }
+    case "mcp_result":
+      return denied
+        ? { permission_denied: { error: reason, is_readonly: false } }
+        : { rejected: { reason, is_readonly: false } }
+    case "pi_write_result":
+    case "pi_edit_result":
+      return { rejected: { reason } }
+    default:
+      return undefined
+  }
+}
+
+function toolResultRoot(workspaceRoot: string | undefined): string | undefined {
+  const trimmedRoot = typeof workspaceRoot === "string" ? workspaceRoot.trim() : ""
+  // A posix process must not turn `C:/…` or `\\server\…` into `<cwd>/C:/…`.
+  return trimmedRoot
+    ? (isForeignAbsoluteToolPath(trimmedRoot) ? trimmedRoot : path.resolve(trimmedRoot))
+    : undefined
+}
+
 /**
  * Map OpenCode tool text into the agent.v1 result oneof for each exec variant.
  * OpenCode returns free-form text; we wrap it in the minimal success shape the
@@ -3057,11 +3136,7 @@ export function buildTypedExecResult(
 ): Record<string, unknown> {
   // Prefer the session workspace; never advertise the host process cwd (daemon
   // often starts in $HOME) as the path Cursor shows the model for glob/ls.
-  const trimmedRoot = typeof workspaceRoot === "string" ? workspaceRoot.trim() : ""
-  // A posix process must not turn `C:/…` or `\\server\…` into `<cwd>/C:/…`.
-  const resultRoot = trimmedRoot
-    ? (isForeignAbsoluteToolPath(trimmedRoot) ? trimmedRoot : path.resolve(trimmedRoot))
-    : undefined
+  const resultRoot = toolResultRoot(workspaceRoot)
   switch (resultField) {
     case "read_result": {
       const parsedFile = parseOpenCode2FileRead(output, resultMetadata)
@@ -3271,7 +3346,7 @@ export function buildTypedExecResult(
       return { success: { output: listing?.text ?? groundSearchOutput(output, resultRoot) } }
     }
     case "delete_result":
-      if (error) return { error: { path: "", error } }
+      if (error) return { error: { path: resolveToolPath(str(resultMetadata?.path) ?? "", resultRoot), error } }
       return { success: { path: "", deleted_file: "" } }
     case "background_shell_spawn_result": {
       const command = str(resultMetadata?.command) ?? ""
@@ -3311,7 +3386,7 @@ export function buildTypedExecResult(
       }
     }
     case "ls_result": {
-      if (error) return { error: { path: "", error } }
+      if (error) return { error: { path: resolveToolPath(str(resultMetadata?.path) ?? "", resultRoot), error } }
       const listing = parseOpenCode2DirectoryListing(output, resultRoot)
       const rootPath = listing?.directory || resultRoot || ""
       const entries = listing ? listing.entries : extractGroundedPaths(output, resultRoot)
