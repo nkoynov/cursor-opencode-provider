@@ -71,6 +71,11 @@ export async function hydrateConversationState(
   }
 }
 
+/** Early steers the session's last turn answered, from its restart snapshot. */
+export async function persistedAnsweredSteers(cacheDir: string, sessionKey: string): Promise<string[]> {
+  return [...(await loadPersistedConversation(cacheDir, sessionKey)).value?.answeredSteers ?? []]
+}
+
 /** Restore only turn provenance when its in-memory entry was evicted. */
 export async function hydrateTurnProvenance(cacheDir: string, sessionKey: string): Promise<void> {
   if (getTurnProvenance(sessionKey)) return
@@ -96,6 +101,7 @@ export async function persistConversationState(
     systemPromptHash?: string
     runInProgress?: boolean
     hostNote?: string
+    answeredSteers?: string[]
   },
 ): Promise<void> {
   // A newer Run may have reset/superseded this conversation while its final
@@ -126,6 +132,7 @@ export async function persistConversationState(
     hostAgent: input.hostAgent,
     systemPromptHash: input.systemPromptHash,
     hostNote: input.hostNote,
+    ...(input.answeredSteers?.length ? { answeredSteers: [...input.answeredSteers] } : {}),
     ...(provenance?.conversationId === input.conversationId
       ? { turnProvenance: serializeTurnProvenance(provenance) }
       : {}),

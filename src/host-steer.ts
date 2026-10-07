@@ -124,21 +124,31 @@ export function settleEarlySteers(sessionID: string, steers: readonly EarlySteer
   settled.set(sessionID, [...(settled.get(sessionID) ?? []), ...steers].slice(-MAX_RECORDS_PER_SESSION))
 }
 
-/** Indices of the messages that carry a steer the model already answered, each matched once; forgets the settled ones. */
-export function takeAnsweredEarlySteers(
-  sessionID: string | undefined,
-  messages: ReadonlyArray<string | undefined>,
-): Set<number> {
-  const indices = new Set<number>()
-  if (!sessionID) return indices
-  const candidates = [
+/** Texts of the steers the model already answered; forgets the settled ones. */
+export function takeAnsweredEarlySteerTexts(sessionID: string | undefined): string[] {
+  if (!sessionID) return []
+  const texts = [
     ...(settled.get(sessionID) ?? []),
     ...(state.injected.get(sessionID) ?? []).filter((record) => record.answered),
-  ]
+  ].map((record) => record.text)
   settled.delete(sessionID)
+  return texts
+}
+
+/** Texts of the steers a Run's turn answers: those Cursor delivered in it or already answered. */
+export function answeredEarlySteerTexts(sessionID: string, delivered: ReadonlySet<string>): string[] {
+  return (state.injected.get(sessionID) ?? [])
+    .filter((record) => record.answered || delivered.has(record.injectionId))
+    .map((record) => record.text)
+}
+
+/** Indices of the messages that carry one of `texts`, each text matched once. */
+export function messagesCarrying(messages: ReadonlyArray<string | undefined>, texts: readonly string[]): Set<number> {
+  const candidates = [...texts]
+  const indices = new Set<number>()
   messages.forEach((message, index) => {
     if (message === undefined) return
-    const match = candidates.findIndex((record) => carries(message, record.text))
+    const match = candidates.findIndex((text) => carries(message, text))
     if (match === -1) return
     candidates.splice(match, 1)
     indices.add(index)

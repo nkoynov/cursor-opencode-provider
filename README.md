@@ -404,7 +404,7 @@ Project `instructions` may reference absolute or `~/` paths (OpenCode parity). S
   - A steer whose injection crosses Cursor's end of turn on the wire fails that turn ("Cursor did not take a message sent during this turn…").
   - A steer Cursor did not take in time goes out as a follow-up Run; if the user stops that Run before it answers, a later promotion of the steer on its own is dropped. T3 cancels such steers before the next turn.
   - While OpenCode runs on its own (a background-shell wake), a new turn sent with a different model can be injected into the wake's Run, on the old model.
-  - A message with files promoted together with a later, already answered plain steer does not reach Cursor: a fresh turn on a checkpoint sends only the last user message, which predates early steers. T3 writes attachments into the text as paths, so it never sends such a message.
+  - A message with files promoted together with a later, already answered plain steer does not reach Cursor: the step that promotes them ends without a Run, as it does for the answered steer alone. T3 writes attachments into the text as paths, so it never sends such a message.
 
 ## Changelog
 

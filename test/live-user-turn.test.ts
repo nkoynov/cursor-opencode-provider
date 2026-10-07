@@ -13,7 +13,9 @@ import { encodeFrame } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { resetCheckpointsForTests, setCheckpoint } from "../src/protocol/checkpoint.js"
 import { resetConversationBindingsForTests, restoreConversationBinding } from "../src/protocol/conversation-bind.js"
-import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
+import { deletePersistedConversation, resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
+import { persistConversationState } from "../src/protocol/conversation-state.js"
+import { opencodeGlobalCacheDir } from "../src/context/paths.js"
 import { resetFrozenRequestContextsForTests } from "../src/context/frozen.js"
 import { closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
 
@@ -262,6 +264,58 @@ describe("the user turn of a fresh Run", () => {
     expect(live).toStartWith(QUESTION)
     expect(live).not.toContain(STEER)
     expect(transcript).toContain(`[User, no reply]\n${STEER}`)
+  })
+
+  /** The turn that answered `steers` ended and saved its snapshot; then the provider restarted. */
+  async function answeredBeforeRestart(sessionKey: string, steers: string[]): Promise<void> {
+    await persistConversationState(opencodeGlobalCacheDir(), {
+      sessionKey,
+      conversationId: `conv-${sessionKey}`,
+      requestContext: { rules_info_complete: true },
+      answeredSteers: steers,
+    })
+    resetConversationPersistenceForTests()
+    resetConversationBindingsForTests()
+    resetCheckpointsForTests()
+    resetTurnStateForTests()
+  }
+
+  it("does not send again an answered steer after a restart", async () => {
+    const sessionKey = newSession({ checkpointed: true })
+    try {
+      await answeredBeforeRestart(sessionKey, [STEER])
+
+      const run = await step(sessionKey, [
+        user("Read the docs"),
+        assistant("Read them, and the README too."),
+        user(STEER),
+        user(QUESTION),
+      ] as Prompt)
+
+      expect(new Uint8Array(run.conversation_state)).toEqual(checkpoint())
+      expect(userText(run)).toStartWith(QUESTION)
+      expect(userText(run)).not.toContain(STEER)
+    } finally {
+      await deletePersistedConversation(opencodeGlobalCacheDir(), sessionKey)
+    }
+  })
+
+  it("still sends a user turn the restart snapshot would leave empty", async () => {
+    const sessionKey = newSession({ checkpointed: true })
+    try {
+      await answeredBeforeRestart(sessionKey, [STEER, QUESTION])
+
+      const run = await step(sessionKey, [
+        user("Read the docs"),
+        assistant("Read them, and the README too."),
+        user(STEER),
+        user(QUESTION),
+      ] as Prompt)
+
+      expect(userText(run)).toStartWith(`${STEER}\n\n${QUESTION}`)
+    } finally {
+      await deletePersistedConversation(opencodeGlobalCacheDir(), sessionKey)
+    }
   })
 
   it("still sends a steer the model has not answered", async () => {

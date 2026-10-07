@@ -157,6 +157,7 @@ import {
   hydrateConversationState,
   hydrateTurnProvenance,
   persistConversationState,
+  persistedAnsweredSteers,
 } from "./protocol/conversation-state.js"
 import { initializeConversationPersistence } from "./protocol/conversation-persistence.js"
 import {
@@ -225,12 +226,14 @@ import {
 } from "./shell-timeout.js"
 import { analyzeReplayFrame, AttemptReplaySafety } from "./replay-safety.js"
 import {
+  answeredEarlySteerTexts,
   clearEarlySteers,
   listenForHostSteers,
   markEarlySteersAnswered,
+  messagesCarrying,
   recordEarlySteer,
   settleEarlySteers,
-  takeAnsweredEarlySteers,
+  takeAnsweredEarlySteerTexts,
   takeEarlySteers,
   type HostSteer,
 } from "./host-steer.js"
@@ -923,7 +926,12 @@ async function doStreamImpl(
         // is preserved. registerSession will not close a prior Run that still
         // has real pending execs; a failed prepare leaves that Run held.
         if (mayBeUserStep(callOptions)) {
-          answeredSteers = answeredSteersInUserTurn(sessionKey, prompt)
+          let answeredTexts = takeAnsweredEarlySteerTexts(sessionKey)
+          // After a restart, only the snapshot of the turn that answered them remembers them.
+          if (answeredTexts.length === 0 && sessionKey && prompt.length - userTurnStart(prompt) > 1) {
+            answeredTexts = await persistedAnsweredSteers(opencodeGlobalCacheDir(), sessionKey).catch(() => [])
+          }
+          answeredSteers = answeredSteersInUserTurn(prompt, answeredTexts)
           if (answeredSteers.size > 0) {
             trace(
               `fresh turn: ${answeredSteers.size} message(s) of the user turn hold a steer the model already ` +
@@ -3953,6 +3961,10 @@ export async function pump(
             hostAgent: session.hostAgent,
             systemPromptHash: session.stableSystemPromptHash,
             hostNote: undeliveredHostNoteBySession.get(session.openCodeSessionId),
+            answeredSteers: answeredEarlySteerTexts(
+              session.openCodeSessionId,
+              new Set((session.steerInjections ?? []).filter((i) => i.state === "delivered").map((i) => i.id)),
+            ),
           },
         ).catch((error) => {
           trace(
@@ -5710,11 +5722,12 @@ function liveUserTurn(
 
 /** OpenCode stores an answered early steer after the reply and its empty step adds no assistant message, so it can open the user turn. */
 function answeredSteersInUserTurn(
-  sessionKey: string | undefined,
   prompt: LanguageModelV3CallOptions["prompt"],
+  answeredTexts: readonly string[],
 ): ReadonlySet<number> {
   const start = userTurnStart(prompt)
-  const found = takeAnsweredEarlySteers(sessionKey, prompt.slice(start).map(plainUserText))
+  const found = messagesCarrying(prompt.slice(start).map(plainUserText), answeredTexts)
+  if (found.size === prompt.length - start) return new Set()
   return new Set([...found].map((offset) => start + offset))
 }
 

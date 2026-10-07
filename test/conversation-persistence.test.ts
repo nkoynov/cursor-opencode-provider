@@ -46,6 +46,7 @@ import {
   restoreTurnToolCatalog,
 } from "../src/language-model.js"
 import type { CursorSession, Frame } from "../src/session.js"
+import { forgetEarlySteers, recordEarlySteer } from "../src/host-steer.js"
 
 const roots: string[] = []
 
@@ -197,6 +198,35 @@ describe("conversation restart persistence", () => {
     expect(restored?.hostAgent).toBe("build")
     expect(restored?.systemPromptHash).toBe("build-prompt-hash")
     expect(parts.some((part: any) => part.type === "finish")).toBe(true)
+  })
+
+  it("keeps the early steers a turn answered in its TurnEnded snapshot", async () => {
+    const root = await cacheRoot()
+    const session = turnEndedSession(root, Uint8Array.from([7]))
+    const sessionKey = session.openCodeSessionId!
+    restoreConversationBinding(sessionKey, session.conversationId)
+    const steer = (text: string, injectionId: string) => ({
+      sessionID: sessionKey,
+      inboxID: `msg_${injectionId}`,
+      text,
+      injectionId,
+      conversationId: session.conversationId,
+      answered: false,
+    })
+    recordEarlySteer(steer("Also check the README", "inj_delivered"))
+    recordEarlySteer(steer("Not taken by this Run", "inj_other"))
+    session.steerInjections = [{ id: "inj_delivered", text: "Also check the README", state: "delivered", checkpointed: true }]
+    try {
+      await pump(session, {
+        enqueue() {},
+        error(error: unknown) { throw error },
+      } as unknown as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
+
+      clearMemory()
+      expect((await getPersistedConversation(root, sessionKey))?.answeredSteers).toEqual(["Also check the README"])
+    } finally {
+      forgetEarlySteers(sessionKey)
+    }
   })
 
   it("does not migrate legacy JSON snapshots", async () => {
