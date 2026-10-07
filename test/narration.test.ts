@@ -181,6 +181,41 @@ describe("progress updates streamed as thinking", () => {
     expect(joined(parts, "text-delta")).toBe("Running the check now.\n\n")
   })
 
+  it("keeps spans apart when reasoning follows a progress update across a Cursor-side tool", async () => {
+    const parts = await pass([
+      thinking("Need the MCP tools.\n\n"),
+      thinkingCompleted,
+      thinking("Looking up the tools first.\n\n"),
+      thinkingCompleted,
+      frame({ interaction_update: { tool_call_started: { call_id: "internal-1", tool_call: {} } } }),
+      frame({ interaction_update: { tool_call_completed: { call_id: "internal-1", tool_call: {} } } }),
+      thinking("Now run it.\n\n"),
+      thinkingCompleted,
+      textFrame("Running the check."),
+      ...shellCall(1, "call-1", "echo hi"),
+    ])
+    const open = new Set<string>()
+    const ended = new Set<string>()
+    for (const part of parts) {
+      const [kind, phase] = String(part.type).split("-")
+      if (!["text", "reasoning"].includes(kind!) || !part.id) continue
+      const key = `${kind}:${part.id}`
+      if (phase === "start") {
+        expect(ended.has(key)).toBe(false)
+        expect(open.size).toBe(0)
+        open.add(key)
+      } else if (phase === "delta") {
+        expect(open.has(key)).toBe(true)
+      } else if (phase === "end") {
+        expect(open.delete(key)).toBe(true)
+        ended.add(key)
+      }
+    }
+    expect(open.size).toBe(0)
+    expect(joined(parts, "reasoning-delta")).toBe("Need the MCP tools.\n\nNow run it.\n\n")
+    expect(joined(parts, "text-delta")).toBe("Looking up the tools first.\n\nRunning the check.")
+  })
+
   it("decodes thinking_completed and thinking_style", () => {
     const decoded = decodeMessage<any>("AgentServerMessage", thinkingCompleted.payload)
     expect(decoded.interaction_update.thinking_completed.thinking_duration_ms).toBe(1200)

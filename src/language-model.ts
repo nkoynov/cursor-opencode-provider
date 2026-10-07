@@ -1298,6 +1298,13 @@ function carryModelSwitchState(from: CursorSession, to: CursorSession): void {
 function noteAssistantBlob(session: CursorSession, kv: Record<string, unknown>): void {
   const guard = session.modelSwitchGuard
   const data = (kv.set_blob_args as { blob_data?: Uint8Array } | undefined)?.blob_data
+  const shape = data ? assistantBlobShape(data) : undefined
+  if (shape) {
+    trace(
+      `assistant blob: shape=${shape.join(",") || "-"} ` +
+        `streamedThinking=${takeThinkingKinds(session).join(",") || "-"}`,
+    )
+  }
   if (!guard || !data || !isAssistantMessageBlob(data)) return
   const found = session.modelSwitch ? undefined : modelSwitchInBlob(data, session.requestedModelId ?? "")
   if (found) {
@@ -3808,6 +3815,7 @@ export async function pump(
     if (reasoningStarted && !textStarted) {
       safeEnqueue({ type: "reasoning-end", id: reasoningId } as V3Part)
       reasoningStarted = false
+      reasoningId = crypto.randomUUID()
     }
     if (!textStarted) {
       safeEnqueue({ type: "text-start", id: textId } as V3Part)
@@ -3820,6 +3828,12 @@ export async function pump(
     if (!text) return
     openModelStep()
     replaySafety.markBarrier("visible-reasoning")
+    // Reasoning after text (a Cursor-side tool ran in between) gets its own spans.
+    if (textStarted) {
+      safeEnqueue({ type: "text-end", id: textId } as V3Part)
+      textStarted = false
+      textId = crypto.randomUUID()
+    }
     if (!reasoningStarted) {
       safeEnqueue({ type: "reasoning-start", id: reasoningId } as V3Part)
       reasoningStarted = true
@@ -5198,17 +5212,7 @@ export async function pump(
           `setDataLen=${(kv.set_blob_args as any)?.blob_data?.length ?? "-"}`,
       )
       const handled = handleKvServerMessage(kv, session)
-      if (handled?.kind === "set") {
-        noteAssistantBlob(session, kv)
-        const blobData = (kv.set_blob_args as { blob_data?: Uint8Array } | undefined)?.blob_data
-        const shape = blobData ? assistantBlobShape(blobData) : undefined
-        if (shape) {
-          trace(
-            `assistant blob: shape=${shape.join(",") || "-"} ` +
-              `streamedThinking=${takeThinkingKinds(session).join(",") || "-"}`,
-          )
-        }
-      }
+      if (handled?.kind === "set") noteAssistantBlob(session, kv)
       // Content-as-id reads are answered by echoing the id back (`echoed`); only a
       // hash we cannot serve means the checkpoint references state we lost.
       if (handled?.kind === "get" && !handled.found && !handled.echoed) blobMiss = true
