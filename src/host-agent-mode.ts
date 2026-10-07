@@ -167,6 +167,13 @@ export function isHostPlanEntryPending(sessionID: string | undefined): boolean {
   return target !== undefined && isPlanModeID(target)
 }
 
+/** True while any approved switch waits for its Run to end and will itself start the next host turn. */
+export function isHostAgentHandoffPending(sessionID: string | undefined): boolean {
+  if (activeSwitch()?.options.resumesTurn !== true) return false
+  const key = sessionID?.trim()
+  return !!key && pending.has(key)
+}
+
 export function cancelHostAgentModeSwitch(sessionID: string | undefined): void {
   const key = sessionID?.trim()
   if (key) pending.delete(key)

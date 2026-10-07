@@ -476,7 +476,7 @@ describe("SwitchMode over a held-open Run without host plan tools", () => {
   })
   afterEach(() => resetHostAgentModeSwitchForTests())
 
-  it("accepts the server's explicit cancellation only for its own plan handoff", async () => {
+  it("ends the step however Cursor ends a Run cancelled for the handoff, and only then", async () => {
     setHostAgentModeSwitch(() => {}, { resumesTurn: true })
     const terminal = { flags: 2, payload: new TextEncoder().encode('{"error":{"code":"canceled"}}') }
     const { session, parts } = await runSwitchMode([switchModePayload(), terminal], ["read"])
@@ -487,9 +487,15 @@ describe("SwitchMode over a held-open Run without host plan tools", () => {
     resetHostAgentModeSwitchForTests()
     await expect(runSwitchMode([terminal], ["read"])).rejects.toMatchObject({ code: "canceled" })
     setHostAgentModeSwitch(() => {}, { resumesTurn: true })
-    await expect(runSwitchMode([switchModePayload(), {
+    const internal = await runSwitchMode([switchModePayload(), {
       flags: 2, payload: new TextEncoder().encode('{"error":{"code":"internal"}}'),
-    }], ["read"])).rejects.toMatchObject({ code: "internal" })
+    }], ["read"])
+    expect(internal.parts.at(-1)?.finishReason.unified).toBe("stop")
+    resetHostAgentModeSwitchForTests()
+    setHostAgentModeSwitch(() => {}, { resumesTurn: true })
+    const lost = await runSwitchMode([switchModePayload()], ["read"])
+    expect(lost.session.closed).toBe(true)
+    expect(lost.parts.at(-1)?.finishReason.unified).toBe("stop")
   })
 
   it("stops the old Run before the resuming host starts its plan agent", async () => {

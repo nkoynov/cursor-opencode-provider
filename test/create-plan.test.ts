@@ -876,6 +876,174 @@ describe("CreatePlan execution approval over a held-open Run", () => {
     sessionManager.close(session, "ordinary-cleanup")
   })
 
+  it("ends the Run after Yes, so the edits run in the build agent's turn", async () => {
+    // OpenCode checks a tool against the agent of the step that called it; this step runs as `plan`.
+    const { session, writes, parts } = await startPlan()
+    const toolCall = parts.find((part: any) => part.type === "tool-call")
+    const question = JSON.parse(toolCall.input).questions[0].question as string
+    const switched: string[] = []
+    setHostAgentModeSwitch(({ targetModeID }) => { switched.push(targetModeID) }, { resumesTurn: true })
+
+    expect(deliverContinuationResults(session, [{
+      toolCallId: toolCall.toolCallId,
+      sessionId: session.sessionId,
+      execId: 900_000,
+      toolName: "question",
+      output: `User has answered your questions: "${question}"="Yes". You can now continue.`,
+    }] as any, { hostAgent: "plan", endRunForHandoff: true })).toBe(session)
+
+    const replies = writes.map((frame) => decodeMessage<any>("AgentClientMessage", frame))
+    expect(replies).toHaveLength(2)
+    expect(replies[0].interaction_response.create_plan_request_response.result.success).toBeDefined()
+    expect(replies[1].conversation_action.cancel_action.reason).toBe("host_build_agent_handoff")
+
+    // The last checkpoint predates the approval, and none follows it here.
+    session.resumeCheckpoint = Uint8Array.from([1, 2, 3])
+    // Cursor had already started implementing when the cancel reached it.
+    const continuation: Frame[] = [
+      { flags: 0, payload: encodeMessage("AgentServerMessage", {
+        exec_server_message: { id: 1, write_args: { path: path.join(workspace, "cli.py"), file_text: "x", tool_call_id: "w1" } },
+      }) },
+      { flags: 2, payload: new TextEncoder().encode('{"error":{"code":"canceled"}}') },
+    ]
+    session.frames = { next: async () => {
+      const frame = continuation.shift()
+      return frame ? { done: false, value: frame } : { done: true, value: undefined }
+    } } as CursorSession["frames"]
+    const after: any[] = []
+    await pump(
+      session,
+      { enqueue(part: unknown) { after.push(part) }, error() {} } as unknown as ReadableStreamDefaultController<any>,
+      { textId: "text", reasoningId: "reasoning" },
+    )
+    expect(after.some((part) => part.type === "tool-call")).toBe(false)
+    expect(after.at(-1)?.finishReason.unified).toBe("stop")
+    expect(session.closed).toBe(true)
+    expect(session.resumeCheckpoint).toBeUndefined()
+    expect(writes).toHaveLength(2)
+    expect(await flushHostAgentModeSwitch("create-plan-opencode-session", {
+      cursorSessionID: session.sessionId, terminal: session.closed,
+    })).toBe(true)
+    expect(switched).toEqual(["agent"])
+  })
+
+  it("keeps a checkpoint Cursor sends after the approval", async () => {
+    const { session, parts } = await startPlan()
+    const toolCall = parts.find((part: any) => part.type === "tool-call")
+    const question = JSON.parse(toolCall.input).questions[0].question as string
+    setHostAgentModeSwitch(() => {}, { resumesTurn: true })
+    deliverContinuationResults(session, [{
+      toolCallId: toolCall.toolCallId,
+      sessionId: session.sessionId,
+      execId: 900_000,
+      toolName: "question",
+      output: `User has answered your questions: "${question}"="Yes". You can now continue.`,
+    }] as any, { hostAgent: "plan", endRunForHandoff: true })
+    session.resumeCheckpoint = Uint8Array.from([1, 2, 3])
+    const continuation: Frame[] = [
+      { flags: 0, payload: encodeMessage("AgentServerMessage", { conversation_checkpoint_update: Uint8Array.from([7, 7]) }) },
+      { flags: 2, payload: new TextEncoder().encode('{"error":{"code":"canceled"}}') },
+    ]
+    session.frames = { next: async () => {
+      const frame = continuation.shift()
+      return frame ? { done: false, value: frame } : { done: true, value: undefined }
+    } } as CursorSession["frames"]
+    await pump(
+      session,
+      { enqueue() {}, error() {} } as unknown as ReadableStreamDefaultController<any>,
+      { textId: "text", reasoningId: "reasoning" },
+    )
+    expect(session.closed).toBe(true)
+    expect([...session.resumeCheckpoint ?? []]).toEqual([7, 7])
+  })
+
+  it("does not take a checkpoint read before the approval for one after it", async () => {
+    const { session, parts } = await startPlan()
+    const toolCall = parts.find((part: any) => part.type === "tool-call")
+    const question = JSON.parse(toolCall.input).questions[0].question as string
+    setHostAgentModeSwitch(() => {}, { resumesTurn: true })
+    // The held-Run watcher read this checkpoint while the question was open; another waits in the transport.
+    const early = (n: number): Frame => ({ flags: 0, payload: encodeMessage("AgentServerMessage", {
+      conversation_checkpoint_update: Uint8Array.from([n, n]),
+    }) })
+    session.queuedFrame = Promise.resolve({ done: false, value: early(5) })
+    const buffered = [early(6)]
+    ;(session.stream as { bufferedFrames?: () => number }).bufferedFrames = () => buffered.length
+    deliverContinuationResults(session, [{
+      toolCallId: toolCall.toolCallId,
+      sessionId: session.sessionId,
+      execId: 900_000,
+      toolName: "question",
+      output: `User has answered your questions: "${question}"="Yes". You can now continue.`,
+    }] as any, { hostAgent: "plan", endRunForHandoff: true })
+    const continuation: Frame[] = [...buffered.splice(0), { flags: 2, payload: new TextEncoder().encode('{"error":{"code":"canceled"}}') }]
+    session.frames = { next: async () => {
+      const frame = continuation.shift()
+      return frame ? { done: false, value: frame } : { done: true, value: undefined }
+    } } as CursorSession["frames"]
+    await pump(
+      session,
+      { enqueue() {}, error() {} } as unknown as ReadableStreamDefaultController<any>,
+      { textId: "text", reasoningId: "reasoning" },
+    )
+    expect(session.closed).toBe(true)
+    expect(session.resumeCheckpoint).toBeUndefined()
+  })
+
+  it("starts the build turn when the cancelled Run is lost instead of acknowledged", async () => {
+    const { session, writes, parts } = await startPlan()
+    const toolCall = parts.find((part: any) => part.type === "tool-call")
+    const question = JSON.parse(toolCall.input).questions[0].question as string
+    const switched: string[] = []
+    setHostAgentModeSwitch(({ targetModeID }) => { switched.push(targetModeID) }, { resumesTurn: true })
+    deliverContinuationResults(session, [{
+      toolCallId: toolCall.toolCallId,
+      sessionId: session.sessionId,
+      execId: 900_000,
+      toolName: "question",
+      output: `User has answered your questions: "${question}"="Yes". You can now continue.`,
+    }] as any, { hostAgent: "plan", endRunForHandoff: true })
+    expect(writes).toHaveLength(2)
+    // Results delivered after the last checkpoint: resuming it would lose the approval.
+    session.resultsAfterCheckpoint = { awaiting: new Set(), unconfirmed: true, toolCallIds: new Set() }
+    session.resumeCheckpoint = Uint8Array.from([1, 2, 3])
+    session.frames = { next: async () => { throw new Error("socket hang up") } } as CursorSession["frames"]
+    const after: any[] = []
+    await pump(
+      session,
+      { enqueue(part: unknown) { after.push(part) }, error() {} } as unknown as ReadableStreamDefaultController<any>,
+      { textId: "text", reasoningId: "reasoning" },
+    )
+    expect(after.at(-1)?.finishReason.unified).toBe("stop")
+    expect(session.closed).toBe(true)
+    expect(session.resumeCheckpoint).toBeUndefined()
+    expect(await flushHostAgentModeSwitch("create-plan-opencode-session", {
+      cursorSessionID: session.sessionId, terminal: session.closed,
+    })).toBe(true)
+    expect(switched).toEqual(["agent"])
+  })
+
+  it("keeps the Run when no host switch will start the build turn, or the user answers No", async () => {
+    for (const [answer, resumesTurn] of [["Yes", false], ["No", true]] as const) {
+      const { session, writes, parts } = await startPlan()
+      fs.rmSync(path.join(workspace, ".git"), { recursive: true, force: true })
+      const toolCall = parts.find((part: any) => part.type === "tool-call")
+      const question = JSON.parse(toolCall.input).questions[0].question as string
+      setHostAgentModeSwitch(() => {}, resumesTurn ? { resumesTurn } : {})
+      deliverContinuationResults(session, [{
+        toolCallId: toolCall.toolCallId,
+        sessionId: session.sessionId,
+        execId: 900_000,
+        toolName: "question",
+        output: `User has answered your questions: "${question}"="${answer}". You can now continue.`,
+      }] as any, { hostAgent: "plan", endRunForHandoff: true })
+      expect({ answer, writes: writes.length, cancelRequested: !!session.hostAgentHandoffCancelRequested })
+        .toEqual({ answer, writes: 1, cancelRequested: false })
+      sessionManager.close(session, "ordinary-cleanup")
+      resetHostAgentModeSwitchForTests()
+    }
+  })
+
   it("honors a Yes that arrived as history under a later host note instead of cancelling it", async () => {
     const { session, writes, parts } = await startPlan()
     const toolCall = parts.find((part: any) => part.type === "tool-call")

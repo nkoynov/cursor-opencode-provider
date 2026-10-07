@@ -126,6 +126,7 @@ import { hostPlanFileFor } from "./host-plan-file.js"
 import {
   flushHostAgentModeSwitch,
   hostAgentModeSwitchKind,
+  isHostAgentHandoffPending,
   isHostPlanEntryPending,
   queueHostAgentModeSwitch,
 } from "./host-agent-mode.js"
@@ -970,6 +971,7 @@ async function doStreamImpl(
     if (session) {
       session = deliverContinuationResults(session, results, {
         hostAgent: hostAgentFromCallOptions(callOptions),
+        endRunForHandoff: true,
       })
     }
     if (session && resultsAfterCheckpoint) session.resultsAfterCheckpoint = resultsAfterCheckpoint
@@ -2891,7 +2893,7 @@ export function deliverContinuationResults(
   session: CursorSession,
   trailingToolResults: ExtractedToolResult[],
   /** Host primary agent of the request that carries these results. */
-  delivery: { hostAgent?: string } = {},
+  delivery: { hostAgent?: string; endRunForHandoff?: boolean } = {},
 ): CursorSession | undefined {
   const pendingResults = trailingToolResults.filter(
     (r) => r.sessionId === session.sessionId && session.pending.has(r.execId),
@@ -2908,6 +2910,7 @@ export function deliverContinuationResults(
     if (!injectHostNote(session, note)) return undefined
     note = undefined
   }
+  let buildHandoffQueued = false
   for (const r of pendingResults) {
     const claim = sessionManager.claim(session.sessionId, r.execId)
     if ("kind" in claim) {
@@ -3092,6 +3095,7 @@ export function deliverContinuationResults(
           cursorSessionID: session.sessionId,
           hostAgent: "plan",
         })
+        buildHandoffQueued ||= queued && delivery.endRunForHandoff === true
         if (!queued) {
           trace(
             `create_plan: approved but no native host-agent switch accepted sessionID=` +
@@ -3144,7 +3148,40 @@ export function deliverContinuationResults(
     session.deferredNote = note
     trace(`continuation: no result could carry the host note; deferred to the next exec result noteLen=${note.length}`)
   }
+  if (buildHandoffQueued && !cancelRunForHostAgentHandoff(session)) return undefined
   return session
+}
+
+/**
+ * OpenCode checks a tool against the agent of the step that called it, and the approval reached
+ * Cursor in a plan-agent step: every edit of this Run would be denied. End the Run instead, so the
+ * queued switch starts the build turn with build permissions.
+ */
+function cancelRunForHostAgentHandoff(session: CursorSession): boolean {
+  if (session.pending.size > 0 || !isHostAgentHandoffPending(session.openCodeSessionId)) {
+    trace(`host-agent-mode: build handoff keeps the Run pending=${session.pending.size}`)
+    return true
+  }
+  session.heartbeatCancel?.()
+  try {
+    session.stream.write(encodeMessage("AgentClientMessage", {
+      conversation_action: { cancel_action: { reason: "host_build_agent_handoff" } },
+    }))
+  } catch (error) {
+    trace(`host-agent-mode: build handoff cancel write FAILED err=${(error as Error).message}`)
+    sessionManager.close(session, "result-write-failed")
+    return false
+  }
+  session.hostAgentHandoffCancelRequested = true
+  session.checkpointPredatesHandoff = true
+  session.framesQueuedBeforeHandoff = framesReceivedBeforeHandoff(session)
+  trace("host-agent-mode: cancelling Run for build handoff")
+  return true
+}
+
+/** Frames the pump will read before any Cursor sent after the handoff's answer; a pending queued read counts too. */
+function framesReceivedBeforeHandoff(session: CursorSession): number {
+  return (session.queuedFrame ? 1 : 0) + (session.stream.bufferedFrames?.() ?? 0)
 }
 
 function isShellResultField(resultField: string): boolean {
@@ -3547,7 +3584,6 @@ export async function pump(
     )
     emitFinish(undefined, { unified: "tool-calls", raw: undefined })
   }
-  let planHandoffCancellationRequested = false
   const replaySafety = new AttemptReplaySafety(session.sessionId)
   const failRunProtocol = (message: string, code: string): never => {
     replaySafety.markBarrier("unknown-or-malformed-frame")
@@ -4155,6 +4191,24 @@ export async function pump(
       trace(`conversation persistence: terminal save failed sessionKey=${session.openCodeSessionId}: ${String(error)}`)
     })
   }
+  // However Cursor ends a Run cancelled for a host-agent handoff, the step ends: recovering it would
+  // resume the outgoing agent's step, and the switch would be dropped as belonging to a stale Run.
+  const endsHostAgentHandoff = () => session.hostAgentHandoffCancelRequested === true
+    && session.pending.size === 0 && isHostAgentHandoffPending(session.openCodeSessionId)
+  const finishHostAgentHandoff = async (how: string): Promise<void> => {
+    if (session.resultsAfterCheckpoint || session.checkpointPredatesHandoff) {
+      trace(`checkpoint: dropped for conversationId=${session.conversationId} — it predates the handoff`)
+      clearCheckpoint(session.conversationId)
+      session.resumeCheckpoint = undefined
+    }
+    // A cancellation is a terminal acknowledgment, not TurnEnded: keep its final checkpoint
+    // without inventing aggregate billing.
+    keepUndeliveredHostNote(session)
+    await persistTerminalCheckpoint()
+    trace(`host-agent-mode: Run ended for the handoff (${how})`)
+    emitFinish(undefined, { unified: "stop", raw: undefined })
+    sessionManager.close(session)
+  }
 
   while (true) {
     if (session.hostInterrupted) stopForHostInterrupt()
@@ -4205,6 +4259,7 @@ export async function pump(
         return
       }
       closeOpenSpans()
+      if (endsHostAgentHandoff()) return finishHostAgentHandoff(`frame read failed: ${(error as Error).message}`)
       const failure = error instanceof CursorProviderError
         ? error
         : new CursorRunInterruptedError(
@@ -4221,10 +4276,13 @@ export async function pump(
     if (next.done) {
       closeOpenSpans()
       trace("pump: frames iterator ended before turn_ended")
+      if (endsHostAgentHandoff()) return finishHostAgentHandoff("stream ended")
       const failure = new CursorRunInterruptedError()
       throw finalizeFailure(failure)
     }
     const frame = next.value as Frame
+    const frameQueuedBeforeHandoff = (session.framesQueuedBeforeHandoff ?? 0) > 0
+    if (frameQueuedBeforeHandoff) session.framesQueuedBeforeHandoff! -= 1
 
     if (frame.flags & 0x02) {
       // A successful agent turn has an explicit turn_ended update before the
@@ -4242,17 +4300,7 @@ export async function pump(
       const failure = payload
         ? connectFrameError(payload)
         : new CursorRunInterruptedError()
-      if (planHandoffCancellationRequested && failure.origin === "server" && failure.code === "canceled"
-        && session.pending.size === 0 && isHostPlanEntryPending(session.openCodeSessionId)) {
-        // Cancellation is an explicit terminal acknowledgment, not TurnEnded.
-        // Preserve its final checkpoint without inventing aggregate billing.
-        keepUndeliveredHostNote(session)
-        await persistTerminalCheckpoint()
-        trace("host-agent-mode: Run cancellation acknowledged for plan handoff")
-        emitFinish(undefined, { unified: "stop", raw: undefined })
-        sessionManager.close(session)
-        return
-      }
+      if (endsHostAgentHandoff()) return finishHostAgentHandoff(`end-stream ${failure.code ?? "without code"}`)
       throw finalizeFailure(failure)
     }
 
@@ -4341,6 +4389,12 @@ export async function pump(
       )
     }
 
+    // A call Cursor made before the handoff cancel reached it would run under the outgoing agent.
+    if (session.hostAgentHandoffCancelRequested && (esm || interactionQuery)) {
+      trace("host-agent-mode: left a Cursor request unanswered while the handoff cancel is pending")
+      continue
+    }
+
     if (iu?.tool_call_started || iu?.tool_call_completed || iu?.step_completed || interactionQuery || esm) {
       textBreakPending = true
     }
@@ -4352,6 +4406,7 @@ export async function pump(
       const bytes = normalizeCheckpointBytes(checkpointRaw)
       if (bytes && bytes.length > 0) {
         cacheDiagnostics.checkpointUpdates++
+        if (!frameQueuedBeforeHandoff) session.checkpointPredatesHandoff = undefined
         setCheckpoint(session.conversationId, bytes)
         session.resumeCheckpoint = Uint8Array.from(bytes)
         if (switchGuard) switchGuard.latestCheckpoint = session.resumeCheckpoint
@@ -4364,7 +4419,7 @@ export async function pump(
           if (injection.state !== "sent") injection.checkpointed = true
         }
         const tokenDetails = decodeConversationTokenDetails(bytes)
-        if (tokenDetails && !(planHandoffCancellationRequested && tokenDetails.usedTokens === 0
+        if (tokenDetails && !(session.hostAgentHandoffCancelRequested && tokenDetails.usedTokens === 0
           && (session.tokenDetails?.usedTokens ?? 0) > 0)) {
           cacheDiagnostics.tokenDetailUpdates++
           session.tokenDetails = tokenDetails
@@ -4423,7 +4478,7 @@ export async function pump(
         undelivered.length > 0
         && (!session.resumeCheckpoint?.length || undelivered.some((injection) => !injection.checkpointed))
       )
-      if (checkpointPredatesStep) {
+      if (checkpointPredatesStep || session.checkpointPredatesHandoff) {
         trace(`checkpoint: dropped for conversationId=${session.conversationId} — it predates this step's results`)
         clearCheckpoint(session.conversationId)
         session.resumeCheckpoint = undefined
@@ -4465,6 +4520,7 @@ export async function pump(
       if (
         typeof session.reopenWithUserMessage === "function"
         && !isHostPlanEntryPending(session.openCodeSessionId)
+        && !session.hostAgentHandoffCancelRequested
         && checkpoint
         && checkpoint.length > 0
         && !session.resultsAfterCheckpoint
@@ -5263,7 +5319,9 @@ export async function pump(
           await writeWithBackpressure(session.stream, encodeMessage("AgentClientMessage", {
             conversation_action: { cancel_action: { reason: "host_plan_agent_handoff" } },
           }), "plan agent handoff")
-          planHandoffCancellationRequested = true
+          session.hostAgentHandoffCancelRequested = true
+          session.checkpointPredatesHandoff = true
+          session.framesQueuedBeforeHandoff = framesReceivedBeforeHandoff(session)
           trace("host-agent-mode: cancelling Run for plan handoff")
         }
         continue

@@ -366,6 +366,12 @@ export type CursorSession = {
   pumpOwner: symbol | null
   heartbeat: ReturnType<typeof setInterval> | null
   heartbeatCancel: (() => void) | null
+  /** This Run was cancelled so a queued host-agent switch can start the next turn. */
+  hostAgentHandoffCancelRequested?: boolean
+  /** No checkpoint arrived since the handoff's answer reached Cursor: the last one predates it. */
+  checkpointPredatesHandoff?: boolean
+  /** Frames already read or being read when the handoff's answer was written, which may predate it. */
+  framesQueuedBeforeHandoff?: number
   hardDeadlineTimer: ReturnType<typeof setTimeout> | null
   semanticDeadlineCancel: (() => void) | null
   terminalUnsubscribe: (() => void) | null

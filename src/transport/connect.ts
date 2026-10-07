@@ -262,6 +262,8 @@ export type BidiStream = {
   destroy(): void
   isClosed(): boolean
   onTerminal(listener: (event: BidiTerminalEvent) => void): () => void
+  /** Frames received and not yet read. */
+  bufferedFrames?(): number
 }
 
 export type BidiTerminalEvent =
@@ -1263,6 +1265,9 @@ export async function bidiRunStream(
       }
       terminalListeners.add(listener)
       return () => terminalListeners.delete(listener)
+    },
+    bufferedFrames() {
+      return inboundFrames.length
     },
   }
 }

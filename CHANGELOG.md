@@ -13,6 +13,7 @@
 
 ### Fixed
 
+- Approving a plan in plan mode ("Yes" to switching to the build agent) starts the build agent's turn instead of implementing in the plan agent's: the approval reached Cursor inside a step OpenCode runs as `plan`, so every edit was denied and the model fell back to writing files through the shell. The provider now ends that Run after the approval, as it does when entering plan mode, and the switch to `build` starts the next turn with build permissions
 - Dynamic-catalog guidance names the namespace for host tools (`opencode`) and states that `cursor` holds only Cursor's built-in tools, so a first `skill` lookup no longer fails in the wrong namespace.
 - A SwitchMode handoff that starts a new host plan turn explicitly terminates the old Cursor Run before the host switch, preserving its checkpoint and preventing premature CreatePlan calls. Native planning guidance distinguishes direct functions from dynamic discovery; debug logs retain native discovery errors.
 - Dynamic tool definitions carry their exact invocation identity and complete outer envelope beside the inner argument schema, so discovery and shortened search results retain required outer call fields.
