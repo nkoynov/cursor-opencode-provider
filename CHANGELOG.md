@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- A Run without a Cursor checkpoint (after a restart, a lost Run, a foreign-history or history-rewrite rebase) keeps the host system context, subagents and MCP instructions, and replays earlier tool calls with their results: prior turns now open the user message instead of replacing Cursor's root prompt, where they dropped the rules for the rest of the conversation and the model took its own earlier work for undone
+- A Run without a Cursor checkpoint (after a restart, a lost Run, a foreign-history or history-rewrite rebase) keeps the host system context, subagents and MCP instructions, and replays earlier tool calls with their results: prior turns now open the user message instead of replacing Cursor's root prompt, where they dropped the rules for the rest of the conversation and the model took its own earlier work for undone. When such a history would fill more than 80% of the model's context, the provider asks OpenCode to compact first, as a foreign-history rebase already did ([#60](https://github.com/oakimov/cursor-opencode-provider/pull/60) by [@nkoynov](https://github.com/nkoynov))
 
 ## [0.8.0] - 2026-10-04
 

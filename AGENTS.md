@@ -173,7 +173,10 @@ and MCP instructions) only when it is empty. Client-seeded root messages drop
 all of that for the rest of the conversation (seen live as Cursor's `rules`
 context category falling to 0). A Run without a checkpoint sends an empty
 `ConversationStateStructure` and opens its user message with the prior turns
-as a `<conversation_history>` transcript (`renderHistoryTranscript`).
+as a `<conversation_history>` transcript (`renderHistoryTranscript`). The
+80%-of-context check of a foreign-history rebase (**Foreign history** below)
+covers every such Run that replays history, except compaction and ephemeral
+Runs.
 Merged `opencode.json` (`loadMergedConfig`) is still read for MCP server ids,
 plugin lists, and interaction guidance.
 
