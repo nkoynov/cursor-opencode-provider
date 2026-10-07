@@ -296,6 +296,17 @@ describe("foreign-history rebase", () => {
     expect((thrown as APICallError).message).toMatch(/prompt is too long/i)
   })
 
+  it("counts the system prompt once, not again as a history entry", () => {
+    expect(() => assertForeignHistoryRebaseFits({
+      modelInfo: { id: "m", maxContext: 1_000, variants: [] },
+      cursorModelId: "m",
+      maxMode: false,
+      history: [{ role: "system", content: "s".repeat(2_000) }, { role: "user", content: "x".repeat(1_000) }],
+      systemPrompt: "s".repeat(2_000),
+      userText: "next",
+    })).not.toThrow()
+  })
+
   it("uses the long-context window in max mode", () => {
     expect(() => assertForeignHistoryRebaseFits({
       modelInfo: { id: "m", maxContext: 1_000, maxContextForMaxMode: 100_000, variants: [] },
