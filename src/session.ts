@@ -12,6 +12,7 @@ import type { CursorConversationTokenDetails } from "./protocol/token-details.js
 import type { HostToolRun, ModelSwitch } from "./model-fallback.js"
 import type { ContextEpoch } from "./context/epoch.js"
 import type { OccupancyUsageLedger } from "./usage.js"
+import type { ToolCallOrder } from "./tool-call-order.js"
 
 export type Frame = { flags: number; payload: Uint8Array }
 
@@ -272,6 +273,10 @@ export type CursorSession = {
    * reader takes it before calling `frames.next()` so no frame is skipped.
    */
   queuedFrame?: Promise<IteratorResult<Frame>>
+  /** The current step's unfinished tool calls in model order, and the execs held back behind them. */
+  toolCallOrder?: ToolCallOrder
+  /** Cursor's call count for a step that the ordering split over several pump passes. */
+  carriedToolStep?: { listed?: number; resolved: Set<string> }
   pending: Map<number, PendingExec>
   /**
    * Cursor display tool calls (tool_call_started) awaiting either an exec or a

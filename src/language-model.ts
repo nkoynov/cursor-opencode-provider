@@ -253,6 +253,22 @@ import {
 import { analyzeReplayFrame, AttemptReplaySafety } from "./replay-safety.js"
 import { noteCursorWaitEnded, noteCursorWaitStarted, semanticDeadlineAt } from "./cursor-waits.js"
 import {
+  deferToolExec,
+  deferredToolExecIds,
+  displayToolCallMutates,
+  dropDeferredToolExec,
+  forceReleaseToolExec,
+  hasDeferredToolExecs,
+  noteToolCallExec,
+  noteToolCallFinished,
+  noteToolCallStarted,
+  takeReadyToolExec,
+  toolCallOrder,
+  toolCallOrderTiming,
+  toolExecMustWait,
+  toolExecMutates,
+} from "./tool-call-order.js"
+import {
   answeredEarlySteerTexts,
   clearEarlySteers,
   listenForHostSteers,
@@ -1364,6 +1380,10 @@ export function applyExecControl(session: CursorSession, control: Record<string,
     trace(`exec control: unknown message ${JSON.stringify(Object.keys(control))} (${where}) sessionId=${session.sessionId}`)
     return
   }
+  if (dropDeferredToolExec(session.toolCallOrder, id)) {
+    trace(`exec control: Cursor aborted held execId=${id} (${where}) sessionId=${session.sessionId} — it will not run`)
+    return
+  }
   const pending = session.pending.get(id)
   const owed = pending !== undefined && !INTERACTION_RESULT_FIELDS.has(pending.resultField)
   const marked = owed && sessionManager.markExecAborted(session, id)
@@ -1390,11 +1410,14 @@ export function attachSessionHeartbeat(session: CursorSession): void {
     heartbeatWritePendingBySession.set(session, true)
     const stream = session.stream
     const execIds = pendingExecIds(session)
+    const heldExecIds = deferredToolExecIds(session.toolCallOrder)
     void writeWithBackpressure(stream, buildHeartbeat(), "heartbeat")
       .then(async () => {
-        for (const execId of execIds) {
+        for (const execId of [...execIds, ...heldExecIds]) {
           if (session.closed || !isCurrentHeartbeatGeneration(session, generation)) return
-          if (session.pending.get(execId)?.state !== "pending") continue
+          const owed = session.pending.get(execId)?.state === "pending"
+            || deferredToolExecIds(session.toolCallOrder).includes(execId)
+          if (!owed) continue
           await writeWithBackpressure(stream, buildExecHeartbeat(execId), `exec heartbeat id=${execId}`)
         }
       })
@@ -2492,6 +2515,7 @@ export async function drainSessionUntilTurnEnded(
 ): Promise<"turn-ended" | "busy" | "timeout" | "interrupted" | "skipped"> {
   if (session.closed) return "skipped"
   if (session.pending.size > 0 || sessionManager.isActivelyPumping(session)) return "busy"
+  if (!opts?.cancelled && hasDeferredToolExecs(session.toolCallOrder)) return "busy"
 
   const timeoutMs = Math.max(1, opts?.timeoutMs ?? FRESH_TURN_DRAIN_TIMEOUT_MS)
   const owner = Symbol(`fresh-turn-drain:${session.sessionId}`)
@@ -3009,6 +3033,10 @@ export function deliverContinuationResults(
       if (outcome.kind === "duplicate") continue
       return undefined
     }
+    // An edit's read result only lets Cursor send the edit's write.
+    if (!(pending.resultField === "read_result" && pending.displayCallId && session.editToolCalls?.has(pending.displayCallId))) {
+      noteToolCallFinished(session.toolCallOrder, pending.displayCallId)
+    }
     // Cursor now holds these in the exec result; the next fresh Run must not
     // attach them again as history images.
     rememberSentHistoryImageHashes(session.openCodeSessionId, deliveredImageHashes)
@@ -3455,12 +3483,27 @@ export async function pump(
   let emittedHostTools = 0
   // The current model step's tool calls: Cursor's listed count, the call ids that
   // reached us (exec request or display completion), and those sent to the host.
-  let toolStep = { listed: undefined as number | undefined, resolved: new Set<string>(), hostCalls: 0 }
+  const carried = session.carriedToolStep
+  session.carriedToolStep = undefined
+  let toolStep = { listed: carried?.listed, resolved: carried?.resolved ?? new Set<string>(), hostCalls: 0 }
   const toolStepComplete = () => toolStep.listed !== undefined && toolStep.resolved.size >= toolStep.listed
+  const order = toolCallOrder(session)
+  // The exec being handled can change state, so nothing after it may start in its step.
+  let execMutates = false
   /** Count a host tool call; true when it must end the AI SDK step now. */
   const endsToolStep = (): boolean => {
     toolStep.hostCalls++
+    if (execMutates) {
+      carryToolStep()
+      return true
+    }
     return !cursorListsToolRequests || toolStepComplete()
+  }
+  /** A step the ordering splits keeps Cursor's count for the next pass. */
+  const carryToolStep = (): void => {
+    if (hasDeferredToolExecs(order) || (toolStep.listed !== undefined && !toolStepComplete())) {
+      session.carriedToolStep = { listed: toolStep.listed, resolved: toolStep.resolved }
+    }
   }
   /** End a held step; `requeue` is a frame read that belongs to the next pump pass. */
   const closeHeldToolStep = (reason: string, requeue?: Promise<IteratorResult<Frame>>): void => {
@@ -3938,6 +3981,7 @@ export async function pump(
       ...(providerMetadata ? { providerMetadata } : {}),
     } as V3Part)
     if (enqueued && reason.unified === "tool-calls") scheduleHeldRunSave(session)
+    if (reason.unified === "tool-calls" && hasDeferredToolExecs(order)) carryToolStep()
   }
 
   // The cancel path drains and closes the Run; a frame read here goes back to it.
@@ -4052,7 +4096,7 @@ export async function pump(
       return
     }
 
-    if (toolStepComplete()) {
+    if (toolStepComplete() && !hasDeferredToolExecs(order)) {
       if (toolStep.hostCalls > 0) {
         closeHeldToolStep("all listed calls received")
         return
@@ -4061,9 +4105,35 @@ export async function pump(
       toolStep = { listed: undefined, resolved: new Set(), hostCalls: 0 }
     }
 
+    execMutates = false
+    let released = takeReadyToolExec(order)
+    let waitForOrderMs: number | undefined
+    if (!released && hasDeferredToolExecs(order)) {
+      if (toolStep.hostCalls > 0) {
+        closeHeldToolStep("the held calls wait for this step's results")
+        return
+      }
+      const quietMs = Date.now() - order.progressAt
+      if (session.pending.size === 0 && !session.cursorWaits?.size) {
+        if (quietMs >= toolCallOrderTiming.releaseQuietMs) {
+          released = forceReleaseToolExec(order)
+          trace(`exec order: released held execId=${released?.execId} after ${quietMs}ms without progress`)
+        } else {
+          waitForOrderMs = toolCallOrderTiming.releaseQuietMs - quietMs
+        }
+      }
+    }
+
     let next: IteratorResult<Frame>
     try {
-      if (toolStep.hostCalls > 0) {
+      if (released) {
+        trace(`exec order: running held execId=${released.execId} callId=${released.callId ?? "-"}`)
+        next = released.read
+      } else if (waitForOrderMs !== undefined) {
+        const read = await nextFrameWithin(session, waitForOrderMs)
+        if (!read) continue
+        next = read
+      } else if (toolStep.hostCalls > 0) {
         const held = await nextFrameWithin(session, HELD_TOOL_STEP_QUIET_MS)
         if (!held) {
           closeHeldToolStep(`quiet ${HELD_TOOL_STEP_QUIET_MS}ms`)
@@ -4150,6 +4220,7 @@ export async function pump(
       continue
     }
     const iu = asm.interaction_update as Record<string, unknown> | undefined
+    if (!iu?.heartbeat) order.progressAt = Date.now()
     // Output after a step's tool calls belongs to the next step.
     if (toolStep.hostCalls > 0 && (iu?.text_delta || iu?.thinking_delta || iu?.turn_ended)) {
       closeHeldToolStep("model output", Promise.resolve(next))
@@ -4268,6 +4339,7 @@ export async function pump(
       keepUndeliveredHostNote(session)
       const turnEnded = iu.turn_ended as Record<string, unknown>
       session.carriedCheckpoint = undefined
+      session.toolCallOrder = undefined
       endingTurns.add(session)
       const injectionIds = (session.steerInjections ?? []).map((injection) => injection.id)
       const undelivered = (session.steerInjections ?? []).filter((injection) => injection.state !== "delivered")
@@ -4423,6 +4495,11 @@ export async function pump(
           editToolCalls.set(callId, { path: editPath })
         }
         if (display) noteCursorWaitStarted(session, callId, display.variant, display.args)
+        noteToolCallStarted(
+          order,
+          callId,
+          display ? displayToolCallMutates(display.variant, display.args, display.preferredToolName) : true,
+        )
         const callIdLog = callId.replace(/\r?\n/g, "\\n")
         let wireFields = ""
         if (variant === "?") {
@@ -4450,6 +4527,7 @@ export async function pump(
       if (callId) session.editToolCalls?.delete(callId)
       if (callId) session.resultsAfterCheckpoint?.awaiting.delete(callId)
       if (callId) noteCursorWaitEnded(session, callId)
+      noteToolCallFinished(order, callId)
       // If exec already claimed this call_id, display map entry is gone — skip.
       if (!callId || !session.displayToolCalls.has(callId)) {
         if (callId) {
@@ -4646,6 +4724,26 @@ export async function pump(
         // An edit's private prerequisite read is not the call's own request; its write is.
         if (displayCallId && !(parsed?.resultField === "read_result" && session.editToolCalls?.has(displayCallId))) {
           toolStep.resolved.add(displayCallId)
+        }
+        if (parsed) {
+          execMutates = noteToolCallExec(
+            order,
+            displayCallId,
+            toolExecMutates(parsed.toolName, parsed.args, parsed.resultField),
+            isShellResultField(parsed.resultField),
+          )
+          if (!released?.forced && toolExecMustWait(order, displayCallId, execMutates)) {
+            deferToolExec(order, { execId: parsed.id, callId: displayCallId, mutating: execMutates, read: next })
+            trace(
+              `exec order: held execId=${parsed.id} callId=${displayCallId ?? "-"} toolName=${parsed.toolName} ` +
+                `mutating=${execMutates} behind=[${order.calls.map((entry) => entry.callId).join(",")}]`,
+            )
+            if (toolStep.hostCalls > 0) {
+              closeHeldToolStep("a call waits for this step's results")
+              return
+            }
+            continue
+          }
         }
         if (parsed) {
           const executableToolName = resolveCustomWebToolAlias(parsed.toolName, session.toolAliases)
