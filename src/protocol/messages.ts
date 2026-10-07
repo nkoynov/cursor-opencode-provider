@@ -571,12 +571,17 @@ export function createMessageTypes(): protobuf.Root {
     { id: 1, name: "path", type: "string" },
     { id: 2, name: "reason", type: "string" },
   ])
+  addType(root, "ReadRejected", [
+    { id: 1, name: "path", type: "string" },
+    { id: 2, name: "reason", type: "string" },
+  ])
   addType(
     root,
     "ReadResult",
     [
       { id: 1, name: "success", type: "ReadSuccess" },
       { id: 2, name: "error", type: "ReadError" },
+      { id: 3, name: "rejected", type: "ReadRejected" },
       { id: 4, name: "file_not_found", type: "ReadFileNotFound" },
       { id: 5, name: "permission_denied", type: "ReadPermissionDenied" },
       { id: 6, name: "invalid_file", type: "ReadInvalidFile" },
@@ -584,7 +589,7 @@ export function createMessageTypes(): protobuf.Root {
     [
       {
         name: "result",
-        fields: ["success", "error", "file_not_found", "permission_denied", "invalid_file"],
+        fields: ["success", "error", "rejected", "file_not_found", "permission_denied", "invalid_file"],
       },
     ],
   )
@@ -679,6 +684,10 @@ export function createMessageTypes(): protobuf.Root {
     { id: 4, name: "error", type: "string" },
     { id: 5, name: "is_readonly", type: "bool" },
   ])
+  addType(root, "WriteRejected", [
+    { id: 1, name: "path", type: "string" },
+    { id: 2, name: "reason", type: "string" },
+  ])
   addType(
     root,
     "WriteResult",
@@ -686,8 +695,9 @@ export function createMessageTypes(): protobuf.Root {
       { id: 1, name: "success", type: "WriteSuccess" },
       { id: 3, name: "permission_denied", type: "WritePermissionDenied" },
       { id: 5, name: "error", type: "WriteError" },
+      { id: 6, name: "rejected", type: "WriteRejected" },
     ],
-    [{ name: "result", fields: ["success", "permission_denied", "error"] }],
+    [{ name: "result", fields: ["success", "permission_denied", "error", "rejected"] }],
   )
 
   // agent.v1 Pi exec results. Cursor places Pi requests at ExecServerMessage
@@ -782,14 +792,25 @@ export function createMessageTypes(): protobuf.Root {
     { id: 1, name: "path", type: "string" },
     { id: 2, name: "error", type: "string" },
   ])
+  addType(root, "DeletePermissionDenied", [
+    { id: 1, name: "path", type: "string" },
+    { id: 2, name: "client_visible_error", type: "string" },
+    { id: 3, name: "is_readonly", type: "bool" },
+  ])
+  addType(root, "DeleteRejected", [
+    { id: 1, name: "path", type: "string" },
+    { id: 2, name: "reason", type: "string" },
+  ])
   addType(
     root,
     "DeleteResult",
     [
       { id: 1, name: "success", type: "DeleteSuccess" },
+      { id: 4, name: "permission_denied", type: "DeletePermissionDenied" },
+      { id: 6, name: "rejected", type: "DeleteRejected" },
       { id: 7, name: "error", type: "DeleteError" },
     ],
-    [{ name: "result", fields: ["success", "error"] }],
+    [{ name: "result", fields: ["success", "permission_denied", "rejected", "error"] }],
   )
 
   addType(root, "LsArgs", [
@@ -812,14 +833,19 @@ export function createMessageTypes(): protobuf.Root {
     { id: 1, name: "path", type: "string" },
     { id: 2, name: "error", type: "string" },
   ])
+  addType(root, "LsRejected", [
+    { id: 1, name: "path", type: "string" },
+    { id: 2, name: "reason", type: "string" },
+  ])
   addType(
     root,
     "LsResult",
     [
       { id: 1, name: "success", type: "LsSuccess" },
       { id: 2, name: "error", type: "LsError" },
+      { id: 3, name: "rejected", type: "LsRejected" },
     ],
-    [{ name: "result", fields: ["success", "error"] }],
+    [{ name: "result", fields: ["success", "error", "rejected"] }],
   )
 
   addType(root, "ShellArgs", [
@@ -907,10 +933,11 @@ export function createMessageTypes(): protobuf.Root {
       { id: 2, name: "failure", type: "ShellFailure" },
       { id: 3, name: "timeout", type: "ShellTimeout" },
       { id: 4, name: "rejected", type: "ShellRejected" },
+      { id: 7, name: "permission_denied", type: "ShellPermissionDenied" },
       { id: 102, name: "is_background", type: "bool" },
       { id: 104, name: "pid", type: "uint32" },
     ],
-    [{ name: "result", fields: ["success", "failure", "timeout", "rejected"] }],
+    [{ name: "result", fields: ["success", "failure", "timeout", "rejected", "permission_denied"] }],
   )
   addType(root, "DiagnosticsError", [
     { id: 1, name: "path", type: "string" },
@@ -1168,6 +1195,14 @@ export function createMessageTypes(): protobuf.Root {
     ],
     [{ name: "content", fields: ["text", "image"] }],
   )
+  addType(root, "McpRejected", [
+    { id: 1, name: "reason", type: "string" },
+    { id: 2, name: "is_readonly", type: "bool" },
+  ])
+  addType(root, "McpPermissionDenied", [
+    { id: 1, name: "error", type: "string" },
+    { id: 2, name: "is_readonly", type: "bool" },
+  ])
   addType(root, "McpSuccess", [
     { id: 1, name: "content", type: "McpToolResultContentItem", repeated: true },
     { id: 2, name: "is_error", type: "bool" },
@@ -1179,8 +1214,10 @@ export function createMessageTypes(): protobuf.Root {
     [
       { id: 1, name: "success", type: "McpSuccess" },
       { id: 2, name: "error", type: "McpError" },
+      { id: 3, name: "rejected", type: "McpRejected" },
+      { id: 4, name: "permission_denied", type: "McpPermissionDenied" },
     ],
-    [{ name: "result", fields: ["success", "error"] }],
+    [{ name: "result", fields: ["success", "error", "rejected", "permission_denied"] }],
   )
 
   // McpToolDefinition — agent.v1 shape for RequestContext.tools (#7) and

@@ -15,6 +15,13 @@ import { isExchangeableApiKey } from "./auth.js"
 import { resolveBearerToken } from "./auth-renewal.js"
 import { buildRunRequest, buildHeartbeat, buildExecHeartbeat, buildCancelAction } from "./protocol/request.js"
 import { onHostInterrupt } from "./host-interrupt.js"
+import {
+  hostToolErrorText,
+  hostToolRefusal,
+  isHostToolInterrupted,
+  parseHostToolErrorEnvelope,
+  type HostToolError,
+} from "./tool-error-envelope.js"
 import { decodeFramePayload } from "./protocol/framing.js"
 import { debugWalkTurnEnded, decodeMessage, encodeMessage } from "./protocol/messages.js"
 import {
@@ -3116,6 +3123,7 @@ function continuationResultInput(
     shellOutcome: shellResult?.outcome,
     workspaceRoot: workspaceRootFromRequestContext(session.requestContext),
     images: r.error ? [] : execResultImages(pending.resultField, r.images),
+    refusal: hostToolRefusal(r.hostError),
   }
 }
 
@@ -5231,6 +5239,7 @@ type ExtractedToolResult = {
   toolName: string
   output: string
   error?: string
+  hostError?: HostToolError
   /** Host media parts of this result (own content, or the trailing media message). */
   media?: unknown[]
   /** `media` decoded for the exec result, with content hashes in the same order. */
@@ -5250,7 +5259,7 @@ function extractToolResults(prompt: LanguageModelV3CallOptions["prompt"]): Extra
       const toolCallId = (p.toolCallId as string) ?? ""
       const parsed = parseExecIdFromToolCallId(toolCallId)
       if (!parsed) continue
-      const { text, isError } = toolResultOutputToText(p.output)
+      const { text, isError, hostError } = toolResultOutputToText(p.output)
       const media = toolResultOutputMedia(p.output)
       out.push({
         toolCallId,
@@ -5259,6 +5268,7 @@ function extractToolResults(prompt: LanguageModelV3CallOptions["prompt"]): Extra
         toolName: (p.toolName as string) ?? "mcp",
         output: text,
         error: isError ? text : undefined,
+        ...(hostError ? { hostError } : {}),
         ...(media.length > 0 ? { media } : {}),
       })
     }
@@ -5386,29 +5396,12 @@ async function decodeTrailingToolImages(
   }))
 }
 
-// A tool OpenCode interrupted (user stop, declined permission). OpenCode 2 and 1.x's newer session
-// engine (`type: "unknown"`) replay a failed tool as plain text holding exactly `{ error, content }`,
-// the same output type as a completed tool's; 1.x's classic loop sends plain error text.
+// A tool OpenCode interrupted (user stop, declined permission). 1.x's classic loop sends plain error text.
 const OPENCODE_INTERRUPTED_TEXT = new Set(["Tool execution aborted", "[Tool execution was interrupted]"])
 
-function isOpenCodeInterruptedEnvelope(output: string): boolean {
-  if (!output.startsWith('{"error":{')) return false
-  let envelope: unknown
-  try {
-    envelope = JSON.parse(output)
-  } catch {
-    return false
-  }
-  const { error, content, ...rest } = envelope as Record<string, unknown>
-  if (Object.keys(rest).length > 0 || !Array.isArray(content) || JSON.stringify(envelope) !== output) return false
-  const { type, message } = error as Record<string, unknown>
-  if (typeof type !== "string" || typeof message !== "string") return false
-  return type === "aborted" || message === "Tool execution interrupted" || message.startsWith("Tool execution interrupted: ")
-}
-
 function isInterruptedToolResult(result: ExtractedToolResult): boolean {
-  return isOpenCodeInterruptedEnvelope(result.output)
-    || (result.error !== undefined && OPENCODE_INTERRUPTED_TEXT.has(result.error.trim()))
+  if (result.hostError) return isHostToolInterrupted(result.hostError)
+  return result.error !== undefined && OPENCODE_INTERRUPTED_TEXT.has(result.error.trim())
 }
 
 function plainUserText(message: LanguageModelV3CallOptions["prompt"][number]): string | undefined {
@@ -5661,14 +5654,17 @@ export function hasApprovedUncorrelatedPlanStageResult(
   return false
 }
 
-function toolResultOutputToText(output: unknown): { text: string; isError: boolean } {
+function toolResultOutputToText(output: unknown): { text: string; isError: boolean; hostError?: HostToolError } {
   if (output == null) return { text: "", isError: false }
   if (typeof output === "string") return { text: output, isError: false }
   const o = output as Record<string, unknown>
   // LanguageModelV3 tool-result output: { type: "text"|"json"|"error-text"|..., value }
   const isError = typeof o.type === "string" && (o.type as string).startsWith("error")
   if (o.type === "text" || o.type === "error-text") {
-    return { text: String(o.value ?? ""), isError }
+    const text = String(o.value ?? "")
+    const hostError = parseHostToolErrorEnvelope(text)
+    if (hostError) return { text: hostToolErrorText(hostError), isError: true, hostError }
+    return { text, isError }
   }
   if (o.type === "json" || o.type === "error-json") {
     return { text: JSON.stringify(o.value ?? null), isError }
