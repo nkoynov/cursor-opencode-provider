@@ -70,10 +70,10 @@ Capture transcript and side effects; confirm no retries/duplicate follow-ups.
 
 For one cold session followed by a normal continuation:
 
-- lifecycle call may arrive with `incomingTools=0`, but wire advertisement equals the full sibling catalog;
-- lifecycle and real Run use identical RequestContext hashes;
+- a compaction call may arrive with `incomingTools=0`, but wire advertisement equals the full sibling catalog; a title or other zero-tool call advertises no tools and does not wait for the catalog;
+- compaction and real Run use identical RequestContext hashes;
 - tool order and definitions are byte-stable;
-- `allowTools=false` only affects execution permission, not advertisement;
+- with tools present, `allowTools=false` only affects execution permission, not advertisement;
 - subsequent diagnostics show warm continuity/cache reads rather than a catalog-induced rebuild.
 
 Use `docs/cache-log-runbook.md` for exact fields and handoff evidence.
