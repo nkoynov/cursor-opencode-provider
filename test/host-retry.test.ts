@@ -1,5 +1,14 @@
 import { afterEach, describe, expect, it } from "bun:test"
+import { EventEmitter } from "node:events"
+import fs from "node:fs"
+import http2 from "node:http2"
+import os from "node:os"
+import path from "node:path"
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
+import { setHostCacheDirOverride } from "../src/context/paths.js"
+import { encodeFrame } from "../src/protocol/framing.js"
+import { decodeMessage } from "../src/protocol/messages.js"
+import { closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
 import {
   CursorRetryExhaustedError,
   CursorServerError,
@@ -178,6 +187,68 @@ describe("final failures OpenCode must not retry", () => {
       expect(takeFinalFailure("ses_refused", `${error?.message}`)).toBe(true)
     } finally {
       globalThis.fetch = realFetch
+    }
+  })
+
+  it("records it for a tool-less step, whose Run is not bound to the session", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-host-retry-"))
+    setHostCacheDirOverride(path.join(root, "cache"))
+    const connect = http2.connect
+    let runs = 0
+    ;(http2 as any).connect = () => {
+      const session: any = Object.assign(new EventEmitter(), {
+        closed: false,
+        destroyed: false,
+        request() {
+          const stream: any = Object.assign(new EventEmitter(), {
+            closed: false,
+            destroyed: false,
+            rstCode: 0,
+            write(data: Uint8Array) {
+              if (decodeMessage<any>("AgentClientMessage", data.subarray(5)).run_request) {
+                runs++
+                setImmediate(() => {
+                  stream.emit("response", { ":status": 200 })
+                  stream.emit("data", encodeFrame(0x02, new TextEncoder().encode(refusalEnvelope)))
+                })
+              }
+              return true
+            },
+            end() {},
+            close() { stream.closed = true },
+            destroy() { stream.destroyed = true; stream.closed = true; stream.emit("close") },
+          })
+          return stream
+        },
+        ping(callback: (error: Error | null) => void) { callback(null); return true },
+        close() { session.closed = true },
+        destroy() { session.destroyed = true },
+      })
+      setImmediate(() => session.emit("connect"))
+      return session
+    }
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async () => { throw new Error("no network in this test") }) as unknown as typeof fetch
+    try {
+      const model = createCursor({
+        name: "cursor", accessToken: "token", agentBaseURL: "https://agentn.us.api5.cursor.sh", workspaceRoot: root,
+      }).languageModel("claude-opus-5-5")
+      const result = await model.doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "Summarize what you did." }] }],
+        headers: { "x-opencode-session-id": "ses_max_steps" },
+        toolChoice: { type: "none" },
+      } as LanguageModelV3CallOptions)
+      const error = await (async () => { for await (const _ of result.stream) { /* drain */ } })()
+        .then(() => undefined, (failure: unknown) => failure as Error)
+      expect(runs).toBe(1)
+      expect(error?.message).toStartWith("Cursor refused the request: Too many computers.")
+      expect(takeFinalFailure("ses_max_steps", `${error?.message}`)).toBe(true)
+    } finally {
+      globalThis.fetch = realFetch
+      ;(http2 as any).connect = connect
+      closeCachedHttp2SessionsForTests()
+      setHostCacheDirOverride(undefined)
+      fs.rmSync(root, { recursive: true, force: true })
     }
   })
 })
