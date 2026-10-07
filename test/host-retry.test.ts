@@ -4,7 +4,7 @@ import fs from "node:fs"
 import http2 from "node:http2"
 import os from "node:os"
 import path from "node:path"
-import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
+import { APICallError, type LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { encodeFrame } from "../src/protocol/framing.js"
 import { decodeMessage } from "../src/protocol/messages.js"
@@ -62,6 +62,14 @@ describe("final failures OpenCode must not retry", () => {
     expect(isFinalForHost(new CursorRetryExhaustedError(3, new CursorTransportError("Cursor transport failure (ECONNRESET)")))).toBe(false)
     expect(isFinalForHost(retrySuppressedError(capacity(), "after visible output", 1, 6))).toBe(false)
     expect(isFinalForHost(new Error("Cursor refused the request: x"))).toBe(false)
+    const overflow = new APICallError({
+      message: "prompt is too long: rebasing this session onto Cursor needs ~900000 tokens",
+      url: "cursor://agent.v1.AgentService/Run",
+      requestBodyValues: {},
+      statusCode: 413,
+      isRetryable: false,
+    })
+    expect(isFinalForHost(overflow)).toBe(false)
   })
 
   it("vetoes once, for the recorded session and message only", () => {
