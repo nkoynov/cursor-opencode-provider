@@ -326,12 +326,23 @@ export type SessionModelRequest = {
   headers: Record<string, string>
 }
 
+/** OpenCode's proposed retry of a failed step; replacing `decision` changes it. */
+export type SessionRetry = {
+  readonly sessionID: string
+  readonly agent: string
+  readonly model: { providerID: string; id: string; variant?: string }
+  readonly error: { readonly type: string; readonly message: string }
+  readonly attempt: number
+  decision: { retry: false } | { retry: true; delay: number }
+}
+
 export type SessionHooks = {
   readonly context: SessionContext
   readonly compaction: SessionCompaction
   readonly generate: SessionGenerate
   readonly title: SessionTitle
   readonly "model.request": SessionModelRequest
+  readonly retry: SessionRetry
 }
 
 /** Only the `location.directory` field we actually read. */
