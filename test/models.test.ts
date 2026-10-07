@@ -1052,6 +1052,133 @@ describe("paramsImplyMaxMode", () => {
     expect(paramsImplyMaxMode([{ id: "context", value: "300k" }])).toBe(false)
     expect(paramsImplyMaxMode([])).toBe(false)
   })
+
+  it("measures a tier against the model's base window", () => {
+    const base = (maxContext?: number) => ({ id: "m", variants: [], ...(maxContext ? { maxContext } : {}) })
+    expect(paramsImplyMaxMode([{ id: "context", value: "500k" }], base(256_000))).toBe(true)
+    expect(paramsImplyMaxMode([{ id: "context", value: "256k" }], base(256_000))).toBe(false)
+    expect(paramsImplyMaxMode([{ id: "context", value: "500k" }], base())).toBe(false)
+    expect(paramsImplyMaxMode([{ id: "context", value: "500k" }])).toBe(false)
+    expect(paramsImplyMaxMode([{ id: "context", value: "1m" }], base(1_000_000))).toBe(true)
+    expect(paramsImplyMaxMode([{ id: "effort", value: "high" }], base(256_000))).toBe(false)
+  })
+})
+
+describe("max mode for long-context variants (Grok, GPT, Opus)", () => {
+  // Shaped like Cursor's AvailableModels: Grok 4.7's max tier is 500k over a
+  // 256k base and repeats the base display names (its defaults are the Fast
+  // variants); GPT-5.6 Sol and Opus 5.5 put 1m over 272k and 300k.
+  function cursorEntry(opts: {
+    name: string
+    displayName: string
+    effortId: string
+    base: string
+    long: string
+    longLabel: string
+    defaultFast: boolean
+  }) {
+    const variants = []
+    for (const context of [opts.base, opts.long]) {
+      for (const fast of [false, true]) {
+        const label = context === opts.long ? opts.longLabel : ""
+        variants.push({
+          displayName: `${opts.displayName}${label} High${fast ? " Fast" : ""}`,
+          isDefaultNonMaxConfig: context === opts.base && fast === opts.defaultFast,
+          isDefaultMaxConfig: context === opts.long && fast === opts.defaultFast,
+          parameterValues: [
+            { id: "context", value: context },
+            { id: opts.effortId, value: "high" },
+            { id: "fast", value: String(fast) },
+          ],
+        })
+      }
+    }
+    return {
+      name: opts.name,
+      clientDisplayName: opts.displayName,
+      supportsAgent: true,
+      supportsThinking: true,
+      supportsMaxMode: true,
+      variants,
+    }
+  }
+  const models = mapAvailableModelsResponse({
+    models: [
+      cursorEntry({ name: "grok-4.7", displayName: "Grok 4.7", effortId: "reasoning_effort", base: "256k", long: "500k", longLabel: "", defaultFast: true }),
+      cursorEntry({ name: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", effortId: "reasoning", base: "272k", long: "1m", longLabel: " 1M", defaultFast: false }),
+      cursorEntry({ name: "claude-opus-5-5", displayName: "Claude Opus 5.5", effortId: "effort", base: "300k", long: "1m", longLabel: " 1M", defaultFast: false }),
+    ],
+  })
+  const [grok, gpt, opus] = models
+
+  it("sets max mode for the variants above each model's base window only", () => {
+    const tiers = (model: (typeof models)[number]) =>
+      model.variants.map((variant) => [
+        variant.parameterValues.map((parameter) => parameter.value).join(","),
+        paramsImplyMaxMode(variant.parameterValues, model),
+      ])
+    expect(grok.maxContext).toBe(256_000)
+    expect(tiers(grok)).toEqual([
+      ["256k,high,false", false],
+      ["256k,high,true", false],
+      ["500k,high,false", true],
+      ["500k,high,true", true],
+    ])
+    expect(tiers(gpt)).toEqual([
+      ["272k,high,false", false],
+      ["272k,high,true", false],
+      ["1m,high,false", true],
+      ["1m,high,true", true],
+    ])
+    expect(tiers(opus)).toEqual([
+      ["300k,high,false", false],
+      ["300k,high,true", false],
+      ["1m,high,false", true],
+      ["1m,high,true", true],
+    ])
+  })
+
+  it("sends max mode for every catalog variant whose context exceeds the base window", () => {
+    const config = modelsToConfig(models)
+    const wire: Record<string, boolean> = {}
+    for (const [id, entry] of Object.entries(config)) {
+      const model = models.find((m) => m.id === (entry.options?.[CURSOR_WIRE_MODEL_ID_KEY] ?? id))!
+      for (const [name, options] of Object.entries(entry.variants as Record<string, Record<string, unknown>>)) {
+        const picked = extractCursorVariantParameters(options)
+        const params = resolveVariantParameters(model, { picked, maxMode: false })
+        const maxMode = resolveVariantMaxMode(params, { picked, maxMode: false, model })
+        const context = params.find((p) => p.id === "context")!.value
+        expect(maxMode).toBe(context === "500k" || context === "1m")
+        wire[`${id} | ${name}`] = maxMode
+      }
+    }
+    expect(wire).toMatchObject({
+      "grok-4.7 | Grok 4.7 High": false,
+      "grok-4.7 | Grok 4.7 High 500k": true,
+      "gpt-5.6-sol | GPT-5.6 Sol High": false,
+      "gpt-5.6-sol-1m | GPT-5.6 Sol 1M High": true,
+      "claude-opus-5-5 | Claude Opus 5.5 High": false,
+      "claude-opus-5-5-1m | Claude Opus 5.5 1M High": true,
+    })
+    expect(Object.keys(wire)).toHaveLength(12)
+  })
+
+  it("lands a maxMode hint on Grok's 500k tier", () => {
+    const params = resolveVariantParameters(grok, { maxMode: true })
+    expect(params).toEqual([
+      { id: "context", value: "500k" },
+      { id: "reasoning_effort", value: "high" },
+      { id: "fast", value: "false" },
+    ])
+    expect(resolveVariantMaxMode(params, { maxMode: true, model: grok })).toBe(true)
+  })
+
+  it("keeps the default variants out of max mode", () => {
+    for (const model of models) {
+      const params = resolveVariantParameters(model, {})
+      expect(resolveVariantMaxMode(params, { model })).toBe(false)
+    }
+  })
 })
 
 describe("parseCursorContextLimit", () => {
