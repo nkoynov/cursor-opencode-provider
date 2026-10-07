@@ -5462,19 +5462,25 @@ function trailingSteer(
   return { start, messages, hostNote: joinNotes(hostNotes), injections }
 }
 
-/** The steer's injections without the messages already injected while Cursor worked on the step. */
-function remainingRunInjections(
+/**
+ * The steer's injections without the messages already injected while Cursor worked on the step.
+ * Those were sent first, so a text that occurs again is matched from the end.
+ */
+export function remainingRunInjections(
   injections: readonly RunInjection[],
   remainingMessages: readonly string[],
 ): RunInjection[] {
   const left = [...remainingMessages]
-  return injections.filter((injection) => {
-    if (injection.hostNote) return true
-    const at = left.indexOf(injection.text)
-    if (at < 0) return false
-    left.splice(at, 1)
-    return true
-  })
+  const kept: RunInjection[] = []
+  for (let i = injections.length - 1; i >= 0; i--) {
+    const injection = injections[i]!
+    if (injection.hostNote) kept.unshift(injection)
+    else if (left.at(-1) === injection.text) {
+      left.pop()
+      kept.unshift(injection)
+    }
+  }
+  return kept
 }
 
 /**

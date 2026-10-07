@@ -8,6 +8,7 @@ import {
   FRESH_TURN_PENDING_CANCEL_REASON,
   mayBeUserStep,
   pumpWithRecovery,
+  remainingRunInjections,
   resetTurnStateForTests,
   type CursorRunRecovery,
 } from "../src/language-model.js"
@@ -164,6 +165,13 @@ describe("mid-turn user message after a complete step", () => {
     expect(steered.messages).toEqual(["also check 3.ts", "then stop"])
     expect(steered.injections).toEqual([{ text: "also check 3.ts" }, { text: NOTE, hostNote: true }, { text: "then stop" }])
     expect(steered.results.at(-1)!.note).toBeUndefined()
+  })
+
+  it("leaves out the messages injected while Cursor worked on the step, keeping a later message with the same text", () => {
+    const note = { text: NOTE, hostNote: true as const }
+    expect(remainingRunInjections([{ text: "x" }, note, { text: "x" }], ["x"])).toEqual([note, { text: "x" }])
+    expect(remainingRunInjections([{ text: "a" }, note, { text: "b" }], ["b"])).toEqual([note, { text: "b" }])
+    expect(remainingRunInjections([{ text: "a" }, note, { text: "b" }], [])).toEqual([note])
   })
 
   it("takes a completed result that only looks like OpenCode's interrupted-tool error for a result", () => {
