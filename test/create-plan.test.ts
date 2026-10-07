@@ -37,6 +37,7 @@ import {
   hostGlobalDataDir,
   hostPlansDir,
   HOST_PATH_BRIDGE,
+  setNativePlansDir,
   type OpenCodePathBridge,
 } from "../src/context/paths.js"
 
@@ -48,6 +49,8 @@ let previousBridge: unknown
 
 beforeEach(() => {
   resetActiveCursorModesForTests()
+  // An OpenCode 2 plugin set up by another test file without cleanup leaves its Plan directory registered.
+  setNativePlansDir(undefined)
   workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-plan-ws-"))
   previousHome = process.env.HOME
   previousXdgData = process.env.XDG_DATA_HOME
