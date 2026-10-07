@@ -3,6 +3,8 @@ import protobuf from "protobufjs"
 import { encodeMessage, decodeMessage } from "../src/protocol/messages.js"
 import {
   advertisedToolNamesFromDescriptors,
+  displayMcpToolError,
+  displayNativeDiscoveryError,
   applyTodoMerge,
   extractExecDisplayCallId,
   extractProtobufSubmessage,
@@ -29,6 +31,44 @@ function encodeCanonicalToolCall(
 }
 
 describe("tool-call-bridge", () => {
+  it("decodes native discovery errors without replaying discovery as host execution", () => {
+    // Independent wire: ToolCall.discovery #44, result #2, error #2, text #1.
+    const writer = protobuf.Writer.create()
+    writer.uint32((44 << 3) | 2).fork()
+    writer.uint32((2 << 3) | 2).fork()
+    writer.uint32((2 << 3) | 2).fork()
+    writer.uint32((1 << 3) | 2).string("CreatePlan is already available directly")
+    writer.ldelim().ldelim().ldelim()
+    const decoded = decodeMessage<Record<string, unknown>>("ToolCall", writer.finish())
+    expect(displayNativeDiscoveryError(decoded)).toBe("CreatePlan is already available directly")
+    expect(displayMcpToolError(decoded)).toBeUndefined()
+    expect(resolveBridgedOpenCodeToolCall(parseDisplayToolCall("discovery-error", decoded)!, ["read"]))
+      .toBeUndefined()
+    expect(displayNativeDiscoveryError({ get_mcp_tools_tool_call: { result: { success: { content: "Error: appears in a tool description" } } } }))
+      .toBeUndefined()
+    expect(displayNativeDiscoveryError(undefined)).toBeUndefined()
+  })
+  it("preserves server-side dynamic-call errors that have no started or exec frame", () => {
+    // Independent wire fixture: ToolCall.mcp (#15), result (#2), error (#2),
+    // title (#1), detail (#2), matching a server-side invocation rejection.
+    const detail = "Missing required fields: namespace, toolName"
+    const writer = protobuf.Writer.create()
+    writer.uint32((15 << 3) | 2).fork()
+    writer.uint32((2 << 3) | 2).fork()
+    writer.uint32((2 << 3) | 2).fork()
+    writer.uint32((1 << 3) | 2).string("Tool execution error")
+    writer.uint32((2 << 3) | 2).string(detail)
+    writer.ldelim().ldelim().ldelim()
+    const decoded = decodeMessage<Record<string, unknown>>("ToolCall", writer.finish())
+    expect(displayMcpToolError(decoded)).toBe(`Tool execution error: ${detail}`)
+    expect(displayMcpToolError({ mcp_tool_call: { result: { error: { error: "Legacy error" } } } }))
+      .toBe("Legacy error")
+    expect(displayMcpToolError({ mcp_tool_call: { result: { success: {} } } })).toBeUndefined()
+    expect(displayMcpToolError(undefined)).toBeUndefined()
+    const display = parseDisplayToolCall("rejected-call", decoded)!
+    expect(resolveBridgedOpenCodeToolCall(display, ["grep"])).toBeUndefined()
+  })
+
   it("decodes UpdateTodosToolCall oneof and maps to todowrite", () => {
     const encoded = encodeMessage("ToolCall", {
       tool_call_id: "tc_todos",
@@ -77,8 +117,8 @@ describe("tool-call-bridge", () => {
       update_todos_tool_call: {
         args: {
           todos: [
-            { id: "a", content: "ocp-token-a", status: "completed" },
-            { id: "b", content: "ocp-token-b", status: "completed" },
+            { id: "a", content: "sv-token-a", status: "completed" },
+            { id: "b", content: "sv-token-b", status: "completed" },
           ],
         },
         result: { success: { todos: [] } },
@@ -86,8 +126,8 @@ describe("tool-call-bridge", () => {
     })
 
     expect(display?.args.todos).toEqual([
-      { id: "a", content: "ocp-token-a", status: "completed", priority: "medium" },
-      { id: "b", content: "ocp-token-b", status: "completed", priority: "medium" },
+      { id: "a", content: "sv-token-a", status: "completed", priority: "medium" },
+      { id: "b", content: "sv-token-b", status: "completed", priority: "medium" },
     ])
   })
 

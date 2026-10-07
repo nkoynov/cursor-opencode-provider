@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "bun:test"
-import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
+import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { resetTurnStateForTests } from "../src/language-model.js"
 import { createCursor } from "../src/index.js"
@@ -99,7 +99,7 @@ async function stream(prompt: Prompt): Promise<{ parts: Array<{ type: string }>;
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     fetched.push(String(input))
     throw new Error("no network in this test")
-  }) as typeof fetch
+  }) as unknown as typeof fetch
   try {
     const model = createCursor({ name: "cursor", accessToken: "token" }).languageModel("cursor-test")
     const result = await model.doStream({
@@ -108,7 +108,7 @@ async function stream(prompt: Prompt): Promise<{ parts: Array<{ type: string }>;
       tools: [{ type: "function", name: "read", description: "Read a file", inputSchema: { type: "object", properties: {} } }],
     } as LanguageModelV3CallOptions)
     const parts: Array<{ type: string }> = []
-    for await (const part of result.stream) parts.push(part)
+    for await (const part of result.stream as unknown as AsyncIterable<LanguageModelV3StreamPart>) parts.push(part)
     return { parts, fetched }
   } finally {
     globalThis.fetch = realFetch

@@ -407,6 +407,28 @@ describe("occupancyStepUsage", () => {
     expect(steps.map(measuredPrompt)).toEqual(occupancy)
   })
 
+  it("distinguishes stale category snapshots from occupancy accounting errors", () => {
+    for (const usedTokens of [20_347, 40_000]) {
+      const stale = {
+        usedTokens, maxTokens: 256_000,
+        breakdown: {
+          totalUsedTokens: 36_122, maxTokens: 256_000,
+          categories: [{ id: "conversation", label: "Conversation", estimatedTokens: 36_122 }],
+        },
+      }
+      const usage = occupancyStepUsage(stale, newOccupancyUsageLedger(details(36_122)))
+      const validation = formatTurnUsageValidation(occupancyValidationCounters(usage), usage, stale)
+      expect(validation).toContain("status=ok")
+      expect(validation).toContain(`sentTotal=${usedTokens} totalMatch=true`)
+      expect(validation).toContain("breakdownTotal=36122 categorySum=36122 breakdownMatch=stale")
+      expect(formatCursorTokenCategories(stale)).toBe("unavailable")
+      const malformed = { ...stale, breakdown: { ...stale.breakdown, totalUsedTokens: 36_123 } }
+      const malformedUsage = occupancyStepUsage(malformed, newOccupancyUsageLedger(details(36_122)))
+      expect(formatTurnUsageValidation(occupancyValidationCounters(malformedUsage), malformedUsage, malformed))
+        .toContain("status=mismatch")
+    }
+  })
+
   it("validates the TurnEnded finish against what it sends, not against request aggregates", () => {
     const current = {
       usedTokens: 89_575,
@@ -463,6 +485,26 @@ describe("Cursor cache diagnostics", () => {
       '{"system_prompt":1000,"tools":9000,"conversation":35000}',
     )
     expect(formatCursorTokenCategories(undefined)).toBe("unavailable")
+  })
+
+  it("does not compare categories retained from an older occupancy snapshot", () => {
+    for (const [after, before] of [
+      [{ ...current, usedTokens: 20_347 }, prior],
+      [current, { ...prior, usedTokens: 20_347 }],
+    ]) {
+      const line = formatCursorCacheDiagnostics(
+        { inputTokens: 50_000, outputTokens: 100, cacheRead: 20_000, cacheWrite: 0, reasoningTokens: 0 },
+        after, before,
+        {
+          conversationId: "fixture-conversation", startedWithCheckpoint: true, requestContextReused: true,
+          requestContextHash: "fixture", checkpointUpdates: 2, tokenDetailUpdates: 2, pumpPasses: 1,
+          stepStarts: 1, stepCompletes: 1, displayToolCalls: 0, execRequests: 1,
+        },
+      )
+      expect(line).toContain("categoryDelta=unavailable")
+      expect(line).toContain("sameSizedCategoryTokens=unavailable")
+      expect(line).toContain("toolsCategoryChurn=none")
+    }
   })
 
   it("separates warm-prefix evidence from Cursor's aggregate cache ratio", () => {

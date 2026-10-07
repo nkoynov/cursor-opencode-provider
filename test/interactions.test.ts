@@ -7,6 +7,7 @@ import {
 } from "../src/protocol/interactions.js"
 import { pump } from "../src/language-model.js"
 import type { CursorSession, Frame } from "../src/session.js"
+import { sessionFixture } from "./session-fixture.js"
 
 type InteractionCase = {
   field: number
@@ -148,7 +149,7 @@ describe("interaction query headless responses", () => {
       expect(handled.variantName).toBe(tc.query)
       expect(handled.outcome).toBe(tc.outcome)
 
-      const response = decodeMessage<any>("AgentClientMessage", handled.reply)
+      const response = decodeMessage<any>("AgentClientMessage", handled.reply!)
         .interaction_response
       expect(response.id).toBe(42)
       expect(response[tc.response]).toBeDefined()
@@ -168,7 +169,7 @@ describe("interaction query headless responses", () => {
     const query = decodeMessage<any>("AgentServerMessage", payload).interaction_query
     const handled = handleInteractionQuery(query, payload)
     expect(handled.id).toBe(0)
-    const response = decodeMessage<any>("AgentClientMessage", handled.reply)
+    const response = decodeMessage<any>("AgentClientMessage", handled.reply!)
       .interaction_response
     expect(response.id).toBe(0)
     expect(response.switch_mode_request_response?.rejected).toBeDefined()
@@ -194,7 +195,7 @@ function fakeSession(payloads: Uint8Array[], writes: Uint8Array[]): CursorSessio
       ? { done: false, value: { flags: 0, payload: payloads[index++] } }
       : { done: true, value: undefined },
   }
-  return {
+  return sessionFixture({
     sessionId: "interaction-test-session",
     conversationId: "interaction-test-conversation",
     stream: {
@@ -205,6 +206,8 @@ function fakeSession(payloads: Uint8Array[], writes: Uint8Array[]): CursorSessio
     } as any,
     frames,
     pending: new Map(),
+    displayToolCalls: new Map(),
+    nextBridgedExecId: 900_000,
     blobs: new Map(),
     toolDescriptors: [],
     requestContext: {},
@@ -212,8 +215,7 @@ function fakeSession(payloads: Uint8Array[], writes: Uint8Array[]): CursorSessio
     allowTools: false,
     pumpActive: true,
     heartbeat: null,
-    expiresAt: Date.now() + 10_000,
-  }
+  })
 }
 
 describe("interaction query pump regression", () => {
@@ -230,7 +232,7 @@ describe("interaction query pump regression", () => {
     const controller = {
       enqueue(part: unknown) { parts.push(part) },
       error(error: Error) { streamError = error },
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 

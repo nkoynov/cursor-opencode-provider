@@ -1,5 +1,44 @@
 # Lessons
 
+- A deferred mode handoff cannot depend on a model obeying a stop instruction after Cursor's native mode has changed. Explicitly cancel the old Run, stop its heartbeat, retain the final checkpoint, and accept only the requested server cancellation as terminal before switching agents. Next-turn-only switches must still record the plan in the current Run. Native discovery errors remain diagnostics, never host execution.
+- A global invocation reminder is insufficient when discovery shows only an inner argument schema. Carry the exact outer identity in every dynamic definition without changing the tool's schema or guessing identities for rejected calls. Inspect saved Cursor calls: a server-side rejection has no client execution to repair.
+
+- Complete every advertised canonical shell field before required-key validation. Native shell requests have no description field; preserve a supplied description and derive one from a real command only when the schema requires it. Leave schemas without that field unchanged. File schemas and host-generated reminders must be normalized by OCP before reaching this provider; weakening the validator conceals those boundary defects.
+
+- Gate guidance about native interactions by the same canonical catalog as execution. Advertising AskQuestion as bridged without `question` invites a predictable refusal; silence about a missing `task`/`subagent` executor also invites unnecessary attempts. State the unavailable route explicitly while preserving supported planning interactions.
+
+- Tool-less calls still expose Cursor's native tools remotely. Give these calls an explicit text-only instruction that treats the supplied task as input, and make a refusal request the answer rather than repeat the embedded task. Before emitting an executable call, check normalized arguments against explicit required keys in the live catalog; a correlated error can request correction without creating an invalid host call. Verify that the catalog and normalized arguments use the same canonical contract through a real consumer session before claiming success; a local rejection test alone misses translation-boundary regressions.
+
+- A diagnostic must apply the same bounds as the value it checks.
+  `occupancyValidationCounters` used the prior checkpoint size as the cached
+  prefix unclamped; the usage builder clamps it to the input. When Cursor's
+  context shrank (26,823 → 26,766) the validator reported `status=mismatch`
+  (`rawCachedRatio=100.2%`) for correct usage.
+
+- A strict wire classifier must follow the extracted proto, not only the
+  fields it was written against. `KvServerMessage` carries
+  `span_context` (#4); `validKvWire` counted it as a second variant, so every
+  live Run hit `replay barrier: reason=unknown-or-malformed-frame` on its
+  first KV frame and lost automatic retry. The exec analyzer already skipped
+  its own `span_context` (#19). When a barrier fires on every Run, read the
+  frame against `agent.proto` before trusting the label.
+- Same class, next run: `InteractionUpdate` members `thinking_completed` #5
+  and `token_delta` #8 were not in the classifier's set, and
+  `ThinkingDeltaUpdate.thinking_style` #2 failed the one-field check. After
+  the KV fix they became the first barrier after every continuation write.
+  Admit only documented members that carry no output or state; keep the rest
+  as barriers.
+- The extracted proto can lag the live server: after that fix, 7-byte
+  `interaction_update` frames right after each tool-result write still
+  failed, and no declared member matched. Guessing field numbers wasted a
+  round. Debug runs now trace `replay frame unknown: layout=…` (field numbers
+  and wire types only) once per layout; read that before changing the set.
+- The layout trace resolved it in one run: `InteractionUpdate`
+  `message_started_at_ms` #25 beside the oneof, `tool_requests_listed` #27,
+  `tool_call_delta` #15, and top-level `AgentServerMessage.ttft_breakdown` #8.
+  The installed Cursor CLI bundle (`index.js`, `"InteractionUpdate|…"`
+  descriptors) has the current schema; the extracted agent.proto does not.
+
 - TurnEnded on a held Run is cumulative across every tool step, but the host
   finish only spans the last generation slice. Emitting `output_tokens` /
   `reasoning_tokens` there made Kilo tok/s (`(output+reasoning)/elapsed`) hit
@@ -330,14 +369,14 @@
   output without an output schema`. Live `execute` → `tools.todoread({})`
   hit that. Declare the schema (JSON Schema is a valid `ValueSchema`) or omit
   `output` from the result.
-- **Do not register permission-sensitive direct tools through the 2.0 public
+- **Do not register a second permission-sensitive web-search fallback through the 2.0 public
   `ToolContext`.** It exposes session/agent/message/call identity and progress,
   but no permission-request method. The provider aliases the host's native
   permission-gated `websearch` → `custom_websearch` and supplies an Exa backend
   through `ctx.websearch.transform`; a second direct fallback would bypass
-  `ask`. For the same reason, stock 2.0 must not advertise
-  `cursor_image_save`: refuse generation/binary writes before staging until the
-  public API can raise `external_directory` and `edit`.
+  `ask`. `cursor_image_save` is handle-only (opaque id, containment) and is
+  registered on 2.0 with catalog `permission: "edit"` so generated images can
+  be committed; do not turn it into a general file writer.
 
 ## 2026-09-15 — Cursor native todos mirror into host todowrite/todoread
 
@@ -506,3 +545,87 @@
   instructions after an intervening update. Matching the frozen first-turn
   prefix does not prove matching the checkpoint's latest effective context
   (`test/context-epoch.test.ts:158`).
+
+## 2026-10-04 — Describe provider behavior in OpenCode terms only
+
+- A fix motivated by a clone host must still be stated, implemented, and tested
+  as OpenCode behavior. "OpenCode 1.x-shaped host without `plan_enter`" and
+  "(Kilo, MiMo)" in the changelog, another host's agent names (`code`,
+  `checkpoint-writer`) in tests, and their approval wording in comments all
+  broke the boundary. Check the OpenCode source first: current 1.x has no
+  `plan_enter` at all, so the case was simply "OpenCode 1.x".
+- A structural bridge member may only override a native OpenCode rule, never
+  replace it. `planFile` without a native fallback left stock OpenCode with no
+  plan file; the provider now follows `Session.plan` itself
+  (`src/context/paths.ts` `hostPlanFilePath`).
+- "Host location" means each OpenCode version's own default, not the
+  operator's config or env: 1.x `Session.plan` (worktree `.opencode/plans`
+  in a git project), 2.0 the Plan directory `~/.opencode/plan`. Verify 2.0
+  through its documented `plugin/opencode2` entry in a dedicated
+  `OPENCODE_CONFIG_DIR`, never through a global config that loads the
+  classic entry.
+- Pin host binaries by absolute path in live runs. A tmux login shell put the
+  nvm OpenCode 1.x ahead of the installed 2.0, so "2.0" runs were 1.x runs.
+
+## 2026-10-04 — Prefer the host's review; ask only where it has none
+
+- Route plan approval to the host's own review first (a plan-stage tool, or
+  `plan_exit` under its `plan` agent). Only where the host has none does
+  CreatePlan ask through `question`, with upstream `PlanExitTool`'s wording.
+- 2026-10-05: the docs, the plan-mode reminder and the SwitchMode refusal had
+  drifted to "the provider never asks; the user switches agents" while the
+  code still asked. One policy, stated identically in code, reminders, README,
+  `docs/opencode-2.md`, `docs/cli-parity.md` and `AGENTS.md`.
+
+## 2026-10-04 — Reconcile state at the delivery boundary
+
+- A smaller catalog is insufficient evidence of a helper when the request
+  carries a result for the held parent's pending call. Check that correlation
+  before choosing isolation; a result followed by an agent reminder is still
+  owed to the parent Run (`test/fresh-turn-drain.test.ts`).
+- Serialize native-agent callbacks per session, including replacement requests.
+  An awaited callback must delete only its own queue entry, and a failed older
+  callback must not clear a newer request's Run ownership
+  (`test/switch-mode.test.ts`).
+- Encode approval replies without mutating execution state. Apply the mode
+  transition and queue the native switch only after delivery succeeds
+  (`test/create-plan.test.ts`).
+
+- Keep acceptance documents reusable: incorporate review findings as test
+  criteria in the checklist, and keep dated review results, approvals, and
+  validation counts in separate run reports.
+
+## 2026-10-05 — Read the whole frame tail before giving up a Run
+
+- A display `tool_call_completed` is Cursor closing a call it already has an
+  answer for; it never waits on the client. The fresh-turn drain stopped there
+  and superseded the Run ~150 ms before its checkpoint and `turn_ended`, so the
+  next Run resumed from the pre-plan checkpoint (live self-verify logs of
+  hosts that answer a plan review together with a new user message).
+  Stop draining only on frames Cursor waits on (new tool, exec, interaction).
+- A tool-less (title/summary) Run still narrates and tries tools; the refused
+  calls are invisible to the host, so the narration ends up in the title. Hold
+  tool-less text and drop the part that preceded a refused call.
+- Cursor can span one "step" over several tool calls and interactions, so
+  `step_completed` is not a text boundary; tool and interaction frames are.
+
+## 2026-10-06 — Token categories can lag occupancy
+
+- A checkpoint can carry updated occupancy with an older, internally consistent category breakdown. Keep the raw wire evidence, omit stale categories from current display/comparisons, and distinguish that from an incorrect usage partition or category sum.
+
+## 2026-10-05 — A plugin cleanup removes only what its own setup installed
+
+- OpenCode 2.0 sets a plugin up once per location instance and again on a
+  plugin reload, then disposes older setups while newer ones run. A cleanup
+  that reset process-wide state (`setHostAgentModeSwitch(undefined)`,
+  `setNativePlansDir(undefined)`) removed the live setup's switch: SwitchMode
+  fell back to provider-owned mode, plans went to `<data>/plans`, and an
+  approved plan never started. Setters return a disposer for their own
+  registration; an entrypoint with nothing to install must not clear another's.
+- Diagnose from the host's own log first: `~/.local/share/opencode/log`
+  showed four "loading plugin" entries for two directories.
+
+## 2026-10-06 — Validate invocation identity and operation, not only required keys
+
+- Dynamic invocation identity (`namespace`, `toolName`) lives outside tool arguments and must accompany every call, including parallel members. Server-side wrapper errors can arrive only in a display completion: decode the MCP error title/detail without replaying that completion as host execution.
+- A file tool with optional fields can accept an unrelated `command` and return a successful default listing. Reject misplaced shell commands against the advertised canonical schema while preserving opaque tools, valid default listings, and explicitly command-capable schemas. Host success alone does not establish that the requested operation ran.

@@ -263,11 +263,15 @@ export function asyncResult(): AskQuestionResultMessage {
 /**
  * Pull each question's answer text out of a host `question` tool output.
  *
- * OpenCode returns prose (`metadata.answers` does not cross the AI SDK
+ * OpenCode 1.x returns prose (`metadata.answers` does not cross the AI SDK
  * boundary):
  *
  *   User has answered your questions: "<q1>"="<a, b>", "<q2>"="Unanswered". You
  *   can now continue with the user's answers in mind.
+ *
+ * OpenCode 2.0 sends the tool's declared output as JSON
+ * (`{ "answers": [["Yes"], …] }`) and does not put that prose on the AI SDK
+ * tool-result. Answers are positional.
  *
  * The prose is located by its `"<question>"="` anchor — robust
  * against commas, quotes and `"="` inside question or answer text, and against
@@ -278,6 +282,8 @@ export function parseAnswerSegments(
   questions: readonly CursorAskQuestionItem[],
   output: string,
 ): Array<string | undefined> {
+  const fromJson = parseJsonAnswerSegments(output, questions.length)
+  if (fromJson) return fromJson
   const answers: Array<string | undefined> = []
   let cursor = 0
   for (const question of questions) {
@@ -305,6 +311,35 @@ export function parseAnswerSegments(
     cursor = valueEnd
   }
   return answers
+}
+
+function cellText(cell: unknown): string | undefined {
+  if (typeof cell === "string") return cell
+  if (typeof cell === "number" || typeof cell === "boolean") return String(cell)
+  if (Array.isArray(cell)) {
+    const parts = cell.map((item) => (typeof item === "string" ? item : "")).filter(Boolean)
+    return parts.length > 0 ? parts.join(", ") : undefined
+  }
+  return undefined
+}
+
+/** OpenCode 2 `question` output `{ answers: string[][] }`, or a JSON array of cells. */
+function parseJsonAnswerSegments(output: string, count: number): Array<string | undefined> | undefined {
+  const trimmed = output.trim()
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    return undefined
+  }
+  const cells = Array.isArray(parsed)
+    ? parsed
+    : parsed && typeof parsed === "object" && Array.isArray((parsed as { answers?: unknown }).answers)
+      ? (parsed as { answers: unknown[] }).answers
+      : undefined
+  if (!cells) return undefined
+  return Array.from({ length: count }, (_, index) => cellText(cells[index]))
 }
 
 /** OpenCode's placeholder for a question the user left blank. */

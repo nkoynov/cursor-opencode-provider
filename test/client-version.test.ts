@@ -106,7 +106,7 @@ describe("resolveClientVersion", () => {
     globalThis.fetch = (async () => {
       fetchCalls += 1
       return new Response(INSTALLER_FIXTURE, { status: 200 })
-    }) as typeof fetch
+    }) as unknown as typeof fetch
 
     expect(await resolveClientVersion()).toBe("cli-override-123")
     expect(fetchCalls).toBe(0)
@@ -115,13 +115,13 @@ describe("resolveClientVersion", () => {
   it("ignores an invalid environment override", async () => {
     process.env.CURSOR_CLIENT_VERSION = "bad\r\nheader"
     globalThis.fetch = (async () =>
-      new Response(INSTALLER_FIXTURE, { status: 200 })) as typeof fetch
+      new Response(INSTALLER_FIXTURE, { status: 200 })) as unknown as typeof fetch
     expect(await resolveClientVersion()).toBe("cli-2026.07.09-a3815c0")
   })
 
   it("uses the remote installer with no environment or local build", async () => {
     globalThis.fetch = (async () =>
-      new Response(INSTALLER_FIXTURE, { status: 200 })) as typeof fetch
+      new Response(INSTALLER_FIXTURE, { status: 200 })) as unknown as typeof fetch
     expect(await resolveClientVersion()).toBe("cli-2026.07.09-a3815c0")
   })
 
@@ -131,7 +131,7 @@ describe("resolveClientVersion", () => {
     globalThis.fetch = (async () => {
       fetchCalls += 1
       return new Response(INSTALLER_FIXTURE, { status: 200 })
-    }) as typeof fetch
+    }) as unknown as typeof fetch
 
     expect(await resolveClientVersion()).toBe("cli-cached-123")
     expect(fetchCalls).toBe(1)
@@ -140,13 +140,13 @@ describe("resolveClientVersion", () => {
 
   it("serves an expired cache entry when refresh fails", async () => {
     writeVersionCache("cli-cached-999", 0)
-    globalThis.fetch = (async () => { throw new Error("offline") }) as typeof fetch
+    globalThis.fetch = (async () => { throw new Error("offline") }) as unknown as typeof fetch
     expect(await resolveClientVersion()).toBe("cli-cached-999")
   })
 
   it("ignores malformed cache data and uses the fallback offline", async () => {
     writeVersionCache("not-a-client-version", "yesterday")
-    globalThis.fetch = (async () => { throw new Error("offline") }) as typeof fetch
+    globalThis.fetch = (async () => { throw new Error("offline") }) as unknown as typeof fetch
     expect(await resolveClientVersion()).toBe(FALLBACK_CLIENT_VERSION)
   })
 
@@ -155,7 +155,7 @@ describe("resolveClientVersion", () => {
     globalThis.fetch = (async () => {
       fetchCalls += 1
       return new Response(INSTALLER_FIXTURE, { status: 200 })
-    }) as typeof fetch
+    }) as unknown as typeof fetch
 
     expect(await resolveClientVersion()).toBe("cli-2026.07.09-a3815c0")
     expect(await resolveClientVersion()).toBe("cli-2026.07.09-a3815c0")

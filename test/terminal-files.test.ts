@@ -795,7 +795,7 @@ describe("terminal file reads", () => {
     await pump(session, {
       enqueue(part: unknown) { parts.push(part) },
       error(error: Error) { throw error },
-    } as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
+    } as unknown as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
     const results = writes
       .map((frame) => decodeMessage<any>("AgentClientMessage", frame).exec_client_message?.read_result)
       .filter((result) => result !== undefined)

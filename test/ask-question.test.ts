@@ -197,6 +197,10 @@ describe("OpenCode answers → Cursor AskQuestionResult (CLI iX parity)", () => 
   it("does not interpret non-OpenCode result envelopes", () => {
     expect(parseAnswerSegments([QUESTION], JSON.stringify({ answers: [] }))).toEqual([undefined])
   })
+
+  it("reads OpenCode 2 JSON answers positionally", () => {
+    expect(parseAnswerSegments([QUESTION], JSON.stringify({ answers: [["Redis"]] }))).toEqual(["Redis"])
+  })
 })
 
 describe("ask-question query decoding", () => {
@@ -288,7 +292,6 @@ function bridgingSession(payloads: Uint8Array[], writes: Uint8Array[]): CursorSe
     pumpActive: true,
     heartbeat: null,
     nextBridgedExecId: 900_000,
-    expiresAt: Date.now() + 10_000,
   } as unknown as CursorSession
 }
 
@@ -298,7 +301,7 @@ async function runBridge(payload: Uint8Array) {
   const session = bridgingSession([payload], writes)
   await pump(
     session,
-    { enqueue(part: unknown) { parts.push(part) }, error() {} } as ReadableStreamDefaultController<any>,
+    { enqueue(part: unknown) { parts.push(part) }, error() {} } as unknown as ReadableStreamDefaultController<any>,
     { textId: "text", reasoningId: "reasoning" },
   )
   return { session, writes, parts }
@@ -370,7 +373,7 @@ describe("bridged ask-question over a held-open Run", () => {
 
     await pump(
       session,
-      { enqueue(part: unknown) { parts.push(part) }, error() {} } as ReadableStreamDefaultController<any>,
+      { enqueue(part: unknown) { parts.push(part) }, error() {} } as unknown as ReadableStreamDefaultController<any>,
       { textId: "text", reasoningId: "reasoning" },
     )
 

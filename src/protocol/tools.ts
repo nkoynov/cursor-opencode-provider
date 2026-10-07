@@ -43,6 +43,34 @@ export type OpencodeToolDef = {
   sourceName?: string
 }
 
+/** Check explicit required keys after normalization, before host execution. */
+export function missingRequiredToolArguments(
+  tool: OpencodeToolDef | undefined,
+  args: Record<string, unknown>,
+): string[] {
+  const schema = tool?.inputSchema
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return []
+  const required = (schema as Record<string, unknown>).required
+  if (!Array.isArray(required)) return []
+  return required.filter((key): key is string =>
+    typeof key === "string" && (!Object.hasOwn(args, key) || args[key] === undefined),
+  )
+}
+
+/** Canonical file/search tools must not silently ignore a misplaced shell command. */
+export function misplacedShellCommand(
+  tool: OpencodeToolDef | undefined,
+  args: Record<string, unknown>,
+): boolean {
+  if (!tool || args.command === undefined) return false
+  if (!["read", "write", "edit", "grep", "glob", "ls"].includes(tool.name)) return false
+  const schema = tool.inputSchema
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return false
+  const properties = (schema as Record<string, unknown>).properties
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) return false
+  return !Object.hasOwn(properties, "command")
+}
+
 /** Host file-tool argument key. OpenCode 1.x uses `filePath`; 2.0 uses `path`. */
 export type HostFilePathKey = "path" | "filePath"
 /** Host shell tool id. OpenCode 1.x uses `bash`; 2.0 uses `shell`. */
@@ -54,6 +82,7 @@ export type HostToolDialect = {
   filePathKey: HostFilePathKey
   shellTool: HostShellTool
   skillArgKey: HostSkillArgKey
+  shellDescription?: "optional" | "required"
 }
 export const OPENCODE_1_TOOL_DIALECT: HostToolDialect = {
   filePathKey: "filePath",
@@ -133,7 +162,20 @@ export function hostToolDialectFromTools(
       ? "id"
       : defaultDialect.skillArgKey
   }
-  return { filePathKey, shellTool, skillArgKey }
+  const shellSchema = tools.find((tool) => tool.name === shellTool)?.inputSchema
+  const shellProps = jsonSchemaProperties(shellSchema)
+  const description = shellProps?.description
+  const required = shellSchema && typeof shellSchema === "object" && !Array.isArray(shellSchema)
+    ? (shellSchema as Record<string, unknown>).required
+    : undefined
+  return {
+    filePathKey, shellTool, skillArgKey,
+    ...(description && typeof description === "object"
+      && (description as Record<string, unknown>).type === "string"
+      ? { shellDescription: Array.isArray(required) && required.includes("description")
+        ? "required" as const : "optional" as const }
+      : {}),
+  }
 }
 
 function assignHostFilePath(
@@ -1563,10 +1605,9 @@ export function mapCursorArgsToOpencode(
   // as any other bash tool call.
   if (execVariant === "delete_args") {
     const target = str(cleaned.path) ?? str(cleaned.filePath)
-    return {
-      toolName: dialect.shellTool,
-      args: target ? { command: `rm -f -- ${shellQuote(target)}` } : { command: "true" },
-    }
+    return mapCursorArgsToOpencode(dialect.shellTool, {
+      command: target ? `rm -f -- ${shellQuote(target)}` : "true",
+    }, undefined, dialect)
   }
 
   switch (toolName) {
@@ -1630,6 +1671,13 @@ export function mapCursorArgsToOpencode(
       const args: Record<string, unknown> = {}
       const command = str(cleaned.command)
       if (command) args.command = command
+      if (dialect.shellDescription) {
+        const description = str(cleaned.description)
+          ?? (dialect.shellDescription === "required" && command
+            ? `Run: ${command.length > 60 ? `${command.slice(0, 57)}...` : command}`
+            : undefined)
+        if (description) args.description = description
+      }
       const workdir = str(cleaned.workdir) ?? str(cleaned.working_directory)
       if (workdir) args.workdir = workdir
       const timeout = num(cleaned.timeout)
@@ -3831,7 +3879,14 @@ export function buildMcpStateResult(
     }
     list.push({
       name: stringValue(tool.name) ?? `${server}-${toolName}`,
-      description: stringValue(tool.description) ?? "",
+      // GetDynamicTools exposes the inner schema without the outer call identity.
+      // Keep the exact identity in the definition, including truncated searches.
+      description: `CallDynamicTool identity: ${JSON.stringify({ namespace: server, toolName })}. `
+        + `Complete outer envelope: ${JSON.stringify({ namespace: server, toolName, arguments: {} })}. `
+        + "Replace arguments with this inputSchema's object; keep both identity fields outside it. "
+        + "Write namespace and toolName FIRST, then arguments containing this inputSchema's object. "
+        + "All three outer fields are required on every invocation.\n\n"
+        + (stringValue(tool.description) ?? ""),
       input_schema: tool.input_schema,
       provider_identifier: server,
       tool_name: toolName,

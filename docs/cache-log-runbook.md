@@ -84,6 +84,13 @@ line. Do not correlate concurrent sessions merely by line proximity:
 rg 'cache diagnosis: sessionKey=ses_EXAMPLE(?: |$)' /tmp/cursor-cache.log
 ```
 
+Server-side dynamic invocation failures can occur before a client execution
+request or even a display start. Include `display tool_call_completed: ERROR`
+when reviewing tool reliability. Its `error` contains the MCP error title and
+detail. A missing `namespace` / `toolName` is a dynamic-call wrapper failure,
+not proof that the underlying file/search tool rejected valid arguments.
+Keep the failure after a successful retry; do not invent a host execution for it.
+
 ## Read one completed Run in this order
 
 ### 1. Establish identity and continuity
@@ -161,12 +168,15 @@ Every completed Run emits `turn usage validation:`. Begin with `status`:
 
 - `status=ok` means the AI SDK input/output partitions sum correctly, the total
   sent to OpenCode matches Cursor's checkpoint total when available, and the
-  category breakdown is internally consistent.
-- `status=mismatch` is a provider accounting bug **for the usage that was
-  sent**. Occupancy finishes (tool-call and TurnEnded/stop) validate against
-  the split they send (`occupancyStepUsage`); aggregate TurnEnded request
-  ratios live on `finish:` / `cache diagnosis:` and are not required to equal
-  it. Preserve the complete line and
+  category breakdown is internally consistent when present. A self-consistent
+  older breakdown is marked `breakdownMatch=stale`; it is not current category
+  evidence and is omitted from display metadata and cache comparisons.
+- `status=mismatch` means a usage partition/total check failed or Cursor's
+  category sum disagreed with its own breakdown total. Inspect the individual
+  checks before attributing it to provider accounting. Occupancy finishes
+  (tool-call and TurnEnded/stop) validate against the split they send
+  (`occupancyStepUsage`); aggregate TurnEnded request ratios live on
+  `finish:` / `cache diagnosis:` and are not required to equal it. Preserve the complete line and
   the preceding checkpoint/TurnEnded lines before changing cache behavior.
 
 Important fields:
@@ -184,7 +194,7 @@ Important fields:
 | `sentTotal` | AI SDK input + output sent to OpenCode. With token details, this must equal Cursor `usedTokens`. |
 | `rawCachedRatio` | For occupancy finishes: the sent split's cached share. TurnEnded request cache ratios are on `finish:` / cache diagnosis, not this field. |
 | `sentCachedRatio` | Occupancy `cacheRead + cacheWrite` / sent input. Equals `rawCachedRatio` on occupancy finishes. |
-| `breakdownMatch` | Whether Cursor's category totals agree with `usedTokens`. |
+| `breakdownMatch` | `true`: category sum and breakdown total match current occupancy/limit. `stale`: self-consistent breakdown with a different occupancy or limit. `false`: category sum disagrees with breakdown total. `unavailable`: no breakdown. |
 
 `finish:` is a compact duplicate of the final AI SDK and raw counters. Tool-call
 boundaries should show `source=occupancy-checkpoint-*` when a snapshot exists

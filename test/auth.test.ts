@@ -114,7 +114,7 @@ describe("exchangeApiKey", () => {
   it("throws AuthExchangeError on non-200", async () => {
     using server = Bun.serve({
       port: 0,
-      fetch(req) {
+      fetch() {
         return new Response("Unauthorized", { status: 401 })
       },
     })
@@ -126,7 +126,7 @@ describe("exchangeApiKey", () => {
   it("throws AuthExchangeError when tokens missing", async () => {
     using server = Bun.serve({
       port: 0,
-      fetch(req) {
+      fetch() {
         return Response.json({})
       },
     })
@@ -138,7 +138,7 @@ describe("exchangeApiKey", () => {
   it("returns tokens on success", async () => {
     using server = Bun.serve({
       port: 0,
-      fetch(req) {
+      fetch() {
         return Response.json({
           accessToken: "access.jwt",
           refreshToken: "refresh.jwt",
@@ -286,7 +286,7 @@ describe("pollForTokens", () => {
   it("throws AuthTimeoutError after exhausting attempts", async () => {
     using server = Bun.serve({
       port: 0,
-      fetch(req) {
+      fetch() {
         return new Response("Not found", { status: 404 })
       },
     })
@@ -298,7 +298,7 @@ describe("pollForTokens", () => {
   it("returns tokens on first success", async () => {
     using server = Bun.serve({
       port: 0,
-      fetch(req) {
+      fetch() {
         return Response.json({
           accessToken: "access.jwt",
           refreshToken: "refresh.jwt",
@@ -317,7 +317,7 @@ describe("pollForTokens", () => {
   it("throws AuthPollError after 3 consecutive errors", async () => {
     using server = Bun.serve({
       port: 0,
-      fetch(req) {
+      fetch() {
         return new Response("Server error", { status: 500 })
       },
     })
@@ -341,7 +341,7 @@ describe("pollForTokens", () => {
     let callCount = 0
     using server = Bun.serve({
       port: 0,
-      fetch(req) {
+      fetch() {
         callCount++
         if (callCount < 4) return new Response("Not found", { status: 404 })
         return Response.json({

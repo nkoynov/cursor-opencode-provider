@@ -2,7 +2,8 @@ import { describe, expect, it, afterEach } from "bun:test"
 import fs from "node:fs"
 import path from "node:path"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
-import { toolsToDescriptors, toolsToMcpDescriptors } from "../src/protocol/tools.js"
+import { encodeJsonAsValue, readAllFields } from "../src/protocol/struct.js"
+import { hostToolDialectFromTools, toolsToDescriptors, toolsToMcpDescriptors } from "../src/protocol/tools.js"
 import {
   pump,
   rememberMirroredTodos,
@@ -10,7 +11,7 @@ import {
   snapshotMirroredTodosBySession,
 } from "../src/language-model.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
-import { CursorProtocolError } from "../src/errors.js"
+import { sessionFixture } from "./session-fixture.js"
 
 function writeVarint(out: number[], value: number): void {
   let remaining = value >>> 0
@@ -58,7 +59,7 @@ function rawToolCallWithFields(callId: string, fieldNums: number[]): Uint8Array 
 function rawExecPayload(
   execId: number,
   variantField: number,
-  argsBytes = new Uint8Array(0),
+  argsBytes: Uint8Array = new Uint8Array(0),
 ): Uint8Array {
   const exec: number[] = []
   writeVarint(exec, (1 << 3) | 0)
@@ -129,7 +130,7 @@ function turnEndedPayload(): Uint8Array {
 function fakeSession(
   payloads: Uint8Array[],
   writes: Uint8Array[],
-  definitionsOverride?: Array<{ name: string; description: string }>,
+  definitionsOverride?: Array<{ name: string; description: string; inputSchema?: unknown }>,
 ): CursorSession {
   let index = 0
   const frames: AsyncIterator<Frame> = {
@@ -149,7 +150,7 @@ function fakeSession(
   ]
   const tools = toolsToDescriptors(definitions, "opencode", ["github"])
   const mcpDescriptors = toolsToMcpDescriptors(definitions, "opencode", ["github"])
-  return {
+  return sessionFixture({
     sessionId: "display-bridge-session",
     conversationId: "display-bridge-conversation",
     stream: {
@@ -176,14 +177,193 @@ function fakeSession(
     allowTools: true,
     pumpActive: true,
     heartbeat: null,
-    expiresAt: Date.now() + 10_000,
-  }
+  })
 }
 
 describe("display-only ToolCall pump bridge", () => {
   afterEach(() => {
     sessionManager.dispose()
     resetTurnStateForTests()
+  })
+
+  it("rejects a shell call with only a file path, then emits the corrected command", async () => {
+    const writes: Uint8Array[] = []
+    const parts: any[] = []
+    const exec = (id: number, args: Record<string, unknown>) => {
+      const struct = readAllFields(encodeJsonAsValue(args)).find((field) => field.fn === 5)!.bytes!
+      const entries = readAllFields(struct).map((field) => field.bytes!)
+      return encodeMessage("AgentServerMessage", {
+        exec_server_message: { id, mcp_args: { name: "opencode-bash", args: entries } },
+      })
+    }
+    const session = fakeSession([
+      exec(1, { filePath: "/tmp/log-extract.txt" }),
+      exec(2, { command: "wc -l /tmp/log-extract.txt" }),
+    ], writes, [{
+      name: "bash",
+      description: "Run a shell command",
+      inputSchema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+    }])
+    const controller = {
+      enqueue(part: unknown) { parts.push(part) },
+      error(error: Error) { throw error },
+    } as unknown as ReadableStreamDefaultController<any>
+
+    await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
+
+    const rejection = decodeMessage<any>("AgentClientMessage", writes[0]!).exec_client_message
+    expect(rejection.id).toBe(1)
+    expect(JSON.stringify(rejection.mcp_result)).toContain("missing required arguments: command")
+    expect(session.pending.has(1)).toBe(false)
+    expect(parts.filter((part) => part.type === "tool-call").map((part) => JSON.parse(part.input)))
+      .toEqual([{ command: "wc -l /tmp/log-extract.txt" }])
+    expect(session.pending.has(2)).toBe(true)
+  })
+
+  it("validates native shell calls after supplying the advertised description", async () => {
+    const writes: Uint8Array[] = []
+    const parts: any[] = []
+    const session = fakeSession([
+      encodeMessage("AgentServerMessage", { exec_server_message: { id: 1, shell_args: { command: "pwd" } } }),
+    ], writes, [{ name: "bash", description: "Run command", inputSchema: {
+      type: "object", properties: { command: { type: "string" }, description: { type: "string" } },
+      required: ["command", "description"],
+    } }])
+    session.hostToolDialect = hostToolDialectFromTools(session.toolCatalog ?? [])
+    const controller: ReadableStreamDefaultController<any> = {
+      desiredSize: 0, close() {}, enqueue(part) { parts.push(part) }, error(error) { throw error },
+    }
+    await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
+    expect(writes).toHaveLength(0)
+    expect(session.pending.has(1)).toBe(true)
+    expect(parts.filter(part => part.type === "tool-call").map(part => JSON.parse(part.input)))
+      .toEqual([{ command: "pwd", description: "Run: pwd", timeout: 30_000 }])
+  })
+
+  it("refuses a shell command sent to a file tool even when all its fields are optional", async () => {
+    const writes: Uint8Array[] = []
+    const parts: any[] = []
+    const exec = (id: number, name: string, args: Record<string, unknown>) => {
+      const struct = readAllFields(encodeJsonAsValue(args)).find((field) => field.fn === 5)!.bytes!
+      const entries = readAllFields(struct).map((field) => field.bytes!)
+      return encodeMessage("AgentServerMessage", {
+        exec_server_message: { id, mcp_args: { name: `opencode-${name}`, args: entries } },
+      })
+    }
+    const session = fakeSession([
+      exec(1, "ls", { command: "wc -l /workspace/extract.txt" }),
+      exec(2, "bash", { command: "wc -l /workspace/extract.txt" }),
+    ], writes, [
+      { name: "ls", description: "List", inputSchema: { type: "object", properties: { path: { type: "string" } } } },
+      { name: "bash", description: "Shell", inputSchema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } },
+    ])
+    await pump(session, {
+      desiredSize: 0,
+      close() {},
+      enqueue(part: unknown) { parts.push(part) },
+      error(error: Error) { throw error },
+    }, { textId: "text", reasoningId: "reasoning" })
+    const rejection = decodeMessage<any>("AgentClientMessage", writes[0]!).exec_client_message
+    expect(rejection.id).toBe(1)
+    expect(JSON.stringify(rejection.mcp_result)).toContain("No command was executed")
+    expect(session.pending.has(1)).toBe(false)
+    expect(parts.filter(part => part.type === "tool-call").map(part => part.toolName)).toEqual(["bash"])
+    expect(session.pending.has(2)).toBe(true)
+  })
+
+  it("observes a server-side dynamic-call rejection without inventing host execution", async () => {
+    const parts: any[] = []
+    const writes: Uint8Array[] = []
+    const session = fakeSession([
+      displayPayload("completed", "server-rejected", {
+        mcp_tool_call: { result: { error: { error: "Tool execution error", detail: "Missing required fields: namespace, toolName" } } },
+      }),
+      encodeMessage("AgentServerMessage", { interaction_update: { text_delta: { text: "Recovered answer" } } }),
+      turnEndedPayload(),
+    ], writes)
+    await pump(session, {
+      desiredSize: 0,
+      close() {},
+      enqueue(part: unknown) { parts.push(part) },
+      error(error: Error) { throw error },
+    }, { textId: "text", reasoningId: "reasoning" })
+    expect(parts.filter(part => part.type === "tool-call")).toHaveLength(0)
+    expect(parts.filter(part => part.type === "text-delta").map(part => part.delta).join("")).toBe("Recovered answer")
+    expect(session.pending.size).toBe(0)
+    expect(writes).toHaveLength(0)
+  })
+
+  it("starts text after a tool call as a new paragraph", async () => {
+    const parts: any[] = []
+    const text = (value: string) => encodeMessage("AgentServerMessage", {
+      interaction_update: { text_delta: { text: value } },
+    })
+    const switchCall = { switch_mode_tool_call: { args: { target_mode_id: "plan" } } }
+    const session = fakeSession(
+      [
+        text("Switching to plan mode."),
+        displayPayload("started", "switch-1", switchCall),
+        displayPayload("completed", "switch-1", switchCall),
+        text("Recording the plan."),
+        text(" Done."),
+        text("\nAlready on a new line."),
+        turnEndedPayload(),
+      ],
+      [],
+      [{ name: "read", description: "Read" }],
+    )
+    const controller = {
+      enqueue(part: unknown) { parts.push(part) },
+      error(error: Error) { throw error },
+    } as unknown as ReadableStreamDefaultController<any>
+
+    await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
+
+    const emitted = parts
+      .filter((part) => part.type === "text-delta")
+      .map((part) => part.delta)
+      .join("")
+    expect(emitted).toBe(
+      "Switching to plan mode.\n\nRecording the plan. Done.\nAlready on a new line.",
+    )
+  })
+
+  it("keeps only the answer of a tool-less turn, not narration before a refused call", async () => {
+    const parts: any[] = []
+    const writes: Uint8Array[] = []
+    const text = (value: string) => encodeMessage("AgentServerMessage", {
+      interaction_update: { text_delta: { text: value } },
+    })
+    const session = fakeSession(
+      [
+        text("I'll read the guide first."),
+        encodeMessage("AgentServerMessage", {
+          exec_server_message: { id: 1, read_args: { path: "/tmp/guide.md", tool_call_id: "read-1" } },
+        }),
+        text("Run the self-verify"),
+        text(" checklist"),
+        turnEndedPayload(),
+      ],
+      writes,
+      [{ name: "read", description: "Read" }],
+    )
+    session.allowTools = false
+    const controller = {
+      enqueue(part: unknown) { parts.push(part) },
+      error(error: Error) { throw error },
+    } as unknown as ReadableStreamDefaultController<any>
+
+    await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
+
+    const read = decodeMessage<any>("AgentClientMessage", writes[0]!).exec_client_message.read_result
+    expect(read.error ?? read.rejected).toBeDefined()
+    const emitted = parts
+      .filter((part) => part.type === "text-delta")
+      .map((part) => part.delta)
+      .join("")
+    expect(emitted).toBe("Run the self-verify checklist")
+    expect(parts.findIndex((part) => part.type === "text-start"))
+      .toBeLessThan(parts.findIndex((part) => part.type === "finish"))
   })
 
   it("continues a new-file edit through write instead of shell fallback", async () => {
@@ -229,7 +409,7 @@ describe("display-only ToolCall pump bridge", () => {
       error(error: Error) {
         throw error
       },
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -302,7 +482,7 @@ describe("display-only ToolCall pump bridge", () => {
       error(error: Error) {
         throw error
       },
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     try {
       await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
@@ -382,7 +562,7 @@ describe("display-only ToolCall pump bridge", () => {
       await pump(session, {
         enqueue(part: unknown) { parts.push(part) },
         error(error: Error) { throw error },
-      } as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
+      } as unknown as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
 
       const read = decodeMessage<any>("AgentClientMessage", writes[0]!)
         .exec_client_message.read_result.success
@@ -439,7 +619,7 @@ describe("display-only ToolCall pump bridge", () => {
       await pump(session, {
         enqueue(part: unknown) { parts.push(part) },
         error(error: Error) { throw error },
-      } as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
+      } as unknown as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
 
       expect(writes).toHaveLength(0)
       const readCall = parts.find((part) => part.type === "tool-call")
@@ -478,7 +658,7 @@ describe("display-only ToolCall pump bridge", () => {
       error(error: Error) {
         throw error
       },
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -520,7 +700,7 @@ describe("display-only ToolCall pump bridge", () => {
         error(error: Error) {
           throw error
         },
-      } as ReadableStreamDefaultController<any>
+      } as unknown as ReadableStreamDefaultController<any>
 
       await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -558,7 +738,7 @@ describe("display-only ToolCall pump bridge", () => {
       error(error: Error) {
         throw error
       },
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -590,7 +770,7 @@ describe("display-only ToolCall pump bridge", () => {
       error(error: Error) {
         throw error
       },
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -624,7 +804,7 @@ describe("display-only ToolCall pump bridge", () => {
       error(error: Error) {
         throw error
       },
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -672,7 +852,7 @@ describe("display-only ToolCall pump bridge", () => {
       error(error: Error) {
         streamError = error
       },
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -707,7 +887,7 @@ describe("display-only ToolCall pump bridge", () => {
         parts.push(part)
       },
       error() {},
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -755,7 +935,7 @@ describe("display-only ToolCall pump bridge", () => {
         parts.push(part)
       },
       error() {},
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -793,7 +973,7 @@ describe("display-only ToolCall pump bridge", () => {
         parts.push(part)
       },
       error() {},
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -831,7 +1011,7 @@ describe("display-only ToolCall pump bridge", () => {
         parts.push(part)
       },
       error() {},
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -885,7 +1065,7 @@ describe("display-only ToolCall pump bridge", () => {
         parts.push(part)
       },
       error() {},
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -925,7 +1105,7 @@ describe("display-only ToolCall pump bridge", () => {
         parts.push(part)
       },
       error() {},
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -945,7 +1125,7 @@ describe("display-only ToolCall pump bridge", () => {
         parts.push(part)
       },
       error() {},
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -981,13 +1161,31 @@ describe("display-only ToolCall pump bridge", () => {
         parts.push(part)
       },
       error() {},
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
     expect(parts.some((p) => p.type === "tool-call")).toBe(false)
     expect(parts.some((p) => p.type === "finish")).toBe(true)
     expect(session.displayToolCalls.size).toBe(0)
+    expect(session.pending.size).toBe(0)
+  })
+
+  it("finishes a rejected native discovery notification without inventing host execution", async () => {
+    const writes: Uint8Array[] = []
+    const parts: any[] = []
+    const session = fakeSession([
+      displayPayload("completed", "native-discovery-error", {
+        get_mcp_tools_tool_call: { result: { error: { error: "CreatePlan is available directly" } } },
+      }),
+      turnEndedPayload(),
+    ], writes)
+    await pump(session, {
+      enqueue(part: unknown) { parts.push(part) }, error() {},
+    } as unknown as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
+    expect(parts.some((p) => p.type === "tool-call")).toBe(false)
+    expect(parts.some((p) => p.type === "finish")).toBe(true)
+    expect(writes).toHaveLength(0)
     expect(session.pending.size).toBe(0)
   })
 
@@ -1001,7 +1199,7 @@ describe("display-only ToolCall pump bridge", () => {
         parts.push(part)
       },
       error() {},
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -1025,7 +1223,7 @@ describe("display-only ToolCall pump bridge", () => {
     const controller = {
       enqueue() {},
       error() {},
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -1043,7 +1241,7 @@ describe("display-only ToolCall pump bridge", () => {
     const controller = {
       enqueue() {},
       error() {},
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -1059,7 +1257,7 @@ describe("display-only ToolCall pump bridge", () => {
     const controller = {
       enqueue() {},
       error() {},
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await expect(
       pump(session, controller, { textId: "text", reasoningId: "reasoning" }),
@@ -1082,7 +1280,7 @@ describe("display-only ToolCall pump bridge", () => {
       error(error: Error) {
         streamError = error
       },
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -1137,7 +1335,7 @@ describe("display-only ToolCall pump bridge", () => {
       error(error: Error) {
         throw error
       },
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -1185,7 +1383,7 @@ describe("display-only ToolCall pump bridge", () => {
       error(error: Error) {
         throw error
       },
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -1215,7 +1413,7 @@ describe("display-only ToolCall pump bridge", () => {
       error(error: Error) {
         streamError = error
       },
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -1257,7 +1455,7 @@ describe("display-only ToolCall pump bridge", () => {
       error(error: Error) {
         throw error
       },
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -1290,7 +1488,7 @@ describe("display-only ToolCall pump bridge", () => {
       error(error: Error) {
         streamError = error
       },
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -1342,7 +1540,7 @@ describe("display-only ToolCall pump bridge", () => {
       error(error: Error) {
         streamError = error
       },
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -1377,7 +1575,7 @@ describe("display-only ToolCall pump bridge", () => {
       error(error: Error) {
         throw error
       },
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -1414,7 +1612,7 @@ describe("display-only ToolCall pump bridge", () => {
       error(error: Error) {
         throw error
       },
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -1438,7 +1636,7 @@ describe("display-only ToolCall pump bridge", () => {
         error(error: Error) {
           throw error
         },
-      } as ReadableStreamDefaultController<any>
+      } as unknown as ReadableStreamDefaultController<any>
 
       await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -1474,7 +1672,7 @@ describe("display-only ToolCall pump bridge", () => {
       error(error: Error) {
         throw error
       },
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -1509,11 +1707,11 @@ describe("display-only ToolCall pump bridge", () => {
         parts.push(part)
       },
       error() {},
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await expect(
       pump(session, controller, { textId: "text", reasoningId: "reasoning" }),
-    ).rejects.toEqual(expect.objectContaining<Partial<CursorProtocolError>>({
+    ).rejects.toEqual(expect.objectContaining({
       message: "Cursor request-context reply failed",
       code: "CURSOR_RUN_REPLY_FAILED",
     }))
@@ -1545,7 +1743,7 @@ describe("display-only ToolCall pump bridge", () => {
 
     await expect(
       pump(session, controller, { textId: "text", reasoningId: "reasoning" }),
-    ).rejects.toEqual(expect.objectContaining<Partial<CursorProtocolError>>({
+    ).rejects.toEqual(expect.objectContaining({
       message: "Cursor KV reply failed",
       code: "CURSOR_RUN_REPLY_FAILED",
     }))
@@ -1578,7 +1776,7 @@ describe("display-only ToolCall pump bridge", () => {
         parts.push(part)
       },
       error() {},
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -1640,7 +1838,7 @@ describe("progress-only continuation pump", () => {
         parts.push(part)
       },
       error() {},
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -1688,7 +1886,7 @@ describe("progress-only continuation pump", () => {
     const controller = {
       enqueue() {},
       error() {},
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -1710,7 +1908,7 @@ describe("progress-only continuation pump", () => {
     const controller = {
       enqueue() {},
       error() {},
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
@@ -1735,7 +1933,7 @@ describe("progress-only continuation pump", () => {
       error(err: unknown) {
         throw err
       },
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
 
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 

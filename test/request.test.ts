@@ -3,8 +3,6 @@ import { buildRunRequest, buildHeartbeat } from "../src/protocol/request.js"
 import { buildLiveRequestContext } from "../src/protocol/tools.js"
 import { SYSTEM_INSTRUCTIONS_RULE_PATH, systemInstructionsRule } from "../src/context/build.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
-import { decodeFramePayload, streamFrames } from "../src/protocol/framing.js"
-import { gunzipSync } from "node:zlib"
 import { readAllFields } from "../src/protocol/struct.js"
 
 describe("buildRunRequest", () => {
@@ -26,6 +24,30 @@ describe("buildRunRequest", () => {
     expect(rr.action?.user_message_action?.user_message?.text).toBe("Hello")
     // The provider sends the concrete model id, never Cursor's "default" Auto.
     expect(rr.requested_model?.model_id).toBe("test-model")
+  })
+
+  it("sends the Cursor mode as UserMessage.mode (field 4, agent.v1.AgentMode)", () => {
+    const userMessageFields = (data: Uint8Array) => {
+      const field = (bytes: Uint8Array, fn: number) => readAllFields(bytes).find((f) => f.fn === fn)?.bytes
+      // AgentClientMessage.run_request → action → user_message_action → user_message
+      const userMessage = field(field(field(field(data, 1)!, 2)!, 1)!, 1)
+      expect(userMessage).toBeDefined()
+      return readAllFields(userMessage!)
+    }
+    const plan = userMessageFields(buildRunRequest({
+      text: "Plan it",
+      modelId: "test-model",
+      conversationId: "conv-mode",
+      mode: 3,
+    }))
+    expect(plan.find((f) => f.fn === 4)).toMatchObject({ wt: 0, varint: 3 })
+
+    const unset = userMessageFields(buildRunRequest({
+      text: "Hello",
+      modelId: "test-model",
+      conversationId: "conv-mode",
+    }))
+    expect(unset.some((f) => f.fn === 4)).toBe(false)
   })
 
   it("encodes image attachments in the live user selected context", () => {

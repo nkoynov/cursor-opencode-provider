@@ -10,7 +10,7 @@ describe("parseInteractionUpdate", () => {
     const event = parseInteractionUpdate(payload)
     expect(event).not.toBeNull()
     expect(event!.type).toBe("text-delta")
-    if (event!.type === "text-delta") {
+    if (event?.type === "text-delta") {
       expect(event.text).toBe("Hello world")
     }
   })
@@ -33,7 +33,7 @@ describe("parseInteractionUpdate", () => {
     const event = parseInteractionUpdate(payload)
     expect(event).not.toBeNull()
     expect(event!.type).toBe("finish")
-    if (event!.type === "finish") {
+    if (event?.type === "finish") {
       expect(event.usage.input).toBe(100)
       expect(event.usage.output).toBe(50)
       expect(event.finishReason).toBe("stop")
@@ -65,7 +65,7 @@ describe("parseInteractionUpdate", () => {
     const event = parseInteractionUpdate(payload)
     expect(event).not.toBeNull()
     expect(event!.type).toBe("tool-call-started")
-    if (event!.type === "tool-call-started") {
+    if (event?.type === "tool-call-started") {
       expect(event.callId).toBe("tool_abc")
       expect(event.toolName).toBe("read_tool_call")
       expect(JSON.parse(event.args)).toMatchObject({ path: "/test.txt" })

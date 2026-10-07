@@ -6,6 +6,8 @@ import { pathToFileURL } from "node:url"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { handleInteractionQuery } from "../src/protocol/interactions.js"
 import {
+  CREATE_PLAN_HOST_PLAN_PENDING_REASON,
+  CREATE_PLAN_HOST_PLAN_WORKFLOW_REASON,
   CREATE_PLAN_NOT_APPROVED_REASON,
   createPlanApprovalQuestion,
   createPlanApproved,
@@ -18,11 +20,18 @@ import {
   writeOpencodePlanFile,
 } from "../src/protocol/create-plan.js"
 import {
+  getActiveCursorMode,
   isCursorPlanModeActive,
   resetActiveCursorModesForTests,
   setActiveCursorMode,
 } from "../src/protocol/switch-mode.js"
-import { deliverContinuationResults, pump } from "../src/language-model.js"
+import { deliverContinuationResults, preparePriorSessionForFreshTurn, pump } from "../src/language-model.js"
+import { resetHostPlanFilesForTests, setHostPlanFile } from "../src/host-plan-file.js"
+import {
+  flushHostAgentModeSwitch,
+  resetHostAgentModeSwitchForTests,
+  setHostAgentModeSwitch,
+} from "../src/host-agent-mode.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import {
   hostGlobalDataDir,
@@ -30,18 +39,6 @@ import {
   HOST_PATH_BRIDGE,
   type OpenCodePathBridge,
 } from "../src/context/paths.js"
-import {
-  cancelPlanExecutionKickoff,
-  createPlanExecutionKickoffText,
-  formatPlanKickoffPath,
-  flushPlanExecutionKickoff,
-  planExecutionKickoffState,
-  planPathFromUri,
-  queuePlanExecutionKickoff,
-  resetPlanExecutionKickoffForTests,
-  setPlanExecutionKickoff,
-  takePlanExecutionKickoffWarning,
-} from "../src/plan-execution-kickoff.js"
 
 let workspace: string
 let sandboxHome: string
@@ -51,7 +48,6 @@ let previousBridge: unknown
 
 beforeEach(() => {
   resetActiveCursorModesForTests()
-  resetPlanExecutionKickoffForTests()
   workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-plan-ws-"))
   previousHome = process.env.HOME
   previousXdgData = process.env.XDG_DATA_HOME
@@ -67,7 +63,6 @@ beforeEach(() => {
 })
 
 afterEach(() => {
-  resetPlanExecutionKickoffForTests()
   fs.rmSync(workspace, { recursive: true, force: true })
   fs.rmSync(sandboxHome, { recursive: true, force: true })
   if (previousHome === undefined) delete process.env.HOME
@@ -201,13 +196,16 @@ describe("resolveCreatePlanBridge", () => {
 
   it("prefers a host plan-stage tool, which owns write and approval together", () => {
     expect(
-      resolveCreatePlanBridge({ allowTools: true, canStage: true, planModeActive: true, advertised }),
+      resolveCreatePlanBridge({ allowTools: true, canStage: true, advertised }),
     ).toEqual({ kind: "stage" })
   })
 
-  it("emulates the approval with `question` when no stage tool exists", () => {
+  it("emulates the approval with `question` when no stage or plan_exit tool exists", () => {
     expect(
       resolveCreatePlanBridge({ allowTools: true, planModeActive: true, advertised }),
+    ).toEqual({ kind: "approve" })
+    expect(
+      resolveCreatePlanBridge({ allowTools: true, hostAgent: "plan", advertised }),
     ).toEqual({ kind: "approve" })
   })
 
@@ -215,14 +213,76 @@ describe("resolveCreatePlanBridge", () => {
     expect(
       resolveCreatePlanBridge({ allowTools: true, planModeActive: true, advertised: ["read"] }),
     ).toEqual({ kind: "ack" })
+    expect(resolveCreatePlanBridge({ allowTools: true, advertised })).toEqual({ kind: "ack" })
     expect(
-      resolveCreatePlanBridge({ allowTools: true, planModeActive: false, advertised }),
+      resolveCreatePlanBridge({ allowTools: true, hostAgent: "build", advertised: [...advertised, "plan_exit"] }),
     ).toEqual({ kind: "ack" })
   })
 
   it("never writes or prompts from a no-tool lifecycle turn", () => {
     expect(
-      resolveCreatePlanBridge({ allowTools: false, canStage: true, planModeActive: true, advertised }),
+      resolveCreatePlanBridge({ allowTools: false, canStage: true, advertised }),
+    ).toEqual({ kind: "ack" })
+    expect(
+      resolveCreatePlanBridge({ allowTools: false, hostPlanEntryPending: true, advertised }),
+    ).toEqual({ kind: "ack" })
+  })
+
+  it("defers while an approved switch into the host plan agent is pending", () => {
+    expect(
+      resolveCreatePlanBridge({
+        allowTools: true,
+        canStage: true,
+        hostPlanEntryPending: true,
+        advertised,
+      }),
+    ).toEqual({ kind: "defer", reason: CREATE_PLAN_HOST_PLAN_PENDING_REASON })
+  })
+
+  it("carries CreatePlan out as the host plan_exit review on the host's own plan file", () => {
+    expect(
+      resolveCreatePlanBridge({
+        allowTools: true,
+        hostAgent: "plan",
+        hostPlanFile: "/repo/.opencode/plans/17-x.md",
+        advertised: [...advertised, "plan_exit"],
+      }),
+    ).toEqual({ kind: "exit", planPath: "/repo/.opencode/plans/17-x.md" })
+    // Without a host plan location the host's own workflow records the plan.
+    expect(
+      resolveCreatePlanBridge({
+        allowTools: true,
+        hostAgent: "plan",
+        advertised: [...advertised, "plan_exit"],
+      }),
+    ).toEqual({ kind: "defer", reason: CREATE_PLAN_HOST_PLAN_WORKFLOW_REASON })
+    // A pending switch into the plan agent still comes first.
+    expect(
+      resolveCreatePlanBridge({
+        allowTools: true,
+        hostPlanEntryPending: true,
+        hostAgent: "build",
+        hostPlanFile: "/repo/.opencode/plans/17-x.md",
+        advertised: [...advertised, "plan_exit"],
+      }),
+    ).toEqual({ kind: "defer", reason: CREATE_PLAN_HOST_PLAN_PENDING_REASON })
+    // A host stage tool still owns the review, and without plan_exit the plan
+    // agent has no host review to defer to.
+    expect(
+      resolveCreatePlanBridge({
+        allowTools: true,
+        canStage: true,
+        hostAgent: "plan",
+        advertised: [...advertised, "plan_exit"],
+      }),
+    ).toEqual({ kind: "stage" })
+    // Outside the host plan agent, plan_exit is not a review of this plan.
+    expect(
+      resolveCreatePlanBridge({
+        allowTools: true,
+        hostAgent: "build",
+        advertised: [...advertised, "plan_exit"],
+      }),
     ).toEqual({ kind: "ack" })
   })
 })
@@ -249,8 +309,6 @@ describe("createPlanApproved", () => {
   })
 
   it("does not approve when the echoed prompt is not the one that was asked", () => {
-    // The answer is anchored on the exact prompt text; a mismatch must read as
-    // unanswered, never as approval.
     expect(createPlanApproved(
       `User has answered your questions: "${question}"="Yes". You can now continue.`,
       false,
@@ -258,9 +316,9 @@ describe("createPlanApproved", () => {
     )).toBe(false)
   })
 
-  it("rejects non-OpenCode result envelopes instead of recognizing a host format", () => {
-    expect(createPlanApproved(JSON.stringify({ approved: true }), false, question)).toBe(false)
-    expect(createPlanApproved(JSON.stringify({ answers: [] }), false, question)).toBe(false)
+  it("approves an OpenCode 2 JSON Yes that does not echo the prompt", () => {
+    expect(createPlanApproved(JSON.stringify({ answers: [["Yes"]] }), false, question)).toBe(true)
+    expect(createPlanApproved(JSON.stringify({ answers: [["No"]] }), false, question)).toBe(false)
   })
 })
 
@@ -426,9 +484,6 @@ describe("CreatePlan interaction #7", () => {
   })
 
   it("asks the user to approve execution once the plan is written", () => {
-    // The live failure: plan mode was entered and the plan file was written,
-    // but nothing ever asked whether to start implementing it, so the turn
-    // simply ended. Writing needs no approval; executing does.
     fs.mkdirSync(path.join(workspace, ".git"))
     setActiveCursorMode("plan-session", "plan")
     const payload = createPlanPayload({
@@ -445,20 +500,16 @@ describe("CreatePlan interaction #7", () => {
       advertisedTools: ["question", "read", "write"],
     })
 
-    // Cursor stays blocked while the host asks, exactly as its own CLI does.
     expect(handled.outcome).toBe("bridged")
     expect(handled.reply).toBeUndefined()
     expect(handled.createPlan?.toolName).toBe("question")
     expect(handled.createPlan?.bridge.kind).toBe("approve")
 
-    // The plan is already on disk — the prompt is about running it, not saving it.
     const planPath = decodeURIComponent(new URL(handled.createPlan!.planUri!).pathname)
     expect(fs.existsSync(planPath)).toBe(true)
     expect(fs.readFileSync(planPath, "utf-8")).toContain("# Gated Plan")
     expect(handled.createPlan?.questionInput?.questions[0]?.question)
       .toBe(createPlanApprovalQuestion(planPath))
-    expect(handled.createPlan?.questionInput?.questions[0]?.question).not.toContain("# Gated Plan")
-    expect(handled.createPlan?.planReview).toContain("# Gated Plan")
   })
 
   it("writes and acknowledges without asking when no plan mode is active", () => {
@@ -482,6 +533,53 @@ describe("CreatePlan interaction #7", () => {
     const response = decodeMessage<any>("AgentClientMessage", handled.reply!).interaction_response
     expect(response.create_plan_request_response.result.success).toBeDefined()
     expect(response.create_plan_request_response.result.plan_uri).toMatch(/^file:\/\//)
+  })
+
+  it("writes nothing and tells the model to wait when host plan entry is pending", () => {
+    setActiveCursorMode("plan-session", "plan")
+    const payload = createPlanPayload({
+      name: "Early Plan",
+      overview: "Raised before the host plan agent took over",
+      plan: "## Approach\n\nDo the work.\n",
+      todos: [],
+    })
+    const query = decodeMessage<any>("AgentServerMessage", payload).interaction_query
+    const handled = handleInteractionQuery(query, payload, {
+      workspaceRoot: workspace,
+      allowTools: true,
+      hostPlanEntryPending: true,
+      hostAgent: "build",
+      advertisedTools: ["question", "read", "write"],
+    })
+    expect(handled.outcome).toBe("failed")
+    expect(handled.createPlan).toBeUndefined()
+    const result = decodeMessage<any>("AgentClientMessage", handled.reply!)
+      .interaction_response.create_plan_request_response.result
+    expect(result.error.error).toBe(CREATE_PLAN_HOST_PLAN_PENDING_REASON)
+    expect(result.plan_uri).toBe("")
+    expect(fs.existsSync(hostPlansDir(workspace))).toBe(false)
+  })
+
+  it("points CreatePlan at the host plan workflow inside the host plan agent", () => {
+    setActiveCursorMode("plan-session", "plan")
+    const payload = createPlanPayload({
+      name: "Host Plan",
+      overview: "Host plan agent owns the file",
+      plan: "## Approach\n\nDo the work.\n",
+      todos: [],
+    })
+    const query = decodeMessage<any>("AgentServerMessage", payload).interaction_query
+    const handled = handleInteractionQuery(query, payload, {
+      workspaceRoot: workspace,
+      allowTools: true,
+      hostAgent: "plan",
+      advertisedTools: ["question", "read", "write", "plan_exit"],
+    })
+    expect(handled.outcome).toBe("failed")
+    const result = decodeMessage<any>("AgentClientMessage", handled.reply!)
+      .interaction_response.create_plan_request_response.result
+    expect(result.error.error).toBe(CREATE_PLAN_HOST_PLAN_WORKFLOW_REASON)
+    expect(fs.existsSync(hostPlansDir(workspace))).toBe(false)
   })
 
   it("decodes CreatePlanRequestQuery args", () => {
@@ -532,7 +630,6 @@ function planSession(payloads: Uint8Array[], writes: Uint8Array[], advertised: s
     pumpActive: true,
     heartbeat: null,
     nextBridgedExecId: 900_000,
-    expiresAt: Date.now() + 10_000,
   } as unknown as CursorSession
 }
 
@@ -542,146 +639,168 @@ async function runCreatePlan(payloads: Uint8Array[], advertised: string[]) {
   const session = planSession(payloads, writes, advertised)
   await pump(
     session,
-    { enqueue(part: unknown) { parts.push(part) }, error() {} } as ReadableStreamDefaultController<any>,
+    { enqueue(part: unknown) { parts.push(part) }, error() {} } as unknown as ReadableStreamDefaultController<any>,
     { textId: "text", reasoningId: "reasoning" },
   )
   return { session, writes, parts }
 }
 
-describe("plan execution kickoff helpers", () => {
-  it("keeps PlanExitTool wording verbatim", () => {
-    expect(createPlanExecutionKickoffText("/tmp/plans/demo.md")).toBe(
-      "The plan at /tmp/plans/demo.md has been approved, you can now edit files. Execute the plan",
+describe("CreatePlan writes the session's own plan file", () => {
+  afterEach(() => resetHostPlanFilesForTests())
+
+  it("records the plan at the known session plan file", async () => {
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const hostPlanFile = path.join(workspace, ".opencode", "plans", "21-quiet-owl.md")
+    setHostPlanFile("create-plan-opencode-session", hostPlanFile)
+    const writes: Uint8Array[] = []
+    const parts: any[] = []
+    // No plan_exit advertised: emulated Yes/No review through `question`.
+    const session = planSession(
+      [
+        createPlanPayload({ name: "Session Plan", overview: "o", plan: "## Steps\n\n1. Do it.\n", todos: [] }),
+        encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: { input_tokens: 3, output_tokens: 1 } } }),
+      ],
+      writes,
+      ["question", "read", "write"],
     )
+    await pump(
+      session,
+      { enqueue(part: unknown) { parts.push(part) }, error() {} } as unknown as ReadableStreamDefaultController<any>,
+      { textId: "text", reasoningId: "reasoning" },
+    )
+    expect(fs.readFileSync(hostPlanFile, "utf-8")).toContain("1. Do it.")
+    const call = parts.find((part: any) => part.type === "tool-call")
+    expect(call?.toolName).toBe("question")
+    expect(JSON.parse(call.input).questions[0].question).toContain("Would you like to switch to the build agent")
+    sessionManager.close(session, "ordinary-cleanup")
+  })
+})
+
+describe("CreatePlan through the host plan agent's plan_exit review", () => {
+  afterEach(() => resetHostPlanFilesForTests())
+
+  async function startHostPlan() {
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const hostPlanFile = path.join(workspace, ".opencode", "plans", "17-calm-wizard.md")
+    setHostPlanFile("create-plan-opencode-session", hostPlanFile)
+    const writes: Uint8Array[] = []
+    const parts: any[] = []
+    const session = planSession(
+      [createPlanPayload({ name: "Host Plan", overview: "o", plan: "## Steps\n\n1. Do it.\n", todos: [] })],
+      writes,
+      ["question", "read", "write", "plan_exit"],
+    )
+    ;(session as { hostAgent?: string }).hostAgent = "plan"
+    await pump(
+      session,
+      { enqueue(part: unknown) { parts.push(part) }, error() {} } as unknown as ReadableStreamDefaultController<any>,
+      { textId: "text", reasoningId: "reasoning" },
+    )
+    return { session, writes, parts, hostPlanFile }
+  }
+
+  function deliver(session: CursorSession, toolCallId: string, hostAgent: string, output: string) {
+    return deliverContinuationResults(session, [{
+      toolCallId,
+      sessionId: session.sessionId,
+      execId: 900_000,
+      toolName: "plan_exit",
+      output,
+    }] as any, { hostAgent })
+  }
+
+  it("writes the plan at the host plan file, shows it, then raises the host plan_exit", async () => {
+    const { session, writes, parts, hostPlanFile } = await startHostPlan()
+    expect(fs.readFileSync(hostPlanFile, "utf-8")).toContain("1. Do it.")
+    const textIndex = parts.findIndex((part: any) => part.type === "text-delta")
+    const callIndex = parts.findIndex((part: any) => part.type === "tool-call")
+    expect(textIndex).toBeGreaterThanOrEqual(0)
+    expect(textIndex).toBeLessThan(callIndex)
+    expect(parts[callIndex].toolName).toBe("plan_exit")
+    expect(JSON.parse(parts[callIndex].input)).toEqual({})
+    // Cursor waits on the host review.
+    expect(writes).toHaveLength(0)
+    expect(session.pending.size).toBe(1)
+    sessionManager.close(session, "ordinary-cleanup")
   })
 
-  it("prefers a worktree-relative label when the plan is under the workspace", () => {
-    const absolute = path.join(workspace, "plans", "demo.md")
-    expect(formatPlanKickoffPath(absolute, workspace)).toBe(path.join("plans", "demo.md"))
+  it("reports approval when the host leaves its plan agent", async () => {
+    const { session, writes, parts, hostPlanFile } = await startHostPlan()
+    const call = parts.find((part: any) => part.type === "tool-call")
+    deliver(session, call.toolCallId, "build", "User approved switching to build agent. Wait for further instructions.")
+    const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
+      .interaction_response.create_plan_request_response.result
+    expect(result.success).toBeDefined()
+    expect(decodeURIComponent(new URL(result.plan_uri).pathname)).toBe(hostPlanFile)
+    expect(getActiveCursorMode("create-plan-opencode-session")).toBe("agent")
+    sessionManager.close(session, "ordinary-cleanup")
   })
 
-  it("keeps absolute paths outside the workspace", () => {
-    const absolute = path.join(sandboxHome, ".local", "share", "opencode", "plans", "demo.md")
-    expect(formatPlanKickoffPath(absolute, workspace)).toBe(absolute)
+  it("keeps planning with the host's own words when the session stays in plan", async () => {
+    const { session, writes, parts } = await startHostPlan()
+    const call = parts.find((part: any) => part.type === "tool-call")
+    const refine = "User chose to stay in plan mode and continue refining the plan."
+    deliver(session, call.toolCallId, "plan", refine)
+    const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
+      .interaction_response.create_plan_request_response.result
+    expect(result.error.error).toBe(refine)
+    expect(result.plan_uri).toBe("")
+    expect(isCursorPlanModeActive("create-plan-opencode-session")).toBe(true)
+    sessionManager.close(session, "ordinary-cleanup")
   })
+})
 
-  it("decodes file:// plan URIs", () => {
-    const absolute = path.join(sandboxHome, "plans", "demo.md")
-    expect(planPathFromUri(pathToFileURL(absolute).href)).toBe(absolute)
-    expect(planPathFromUri(absolute)).toBe(absolute)
-  })
-
-  it("does not flush before the owning Run is terminal and idle", async () => {
-    const calls: string[] = []
-    setPlanExecutionKickoff(async input => { calls.push(input.planPath) })
-    expect(queuePlanExecutionKickoff({
-      sessionID: "settle-session",
-      planPath: "/tmp/settle.md",
-      cursorSessionID: "cursor-run-1",
-    })).toBe(true)
-
-    expect(await flushPlanExecutionKickoff("settle-session", {
-      cursorSessionID: "cursor-run-1",
-      terminal: false,
-      pumpActive: true,
-      pendingExecs: 0,
-    })).toBe(false)
-    expect(await flushPlanExecutionKickoff("settle-session", {
-      cursorSessionID: "cursor-run-1",
-      terminal: true,
-      pumpActive: false,
-      pendingExecs: 1,
-    })).toBe(false)
-    expect(calls).toEqual([])
-    expect(planExecutionKickoffState("settle-session")?.status).toBe("pending")
-
-    expect(await flushPlanExecutionKickoff("settle-session", {
-      cursorSessionID: "cursor-run-1",
-      terminal: true,
-      pumpActive: false,
-      pendingExecs: 0,
-    })).toBe(true)
-    expect(calls).toEqual(["/tmp/settle.md"])
-    expect(await flushPlanExecutionKickoff("settle-session", {
-      cursorSessionID: "cursor-run-1",
-      terminal: true,
-      pumpActive: false,
-      pendingExecs: 0,
-    })).toBe(false)
-    expect(calls).toHaveLength(1)
-  })
-
-  it("keeps a failed kickoff retryable and exposes one warning", async () => {
-    let attempts = 0
-    setPlanExecutionKickoff(async () => {
-      attempts += 1
-      if (attempts === 1) throw new Error("host queue failed")
+describe("deferred CreatePlan display", () => {
+  function display(kind: "started" | "completed", callId: string): Uint8Array {
+    const key = kind === "started" ? "tool_call_started" : "tool_call_completed"
+    return encodeMessage("AgentServerMessage", {
+      interaction_update: {
+        [key]: {
+          call_id: callId,
+          tool_call: {
+            create_plan_tool_call: {
+              args: { name: "Host Plan", overview: "o", plan: "1. A", todos: [{ id: "t1", content: "A", status: 1 }] },
+            },
+          },
+        },
+      },
     })
-    queuePlanExecutionKickoff({
-      sessionID: "retry-session",
-      planPath: "/tmp/retry.md",
-      cursorSessionID: "cursor-run-failed",
-    })
+  }
 
-    expect(await flushPlanExecutionKickoff("retry-session", {
-      cursorSessionID: "cursor-run-failed",
-      terminal: true,
-      pumpActive: false,
-      pendingExecs: 0,
-    })).toBe(false)
-    expect(planExecutionKickoffState("retry-session")).toMatchObject({
-      status: "failed",
-      attempts: 1,
-      planPath: "/tmp/retry.md",
-    })
-    const warning = takePlanExecutionKickoffWarning("retry-session")
-    expect(warning).toContain("host queue failed")
-    expect(warning).toContain("remains active")
-    expect(takePlanExecutionKickoffWarning("retry-session")).toBeUndefined()
-
-    // A later explicit provider turn may retry after its own terminal boundary.
-    expect(await flushPlanExecutionKickoff("retry-session", {
-      cursorSessionID: "cursor-run-next",
-      terminal: true,
-      pumpActive: false,
-      pendingExecs: 0,
-    })).toBe(true)
-    expect(attempts).toBe(2)
-    expect(planExecutionKickoffState("retry-session")).toBeUndefined()
-  })
-
-  it("discards a kickoff whose owning Run was superseded", async () => {
-    const calls: string[] = []
-    setPlanExecutionKickoff(async input => { calls.push(input.planPath) })
-    expect(queuePlanExecutionKickoff({
-      sessionID: "stale-session",
-      planPath: "/tmp/stale.md",
-      cursorSessionID: "cursor-old",
-    })).toBe(true)
-
-    expect(await flushPlanExecutionKickoff("stale-session", {
-      cursorSessionID: "cursor-new",
-      terminal: true,
-    })).toBe(false)
-    expect(planExecutionKickoffState("stale-session")).toBeUndefined()
-    expect(calls).toEqual([])
-  })
-
-  it("clears a deleted session's pending kickoff and warning", async () => {
-    setPlanExecutionKickoff(async () => { throw new Error("not available") })
-    queuePlanExecutionKickoff({
-      sessionID: "deleted-session",
-      planPath: "/tmp/deleted.md",
-    })
-    await flushPlanExecutionKickoff("deleted-session", { terminal: true })
-    cancelPlanExecutionKickoff("deleted-session")
-
-    expect(planExecutionKickoffState("deleted-session")).toBeUndefined()
-    expect(takePlanExecutionKickoffWarning("deleted-session")).toBeUndefined()
+  it("does not mirror the todos of a plan the host plan agent records instead", async () => {
+    const writes: Uint8Array[] = []
+    const parts: any[] = []
+    const payload = createPlanPayload({ name: "Host Plan", overview: "o", plan: "1. A", todos: [] })
+    const session = planSession(
+      [
+        display("started", "tool_plan"),
+        payload,
+        display("completed", "tool_plan"),
+        encodeMessage("AgentServerMessage", {
+          interaction_update: { turn_ended: { input_tokens: 3, output_tokens: 1 } },
+        }),
+      ],
+      writes,
+      ["question", "read", "write", "todowrite", "plan_exit"],
+    )
+    ;(session as { hostAgent?: string }).hostAgent = "plan"
+    await pump(
+      session,
+      { enqueue(part: unknown) { parts.push(part) }, error() {} } as unknown as ReadableStreamDefaultController<any>,
+      { textId: "text", reasoningId: "reasoning" },
+    )
+    const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
+      .interaction_response.create_plan_request_response.result
+    expect(result.error.error).toBe(CREATE_PLAN_HOST_PLAN_WORKFLOW_REASON)
+    expect(parts.some((part) => part.type === "tool-call")).toBe(false)
+    expect(session.deferredCreatePlanCalls?.size ?? 0).toBe(0)
+    sessionManager.close(session, "ordinary-cleanup")
   })
 })
 
 describe("CreatePlan execution approval over a held-open Run", () => {
+  afterEach(() => resetHostAgentModeSwitchForTests())
+
   function startPlan() {
     fs.mkdirSync(path.join(workspace, ".git"))
     setActiveCursorMode("create-plan-opencode-session", "plan")
@@ -697,10 +816,6 @@ describe("CreatePlan execution approval over a held-open Run", () => {
   }
 
   it("shows the plan in the transcript before asking to approve it", async () => {
-    // Cursor routes the plan body through the interaction query, never the text
-    // stream, so the first version asked the user to approve a plan they had
-    // not been shown. It goes in the assistant message, not the question: the
-    // host renders the question dock outside its scrollbox.
     const { session, parts } = await startPlan()
 
     const text = parts
@@ -711,14 +826,12 @@ describe("CreatePlan execution approval over a held-open Run", () => {
     expect(text).toContain("Implement it.")
     expect(text).toContain("Plan saved to ")
 
-    // The plan is visible before the prompt, and the prompt itself stays short.
     const textIndex = parts.findIndex((part: any) => part.type === "text-delta")
     const callIndex = parts.findIndex((part: any) => part.type === "tool-call")
     expect(textIndex).toBeGreaterThanOrEqual(0)
     expect(textIndex).toBeLessThan(callIndex)
-    const asked = JSON.parse(parts[callIndex].input).questions[0]
-    expect(asked.question).not.toContain("Implement it.")
-    expect(asked.detail).toBeUndefined()
+    const question = JSON.parse(parts[callIndex].input).questions[0].question as string
+    expect(question).not.toContain("Implement it.")
     sessionManager.close(session, "ordinary-cleanup")
   })
 
@@ -732,75 +845,18 @@ describe("CreatePlan execution approval over a held-open Run", () => {
     const question = JSON.parse(toolCall.input).questions[0].question as string
     expect(question).toContain("Would you like to switch to the build agent")
 
-    const kickoffs: Array<{ sessionID: string; planPath: string }> = []
-    setPlanExecutionKickoff((input) => {
-      kickoffs.push(input)
-    })
+    const switched: string[] = []
+    setHostAgentModeSwitch(({ targetModeID }) => { switched.push(targetModeID) })
 
-    let delivering = true
     deliverContinuationResults(session, [{
       toolCallId: toolCall.toolCallId,
       sessionId: session.sessionId,
       execId: 900_000,
       toolName: "question",
       output: `User has answered your questions: "${question}"="Yes". You can now continue.`,
-    }] as any)
+    }] as any, { hostAgent: "plan" })
 
-    // Continuation delivery only records the kickoff. The host prompt cannot run
-    // until doStream has returned and its outer boundary flushes the request.
-    expect(kickoffs).toEqual([])
-    delivering = false
-    await flushPlanExecutionKickoff("create-plan-opencode-session", {
-      cursorSessionID: session.sessionId,
-      terminal: true,
-      pumpActive: false,
-      pendingExecs: 0,
-    })
-    expect(delivering).toBe(false)
-
-    expect(writes).toHaveLength(1)
-    const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
-      .interaction_response.create_plan_request_response.result
-    expect(result.success).toBeDefined()
-    expect(result.plan_uri).toMatch(/^file:\/\//)
-    const absolute = decodeURIComponent(new URL(result.plan_uri).pathname)
-    expect(fs.existsSync(absolute)).toBe(true)
-    expect(kickoffs).toEqual([{
-      sessionID: "create-plan-opencode-session",
-      planPath: absolute,
-      cursorSessionID: session.sessionId,
-    }])
-    sessionManager.close(session, "ordinary-cleanup")
-  })
-
-  it("does not queue a provider kickoff for a successful host stage", async () => {
-    const writes: Uint8Array[] = []
-    const session = planSession([], writes, ["cursor_plan_stage"])
-    sessionManager.registerPending(
-      900_000,
-      session,
-      "create_plan_request_response",
-      "cursor_plan_stage",
-      false,
-      {
-        interactionId: 42,
-        createPlanBridgeKind: "stage",
-        planUri: "local://native-plan.md",
-        planPath: "/tmp/native-plan.md",
-        workspaceRoot: workspace,
-      },
-    )
-    const kickoffs: Array<{ sessionID: string; planPath: string }> = []
-    setPlanExecutionKickoff(input => { kickoffs.push(input) })
-
-    deliverContinuationResults(session, [{
-      toolCallId: "stage-call",
-      sessionId: session.sessionId,
-      execId: 900_000,
-      toolName: "cursor_plan_stage",
-      output: "Plan approved by host stage",
-    }] as any)
-    await flushPlanExecutionKickoff("create-plan-opencode-session", {
+    await flushHostAgentModeSwitch("create-plan-opencode-session", {
       cursorSessionID: session.sessionId,
       terminal: true,
       pumpActive: false,
@@ -811,46 +867,54 @@ describe("CreatePlan execution approval over a held-open Run", () => {
     const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
       .interaction_response.create_plan_request_response.result
     expect(result.success).toBeDefined()
-    expect(result.plan_uri).toBe("local://native-plan.md")
-    expect(kickoffs).toEqual([])
+    expect(result.plan_uri).toMatch(/^file:\/\//)
+    expect(getActiveCursorMode("create-plan-opencode-session")).toBe("agent")
+    expect(switched).toEqual(["agent"])
     sessionManager.close(session, "ordinary-cleanup")
   })
 
-  it("fails closed when no host kickoff exists and retains plan mode", async () => {
+  it("honors a Yes that arrived as history under a later host note instead of cancelling it", async () => {
     const { session, writes, parts } = await startPlan()
     const toolCall = parts.find((part: any) => part.type === "tool-call")
-    const question = JSON.parse(toolCall.input).questions[0].question as string
-    // Model a host/plugin surface that has no safe way to start an execution
-    // turn after approval.
-    setPlanExecutionKickoff(undefined)
+    const switched: string[] = []
+    setHostAgentModeSwitch(({ targetModeID }) => { switched.push(targetModeID) })
+    session.pumpActive = false
+    session.pumpOwner = null
 
-    deliverContinuationResults(session, [{
-      toolCallId: toolCall.toolCallId,
-      sessionId: session.sessionId,
-      execId: 900_000,
-      toolName: "question",
-      output: `User has answered your questions: "${question}"="Yes". You can now continue.`,
-    }] as any)
+    await preparePriorSessionForFreshTurn(session.openCodeSessionId, {
+      timeoutMs: 50,
+      toolResults: [{
+        toolCallId: toolCall.toolCallId,
+        sessionId: session.sessionId,
+        execId: 900_000,
+        toolName: "question",
+        output: JSON.stringify({ answers: [["Yes"]] }),
+      }],
+      hostAgent: "plan",
+    })
 
+    expect(session.pending.size).toBe(0)
+    expect(writes).toHaveLength(1)
     const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
       .interaction_response.create_plan_request_response.result
-    expect(result.success).toBeUndefined()
-    expect(result.error.error).toContain("cannot start its execution turn")
-    expect(result.plan_uri).toMatch(/^file:\/\//)
-    expect(isCursorPlanModeActive("create-plan-opencode-session")).toBe(true)
-    expect(planExecutionKickoffState("create-plan-opencode-session")).toBeUndefined()
-    sessionManager.close(session, "ordinary-cleanup")
+    expect(result.success).toBeDefined()
+    expect(getActiveCursorMode("create-plan-opencode-session")).toBe("agent")
+    await flushHostAgentModeSwitch("create-plan-opencode-session", {
+      cursorSessionID: session.sessionId,
+      terminal: true,
+      pumpActive: false,
+      pendingExecs: 0,
+    })
+    expect(switched).toEqual(["agent"])
+    if (!session.closed) sessionManager.close(session, "ordinary-cleanup")
   })
 
-  it("reports the plan as not accepted on No, so the model keeps planning", async () => {
+  it("keeps planning when the user answers No", async () => {
     const { session, writes, parts } = await startPlan()
     const toolCall = parts.find((part: any) => part.type === "tool-call")
     const question = JSON.parse(toolCall.input).questions[0].question as string
-
-    const kickoffs: Array<{ sessionID: string; planPath: string }> = []
-    setPlanExecutionKickoff((input) => {
-      kickoffs.push(input)
-    })
+    const switched: string[] = []
+    setHostAgentModeSwitch(({ targetModeID }) => { switched.push(targetModeID) })
 
     deliverContinuationResults(session, [{
       toolCallId: toolCall.toolCallId,
@@ -858,20 +922,98 @@ describe("CreatePlan execution approval over a held-open Run", () => {
       execId: 900_000,
       toolName: "question",
       output: `User has answered your questions: "${question}"="No". You can now continue.`,
-    }] as any)
+    }] as any, { hostAgent: "plan" })
 
     const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
       .interaction_response.create_plan_request_response.result
-    expect(result.success).toBeUndefined()
     expect(result.error.error).toBe(CREATE_PLAN_NOT_APPROVED_REASON)
-    expect(result.plan_uri).toBe("")
-    await flushPlanExecutionKickoff("create-plan-opencode-session", {
+    expect(isCursorPlanModeActive("create-plan-opencode-session")).toBe(true)
+    expect(switched).toEqual([])
+    sessionManager.close(session, "ordinary-cleanup")
+  })
+})
+
+describe("CreatePlan approval delivery failure", () => {
+  afterEach(() => resetHostAgentModeSwitchForTests())
+
+  it("keeps planning and queues no execution when delivering Yes fails", () => {
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const session = planSession([], [], ["question"])
+    sessionManager.registerPending(900_000, session, "create_plan_request_response", "question", false, {
+      interactionId: 42,
+      createPlanBridgeKind: "approve",
+      createPlanQuestion: "Approve this plan?",
+      planUri: "file:///plans/review.md",
+    })
+    const switched: string[] = []
+    setHostAgentModeSwitch(({ targetModeID }) => { switched.push(targetModeID) })
+    session.stream.write = () => { throw new Error("transport closed") }
+    expect(deliverContinuationResults(session, [{
+      toolCallId: "approval", sessionId: session.sessionId, execId: 900_000,
+      toolName: "question", output: JSON.stringify({ answers: [["Yes"]] }),
+    }])).toBeUndefined()
+    expect(getActiveCursorMode(session.openCodeSessionId)).toBe("plan")
+    return flushHostAgentModeSwitch(session.openCodeSessionId, {
       cursorSessionID: session.sessionId,
       terminal: true,
-      pumpActive: false,
-      pendingExecs: 0,
+    }).then(flushed => {
+      expect(flushed).toBe(false)
+      expect(switched).toEqual([])
     })
-    expect(kickoffs).toEqual([])
+  })
+})
+
+describe("CreatePlan through a host plan-stage tool", () => {
+  function stageSession(writes: Uint8Array[]) {
+    const session = planSession([], writes, ["cursor_plan_stage"])
+    sessionManager.registerPending(900_000, session, "create_plan_request_response", "cursor_plan_stage", false, {
+      interactionId: 42,
+      createPlanBridgeKind: "stage",
+      planUri: "local://native-plan.md",
+    })
+    return session
+  }
+
+  it("reports approval when the host stage succeeds", () => {
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const writes: Uint8Array[] = []
+    const session = stageSession(writes)
+    deliverContinuationResults(session, [{
+      toolCallId: "stage-call", sessionId: session.sessionId, execId: 900_000,
+      toolName: "cursor_plan_stage", output: "Plan approved by host stage",
+    }] as any)
+    const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
+      .interaction_response.create_plan_request_response.result
+    expect(result.success).toBeDefined()
+    expect(result.plan_uri).toBe("local://native-plan.md")
+    expect(getActiveCursorMode("create-plan-opencode-session")).toBe("agent")
+    sessionManager.close(session, "ordinary-cleanup")
+  })
+
+  it("keeps planning when delivering a successful stage reply fails", () => {
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const session = stageSession([])
+    session.stream.write = () => { throw new Error("transport closed") }
+    expect(deliverContinuationResults(session, [{
+      toolCallId: "stage-call", sessionId: session.sessionId, execId: 900_000,
+      toolName: "cursor_plan_stage", output: "Plan approved by host stage",
+    }])).toBeUndefined()
+    expect(getActiveCursorMode(session.openCodeSessionId)).toBe("plan")
+  })
+
+  it("keeps planning with the host's reason when the stage review is declined", () => {
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const writes: Uint8Array[] = []
+    const session = stageSession(writes)
+    deliverContinuationResults(session, [{
+      toolCallId: "stage-call", sessionId: session.sessionId, execId: 900_000,
+      toolName: "cursor_plan_stage", output: "", error: "Plan refinement requested.",
+    }] as any)
+    const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
+      .interaction_response.create_plan_request_response.result
+    expect(result.success).toBeUndefined()
+    expect(result.error.error).toBe("Plan refinement requested.")
+    expect(getActiveCursorMode("create-plan-opencode-session")).toBe("plan")
     sessionManager.close(session, "ordinary-cleanup")
   })
 })

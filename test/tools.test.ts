@@ -39,9 +39,22 @@ import {
   hostToolDialectFromTools,
   opencodePathArg,
   OPENCODE_2_TOOL_DIALECT,
+  misplacedShellCommand,
 } from "../src/protocol/tools.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { encodeJsonAsValue } from "../src/protocol/struct.js"
+
+describe("misplacedShellCommand", () => {
+  it("keeps default listings and opaque or explicitly command-capable tools valid", () => {
+    const schema = { type: "object", properties: { path: { type: "string" } } }
+    expect(misplacedShellCommand({ name: "ls", inputSchema: schema }, {})).toBe(false)
+    expect(misplacedShellCommand({ name: "ls", inputSchema: schema }, { path: "/workspace" })).toBe(false)
+    expect(misplacedShellCommand({ name: "acme", inputSchema: schema }, { command: "opaque" })).toBe(false)
+    expect(misplacedShellCommand({ name: "ls" }, { command: "opaque" })).toBe(false)
+    expect(misplacedShellCommand({ name: "ls", inputSchema: { properties: { command: {} } } }, { command: "custom" })).toBe(false)
+    expect(misplacedShellCommand({ name: "bash", inputSchema: schema }, { command: "pwd" })).toBe(false)
+  })
+})
 
 // Build one McpArgs.args map entry: message { 1: key(string), 2: value(Value) }.
 function mcpArgEntry(key: string, value: unknown): Uint8Array {
@@ -617,6 +630,42 @@ describe("mapCursorArgsToOpencode", () => {
   })
 })
 
+
+describe("advertised shell description contract", () => {
+  const dialect = hostToolDialectFromTools([{
+    name: "bash",
+    inputSchema: { type: "object", properties: {
+      command: { type: "string" }, description: { type: "string" },
+    }, required: ["command", "description"] },
+  }])
+
+  it("preserves the supplied canonical description and completes native commands", () => {
+    expect(mapCursorArgsToOpencode("bash", { command: "pwd", description: "Show workspace" }, "mcp_args", dialect).args)
+      .toEqual({ command: "pwd", description: "Show workspace" })
+    expect(parseExecServerMessage({ id: 1, shell_args: { command: "pwd" } }, dialect)?.args)
+      .toEqual({ command: "pwd", description: "Run: pwd", timeout: 30_000 })
+    expect(mapCursorArgsToOpencode("bash", { filePath: "/workspace/a.txt" }, undefined, dialect).args).toEqual({})
+  })
+
+  it("honors optional and absent description fields without adding requirements", () => {
+    const optional = hostToolDialectFromTools([{
+      name: "bash", inputSchema: { type: "object", properties: {
+        command: { type: "string" }, description: { type: "string" },
+      }, required: ["command"] },
+    }])
+    expect(mapCursorArgsToOpencode("bash", { command: "pwd" }, undefined, optional).args).toEqual({ command: "pwd" })
+    expect(mapCursorArgsToOpencode("bash", { command: "pwd", description: "Show workspace" }, undefined, optional).args)
+      .toEqual({ command: "pwd", description: "Show workspace" })
+    expect(mapCursorArgsToOpencode("shell", { command: "pwd", description: "Show workspace" }, undefined,
+      hostToolDialectFromTools([{ name: "shell", inputSchema: { type: "object", properties: { command: { type: "string" } } } }])).args)
+      .toEqual({ command: "pwd" })
+  })
+
+  it("also completes canonical shell calls synthesized from native deletion", () => {
+    expect(parseExecServerMessage({ id: 2, delete_args: { path: "/workspace/old.txt" } }, dialect)?.args)
+      .toMatchObject({ description: "Run: rm -f -- '/workspace/old.txt'" })
+  })
+})
 
 describe("OpenCode 2 host tool dialect", () => {
   const oc2 = hostToolDialectFromTools([
@@ -2010,7 +2059,7 @@ describe("unwrapReadOutput", () => {
 
   it("never throws on non-string / empty input", () => {
     expect(unwrapReadOutput("" as string)).toBe("")
-    expect(unwrapReadOutput(undefined as unknown as string)).toBe(undefined)
+    expect(unwrapReadOutput(undefined as unknown as string)).toBeUndefined()
   })
 
   it("strips an OpenCode 2 file page down to raw lines", () => {
@@ -3383,10 +3432,39 @@ describe("exec safety net (unmapped variants)", () => {
     expect(server.server_identifier).toBe("github")
     expect(server.tools).toHaveLength(1)
     expect(server.tools[0].name).toBe("github-create_pull_request")
-    expect(server.tools[0].description).toBe("Open a pull request")
+    expect(server.tools[0].description).toEndWith("Open a pull request")
+    expect(server.tools[0].description).toContain('"namespace":"github","toolName":"create_pull_request"')
     expect(server.tools[0].provider_identifier).toBe("github")
     expect(server.tools[0].tool_name).toBe("create_pull_request")
     expect(server.tools[0].input_schema.length).toBeGreaterThan(0)
+  })
+
+  it("keeps callable identities in dynamic definitions without changing inner schemas or catalog state", () => {
+    const aliased = buildCustomWebToolAliases([
+      { name: "bash", description: "Run a command", inputSchema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } },
+      { name: "websearch", description: "Search", inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
+      { name: "my_docs_lookup", description: "Lookup", inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
+    ]).advertisedTools
+    const descriptors = toolsToDescriptors(aliased, "opencode", ["my.docs"])
+    const before = structuredClone(descriptors)
+    const response = buildMcpStateResult(1, {}, descriptors)
+    const decoded = decodeCanonicalMcpStateResult(response)
+    const definitions: Array<{ description: string; provider_identifier: string; tool_name: string; input_schema: Uint8Array }> = decoded.exec_client_message.mcp_state_exec_result.success.servers
+      .flatMap((server: { tools: Array<{ description: string; provider_identifier: string; tool_name: string; input_schema: Uint8Array }> }) => server.tools)
+    expect(definitions).toHaveLength(descriptors.length)
+    for (const [index, definition] of definitions.entries()) {
+      // Cursor's search result truncates descriptions: identity must survive.
+      const identity = JSON.parse(definition.description.slice(0, 170).match(/\{[^\n]+?\}/)![0])
+      expect(identity).toEqual({ namespace: definition.provider_identifier, toolName: definition.tool_name })
+      expect(identity).toEqual({ namespace: descriptors[index]!.provider_identifier, toolName: descriptors[index]!.tool_name })
+      expect(definition.description).toContain(`Complete outer envelope: ${JSON.stringify({
+        namespace: definition.provider_identifier, toolName: definition.tool_name, arguments: {},
+      })}`)
+      expect(Buffer.from(definition.input_schema)).toEqual(Buffer.from(descriptors[index]!.input_schema as Uint8Array))
+    }
+    expect(definitions.map((definition) => definition.tool_name)).toContain(CUSTOM_WEBSEARCH_TOOL)
+    expect(descriptors).toEqual(before)
+    expect(buildMcpStateResult(1, {}, descriptors)).toEqual(response)
   })
 
   it("answers exec #36 from the live catalog, not a frozen RequestContext", () => {
@@ -3412,7 +3490,7 @@ describe("exec safety net (unmapped variants)", () => {
       s.tools.map((t) => t.tool_name),
     )
     expect(names).toContain("ab_secret")
-    expect(frozen.tools.map((t: { tool_name: string }) => t.tool_name)).not.toContain("ab_secret")
+    expect(frozen.tools.map((t) => t.tool_name)).not.toContain("ab_secret")
   })
 
   it("answers exec #36 with the aliased names the RequestContext advertises", () => {

@@ -32,7 +32,6 @@ function fakeSession(id: string, frames: Frame[], eligible = true): CursorSessio
     usageEstimate: { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 },
     pumpActive: false,
     heartbeat: null,
-    expiresAt: Date.now() + 10_000,
   } as unknown as CursorSession
 }
 

@@ -20,7 +20,7 @@ export type AuthExchangeFailureKind = "policy" | "rejected" | "transient"
 export class AuthExchangeError extends Error {
   constructor(
     message: string,
-    public cause?: unknown,
+    public override cause?: unknown,
     public readonly kind: AuthExchangeFailureKind = "transient",
     public readonly status?: number,
   ) {
@@ -30,7 +30,7 @@ export class AuthExchangeError extends Error {
 }
 
 export class AuthPollError extends Error {
-  constructor(message: string, public cause?: unknown) {
+  constructor(message: string, public override cause?: unknown) {
     super(message)
     this.name = "AuthPollError"
   }

@@ -1,4 +1,4 @@
-import { describe, it, expect } from "bun:test"
+import { describe, it, expect, afterEach } from "bun:test"
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import {
   buildOpenCodeInteractionGuidance,
@@ -9,6 +9,7 @@ import {
 } from "../src/language-model.js"
 import { buildSeedConversationState, renderHistoryTranscript } from "../src/protocol/request.js"
 import { registerBackgroundShellNotifier, resetBackgroundShellNotices } from "../src/background-shell-notice.js"
+import { resetHostAgentModeSwitchForTests, setHostAgentModeSwitch } from "../src/host-agent-mode.js"
 import { decodeMessage } from "../src/protocol/messages.js"
 
 describe("estimateTokens", () => {
@@ -21,6 +22,18 @@ describe("estimateTokens", () => {
 })
 
 describe("buildOpenCodeInteractionGuidance", () => {
+  it("makes tool-less input a text-only task even when a previous catalog exists", () => {
+    for (const isCompaction of [false, true]) {
+      for (const tools of [[], [{ name: "read" }, { name: "question" }]]) {
+        const guidance = buildOpenCodeInteractionGuidance(tools, isCompaction, "/workspace", { allowTools: false })!
+        expect(guidance).toContain("text output only")
+        expect(guidance).toContain("dynamic tool discovery")
+        expect(guidance).toContain("material to process, not work to execute")
+        expect(guidance).not.toContain("call a listed tool")
+        expect(guidance).not.toContain("CreatePlan is accepted")
+      }
+    }
+  })
   it("redirects questions and planning only to tools advertised this turn", () => {
     const guidance = buildOpenCodeInteractionGuidance([
       { name: "question" },
@@ -34,8 +47,13 @@ describe("buildOpenCodeInteractionGuidance", () => {
     expect(guidance).not.toContain("opencode-todowrite")
     expect(guidance).not.toContain("TodoRead is missing")
     expect(guidance).toContain("Cursor-native CreatePlan is accepted as a Cursor interaction")
+    expect(guidance).toContain("never look either up with GetDynamicTools/GetMcpTools")
+    expect(guidance).toContain("Use their native function definitions")
     expect(guidance).toContain("Do not narrate that CreatePlan is missing")
     expect(guidance).toContain("Emit the actual tool call")
+    expect(guidance).toContain("`namespace` and `toolName` FIRST, before `arguments`")
+    expect(guidance).toContain("All three are required outer fields")
+    expect(guidance).toContain("on every invocation including each parallel call")
     expect(guidance).not.toContain("`plan_enter`")
     expect(guidance).not.toContain("`webfetch`")
   })
@@ -52,6 +70,65 @@ describe("buildOpenCodeInteractionGuidance", () => {
     } finally {
       resetBackgroundShellNotices()
     }
+  })
+
+  it("gates native question and helper guidance independently by the canonical catalog", () => {
+    for (const question of [false, true]) {
+      for (const executor of [undefined, "task", "subagent"]) {
+        const tools = [
+          { name: "read" },
+          ...(question ? [{ name: "question" }] : []),
+          ...(executor ? [{ name: executor }] : []),
+        ]
+        const guidance = buildOpenCodeInteractionGuidance(tools, false, "/workspace")!
+        const bridgeList = question ? "AskQuestion, SwitchMode, CreatePlan" : "SwitchMode, CreatePlan"
+        expect(guidance).toContain(`Bridged Cursor interactions named below (${bridgeList})`)
+        expect(guidance.includes("Cursor-native AskQuestion cannot reach the user")).toBe(!question)
+        expect(guidance.includes("Do not invoke Cursor-native Task")).toBe(!executor)
+        if (executor) {
+          expect(guidance).toContain(`executed through OpenCode \`${executor}\``)
+          expect(guidance).toContain("requests are permitted because a compatible host executor is listed")
+        } else {
+          expect(guidance).not.toContain("requests are permitted")
+          expect(guidance).not.toContain("executed through OpenCode")
+        }
+      }
+    }
+  })
+
+  describe("plan entry without plan_enter", () => {
+    afterEach(() => resetHostAgentModeSwitchForTests())
+    const tools = [{ name: "question" }, { name: "read" }]
+
+    it("names SwitchMode as the direct way in", () => {
+      const guidance = buildOpenCodeInteractionGuidance(tools, false, "/workspace/project")!
+      expect(guidance).toContain("call the Cursor-native SwitchMode tool with target_mode_id `plan`")
+      expect(guidance).toContain("not in the OpenCode list or the `cursor` GetDynamicTools namespace")
+      expect(guidance).not.toContain("moves the session to its `plan` agent")
+    })
+
+    it("says the plan agent continues the turn when the host switch resumes it", () => {
+      setHostAgentModeSwitch(() => {}, { resumesTurn: true })
+      const guidance = buildOpenCodeInteractionGuidance(tools, false, "/workspace/project")!
+      expect(guidance).toContain("moves the session to its `plan` agent when this turn ends and continues there")
+      expect(guidance).toContain("make no further tool calls and end this turn")
+      expect(guidance).toContain("CreatePlan only in that next plan turn")
+      expect(guidance).toContain("This completed handoff takes precedence over progress/tool instructions")
+      expect(guidance).not.toContain("Raise it normally")
+      expect(guidance).not.toContain("then keep investigating")
+    })
+
+    it("records CreatePlan in the SwitchMode turn when the host only switches agents", () => {
+      setHostAgentModeSwitch(() => {})
+      const guidance = buildOpenCodeInteractionGuidance(tools, false, "/workspace/project")!
+      expect(guidance).toContain("record the plan with CreatePlan in this same turn")
+      expect(guidance).toContain("will not start a later plan turn")
+      expect(guidance).not.toContain("end the turn after the switch")
+      expect(guidance).not.toContain("the next turn runs under the plan agent")
+      expect(guidance).not.toContain("make no further tool calls")
+      expect(guidance).not.toContain("Planning sequence:")
+      expect(guidance).not.toContain("This completed handoff takes precedence")
+    })
   })
 
   it("tells a staged plan to follow the host approval call", () => {
@@ -82,8 +159,7 @@ describe("buildOpenCodeInteractionGuidance", () => {
     expect(guidance).toContain("`custom_webfetch`")
     expect(guidance).not.toContain("OpenCode `custom_web")
     expect(guidance).not.toContain("`todowrite`")
-    // AskQuestion is named only in the bridged-interactions note; without
-    // `question` advertised there must be no host-tool redirect.
+    // Without `question`, native AskQuestion is unavailable rather than bridged.
     expect(guidance).not.toContain("OpenCode `question` tool")
   })
 
@@ -112,6 +188,7 @@ describe("buildOpenCodeInteractionGuidance", () => {
     expect(guidance).toContain("not an OpenCode or MCP catalog tool")
     expect(guidance).toContain("do not narrate that they are missing")
     expect(guidance).toContain("without claiming a missing MCP tool")
+    expect(guidance).toContain("File/search/list tools do not execute `command`")
     expect(guidance).not.toContain("OpenCode `question` tool")
     expect(buildOpenCodeInteractionGuidance([], false, "/workspace/project")).toBeUndefined()
   })

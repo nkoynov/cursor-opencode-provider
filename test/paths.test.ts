@@ -1,9 +1,13 @@
-import { afterEach, describe, expect, it } from "bun:test"
+import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import { existsSync, rmSync } from "node:fs"
 import path from "node:path"
 import {
   ensureOpencodeProjectDir,
   getHostCacheDirOverride,
+  hostPlanFilePath,
+  hostPlansDir,
+  opencode2PlanDir,
+  setNativePlansDir,
   opencodeGlobalCacheDir,
   opencodeGlobalConfigDir,
   opencodeGlobalDataDir,
@@ -86,6 +90,67 @@ describe("resolveHostCacheDir", () => {
     }
     try {
       expect(resolveHostCacheDir({ HOME: "/tmp/fake-home" })).toBe("/tmp/bridge-cache")
+    } finally {
+      if (previous === undefined) delete (globalThis as Record<PropertyKey, unknown>)[key]
+      else (globalThis as Record<PropertyKey, unknown>)[key] = previous
+    }
+  })
+})
+
+describe("hostPlansDir", () => {
+  beforeEach(() => setNativePlansDir(undefined))
+  afterEach(() => setNativePlansDir(undefined))
+
+  it("uses OpenCode 2.0's Plan directory once its entrypoint selects it", () => {
+    const env = { HOME: "/tmp/fake-home", XDG_DATA_HOME: "/tmp/xdg-data" }
+    expect(hostPlansDir(undefined, env)).toBe(path.join("/tmp/xdg-data", "opencode", "plans"))
+    expect(opencode2PlanDir({ OPENCODE_TEST_HOME: "/tmp/oc-home" })).toBe(path.join("/tmp/oc-home", ".opencode", "plan"))
+    setNativePlansDir(opencode2PlanDir({ OPENCODE_TEST_HOME: "/tmp/oc-home" }))
+    expect(hostPlansDir(undefined, env)).toBe(path.join("/tmp/oc-home", ".opencode", "plan"))
+  })
+
+  it("lets an installed bridge own host paths", () => {
+    const key = Symbol.for("opencode.host.path-bridge")
+    const previous = (globalThis as Record<PropertyKey, unknown>)[key]
+    setNativePlansDir("/tmp/oc-home/.opencode/plan")
+    ;(globalThis as Record<PropertyKey, unknown>)[key] = {
+      projectConfigDirs: () => [],
+      globalConfigDirs: () => [],
+      globalDataDir: () => "/tmp/bridge-data",
+    }
+    try {
+      expect(hostPlansDir()).toBe(path.join("/tmp/bridge-data", "plans"))
+    } finally {
+      if (previous === undefined) delete (globalThis as Record<PropertyKey, unknown>)[key]
+      else (globalThis as Record<PropertyKey, unknown>)[key] = previous
+    }
+  })
+})
+
+describe("hostPlanFilePath", () => {
+  const key = Symbol.for("opencode.host.path-bridge")
+  const input = { worktree: "/repo", vcs: true, created: 17, slug: "calm-wizard" }
+
+  it("follows OpenCode's Session.plan location without a bridge", () => {
+    const env = { HOME: "/tmp/fake-home", XDG_DATA_HOME: "/tmp/xdg-data" }
+    expect(hostPlanFilePath(input, env)).toBe(path.join("/repo", ".opencode", "plans", "17-calm-wizard.md"))
+    expect(hostPlanFilePath({ ...input, vcs: false }, env))
+      .toBe(path.join("/tmp/xdg-data", "opencode", "plans", "17-calm-wizard.md"))
+    expect(hostPlanFilePath({ ...input, slug: "../x" }, env)).toBeUndefined()
+    expect(hostPlanFilePath({ ...input, created: 0 }, env)).toBeUndefined()
+  })
+
+  it("defers to an installed bridge, which may define no plan file", () => {
+    const previous = (globalThis as Record<PropertyKey, unknown>)[key]
+    try {
+      ;(globalThis as Record<PropertyKey, unknown>)[key] = { projectConfigDirs: () => [], globalConfigDirs: () => [] }
+      expect(hostPlanFilePath(input)).toBeUndefined()
+      ;(globalThis as Record<PropertyKey, unknown>)[key] = {
+        projectConfigDirs: () => [],
+        globalConfigDirs: () => [],
+        planFile: () => "/bridge/plans/p.md",
+      }
+      expect(hostPlanFilePath(input)).toBe(path.resolve("/bridge/plans/p.md"))
     } finally {
       if (previous === undefined) delete (globalThis as Record<PropertyKey, unknown>)[key]
       else (globalThis as Record<PropertyKey, unknown>)[key] = previous

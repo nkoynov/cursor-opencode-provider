@@ -4,10 +4,39 @@
 
 ### Changed
 
+- CreatePlan writes plans where OpenCode keeps them: the session's own plan file on OpenCode 1.x (`.opencode/plans/` in a git project, otherwise the data `plans/` folder) and the Plan directory (`~/.opencode/plan`) on OpenCode 2.0, instead of a provider-chosen folder
+- Cursor follows the OpenCode agent on every turn, as Cursor CLI does: choosing `plan` in OpenCode's agent picker puts Cursor in plan mode, and leaving it returns Cursor to agent mode
+- Cursor SwitchMode into plan mode moves the session to OpenCode's `plan` agent once the turn ends (OpenCode 2.0, and 1.x without `plan_enter`)
+- In plan mode without a host `plan_exit`, CreatePlan shows the plan and asks through `question` whether to start implementing; Yes switches to the build agent and continues. Under the `plan` agent with `plan_exit`, CreatePlan writes the session plan file and runs that review instead; a host plan-stage tool receives the plan directly
+- `cursor-opencode-provider/image-save` accepts `ask: null` for hosts without a permission prompt (the image is written after containment only); a missing `ask` is still refused
 - A Run starts without the HTTP/2 health-check ping when its connection received data in the last 10 seconds, as Cursor CLI does, which saves a round trip to Cursor on most Runs. If that connection turns out to be dead before Cursor answers (reset, refused stream, or a GOAWAY that excludes the Run), the Run is sent once more on a new connection; once Cursor has answered it is never sent again
 
 ### Fixed
 
+- Dynamic-catalog guidance names the namespace for host tools (`opencode`) and states that `cursor` holds only Cursor's built-in tools, so a first `skill` lookup no longer fails in the wrong namespace.
+- A SwitchMode handoff that starts a new host plan turn explicitly terminates the old Cursor Run before the host switch, preserving its checkpoint and preventing premature CreatePlan calls. Native planning guidance distinguishes direct functions from dynamic discovery; debug logs retain native discovery errors.
+- Dynamic tool definitions carry their exact invocation identity and complete outer envelope beside the inner argument schema, so discovery and shortened search results retain required outer call fields.
+- Shell calls preserve an advertised description and supply one for native commands when the canonical schema requires it, before required-argument validation.
+- Dynamic-call guidance requires complete tool identities on every invocation; file tools reject misplaced shell commands, and debug logs retain server-side MCP validation errors that never reached host execution.
+- Interaction guidance no longer advertises native AskQuestion as bridged without `question`, and explicitly skips optional delegation without a canonical `task`/`subagent` executor.
+- Tool-less title and summary requests explicitly process supplied context without executing its task, and missing required tool arguments are rejected before host execution with a correlated correction request.
+- Stale Cursor token categories no longer appear as current context metadata or cache changes; usage validation marks a retained older breakdown `stale` while checking current occupancy independently.
+- Refused exec debug lines include the rejection reason, so partial-read protection can be distinguished from an invalid tool mapping.
+- OpenCode 2.0 saves Cursor-generated images through `cursor_image_save` instead of refusing the binary write
+- On OpenCode 2.0, an approved plan starts implementing and plans land in the Plan directory even after the plugin is set up for several locations or reloaded; before, disposing an older setup removed the newer one's agent switch and the session stopped after approval
+- Assistant text before and after a tool call or plan review is separated into paragraphs instead of running together, so a shown plan's heading renders
+- Session titles and summaries contain only the model's answer, not its narration before tools it could not use
+- A new message that arrives with a plan approval or plan-mode switch no longer discards the Cursor turn that raised it, and one that arrives while Cursor is still answering no longer waits for that unseen answer before starting over
+- A new message sent while a plan review, question, or mode switch is still open declines it instead of leaving the earlier Cursor run open
+- A pending tool result in a new message reaches its Cursor run before helper detection, so the conversation is kept even when the tool catalog shrank
+- Approving a plan is not undone by plan-mode reminders the host appends after the answer, and a failed approval delivery no longer changes the mode or starts implementing
+- Native agent switches run once per session at a time and keep a newer request that arrives while one is applying
+- On OpenCode 1.x, a SwitchMode in a session's first turn moves it to the `plan` agent too
+- Where OpenCode offers no `plan_enter`, the model is told to enter plan mode with Cursor's SwitchMode directly instead of concluding plan mode is unavailable
+- With a host plan-stage tool, plan mode is kept while the host still advertises `plan_enter`
+- After MCP tools appear mid-turn, the next user message reuses RequestContext instead of rebuilding it
+- A Cursor run that fails before showing any output can be retried automatically again: timing, tracing, and progress fields Cursor now sends on ordinary updates no longer mark every run unsafe to retry
+- The debug log's turn usage validation no longer reports `status=mismatch` when Cursor's context shrinks between steps
 - The first Cursor request after the provider starts no longer waits for every saved conversation to be decompressed and decoded (about 11 s, blocking the whole process, with a day of sessions): startup cleanup decodes only files last written more than 24 hours ago
 - An account-level refusal from Cursor (for example "Too many computers.") shows Cursor's own message instead of `Cursor API error (code=resource_exhausted)`, and is not retried, by the provider or by OpenCode
 - Session titles and other tool-less requests (plugin `generate` calls) no longer advertise the session's tools, and the host's instructions open the request with its message as the input, so the title model answers in one call instead of trying tools that are then refused. Compaction still advertises the session's tools
@@ -41,6 +70,7 @@
 - A resumed Run that fails before Cursor sends a newer checkpoint resumes again from the one it started from, as Cursor CLI does, instead of ending the turn as unsafe to retry; once the Run asks the host for anything or answers an interaction, that checkpoint is no longer reused
 - A Run Cursor refuses for capacity (`resource_exhausted`, `unavailable`, HTTP 429/503) is retried over about a minute (six attempts, delays from 1–2 s doubling to 15–30 s, or Cursor's retry delay) instead of three attempts within about 1.5 s, which an Opus capacity shortage outlasted. The final error says the capacity is on Cursor's side, not a limit on the key. Network errors keep the fast retries
 - Grok 4.7's 500k variants (`Grok 4.7 High 500k` and the rest) run in max mode like the 1M variants, instead of failing with `Cursor API error (code=not_found)`: any context above the model's base window now selects max mode, not only 1m
+
 ## [0.8.0] - 2026-10-04
 
 ### Changed

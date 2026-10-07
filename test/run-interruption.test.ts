@@ -15,10 +15,11 @@ import type { CursorSession, Frame } from "../src/session.js"
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
 import { CursorAuthError, CursorRetryExhaustedError } from "../src/errors.js"
 import { carryTurnEndedCounters, newOccupancyUsageLedger, occupancyStepUsage } from "../src/usage.js"
+import { sessionFixture } from "./session-fixture.js"
 
 function fakeSession(id: string, frames: Frame[], writes: Uint8Array[] = []): CursorSession {
   let index = 0
-  return {
+  return sessionFixture({
     sessionId: id,
     conversationId: `conv-${id}`,
     stream: {
@@ -31,6 +32,7 @@ function fakeSession(id: string, frames: Frame[], writes: Uint8Array[] = []): Cu
       }),
       destroy() {},
       isClosed: () => false,
+      onTerminal: () => () => {},
     },
     frames: {
       next: async () => index < frames.length
@@ -47,8 +49,7 @@ function fakeSession(id: string, frames: Frame[], writes: Uint8Array[] = []): Cu
     usageEstimate: { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 },
     pumpActive: false,
     heartbeat: null,
-    expiresAt: Date.now() + 10_000,
-  }
+  })
 }
 
 function controller(parts: unknown[]) {
@@ -56,7 +57,7 @@ function controller(parts: unknown[]) {
     enqueue(part: unknown) { parts.push(part) },
     close() {},
     error(error: unknown) { throw error },
-  } as ReadableStreamDefaultController<any>
+  } as unknown as ReadableStreamDefaultController<any>
 }
 
 function serverFrame(message: Record<string, unknown>, flags = 0): Frame {
@@ -75,7 +76,7 @@ function writeVarint(out: number[], value: number): void {
   out.push(remaining)
 }
 
-function lengthDelimitedField(field: number, bytes = new Uint8Array()): Uint8Array {
+function lengthDelimitedField(field: number, bytes: Uint8Array = new Uint8Array()): Uint8Array {
   const out: number[] = []
   writeVarint(out, (field << 3) | 2)
   writeVarint(out, bytes.length)

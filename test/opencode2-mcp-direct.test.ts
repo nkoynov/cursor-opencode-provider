@@ -15,7 +15,13 @@ type Tool = {
 function editor(tools: Tool[]): ToolDraft {
   return {
     add: () => {},
-    list: () => tools,
+    list: () => tools.map((tool) => ({
+      name: tool.id,
+      description: tool.id,
+      input: {},
+      execute: async () => ({}),
+      ...tool,
+    })),
     update: (id, update) => {
       const tool = tools.find((item) => item.id === id)
       if (tool) update(tool)
@@ -26,11 +32,13 @@ function editor(tools: Tool[]): ToolDraft {
 describe("rememberDirectMcpNamespaces", () => {
   test("keeps every server that did not explicitly opt into Code Mode", () => {
     const namespaces = new Set<string>(["stale"])
-    rememberDirectMcpNamespaces(namespaces, [
+    // Host MCP server configs carry more than `codemode`.
+    const servers: ReadonlyArray<readonly [string, { readonly type: string; readonly codemode?: boolean }]> = [
       ["github", { type: "local" }],
       ["my.docs", { type: "remote", codemode: false }],
       ["executor", { type: "local", codemode: true }],
-    ])
+    ]
+    rememberDirectMcpNamespaces(namespaces, servers)
     expect(namespaces).toEqual(new Set(["github", "my_docs"]))
     expect(mcpServerNamespace("my.docs")).toBe("my_docs")
   })

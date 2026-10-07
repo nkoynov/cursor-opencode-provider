@@ -46,7 +46,7 @@ describe("OpenCode-backed websearch tool", () => {
         return new Response(JSON.stringify({
           result: { content: [{ type: "text", text: "search output" }] },
         }))
-      }) as typeof fetch,
+      }) as unknown as typeof fetch,
     )
 
     expect(asks).toEqual([expect.objectContaining({

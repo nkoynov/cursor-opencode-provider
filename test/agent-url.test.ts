@@ -48,7 +48,7 @@ describe("resolveAgentUrl", () => {
         return new Response(INSTALLER_FIXTURE, { status: 200 })
       }
       throw new Error(`unexpected fetch: ${url}`)
-    }) as typeof fetch
+    }) as unknown as typeof fetch
   })
 
   afterEach(() => {
@@ -85,7 +85,7 @@ describe("resolveAgentUrl", () => {
     globalThis.fetch = (async () =>
       Response.json({
         agentUrlConfig: { agentnUrl: "https://agentn.eu.api5.cursor.sh" },
-      })) as typeof fetch
+      })) as unknown as typeof fetch
     expect(await resolveAgentUrl(fakeJwt(3600))).toBe("https://agentn.eu.api5.cursor.sh")
   })
 
@@ -93,7 +93,7 @@ describe("resolveAgentUrl", () => {
     globalThis.fetch = (async () =>
       Response.json({
         agentUrlConfig: { agentUrl: "agentn.eu.api5.cursor.sh" },
-      })) as typeof fetch
+      })) as unknown as typeof fetch
     expect(await resolveAgentUrl(fakeJwt(3600))).toBe("https://agentn.eu.api5.cursor.sh")
   })
 
@@ -130,7 +130,7 @@ describe("resolveAgentUrl", () => {
   it("throws when the fetch fails instead of falling back to the global host", async () => {
     globalThis.fetch = (async () => {
       throw new Error("network down")
-    }) as typeof fetch
+    }) as unknown as typeof fetch
     await expect(resolveAgentUrl(fakeJwt(3600))).rejects.toThrow(
       "GetServerConfig network request failed",
     )
@@ -151,7 +151,7 @@ describe("resolveAgentUrl", () => {
         return Response.json({ agentUrlConfig: { agentnUrl: "https://agentn.us.api5.cursor.sh" } })
       }
       return new Response(INSTALLER_FIXTURE, { status: 200 })
-    }) as typeof fetch
+    }) as unknown as typeof fetch
 
     await expect(resolveAgentUrl(fakeJwt(3600))).rejects.toThrow(
       "GetServerConfig response missing agentUrlConfig.agentnUrl",
@@ -181,7 +181,7 @@ describe("resolveAgentUrl", () => {
         return Response.json({ agentUrlConfig: { agentnUrl: "https://agentn.us.api5.cursor.sh" } })
       }
       return new Response(INSTALLER_FIXTURE, { status: 200 })
-    }) as typeof fetch
+    }) as unknown as typeof fetch
 
     // First call fails and is not memoized.
     await expect(resolveAgentUrl(fakeJwt(3600))).rejects.toThrow(
@@ -204,7 +204,7 @@ describe("resolveAgentUrl", () => {
     globalThis.fetch = (async () =>
       Response.json({
         agentUrlConfig: { agentnUrl: "agentn.us.api5.cursor.sh" },
-      })) as typeof fetch
+      })) as unknown as typeof fetch
     expect(await resolveAgentUrl(fakeJwt(3600))).toBe("https://agentn.us.api5.cursor.sh")
   })
 
@@ -225,7 +225,7 @@ describe("resolveAgentUrl", () => {
         return Response.json({ agentUrlConfig: { agentnUrl: "https://agentn.us.api5.cursor.sh" } })
       }
       return new Response(INSTALLER_FIXTURE, { status: 200 })
-    }) as typeof fetch
+    }) as unknown as typeof fetch
 
     await expect(resolveAgentUrl(fakeJwt(3600))).rejects.toThrow(
       "GetServerConfig returned an invalid Cursor agent URL",
@@ -259,7 +259,7 @@ describe("resolveAgentUrl", () => {
         return Response.json({ agentUrlConfig: { agentnUrl: region } })
       }
       return new Response(INSTALLER_FIXTURE, { status: 200 })
-    }) as typeof fetch
+    }) as unknown as typeof fetch
 
     expect(await resolveAgentUrl(tokenA)).toBe(regionForA)
     expect(await resolveAgentUrl(tokenA)).toBe(regionForA)
@@ -293,7 +293,7 @@ describe("resolveAgentUrl", () => {
         })
       }
       return new Response(INSTALLER_FIXTURE, { status: 200 })
-    }) as typeof fetch
+    }) as unknown as typeof fetch
 
     expect(await resolveAgentUrl(tokenA)).toBe(regionForA)
     expect(await resolveAgentUrl(tokenB)).toBe(regionForB)

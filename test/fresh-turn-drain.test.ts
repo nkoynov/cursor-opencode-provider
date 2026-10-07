@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test"
-import { encodeMessage } from "../src/protocol/messages.js"
+import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import {
   cancelPendingExecsForFreshTurn,
   drainSessionUntilTurnEnded,
@@ -9,6 +9,7 @@ import {
   shouldIsolateInSessionHelper,
 } from "../src/language-model.js"
 import { sessionManager, type CursorSession } from "../src/session.js"
+import { sessionFixture } from "./session-fixture.js"
 
 function turnEndedPayload(inputTokens: number, cacheRead: number): Uint8Array {
   return encodeMessage("AgentServerMessage", {
@@ -28,7 +29,7 @@ function fakeSessionWithPayloads(payloads: Uint8Array[]): CursorSession {
   let index = 0
   const written: Uint8Array[] = []
   const conversationId = `conv_drain_${Date.now()}_${Math.random().toString(16).slice(2)}`
-  const session: CursorSession = {
+  const session = sessionFixture({
     sessionId: `sess_drain_${Date.now()}_${Math.random().toString(16).slice(2)}`,
     conversationId,
     openCodeSessionId: `opencode-fresh-turn-${Math.random().toString(16).slice(2)}`,
@@ -63,7 +64,6 @@ function fakeSessionWithPayloads(payloads: Uint8Array[]): CursorSession {
     allowTools: true,
     pumpActive: false,
     heartbeat: null,
-    expiresAt: Date.now() + 10_000,
     cacheDiagnostics: {
       sessionKey: "opencode-fresh-turn",
       conversationId,
@@ -79,7 +79,7 @@ function fakeSessionWithPayloads(payloads: Uint8Array[]): CursorSession {
       execRequests: 0,
       priorTokenDetails: { usedTokens: 1000, maxTokens: 256_000 },
     },
-  }
+  })
   ;(session as CursorSession & { _written: Uint8Array[] })._written = written
   sessionManager.registerSession(session)
   return session
@@ -146,6 +146,51 @@ describe("fresh-turn prior drain", () => {
     sessionManager.close(session, "ordinary-cleanup")
   })
 
+  it("refuses an abandoned CreatePlan review with the cancel reason, never an approval", () => {
+    const session = fakeSessionWithPayloads([])
+    sessionManager.registerPending(900_000, session, "create_plan_request_response", "question", false, {
+      interactionId: 1,
+      createPlanBridgeKind: "approve",
+      planUri: "file:///tmp/plan.md",
+    })
+    sessionManager.registerPending(0, session, "grep_result", "grep", false)
+    expect(cancelPendingExecsForFreshTurn(session)).toBe(2)
+    expect(session.pending.size).toBe(0)
+    const replies = (session as CursorSession & { _written: Uint8Array[] })._written
+      .map((frame) => decodeMessage<any>("AgentClientMessage", frame))
+    const plan = replies.find((reply) => reply.interaction_response?.create_plan_request_response)
+      ?.interaction_response.create_plan_request_response.result
+    expect(plan.success).toBeUndefined()
+    expect(plan.error.error).toBe(FRESH_TURN_PENDING_CANCEL_REASON)
+    expect(plan.plan_uri).toBe("")
+    sessionManager.close(session, "ordinary-cleanup")
+  })
+
+  it("delivers the host's own answer before cancelling, so it is never replaced", async () => {
+    const session = fakeSessionWithPayloads([turnEndedPayload(100, 80)])
+    sessionManager.registerPending(900_000, session, "create_plan_request_response", "question", false, {
+      interactionId: 3,
+      createPlanBridgeKind: "approve",
+      planUri: "file:///tmp/plan.md",
+      createPlanQuestion: "Approve?",
+    })
+    expect(await preparePriorSessionForFreshTurn(session.openCodeSessionId, {
+      timeoutMs: 1_000,
+      toolResults: [{
+        toolCallId: "q",
+        sessionId: session.sessionId,
+        execId: 900_000,
+        toolName: "question",
+        output: "User has answered your questions: \"Approve?\"=\"No\". You can now continue with the user's answers in mind.",
+      }],
+    })).toBe("drained")
+    const writes = (session as CursorSession & { _written: Uint8Array[] })._written
+    expect(writes).toHaveLength(1)
+    const plan = decodeMessage<any>("AgentClientMessage", writes[0]!)
+      .interaction_response.create_plan_request_response.result
+    expect(plan.error.error).not.toBe(FRESH_TURN_PENDING_CANCEL_REASON)
+  })
+
   it("drainSessionUntilTurnEnded times out when Cursor stays silent", async () => {
     const session = fakeSessionWithPayloads([])
     let resolveNext: ((value: IteratorResult<{ flags: number; payload: Uint8Array }>) => void) | undefined
@@ -163,6 +208,104 @@ describe("fresh-turn prior drain", () => {
 })
 
 describe("in-session helper catalog isolation", () => {
+  it("reconciles a pending plan review before classifying a reduced catalog as a helper", async () => {
+    const parent = fakeSessionWithPayloads([turnEndedPayload(100, 80)])
+    parent.toolCatalog = ["read", "write", "plan_exit"].map(name => ({ name })) as never
+    sessionManager.registerPending(900_000, parent, "create_plan_request_response", "plan_exit", false, {
+      interactionId: 7,
+      createPlanBridgeKind: "exit",
+      planUri: "file:///plans/review.md",
+    })
+    const incoming = [{ name: "read" }, { name: "write" }]
+    const results = [{
+      toolCallId: "plan-review",
+      sessionId: parent.sessionId,
+      execId: 900_000,
+      toolName: "plan_exit",
+      output: "Plan review complete",
+    }]
+    expect(shouldIsolateInSessionHelper(parent.openCodeSessionId, incoming)).toBe(true)
+    expect(shouldIsolateInSessionHelper(parent.openCodeSessionId, incoming, [
+      { ...results[0]!, sessionId: "another-run" },
+    ])).toBe(true)
+    expect(shouldIsolateInSessionHelper(parent.openCodeSessionId, incoming, results)).toBe(false)
+
+    expect(await preparePriorSessionForFreshTurn(parent.openCodeSessionId, {
+      timeoutMs: 1_000,
+      toolResults: results,
+      hostAgent: "build",
+    })).toBe("drained")
+    const writes = (parent as CursorSession & { _written: Uint8Array[] })._written
+    const reply = decodeMessage<any>("AgentClientMessage", writes[0]!)
+      .interaction_response.create_plan_request_response.result
+    expect(reply.success).toBeDefined()
+    expect(reply.plan_uri).toBe("file:///plans/review.md")
+    expect(parent.pending.size).toBe(0)
+    expect(parent.closed).toBe(true)
+  })
+
+  it("drains past the display close of the delivered call to keep the turn's checkpoint", async () => {
+    // Live order after a delivered host result: display close of the same
+    // call, checkpoint, turn_ended. Stopping at the close lost the turn.
+    const closeDisplay = encodeMessage("AgentServerMessage", {
+      interaction_update: {
+        tool_call_completed: {
+          call_id: "call-plan-review",
+          tool_call: { create_plan_tool_call: { args: { name: "Review", plan: "1. A" } } },
+        },
+      },
+    })
+    const parent = fakeSessionWithPayloads([closeDisplay, turnEndedPayload(100, 80)])
+    sessionManager.registerPending(900_000, parent, "create_plan_request_response", "plan_exit", false, {
+      interactionId: 7,
+      createPlanBridgeKind: "exit",
+      planUri: "file:///plans/review.md",
+    })
+    expect(await preparePriorSessionForFreshTurn(parent.openCodeSessionId, {
+      timeoutMs: 1_000,
+      toolResults: [{
+        toolCallId: "plan-review",
+        sessionId: parent.sessionId,
+        execId: 900_000,
+        toolName: "plan_exit",
+        output: "Plan review complete",
+      }],
+      hostAgent: "build",
+    })).toBe("drained")
+    expect(parent.closed).toBe(true)
+  })
+
+  it("stops draining as soon as the model answers in the abandoned Run", async () => {
+    // Live: a delivered helper result made Cursor write its whole answer in
+    // the old Run for ~8 s before the drain gave up; nobody could see it.
+    let reads = 0
+    const answer = encodeMessage("AgentServerMessage", {
+      interaction_update: { text_delta: { text: "Reply continue to run steps 8–10." } },
+    })
+    const session = fakeSessionWithPayloads([answer, answer, turnEndedPayload(100, 80)])
+    const next = session.frames.next.bind(session.frames)
+    session.frames = { next: async () => { reads++; return next() } } as never
+    expect(await drainSessionUntilTurnEnded(session, { timeoutMs: 1_000 })).toBe("busy")
+    expect(reads).toBe(1)
+    expect(session.closed).toBe(false)
+    sessionManager.close(session, "ordinary-cleanup")
+  })
+
+  it("stops draining when Cursor starts a new tool", async () => {
+    const startDisplay = encodeMessage("AgentServerMessage", {
+      interaction_update: {
+        tool_call_started: {
+          call_id: "call-next",
+          tool_call: { create_plan_tool_call: { args: { name: "Next", plan: "1. B" } } },
+        },
+      },
+    })
+    const session = fakeSessionWithPayloads([startDisplay, turnEndedPayload(100, 80)])
+    expect(await drainSessionUntilTurnEnded(session, { timeoutMs: 1_000 })).toBe("busy")
+    expect(session.closed).toBe(false)
+    sessionManager.close(session, "ordinary-cleanup")
+  })
+
   it("detects a proper catalog subset (67 of 70, missing task/question/plan_exit)", () => {
     const parent = ["bash", "edit", "grep", "plan_exit", "question", "read", "task", "write"].map(
       (name) => ({ name }),
@@ -212,7 +355,7 @@ describe("in-session helper catalog isolation", () => {
     const parent = fakeSessionWithPayloads([turnEndedPayload(100, 80)])
     parent.toolCatalog = Array.from({ length: 70 }, (_, index) => ({
       name: index === 37 ? "task" : `tool-${index}`,
-    })) as never
+    })) as NonNullable<CursorSession["toolCatalog"]>
     sessionManager.registerPending(37, parent, "mcp_result", "task", false)
 
     const helperTools = (parent.toolCatalog ?? []).filter((tool) => tool.name !== "task")

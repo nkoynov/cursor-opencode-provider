@@ -1347,7 +1347,7 @@ describe("model cache integrity", () => {
   it("force-refreshes a fresh cache for a newly selected account", async () => {
     const directory = await tempDir()
     await writeCache(directory, testCache("old-account"))
-    let authorization: string | null = null
+    let authorization = null as string | null
     using server = Bun.serve({
       port: 0,
       fetch(request) {

@@ -4,6 +4,7 @@ import path from "node:path"
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import { sessionManager, type CursorSession } from "../src/session.js"
 import { findContinuationSession, deliverContinuationResults, extractTrailingToolResults, hasApprovedUncorrelatedPlanStageResult, rememberMirroredTodos, refreshHeldSessionToolCatalog, resetTurnStateForTests, snapshotMirroredTodosBySession } from "../src/language-model.js"
+import { getOrBuildRequestContext } from "../src/context/frozen.js"
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
 import { CREATE_PLAN_RESULT_FIELD } from "../src/protocol/create-plan.js"
 import { decodeMessage } from "../src/protocol/messages.js"
@@ -14,10 +15,11 @@ import {
   registerCursorShellCall,
   resetCursorShellCalls,
 } from "../src/shell-timeout.js"
+import { sessionFixture } from "./session-fixture.js"
 
 let _seq = 0
 function fakeSession(id?: string): CursorSession {
-  return {
+  return sessionFixture({
     sessionId: id ?? `sess_test_${++_seq}`,
     conversationId: `conv_test_${_seq}`,
     stream: {
@@ -29,6 +31,8 @@ function fakeSession(id?: string): CursorSession {
     } as any,
     frames: { next: async () => ({ done: true, value: undefined }) } as any,
     pending: new Map(),
+    displayToolCalls: new Map(),
+    nextBridgedExecId: 900_000,
     blobs: new Map(),
     toolDescriptors: [],
     requestContext: {},
@@ -36,8 +40,7 @@ function fakeSession(id?: string): CursorSession {
     allowTools: true,
     pumpActive: false,
     heartbeat: null,
-    expiresAt: Date.now() + 10_000,
-  }
+  })
 }
 
 function toolMsg(sessionId: string, execId: number): LanguageModelV3CallOptions["prompt"][number] {
@@ -177,6 +180,29 @@ describe("extractTrailingToolResults", () => {
     ] as LanguageModelV3CallOptions["prompt"])).toEqual([])
   })
 
+  it("sees through OpenCode plan-mode system-reminder notes without appending them", () => {
+    const reminder = {
+      role: "user" as const,
+      content: [{
+        type: "text" as const,
+        text: "<system-reminder>\nYou are in Plan mode. Tell them they need to switch agents.\n</system-reminder>",
+      }],
+    }
+    const trailing = extractTrailingToolResults([
+      toolMsg("live", 1),
+      reminder,
+      reminder,
+    ] as LanguageModelV3CallOptions["prompt"])
+    expect(trailing).toEqual([{
+      toolCallId: "cursor_live_1",
+      sessionId: "live",
+      execId: 1,
+      toolName: "glob",
+      output: "ok",
+      error: undefined,
+    }])
+  })
+
   it("returns empty for an empty prompt", () => {
     expect(extractTrailingToolResults([])).toEqual([])
   })
@@ -264,14 +290,14 @@ describe("deliverContinuationResults", () => {
     setActiveCursorMode(live.openCodeSessionId, "plan")
     sessionManager.registerPending(8, live, "mcp_result", "cursor_plan_stage")
 
-    expect(deliverContinuationResults(live, [{
+    expect(deliverContinuationResults(live, [{ toolCallId: "result-244",
       sessionId: live.sessionId, execId: 8, toolName: "cursor_plan_stage", output: "Plan approved",
     }])).toBe(live)
     expect(getActiveCursorMode(live.openCodeSessionId)).toBe("agent")
 
     setActiveCursorMode(live.openCodeSessionId, "plan")
     sessionManager.registerPending(9, live, "mcp_result", "cursor_plan_stage")
-    expect(deliverContinuationResults(live, [{
+    expect(deliverContinuationResults(live, [{ toolCallId: "result-251",
       sessionId: live.sessionId, execId: 9, toolName: "cursor_plan_stage", output: "", error: "Keep planning",
     }])).toBe(live)
     expect(getActiveCursorMode(live.openCodeSessionId)).toBe("plan")
@@ -284,7 +310,7 @@ describe("deliverContinuationResults", () => {
     sessionManager.registerPending(7, live, "grep_result", "glob")
 
     const kept = deliverContinuationResults(live, [
-      { sessionId: "live-write", execId: 7, toolName: "glob", output: "a.ts" },
+      { toolCallId: "result-264", sessionId: "live-write", execId: 7, toolName: "glob", output: "a.ts" },
     ])
 
     expect(kept).toBe(live)
@@ -355,7 +381,7 @@ describe("deliverContinuationResults", () => {
         correlatedEditCallId: "edit-call",
       })
 
-      const kept = deliverContinuationResults(live, [{
+      const kept = deliverContinuationResults(live, [{ toolCallId: "result-290",
         sessionId: "authorized-external-read",
         execId: 31,
         toolName: "read",
@@ -473,7 +499,7 @@ describe("deliverContinuationResults", () => {
       { interactionId: 7, planUri: "local://sample-plan.md" },
     )
 
-    const kept = deliverContinuationResults(live, [{
+    const kept = deliverContinuationResults(live, [{ toolCallId: "result-408",
       sessionId: "native-plan",
       execId: 900_101,
       toolName: "write",
@@ -500,7 +526,7 @@ describe("deliverContinuationResults", () => {
       { interactionId: 8, planUri: "local://sample-plan.md" },
     )
 
-    deliverContinuationResults(live, [{
+    deliverContinuationResults(live, [{ toolCallId: "result-435",
       sessionId: "native-plan-error",
       execId: 900_102,
       toolName: "write",
@@ -522,7 +548,7 @@ describe("deliverContinuationResults", () => {
     sessionManager.registerPending(3, live, "read_result", "read")
 
     const kept = deliverContinuationResults(live, [
-      { sessionId: "dead-write", execId: 3, toolName: "read", output: "content" },
+      { toolCallId: "result-457", sessionId: "dead-write", execId: 3, toolName: "read", output: "content" },
     ])
 
     expect(kept).toBeUndefined()
@@ -540,7 +566,7 @@ describe("deliverContinuationResults", () => {
     sessionManager.registerPending(900_001, live, "todowrite", "todowrite", true)
 
     const kept = deliverContinuationResults(live, [
-      { sessionId: "bridged", execId: 900_001, toolName: "todowrite", output: "ok" },
+      { toolCallId: "result-475", sessionId: "bridged", execId: 900_001, toolName: "todowrite", output: "ok" },
     ])
 
     expect(kept).toBe(live)
@@ -562,7 +588,7 @@ describe("deliverContinuationResults", () => {
     sessionManager.registerPending(900_002, live, "todoread", "todoread", true)
 
     const kept = deliverContinuationResults(live, [
-      {
+      { toolCallId: "result-497",
         sessionId: "todoread-sess",
         execId: 900_002,
         toolName: "todoread",
@@ -585,7 +611,7 @@ describe("deliverContinuationResults", () => {
     // Non-JSON host output must not wipe a useful prior.
     sessionManager.registerPending(900_003, live, "todoread", "todoread", true)
     deliverContinuationResults(live, [
-      {
+      { toolCallId: "result-520",
         sessionId: "todoread-sess",
         execId: 900_003,
         toolName: "todoread",
@@ -654,5 +680,33 @@ describe("refreshHeldSessionToolCatalog", () => {
     // #36 names match the aliased names RequestContext advertises.
     expect(listed.map((tool) => tool.name)).toContain("custom_websearch")
     expect(listed.map((tool) => tool.tool_name)).not.toContain("websearch")
+  })
+
+  it("grows the conversation overlay so the next Run reuses RequestContext after MCP tools appear", async () => {
+    const live = fakeSession("mcp-reuse")
+    live.openCodeSessionId = "ses_mcp_reuse"
+    const schema = { type: "object", properties: {} }
+    const call = (names: string[]) => ({
+      prompt: [],
+      tools: names.map((name) => ({ type: "function", name, description: name, inputSchema: schema })),
+    }) as LanguageModelV3CallOptions
+    live.requestContext = { env: { workspace_paths: [process.cwd()] } }
+    await refreshHeldSessionToolCatalog(live, call(["read"]))
+    await getOrBuildRequestContext(live.conversationId, {
+      workspaceRoot: process.cwd(),
+      tools: live.toolCatalog,
+      conversationId: live.conversationId,
+      mergedConfig: { mcp: {} },
+    })
+    await refreshHeldSessionToolCatalog(live, call(["read", "github_get_me"]))
+    expect(live.requestContext).toEqual({ env: { workspace_paths: [process.cwd()] } })
+    expect(live.toolCatalog?.map((tool) => tool.name)).toEqual(["read", "github_get_me"])
+    const next = await getOrBuildRequestContext(live.conversationId, {
+      workspaceRoot: process.cwd(),
+      tools: live.toolCatalog,
+      conversationId: live.conversationId,
+      mergedConfig: { mcp: {} },
+    })
+    expect(next.reused).toBe(true)
   })
 })

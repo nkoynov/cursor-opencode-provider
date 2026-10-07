@@ -48,8 +48,8 @@ export function createMessageTypes(): protobuf.Root {
   addType(root, "Heartbeat", [])
 
   // Display ToolCall (interaction_update.tool_call_*) — agent.v1 oneof, not
-  // {tool_name,args} strings. Args-only wrappers are enough to bridge into
-  // OpenCode; result payloads are ignored on decode.
+  // {tool_name,args} strings. Decode finalized todo state for mirroring and
+  // MCP errors for diagnostics; other completion results are not replayed.
   root.add(new protobuf.Enum("TodoStatus", {
     TODO_STATUS_UNSPECIFIED: 0,
     TODO_STATUS_PENDING: 1,
@@ -104,7 +104,10 @@ export function createMessageTypes(): protobuf.Root {
   ])
   addType(root, "EditToolCall", [{ id: 1, name: "args", type: "EditToolArgs" }])
   addType(root, "LsToolCall", [{ id: 1, name: "args", type: "LsArgs" }])
-  addType(root, "McpToolCall", [{ id: 1, name: "args", type: "McpArgs" }])
+  addType(root, "McpToolCall", [
+    { id: 1, name: "args", type: "McpArgs" },
+    { id: 2, name: "result", type: "McpResult" },
+  ])
   addType(root, "CreatePlanArgs", [
     { id: 1, name: "plan", type: "string" },
     { id: 2, name: "todos", type: "TodoItem", repeated: true },
@@ -1172,7 +1175,11 @@ export function createMessageTypes(): protobuf.Root {
     { id: 1, name: "content", type: "McpToolResultContentItem", repeated: true },
     { id: 2, name: "is_error", type: "bool" },
   ])
-  addType(root, "McpError", [{ id: 1, name: "error", type: "string" }])
+  addType(root, "McpError", [
+    { id: 1, name: "error", type: "string" },
+    // Server-side CallDynamicTool validation uses a title (#1) and detail (#2).
+    { id: 2, name: "detail", type: "string" },
+  ])
   addType(
     root,
     "McpResult",
@@ -1650,10 +1657,24 @@ export function createMessageTypes(): protobuf.Root {
     { id: 1, name: "selected_images", type: "SelectedImage", repeated: true },
   ])
 
+  // agent.v1.AgentMode — the client's current mode, sent on every user message.
+  root.add(new protobuf.Enum("AgentMode", {
+    AGENT_MODE_UNSPECIFIED: 0,
+    AGENT_MODE_AGENT: 1,
+    AGENT_MODE_ASK: 2,
+    AGENT_MODE_PLAN: 3,
+    AGENT_MODE_DEBUG: 4,
+    AGENT_MODE_TRIAGE: 5,
+    AGENT_MODE_PROJECT: 6,
+    AGENT_MODE_MULTITASK: 7,
+    AGENT_MODE_CUSTOM: 8,
+  }))
+
   addType(root, "UserMessage", [
     { id: 1, name: "text", type: "string" },
     { id: 2, name: "message_id", type: "string" },
     { id: 3, name: "selected_context", type: "SelectedContext" },
+    { id: 4, name: "mode", type: "AgentMode" },
   ])
 
   // RequestContext — UserMessageAction #2. Slim mcp_meta_tool_options names
@@ -1699,6 +1720,7 @@ export function createMessageTypes(): protobuf.Root {
   // Cursor CLI's Stop sends `user_cancelled`; field 3 (resolutions for shells
   // and subagents it moved to the background) is not modeled.
   addType(root, "CancelAction", [
+    // Cursor CLI CancelAction field #1 is the interruption reason, not an id.
     { id: 1, name: "reason", type: "string" },
   ])
 

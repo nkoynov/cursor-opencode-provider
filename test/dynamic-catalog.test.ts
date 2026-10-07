@@ -60,6 +60,12 @@ describe("buildDynamicCatalogRoutingInstruction", () => {
     expect(line).toContain("before Grep/Shell fallbacks")
     expect(line).toContain("Use the `skill` tool through CallDynamicTool to load a skill when a task matches its description")
     expect(line).toContain("does not need to be invoked again")
+    expect(line).toContain("Host tools are in namespace `opencode` and MCP tools in their server's namespace; namespace `cursor` holds only Cursor's built-in tools.")
+  })
+
+  it("names the host tool namespace without MCP servers", () => {
+    const line = buildDynamicCatalogRoutingInstruction({ toolNames: ["skill", "read"] })
+    expect(line).toContain("Host tools are in namespace `opencode`; namespace `cursor` holds only Cursor's built-in tools.")
   })
 
   it("reports servers beyond the listed limit", () => {

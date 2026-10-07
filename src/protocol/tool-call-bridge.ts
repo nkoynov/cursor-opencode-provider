@@ -107,6 +107,24 @@ function asRecord(v: unknown): Record<string, unknown> | undefined {
   return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined
 }
 
+/** Server-side dynamic-call failures may complete without a started/exec frame. */
+export function displayMcpToolError(toolCall: Record<string, unknown> | undefined): string | undefined {
+  const call = asRecord(toolCall?.mcp_tool_call)
+  const result = asRecord(call?.result)
+  const error = asRecord(result?.error)
+  const parts = [error?.error, error?.detail].filter(
+    (value): value is string => typeof value === "string" && value.length > 0,
+  )
+  return parts.length > 0 ? parts.join(": ") : undefined
+}
+
+/** Native discovery errors are server-side results, never host execution. */
+export function displayNativeDiscoveryError(toolCall: Record<string, unknown> | undefined): string | undefined {
+  const call = asRecord(toolCall?.get_mcp_tools_tool_call)
+  const error = asRecord(asRecord(call?.result)?.error)?.error
+  return typeof error === "string" && error.length > 0 ? error : undefined
+}
+
 function findToolVariant(toolCall: Record<string, unknown>): string | undefined {
   for (const key of TOOL_CALL_VARIANTS) {
     if (toolCall[key] != null) return key
