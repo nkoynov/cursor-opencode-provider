@@ -277,7 +277,7 @@ describe("foreign-history rebase", () => {
     })).not.toThrow()
   })
 
-  it("sizes the replay at two characters per token, as Cursor counts coding sessions", () => {
+  it("sizes the replay at 1.75 characters per token, as Cursor counts dense coding sessions", () => {
     expect(() => assertForeignHistoryRebaseFits({
       modelInfo: { id: "m", maxContext: 2_000, variants: [] },
       cursorModelId: "m",

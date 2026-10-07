@@ -6255,10 +6255,11 @@ export const FOREIGN_HISTORY_REBASE_CONTEXT_SHARE = 0.8
 
 /**
  * Cursor counts about two characters per token of a coding session's context
- * (median 2.1, 1st percentile 1.7 over 18,514 context breakdowns), half of
- * what `estimateTokens` assumes, so a replay is sized with this instead.
+ * (median 2.1, 1st percentile 1.73, lowest 1.45 over 18,514 context
+ * breakdowns), half of what `estimateTokens` assumes. A replay is sized at the
+ * 1st percentile, so even the densest session seen fits the window.
  */
-export const REPLAY_CHARS_PER_TOKEN = 2
+export const REPLAY_CHARS_PER_TOKEN = 1.75
 
 /** Tokens a Run without a checkpoint may fill with its replay, of the target context `limit`. */
 export function replayContextBudget(input: {

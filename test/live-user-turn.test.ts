@@ -235,13 +235,13 @@ describe("the user turn of a fresh Run", () => {
   })
 
   it("shortens only the oldest tool result when the replay would exceed the context budget", async () => {
-    // cursor-test has the 200K default context, so the replay may take 80% of it: ~320K characters.
+    // cursor-test has the 200K default context, so the replay may take 80% of it: ~280K characters.
     const { transcript } = splitTranscript(await step(newSession({ bound: true }), readsPrompt(200_000, 150_000)))
     expect(transcript).toContain("a-start")
     expect(transcript).not.toContain("a-end")
     expect(transcript).toContain("more characters left out of this replay to fit the context window]")
     expect(transcript).toContain("b-end")
-    expect(transcript.length).toBeLessThan(320_000)
+    expect(transcript.length).toBeLessThan(280_000)
   })
 
   it("leaves a call without tools, such as a title, to its own last message", async () => {

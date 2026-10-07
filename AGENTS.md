@@ -176,8 +176,9 @@ The transcript keeps every tool call input and result whole, as a resumed
 Claude Code session resends its whole transcript; only when it would pass 80%
 of the context are the oldest ones shortened (with a note in place), and when
 even that does not fit the Run fails with a 413 so the host compacts. The
-replay is sized at two characters per token (`REPLAY_CHARS_PER_TOKEN`), which
-is how Cursor counts coding sessions, not with `estimateTokens`' four.
+replay is sized at 1.75 characters per token (`REPLAY_CHARS_PER_TOKEN`, the
+1st percentile of how Cursor counts coding sessions; the median is 2.1), not
+with `estimateTokens`' four.
 Merged `opencode.json` (`loadMergedConfig`) is still read for MCP server ids,
 plugin lists, and interaction guidance.
 
