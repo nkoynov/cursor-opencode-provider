@@ -200,6 +200,7 @@ import {
   isRejectedCredentialError,
   isTransientGrpcStatus,
   retrySuppressedError,
+  sanitizeHostTerminalMessage,
   toCursorProviderError,
 } from "./errors.js"
 import { readCache, cacheFilePath, resolveVariantParameters, resolveVariantMaxMode, extractCursorVariantParameters, resolveCursorWireModelId, type ModelInfo } from "./models.js"
@@ -530,6 +531,15 @@ function retryInfoProtobufDelayMs(encoded: string): number | undefined {
   return Math.ceil(Number(seconds) * 1_000 + Number(nanos) / 1_000_000)
 }
 
+function cursorCustomErrorMessage(record: Record<string, unknown>): string | undefined {
+  if (record.type !== "aiserver.v1.ErrorDetails" || !record.debug || typeof record.debug !== "object") return undefined
+  const debug = record.debug as { error?: unknown; details?: unknown }
+  if (debug.error !== "ERROR_CUSTOM_MESSAGE" || !debug.details || typeof debug.details !== "object") return undefined
+  const { title, detail } = debug.details as { title?: unknown; detail?: unknown }
+  const parts = [title, detail].filter((part): part is string => typeof part === "string" && part.trim() !== "")
+  return parts.length > 0 ? parts.map((part) => part.trim()).join(" ") : undefined
+}
+
 export function connectFrameError(payload: string): CursorProviderError {
   try {
     const envelope = JSON.parse(payload) as {
@@ -546,6 +556,7 @@ export function connectFrameError(payload: string): CursorProviderError {
       envelope.error?.retryAfter ?? envelope.error?.retry_after,
     )
     let hasRetryInfo = false
+    let customMessage: string | undefined
     if (Array.isArray(envelope.error?.details)) {
       for (const detail of envelope.error.details) {
         if (!detail || typeof detail !== "object") continue
@@ -557,7 +568,16 @@ export function connectFrameError(payload: string): CursorProviderError {
             record.retryDelay ?? record.retry_delay ?? record.value,
           )
         }
+        customMessage ??= cursorCustomErrorMessage(record)
       }
+    }
+    if (customMessage !== undefined) {
+      // An account-level refusal ("Too many computers.", usage caps): retrying only adds refused
+      // requests, and OpenCode retries any text saying "try again".
+      return new CursorServerError(
+        `Cursor refused the request: ${sanitizeHostTerminalMessage(customMessage).replace(/\btry again\b/gi, "retry")}`,
+        { transient: false, replaySafe: false, code },
+      )
     }
     return new CursorServerError(`Cursor API error (code=${code})`, {
       transient: isTransientGrpcStatus(code) || hasRetryInfo,

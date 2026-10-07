@@ -62,6 +62,43 @@ describe("Cursor provider errors", () => {
     expect(failure).toMatchObject({ transient: true, retryAfterMs: 30_000 })
   })
 
+  it("surfaces Cursor's custom message and doesn't retry it", () => {
+    const failure = connectFrameError(JSON.stringify({
+      error: {
+        code: "resource_exhausted",
+        message: "Error",
+        details: [{
+          type: "aiserver.v1.ErrorDetails",
+          debug: {
+            error: "ERROR_CUSTOM_MESSAGE",
+            details: {
+              title: "Too many computers.",
+              detail: "Too many computers used within the last 24 hours for the same Cursor account. Please try again later.",
+            },
+            isExpected: true,
+          },
+          value: "CB0S",
+        }],
+      },
+    }))
+    expect(failure).toMatchObject({ code: "resource_exhausted", transient: false, replaySafe: false })
+    expect(failure.message).toBe(
+      "Cursor refused the request: Too many computers. Too many computers used within the last 24 hours " +
+        "for the same Cursor account. Please retry later.",
+    )
+    expect(failure.message).not.toMatch(/try again|exhausted|capacity/i)
+  })
+
+  it("keeps the code-only message for other ErrorDetails", () => {
+    const failure = connectFrameError(JSON.stringify({
+      error: {
+        code: "resource_exhausted",
+        details: [{ type: "aiserver.v1.ErrorDetails", debug: { error: "ERROR_RATE_LIMITED", isExpected: true } }],
+      },
+    }))
+    expect(failure).toMatchObject({ message: "Cursor API error (code=resource_exhausted)", transient: true })
+  })
+
   it("uses the shared gRPC retry classification for Connect envelopes", () => {
     for (const code of ["resource_exhausted", "internal"]) {
       expect(connectFrameError(JSON.stringify({ error: { code } }))).toMatchObject({

@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- An account-level refusal from Cursor (for example "Too many computers.") shows Cursor's own message instead of `Cursor API error (code=resource_exhausted)`, and is not retried, by the provider or by OpenCode
 - Session titles and other tool-less requests (plugin `generate` calls) no longer advertise the session's tools, and the host's instructions open the request with its message as the input, so the title model answers in one call instead of trying tools that are then refused. Compaction still advertises the session's tools
 - OpenCode 2's session cost is close to Cursor's list price instead of several times higher: each step's context snapshot is split like a cached model call (previous context as cache read, growth as cache write), and the Run's last step settles against Cursor's own token counters. The total per step, which OpenCode compacts on, is unchanged
 - OpenCode 2 plugin `generate.text` calls (memory recall, summaries) complete instead of waiting forever for a tool catalog ([#40](https://github.com/oakimov/cursor-opencode-provider/pull/40) by [@nkoynov](https://github.com/nkoynov))
