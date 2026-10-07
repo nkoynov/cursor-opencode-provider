@@ -45,6 +45,7 @@ import {
 import { createDirectMcpPlacement } from "./opencode2/mcp-direct.js"
 import { registerTodoTools } from "./opencode2/todo-tools.js"
 import { registerCursorImageSaveTool } from "./opencode2/image-save-tool.js"
+import { sessionRulesDenyEdits } from "./opencode2/session-permissions.js"
 import { OPENCODE_2_TOOL_DIALECT } from "./protocol/tools.js"
 import { clearSessionTodos } from "./todo-store.js"
 import { markCompactionSession } from "./compaction-marker.js"
@@ -183,9 +184,15 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
           // switchAgent only publishes AgentSelected and leaves the session idle.
           // Continue under the new agent the same way OpenCode 1.x promptAsync does.
           if (continueTurn) {
+            const editsDenied = agent === "build" && await ctx.session.get({ sessionID })
+              .then((info) => sessionRulesDenyEdits(info.permissions))
+              .catch((error) => {
+                trace(`host-agent-mode: session.get failed sessionID=${sessionID}: ${String(error)}`)
+                return false
+              })
             await continueTurn({
               sessionID,
-              text: hostAgentSwitchPromptText(agent),
+              text: hostAgentSwitchPromptText(agent, { editsDenied }),
             })
           }
         },

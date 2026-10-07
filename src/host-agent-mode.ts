@@ -59,10 +59,16 @@ function isPlanModeID(targetModeID: string): boolean {
 }
 
 /** Synthetic user text that carries an OpenCode 1.x primary-agent switch. */
-export function hostAgentSwitchPromptText(agent: "plan" | "build"): string {
-  return agent === "plan"
-    ? "Plan mode is now active. Continue planning the request above under the plan-mode " +
-        "instructions, and do not implement anything until the plan is approved."
+export function hostAgentSwitchPromptText(agent: "plan" | "build", options: { editsDenied?: boolean } = {}): string {
+  if (agent === "plan") {
+    return "Plan mode is now active. Continue planning the request above under the plan-mode " +
+      "instructions, and do not implement anything until the plan is approved."
+  }
+  return options.editsDenied
+    ? "The plan is approved and the build agent is active, but this session's own permission rules " +
+        "still deny file edits: the client keeps the session in plan mode. Do not edit files or write " +
+        "them through the shell. Tell the user the plan is approved and that they need to switch the " +
+        "session out of plan mode in their client to have it implemented."
     : "Plan mode has ended. Continue with the approved work."
 }
 

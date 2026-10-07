@@ -24,6 +24,7 @@ import {
 } from "../src/session-directory.js"
 import {
   flushHostAgentModeSwitch,
+  hostAgentSwitchPromptText,
   isHostPlanEntryPending,
   queueHostAgentModeSwitch,
   resetHostAgentModeSwitchForTests,
@@ -1525,6 +1526,41 @@ describe("opencode2 setup", () => {
 
     await cleanup()
     expect(queueHostAgentModeSwitch({ sessionID: "s-mode", targetModeID: "plan" })).toBe(false)
+  })
+
+  test("tells the build turn when the session's own rules still deny edits", async () => {
+    const { ctx } = fakeContext()
+    const continued: string[] = []
+    let permissions: Array<{ action: string; resource: string; effect: string }> = []
+    ctx.session.switchAgent = async () => {}
+    ctx.session.synthetic = async ({ text }: { text: string }) => {
+      continued.push(text)
+      return {}
+    }
+    ctx.session.get = async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, location: { directory: "/w" }, permissions })
+    const cleanup = await setupPlugin(ctx)
+    const approve = async () => {
+      expect(queueHostAgentModeSwitch({ sessionID: "s-rules", targetModeID: "agent", cursorSessionID: "run" })).toBe(true)
+      expect(await flushHostAgentModeSwitch("s-rules", { cursorSessionID: "run", terminal: true })).toBe(true)
+      return continued.at(-1)
+    }
+
+    // A client's plan mode: everything allowed, then edits denied except the plan directory.
+    permissions = [
+      { action: "*", resource: "*", effect: "allow" },
+      { action: "edit", resource: "*", effect: "deny" },
+      { action: "edit", resource: "/home/u/.opencode/plan/*", effect: "allow" },
+    ]
+    const denied = await approve()
+    expect(denied).toContain("still deny file edits")
+    expect(denied).not.toBe(hostAgentSwitchPromptText("build"))
+    permissions = [{ action: "*", resource: "*", effect: "allow" }]
+    expect(await approve()).toBe(hostAgentSwitchPromptText("build"))
+    permissions = [{ action: "edit", resource: "*", effect: "deny" }, { action: "*", resource: "*", effect: "allow" }]
+    expect(await approve()).toBe(hostAgentSwitchPromptText("build"))
+    ctx.session.get = async () => { throw new Error("gone") }
+    expect(await approve()).toBe(hostAgentSwitchPromptText("build"))
+    await cleanup()
   })
 
   test("disposing an older setup keeps the switch and Plan directory of a newer one", async () => {
