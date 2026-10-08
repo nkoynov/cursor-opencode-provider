@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto"
 import path from "node:path"
-import { chmod, link, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises"
+import { chmod, link, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises"
 import { constants as zlibConstants, gunzipSync, gzipSync } from "node:zlib"
 import protobuf from "protobufjs"
 import {
@@ -451,6 +451,19 @@ function queueDelete(store: ConversationStore): Promise<void> {
   return write
 }
 
+async function hasGzipMagic(filePath: string): Promise<boolean> {
+  const handle = await open(filePath, "r").catch(() => undefined)
+  if (!handle) return false
+  try {
+    const { bytesRead, buffer } = await handle.read(Buffer.alloc(2), 0, 2, 0)
+    return bytesRead === 2 && buffer[0] === 0x1f && buffer[1] === 0x8b
+  } catch {
+    return false
+  } finally {
+    await handle.close().catch(() => {})
+  }
+}
+
 async function pruneConversationDirectory(cacheDir: string, now: number): Promise<void> {
   const directory = conversationCacheDirectoryPath(cacheDir)
   await ensureCacheDirectory(directory)
@@ -464,6 +477,10 @@ async function pruneConversationDirectory(cacheDir: string, now: number): Promis
       return
     }
     if (!entry.name.endsWith(".pb.gz")) return
+    // Decoding is a synchronous gunzip that blocks the process (seconds for a day of sessions);
+    // only a file last written more than the TTL ago can hold an expired record.
+    const modifiedAt = (await stat(filePath).catch(() => undefined))?.mtimeMs
+    if (modifiedAt !== undefined && now - modifiedAt <= CONVERSATION_CACHE_TTL_MS && await hasGzipMagic(filePath)) return
     const loaded = await readConversationFileWithStatus(filePath)
     if (loaded.status === "invalid") {
       recordStartupDiscard(cacheDir, entry.name, "invalid")

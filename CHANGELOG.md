@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The first Cursor request after the provider starts no longer waits for every saved conversation to be decompressed and decoded (about 11 s, blocking the whole process, with a day of sessions): startup cleanup decodes only files last written more than 24 hours ago
+
 ## [0.8.1] - 2026-10-08
 
 ### Added
