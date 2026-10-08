@@ -464,11 +464,22 @@ export async function extractCursorPromptImages(
   const caption = toolCaption && options.supportsImages
     ? await extractCursorToolResultImages(lastUser!.content as unknown[], { signal: options.signal, maxBytes })
     : undefined
-  const userImages = toolCaption ? caption?.images ?? [] : await extractCursorUserImages(lastUser, options.signal, maxBytes)
+  const captionHashes: string[] = []
+  const seenHashes = new Set(options.seenHistoryHashes)
+  let captionDuplicates = 0
+  const userImages = toolCaption ? (caption?.images ?? []).filter((_image, index) => {
+    const hash = caption!.hashes[index]!
+    if (seenHashes.has(hash)) {
+      captionDuplicates++
+      return false
+    }
+    seenHashes.add(hash)
+    captionHashes.push(hash)
+    return true
+  }) : await extractCursorUserImages(lastUser, options.signal, maxBytes)
   const userBytes = userImages.reduce((total, image) => total + image.data.length, 0)
   // Seed history dedupe with this-turn last-user hashes so the same bytes on an
   // earlier user/assistant/tool message are not attached twice in one Run.
-  const seenHashes = new Set(options.seenHistoryHashes)
   for (const image of userImages) seenHashes.add(imageContentHash(image.data))
   const history = await extractCursorHistoryImages(prompt, {
     supportsImages: options.supportsImages,
@@ -479,6 +490,8 @@ export async function extractCursorPromptImages(
   })
   return {
     ...history,
+    hashes: [...captionHashes, ...history.hashes],
+    duplicateCount: history.duplicateCount + captionDuplicates,
     images: [...userImages, ...history.images],
     userImageCount: toolCaption ? 0 : userImages.length,
     ...((history.omittedCount ?? 0) + (caption?.omittedCount ?? 0) > 0

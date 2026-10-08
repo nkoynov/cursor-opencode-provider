@@ -1635,7 +1635,9 @@ async function startSession(
     const next = await bidiRunStream(freshToken, { baseURL: agentBaseUrl, headers: options.headers })
     abortIfNeeded(next)
     const conversationState = session.resumeCheckpoint ?? getCheckpoint(session.conversationId)
+    const nextRunId = crypto.randomUUID()
     const reqBytes = buildRunRequest({
+      messageId: nextRunId,
       text,
       modelId: cursorModelId,
       conversationId: session.conversationId,
@@ -1658,7 +1660,7 @@ async function startSession(
     session.heartbeatCancel?.()
     await waitForStreamWrites(session.stream)
     abortIfNeeded(next)
-    sessionManager.replaceStream(session, next)
+    sessionManager.replaceStream(session, next, nextRunId)
     attachSessionHeartbeat(session)
   }
 

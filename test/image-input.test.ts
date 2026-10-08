@@ -77,6 +77,26 @@ describe("tool-result images", () => {
     ] }
     const result = await extractCursorPromptImages([caption], caption, { supportsImages: true })
     expect(result.images[0]?.data).toEqual(Uint8Array.from([1, 2, 3]))
+    expect(result.hashes).toHaveLength(1)
+    const seenHistoryHashes = new Set(result.hashes)
+    const repeated = await extractCursorPromptImages([caption], caption, { supportsImages: true, seenHistoryHashes })
+    expect(repeated.images).toEqual([])
+    expect(repeated.duplicateCount).toBe(1)
+    const nextUser = { role: "user", content: [{ type: "text", text: "continue" }] }
+    const nextTurn = await extractCursorPromptImages([caption, nextUser], nextUser, { supportsImages: true, seenHistoryHashes })
+    expect(nextTurn.images).toEqual([])
+    // Explicit attachments retain user intent even when their bytes were sent earlier.
+    const explicit = { role: "user", content: [{ type: "file", mediaType: "image/png", data: "AQID" }] }
+    expect((await extractCursorPromptImages([explicit], explicit, { supportsImages: true, seenHistoryHashes })).userImageCount).toBe(1)
+  })
+
+  it("deduplicates multiple detached caption parts in a recovery Run", async () => {
+    const file = { type: "file", mediaType: "image/png", data: "AQID" }
+    const caption = { role: "user", content: [{ type: "text", text: "Attached media from tool result:" }, file, file] }
+    const result = await extractCursorPromptImages([caption], caption, { supportsImages: true })
+    expect(result.images).toHaveLength(1)
+    expect(result.hashes).toHaveLength(1)
+    expect(result.duplicateCount).toBe(1)
   })
 
   it("decodes host tool media and skips non-image or undecodable parts", async () => {

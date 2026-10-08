@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- Recovery Runs remember detached tool images without resending them on later turns; progress-only reopens use the current Run ID for host instruction updates
 - Tool images stay with the correct result; unreadable or oversized images are reported without blocking other results, and recovery retains supported image formats
 - Host instruction updates survive image reads, and declined tool calls return errors instead of successes
 - Images read with the `read` tool reach the model in the same turn instead of a "Media attached" placeholder ([#42](https://github.com/oakimov/cursor-opencode-provider/pull/42) by [@nkoynov](https://github.com/nkoynov))

@@ -453,6 +453,7 @@ describe("SessionManager", () => {
     const owner = Symbol("pump")
     mgr.beginPump(s, owner)
     s.deferredTerminalReason = "remote-clean-close"
+    s.runId = "previous-run"
 
     const nextFrames = { next: async () => ({ done: true as const, value: undefined }) }
     const next: BidiStream = {
@@ -463,11 +464,12 @@ describe("SessionManager", () => {
       frames: () => ({ [Symbol.asyncIterator]: () => nextFrames }),
       onTerminal() { return () => {} },
     }
-    mgr.replaceStream(s, next)
+    mgr.replaceStream(s, next, "replacement-run")
 
     expect(oldDestroyed).toBe(true)
     expect(unsubscribed).toBe(true)
     expect(s.stream).toBe(next)
+    expect(s.runId).toBe("replacement-run")
     expect(s.frames).toBe(nextFrames)
     expect(s.deferredTerminalReason as CursorSession["deferredTerminalReason"]).toBe(null)
     expect(mgr.isPumpOwner(s, owner)).toBe(true)
