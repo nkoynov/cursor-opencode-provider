@@ -307,6 +307,21 @@ describe("modelInfoToConfig", () => {
     expect(config.variants).toBeUndefined()
   })
 
+  it("distinguishes a parameterless default variant from its model name", () => {
+    const config = modelInfoToConfig({
+      id: "plain-model",
+      displayName: "Plain",
+      variants: [{
+        key: "plain-model",
+        displayName: "Plain",
+        isDefaultNonMax: true,
+        isDefaultMax: false,
+        parameterValues: [],
+      }],
+    })
+    expect(config.variants).toEqual({ "Plain default": variantParams([]) })
+  })
+
   it("disambiguates variants that share a display name by tagging distinguishing params", () => {
     // Mirrors Cursor's Composer 2.5: both variants render the same base
     // display name (the "Fast" suffix is in a <span> that safeLabel drops);
@@ -669,6 +684,43 @@ afterEach(() => {
 })
 
 describe("CursorPlugin config hook", () => {
+  it("publishes derived and supplied families from the cached model inventory", async () => {
+    const fakeHome = path.join(os.tmpdir(), `cursor-plugin-family-${process.pid}-${Date.now()}`)
+    process.env.HOME = fakeHome
+    delete process.env.XDG_CACHE_HOME
+    delete process.env.OPENCODE_AUTH_CONTENT
+    const cacheDir = path.join(fakeHome, ".cache", "opencode")
+    try {
+      await writeCache(cacheDir, {
+        fetchedAt: Date.now(),
+        models: [
+          { id: "default", variants: [] },
+          { id: "gemini-3.8-flash", variants: [] },
+          { id: "gpt-5.4-nano", variants: [] },
+          { id: "claude-haiku-4-5", family: "   ", variants: [] },
+          { id: "gpt-5.6-sol-1m", variants: [] },
+          { id: "grok-4.7-fast", variants: [] },
+          { id: "kimi-k2.7-code", variants: [] },
+          { id: "explicit", family: "  custom-family  ", variants: [] },
+        ],
+      })
+      const plugin = await CursorPlugin({ directory: fakeHome } as never)
+      const config: { provider?: Record<string, { models?: Record<string, Record<string, unknown>> }> } = {}
+      await plugin.config?.(config as never)
+      const models = config.provider?.cursor?.models
+      expect(models?.default).not.toHaveProperty("family")
+      expect(models?.["gemini-3.8-flash"]?.family).toBe("gemini-flash")
+      expect(models?.["gpt-5.4-nano"]?.family).toBe("gpt-nano")
+      expect(models?.["claude-haiku-4-5"]?.family).toBe("claude-haiku")
+      expect(models?.["gpt-5.6-sol-1m"]?.family).toBe("gpt-sol")
+      expect(models?.["grok-4.7-fast"]?.family).toBe("grok")
+      expect(models?.["kimi-k2.7-code"]?.family).toBe("kimi-k2")
+      expect(models?.explicit?.family).toBe("custom-family")
+    } finally {
+      await rm(fakeHome, { recursive: true, force: true })
+    }
+  })
+
   it("loads cached models from ~/.cache/opencode, not input.directory", async () => {
     const fakeHome = path.join(os.tmpdir(), `cursor-plugin-test-${process.pid}-${Date.now()}`)
     process.env.HOME = fakeHome

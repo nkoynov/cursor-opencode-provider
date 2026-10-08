@@ -2,9 +2,11 @@ import { describe, it, expect } from "bun:test"
 import {
   encodeMessage,
   decodeMessage,
+  decodeMessageSparse,
   getMessageTypes,
 } from "../src/protocol/messages.js"
 import { readAllFields } from "../src/protocol/struct.js"
+import { mapAvailableModelsResponse } from "../src/models.js"
 
 describe("message round-trip", () => {
   it("encodes cancellation reason at the CLI's field number", () => {
@@ -187,6 +189,41 @@ describe("message round-trip", () => {
     expect(data.length).toBe(0)
     const decoded = decodeMessage<any>("AvailableModelsRequest", data)
     expect(decoded).toBeDefined()
+  })
+
+  it("decodes canonical AvailableModels fields before catalog mapping", () => {
+    // Cursor CLI 2026.10.01: response names #1, models #2; max context #16;
+    // variant parameters #1, label #2, max #3, default max #4, default base #5.
+    // Constructed independently of this package's encoder from that descriptor.
+    const hex = "0a0a746573742d6d6f64656c12330a0a746573742d6d6f64656c78e0a7128001c0843df2011b0a0d0a07636f6e746578741202316d12044c6f6e67180120012800"
+    const bytes = Uint8Array.from(Buffer.from(hex, "hex"))
+    const decoded = decodeMessage<any>("AvailableModelsResponse", bytes)
+    expect(decoded.model_names).toEqual(["test-model"])
+    expect(decoded.models).toHaveLength(1)
+    expect(decoded.models[0]).toMatchObject({
+      name: "test-model",
+      context_token_limit: 300_000,
+      context_token_limit_for_max_mode: 1_000_000,
+      variants: [{
+        parameter_values: [{ id: "context", value: "1m" }],
+        display_name: "Long",
+        is_max_mode: true,
+        is_default_max_config: true,
+        is_default_non_max_config: false,
+      }],
+    })
+    expect(mapAvailableModelsResponse(decoded)[0]).toMatchObject({
+      id: "test-model",
+      maxContextForMaxMode: 1_000_000,
+      variants: [{
+        displayName: "Long",
+        parameterValues: [{ id: "context", value: "1m" }],
+        isDefaultMax: true,
+        isDefaultNonMax: false,
+      }],
+    })
+    const encoded = encodeMessage("AvailableModelsResponse", decodeMessageSparse("AvailableModelsResponse", bytes))
+    expect(Array.from(encoded)).toEqual(Array.from(bytes))
   })
 
   it("ClientHeartbeat", () => {

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import plugin from "../src/plugin-opencode2.js"
 import { CursorPlugin } from "../src/plugin.js"
-import { applyCursorProviderInventory, CURSOR_AISDK_PACKAGE } from "../src/opencode2/catalog.js"
+import { applyCursorProviderInventory, CURSOR_AISDK_PACKAGE, modelConfigEntryToInfo } from "../src/opencode2/catalog.js"
 import {
   accessTokenFromCredential,
   applyCursorIntegration,
@@ -181,6 +181,27 @@ describe("opencode2 provider inventory", () => {
     expect(model!.family).toBe("claude-sonnet")
   })
 
+  test("preserves non-empty family metadata and omits absent or blank metadata", () => {
+    expect(modelConfigEntryToInfo("example", { family: "  custom-family  " }).family).toBe("custom-family")
+    for (const family of [undefined, "", "   "]) {
+      expect(modelConfigEntryToInfo("example", { family })).not.toHaveProperty("family")
+    }
+  })
+
+  test("publishes canonical families for wire ids with context and speed suffixes", () => {
+    const { editor, models } = fakeProviderEditor()
+    const entries = [
+      ["gpt-5.4-1m", "gpt"],
+      ["claude-sonnet-4-1m", "claude-sonnet"],
+      ["grok-4.7-fast", "grok"],
+      ["kimi-k2.7-code", "kimi-k2"],
+    ] as const
+    applyCursorProviderInventory(editor, entries.map(([id]) => ({ id, variants: [] })))
+    for (const [id, family] of entries) {
+      expect(models.get(`cursor/${id}`)).toMatchObject({ id, modelID: id, family })
+    }
+  })
+
   test("attaches published Cursor token rates to catalog cost tiers", () => {
     const { editor, models } = fakeProviderEditor()
     applyCursorProviderInventory(editor, [
@@ -232,6 +253,7 @@ describe("opencode2 provider inventory", () => {
     expect(long!.id).toBe("claude-4.5-sonnet-1m")
     expect(long!.modelID).toBe("claude-4.5-sonnet")
     expect(long!.limit.context).toBe(1_000_000)
+    expect(long!.family).toBe("claude-sonnet")
   })
 
   test("Fast entries keep a distinct id but address the same wire model", () => {
@@ -265,6 +287,7 @@ describe("opencode2 provider inventory", () => {
     expect(fast!.id).toBe("composer-2.5-fast")
     expect(fast!.modelID).toBe("composer-2.5")
     expect(fast!.name).toBe("Composer 2.5 Fast")
+    expect(fast!.family).toBe("composer")
     expect(fast!.cost).toEqual([
       {
         input: 3,

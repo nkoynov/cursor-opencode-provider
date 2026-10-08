@@ -48,7 +48,8 @@
 - After MCP tools appear mid-turn, the next user message reuses RequestContext instead of rebuilding it
 - A Cursor run that fails before showing any output can be retried automatically again: timing, tracing, and progress fields Cursor now sends on ordinary updates no longer mark every run unsafe to retry
 - The debug log's turn usage validation no longer reports `status=mismatch` when Cursor's context shrinks between steps
-- Cursor models carry a model `family`, so OpenCode writes session titles and summaries with its small model (for example GPT-5.6 Luna) instead of the model you are coding with ([#43](https://github.com/oakimov/cursor-opencode-provider/pull/43) by [@nkoynov](https://github.com/nkoynov))
+- Cursor models carry a model `family`, so OpenCode can write session titles with its small model (for example GPT-5.6 Luna) instead of the model you are coding with; context/speed suffixes and Kimi minor versions stay in their model's family ([#43](https://github.com/oakimov/cursor-opencode-provider/pull/43) by [@nkoynov](https://github.com/nkoynov))
+- A parameterless default variant is labeled distinctly from its model in the picker.
 
 ## [0.8.0] - 2026-10-04
 

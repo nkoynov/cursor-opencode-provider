@@ -183,7 +183,9 @@ The docs fallback only fills static catalog metadata. It does not invent Cursor 
 
 #### Model families
 
-Each catalog entry carries a models.dev-style `family`: the Cursor model id without its version segments (`claude-haiku-4-5` → `claude-haiku`, `gpt-5.6-luna` → `gpt-luna`; `-1m` / `-fast` entries keep their model's family). OpenCode picks the small model for session titles and summaries by family (2.0: `gpt-luna`, `gemini-flash-lite`, `gemini-flash`, `claude-haiku`; 1.x: `gemini-flash`, `gpt-nano`, `claude-haiku`). With no family it uses the session's own model, so every title ran on the model you were coding with. To pick a different one, set the 2.0 `title` agent's `model` (1.x: `small_model`). OpenCode 2's model-listing tool shows one entry per family unless asked for all.
+Catalog entries derive a models.dev-style `family` from the Cursor model id (`claude-haiku-4-5` → `claude-haiku`, `gpt-5.6-luna` → `gpt-luna`). Version segments and trailing `-1m` / `-fast` suffixes do not split families; Kimi keeps its major generation (`kimi-k2.7-code` → `kimi-k2`). Auto (`default`) has no derived family. A non-empty family supplied in cached model metadata takes precedence; the live `AvailableModels` schema has no family field.
+
+OpenCode uses family metadata to select a small model for session titles (2.0: `gpt-luna`, `gemini-flash-lite`, `gemini-flash`, `claude-haiku`; 1.x: `gemini-flash`, `gpt-nano`, `claude-haiku`). If no eligible family is available, titles fall back to the session model. To override this selection, set the `title` agent's `model` on either major, or `small_model` on 1.x. Compaction summaries use the host's compaction model selection; this metadata does not move them to the small model. OpenCode 2's model-listing tool shows one entry per family unless asked for all.
 
 #### Image input
 

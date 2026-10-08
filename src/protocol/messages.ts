@@ -2043,11 +2043,11 @@ export function createMessageTypes(): protobuf.Root {
   ])
 
   addType(root, "AvailableModelVariant", [
-    { id: 1, name: "display_name", type: "string" },
-    { id: 2, name: "is_max_mode", type: "bool" },
-    { id: 3, name: "is_default_max_config", type: "bool" },
-    { id: 4, name: "is_default_non_max_config", type: "bool" },
-    { id: 5, name: "parameter_values", type: "AvailableModelParameterValue", repeated: true },
+    { id: 1, name: "parameter_values", type: "AvailableModelParameterValue", repeated: true },
+    { id: 2, name: "display_name", type: "string" },
+    { id: 3, name: "is_max_mode", type: "bool" },
+    { id: 4, name: "is_default_max_config", type: "bool" },
+    { id: 5, name: "is_default_non_max_config", type: "bool" },
   ])
 
   addType(root, "AvailableModelEntry", [
@@ -2057,7 +2057,8 @@ export function createMessageTypes(): protobuf.Root {
     { id: 9, name: "supports_thinking", type: "bool" },
     { id: 10, name: "supports_images", type: "bool" },
     { id: 14, name: "supports_max_mode", type: "bool" },
-    { id: 15, name: "context_token_limit", type: "uint32" },
+    { id: 15, name: "context_token_limit", type: "int32" },
+    { id: 16, name: "context_token_limit_for_max_mode", type: "int32" },
     { id: 17, name: "client_display_name", type: "string" },
     { id: 18, name: "server_model_name", type: "string" },
     { id: 29, name: "parameter_definitions", type: "AvailableModelParameterDefinition", repeated: true },
@@ -2065,7 +2066,8 @@ export function createMessageTypes(): protobuf.Root {
   ])
 
   addType(root, "AvailableModelsResponse", [
-    { id: 1, name: "models", type: "AvailableModelEntry", repeated: true },
+    { id: 1, name: "model_names", type: "string", repeated: true },
+    { id: 2, name: "models", type: "AvailableModelEntry", repeated: true },
   ])
 
   return root
