@@ -590,6 +590,11 @@
 - Encode approval replies without mutating execution state. Apply the mode
   transition and queue the native switch only after delivery succeeds
   (`test/create-plan.test.ts`).
+- Revalidate the pending exec owner after every awaited result write, including
+  drain failures. A closed or replaced owner must retain its terminal state,
+  pending entry, and approval state (`test/session.test.ts`). Serialize the
+  entire continuation transaction so overlapping calls cannot split claims and
+  independently inject the same step notes (`test/host-notes.test.ts`).
 
 - Keep acceptance documents reusable: incorporate review findings as test
   criteria in the checklist, and keep dated review results, approvals, and
@@ -648,3 +653,18 @@
 
 - Racing an iterator read against a timer does not cancel that read. Keep its promise on the session until consumed, including late EOF/errors; every continuation and drain must use the same reader (`src/session.ts:922`, `test/parallel-pump.test.ts:322`).
 - Once a streamed host tool has been emitted, terminal recovery must finish the tool step before rebasing from its result. A checkpoint does not make replay of already-started host side effects safe (`src/language-model.ts:2863`, `test/parallel-pump.test.ts:351`).
+
+## 2026-10-09 — Deferred instructions retain their original order and carrier
+
+- A fresh history seed does not prove that a deferred instruction is present.
+  Compare the actual seed before suppressing it, and retain initial user-action
+  notes across recovery until a replacement seed carries them
+  (`test/host-notes-run.test.ts`). Match the note's text inside the seed, not
+  whole seed entries: the seed merges adjacent user-role entries and carries
+  tool observations (with lifted read instructions) as user text, so equality
+  re-sends notes the seed already holds (`test/host-notes.test.ts`).
+- Acknowledgement arrival order is not instruction order. Preserve the original
+  batch order through rejection, unacknowledged release, recovery, and
+  persistence. When a user action is sent, remove only its captured batches;
+  later arrivals must survive without replaying the earlier instructions
+  (`test/host-notes.test.ts`).

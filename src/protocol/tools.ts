@@ -1,7 +1,8 @@
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { encodeMessage } from "./messages.js"
+import { encodeMessage, getMessageTypes } from "./messages.js"
+import type { HookAdditionalContext } from "./host-notes.js"
 import type { CursorImageInput } from "../image-input.js"
 import { encodeJsonAsValue, decodeStructEntriesToJson, readAllFields } from "./struct.js"
 import { buildEnv } from "../context/env.js"
@@ -1948,6 +1949,51 @@ export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
   return frames
 }
 
+/**
+ * Attach host notes to an exec result as Cursor CLI postToolUse hook context:
+ * `ExecClientMessage.hook_additional_contexts` (#45) on a unary result, or a
+ * `ShellStream.hook_context` (#8) event after the stream's own events and
+ * before `stream_close` (CLI agent-exec hook wrapper). Cursor renders it as a
+ * system reminder on that tool result, so it never mixes into file content.
+ * Returns undefined when the frames carry no exec result (bridged
+ * interaction replies have no such field).
+ */
+export function attachHookAdditionalContexts(
+  frames: readonly Uint8Array[],
+  contexts: readonly HookAdditionalContext[],
+): Uint8Array[] | undefined {
+  const root = getMessageTypes()
+  const type = root.lookupType("AgentClientMessage")
+  const contextType = root.lookupType("HookAdditionalContext")
+  let shellStreamAt = -1
+  let shellStreamId = 0
+  for (let index = 0; index < frames.length; index++) {
+    const message = type.decode(frames[index]!)
+    const exec = (message as {
+      exec_client_message?: { id?: number; result?: string; hook_additional_contexts?: unknown[] }
+    }).exec_client_message
+    if (!exec?.result) continue
+    if (exec.result === "shell_stream") {
+      shellStreamAt = index
+      shellStreamId = exec.id ?? 0
+      continue
+    }
+    exec.hook_additional_contexts = contexts.map((context) => contextType.fromObject(context))
+    const out = [...frames]
+    out[index] = type.encode(message).finish()
+    return out
+  }
+  if (shellStreamAt === -1) return undefined
+  const out = [...frames]
+  out.splice(shellStreamAt + 1, 0, encodeMessage("AgentClientMessage", {
+    exec_client_message: {
+      id: shellStreamId,
+      shell_stream: { hook_context: { hook_additional_contexts: [...contexts] } },
+    },
+  }))
+  return out
+}
+
 /** ACM #5 exec_client_control_message { stream_close { id } }. */
 export function buildExecStreamClose(execId: number): Uint8Array {
   return encodeMessage("AgentClientMessage", {
@@ -2856,6 +2902,26 @@ export function unwrapReadOutput(output: string): string {
   // Envelope confirmed but no numbered body → empty file. Return "" rather
   // than the envelope (the envelope is exactly what Cursor echoes into writes).
   return raw.join("\n")
+}
+
+/**
+ * OpenCode's read tool appends newly discovered instructions after the
+ * envelope's unnumbered `</content>`, in one `<system-reminder>` block.
+ * The numbered-body parser stops before that block, so callers must lift it
+ * out before the file text is encoded.
+ */
+export function extractOpenCodeReadInstruction(output: string): string | undefined {
+  if (!output.includes("<content>") || !output.includes("<system-reminder>")) return undefined
+  const contentHeaderIdx = output.indexOf("<content>")
+  const header = output.slice(0, contentHeaderIdx)
+  if (!header.includes("<path>") || !header.includes("<type>file</type>")) return undefined
+  const rest = output.slice(contentHeaderIdx + "<content>".length)
+  const closeAt = rest.search(/(?:^|\n)<\/content>(?:\n|$)/)
+  if (closeAt === -1) return undefined
+  const afterClose = rest.slice(closeAt).replace(/^(?:\n)?<\/content>/, "")
+  const match = /^\s*<system-reminder>\n([\s\S]*?)\n<\/system-reminder>/.exec(afterClose)
+  const body = match?.[1]?.trim()
+  return body ? body : undefined
 }
 
 /**

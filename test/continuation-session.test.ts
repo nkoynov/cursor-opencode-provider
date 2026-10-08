@@ -96,7 +96,7 @@ describe("findContinuationSession", () => {
 })
 
 describe("extractTrailingToolResults", () => {
-  it("preserves execution-denied as an error instead of reporting success", () => {
+  it("preserves execution-denied as an error instead of reporting success", async () => {
     const results = extractTrailingToolResults([{
       role: "tool", content: [{ type: "tool-result", toolCallId: "cursor_denied_1", toolName: "read",
         output: { type: "execution-denied", reason: "User declined" } }],
@@ -106,7 +106,7 @@ describe("extractTrailingToolResults", () => {
     const live = fakeSession("denied")
     live.stream.write = frame => { writes.push(frame) }
     sessionManager.registerPending(1, live, "read_result", "read")
-    deliverContinuationResults(live, results)
+    await deliverContinuationResults(live, results)
     expect(decodeMessage<any>("AgentClientMessage", writes[0]).exec_client_message.read_result.error.error).toBe("User declined")
   })
 
@@ -227,11 +227,12 @@ describe("extractTrailingToolResults", () => {
 
     const trailing = extractTrailingToolResults(prompt)
     expect(trailing.map((r) => r.toolCallId)).toEqual(["cursor_live_1"])
-    // Notes ride on the last result so Cursor still sees them.
-    expect(trailing[0]!.output).toBe(
-      "ok\n\n<system-update>\nThe following skill IDs are no longer available: repro-r7.\n</system-update>" +
-        "\n\nMCP server instructions are no longer available.",
-    )
+    // Notes ride on the last result outside output so parse/encode stays clean.
+    expect(trailing[0]!.output).toBe("ok")
+    expect(trailing[0]!.notes).toEqual([
+      "<system-update>\nThe following skill IDs are no longer available: repro-r7.\n</system-update>",
+      "MCP server instructions are no longer available.",
+    ])
     // A note after a real user message is still a fresh turn.
     expect(extractTrailingToolResults([
       toolMsg("old", 0),
@@ -316,7 +317,7 @@ describe("extractTrailingToolResults", () => {
     const [result] = extractTrailingToolResults([read, caption] as LanguageModelV3CallOptions["prompt"])
     expect(result).toMatchObject({ execId: 4, output: "Image read successfully", media: [image] })
     const updated = [read, caption, { role: "system", content: "New tool instructions" }] as LanguageModelV3CallOptions["prompt"]
-    expect(extractTrailingToolResults(updated)[0]?.notes).toBe("New tool instructions")
+    expect(extractTrailingToolResults(updated)[0]?.notes).toEqual(["New tool instructions"])
 
     // With several results, the media read takes its one file.
     const several = extractTrailingToolResults([toolMsg("live", 1), read, caption] as LanguageModelV3CallOptions["prompt"])
@@ -396,6 +397,32 @@ describe("decodeTrailingToolImages", () => {
     expect(decoded[1]?.error).toContain("omitted")
   })
 
+  it("delivers a kept read image's omission notice as hook context on that read", async () => {
+    const writes: Uint8Array[] = []
+    const live = fakeSession("read-image-notice")
+    live.supportsImages = true
+    live.stream.write = frame => { writes.push(frame) }
+    sessionManager.registerPending(1, live, "read_result", "read", false, { path: "/work/badge.png" })
+    const image = { type: "file-data", mediaType: "image/png", data: "AQID" }
+    const [decoded] = await decodeTrailingToolImages(live, [{
+      toolCallId: "cursor_read-image-notice_1", sessionId: live.sessionId, execId: 1,
+      toolName: "read", output: "Image read successfully", media: [image, image],
+    }])
+    expect(decoded?.images).toHaveLength(1)
+    expect(decoded?.output).toBe("Image read successfully")
+    expect(decoded?.error).toBeUndefined()
+    expect(decoded?.notices?.[0]).toContain("1 tool-result image(s) omitted")
+
+    expect(await deliverContinuationResults(live, [decoded!])).toBe(live)
+    const exec = writes
+      .map(frame => decodeMessage<any>("AgentClientMessage", frame).exec_client_message)
+      .find(message => message?.read_result)
+    expect(Uint8Array.from(exec.read_result.success.data)).toEqual(Uint8Array.from([1, 2, 3]))
+    expect(exec.hook_additional_contexts).toEqual([
+      { hook_event_name: "postToolUse", content: decoded!.notices![0] },
+    ])
+  })
+
   it("does not resolve media for failed, bridged, foreign, or text-only execs", async () => {
     const live = fakeSession("skip-images")
     live.supportsImages = true
@@ -413,32 +440,32 @@ describe("decodeTrailingToolImages", () => {
 })
 
 describe("deliverContinuationResults", () => {
-  it("leaves provider plan mode after a directly called stage tool succeeds", () => {
+  it("leaves provider plan mode after a directly called stage tool succeeds", async () => {
     const live = fakeSession("direct-stage")
     live.openCodeSessionId = "host-direct-stage"
     setActiveCursorMode(live.openCodeSessionId, "plan")
     sessionManager.registerPending(8, live, "mcp_result", "cursor_plan_stage")
 
-    expect(deliverContinuationResults(live, [{ toolCallId: "result-244",
+    expect(await deliverContinuationResults(live, [{ toolCallId: "result-244",
       sessionId: live.sessionId, execId: 8, toolName: "cursor_plan_stage", output: "Plan approved",
     }])).toBe(live)
     expect(getActiveCursorMode(live.openCodeSessionId)).toBe("agent")
 
     setActiveCursorMode(live.openCodeSessionId, "plan")
     sessionManager.registerPending(9, live, "mcp_result", "cursor_plan_stage")
-    expect(deliverContinuationResults(live, [{ toolCallId: "result-251",
+    expect(await deliverContinuationResults(live, [{ toolCallId: "result-251",
       sessionId: live.sessionId, execId: 9, toolName: "cursor_plan_stage", output: "", error: "Keep planning",
     }])).toBe(live)
     expect(getActiveCursorMode(live.openCodeSessionId)).toBe("plan")
   })
 
-  it("writes pending exec results and keeps the live session", () => {
+  it("writes pending exec results and keeps the live session", async () => {
     const writes: Uint8Array[] = []
     const live = fakeSession("live-write")
     live.stream.write = (frame: Uint8Array) => { writes.push(frame) }
     sessionManager.registerPending(7, live, "grep_result", "glob")
 
-    const kept = deliverContinuationResults(live, [
+    const kept = await deliverContinuationResults(live, [
       { toolCallId: "result-264", sessionId: "live-write", execId: 7, toolName: "glob", output: "a.ts" },
     ])
 
@@ -447,7 +474,7 @@ describe("deliverContinuationResults", () => {
     expect(live.pending.has(7)).toBe(false)
   })
 
-  it("delivers a read image as ReadSuccess.data on the held Run", () => {
+  it("delivers a read image as ReadSuccess.data on the held Run", async () => {
     const writes: Uint8Array[] = []
     const live = fakeSession("image-read")
     live.openCodeSessionId = "host-image-read"
@@ -455,7 +482,7 @@ describe("deliverContinuationResults", () => {
     sessionManager.registerPending(12, live, "read_result", "read", false, { path: "/work/badge.png" })
     const data = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
 
-    expect(deliverContinuationResults(live, [{
+    expect(await deliverContinuationResults(live, [{
       toolCallId: "cursor_image-read_12",
       sessionId: "image-read",
       execId: 12,
@@ -471,27 +498,36 @@ describe("deliverContinuationResults", () => {
     expect(snapshotSentHistoryImageHashesForTests("host-image-read")).toEqual(["hash"])
   })
 
-  it("preserves host updates beside a binary read without opening a new Run", () => {
+  it("injects a host update after an image read and leaves the bytes unchanged", async () => {
     const writes: Uint8Array[] = []
     const live = fakeSession("image-read-update")
     live.runId = "run-image-update"
     live.stream.write = frame => { writes.push(frame) }
     sessionManager.registerPending(12, live, "read_result", "read", false, { path: "/work/badge.png" })
-    const notes = "<system-update>New tool instructions</system-update>"
+    const notes = ["<system-update>New tool instructions</system-update>"]
     const data = Uint8Array.from([1, 2, 3])
-    expect(deliverContinuationResults(live, [{
+    expect(await deliverContinuationResults(live, [{
       toolCallId: "cursor_image-read-update_12", sessionId: live.sessionId, execId: 12, toolName: "read",
-      output: `Image read successfully\n\n${notes}`, notes,
+      output: "Image read successfully", notes,
       images: [{ data, filename: "badge.png", mimeType: "image/png" }],
     }])).toBe(live)
-    const injection = decodeMessage<any>("AgentClientMessage", writes[0]).conversation_action.inject_context_action
-    expect(injection.expected_run_id).toBe(live.runId)
-    expect(injection.system_context).toEqual({ producer: "opencode", content: notes })
-    expect(Uint8Array.from(decodeMessage<any>("AgentClientMessage", writes[1]).exec_client_message.read_result.success.data)).toEqual(data)
-    expect(writes.map(frame => decodeMessage<any>("AgentClientMessage", frame).run_request).filter(Boolean)).toEqual([])
+    const decoded = writes.map(frame => decodeMessage<any>("AgentClientMessage", frame))
+    const readAt = decoded.findIndex(message => message.exec_client_message?.read_result)
+    const injectAt = decoded.findIndex(message => message.conversation_action?.inject_context_action)
+    expect(injectAt).toBeGreaterThan(readAt)
+    const injection = decoded[injectAt].conversation_action.inject_context_action
+    expect(injection.expected_run_id).toBe("run-image-update")
+    expect(injection.user_context.user_message.text).toBe("New tool instructions")
+    const exec = decoded[readAt].exec_client_message
+    expect(exec.hook_additional_contexts).toEqual([])
+    const success = exec.read_result.success
+    expect(Uint8Array.from(success.data)).toEqual(data)
+    expect(success.content).toBeUndefined()
+    expect(JSON.stringify(success)).not.toContain("New tool instructions")
+    expect(decoded.filter(message => message.run_request)).toEqual([])
   })
 
-  it("does not record history-image hashes when the image write never lands", () => {
+  it("does not record history-image hashes when the image write never lands", async () => {
     const live = fakeSession("image-read-fail")
     live.openCodeSessionId = "host-image-read-fail"
     live.stream.write = () => {
@@ -500,7 +536,7 @@ describe("deliverContinuationResults", () => {
     sessionManager.registerPending(13, live, "read_result", "read", false, { path: "/work/badge.png" })
     const data = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
 
-    expect(deliverContinuationResults(live, [{
+    expect(await deliverContinuationResults(live, [{
       toolCallId: "cursor_image-read-fail_13",
       sessionId: "image-read-fail",
       execId: 13,
@@ -512,14 +548,14 @@ describe("deliverContinuationResults", () => {
     expect(snapshotSentHistoryImageHashesForTests("host-image-read-fail")).toEqual([])
   })
 
-  it("delivers MCP tool images on the held Run instead of waiting for the next user turn", () => {
+  it("delivers MCP tool images on the held Run instead of waiting for the next user turn", async () => {
     const writes: Uint8Array[] = []
     const live = fakeSession("mcp-image")
     live.stream.write = (frame: Uint8Array) => { writes.push(frame) }
     sessionManager.registerPending(13, live, "mcp_result", "parity_status_badge")
     const data = Uint8Array.from([0x89, 0x50, 0x4e, 0x47])
 
-    expect(deliverContinuationResults(live, [{
+    expect(await deliverContinuationResults(live, [{
       toolCallId: "cursor_mcp-image_13",
       sessionId: "mcp-image",
       execId: 13,
@@ -535,7 +571,7 @@ describe("deliverContinuationResults", () => {
     expect(content[1].image.mime_type).toBe("image/png")
   })
 
-  it("upgrades a host-authorized external edit read to complete content", () => {
+  it("upgrades a host-authorized external edit read to complete content", async () => {
     const writes: Uint8Array[] = []
     const root = fs.mkdtempSync(path.join("/tmp", "cursor-edit-workspace-"))
     const externalRoot = fs.mkdtempSync(path.join("/tmp", "cursor-edit-authorized-"))
@@ -553,7 +589,7 @@ describe("deliverContinuationResults", () => {
         correlatedEditCallId: "edit-call",
       })
 
-      const kept = deliverContinuationResults(live, [{ toolCallId: "result-290",
+      const kept = await deliverContinuationResults(live, [{ toolCallId: "result-290",
         sessionId: "authorized-external-read",
         execId: 31,
         toolName: "read",
@@ -575,7 +611,7 @@ describe("deliverContinuationResults", () => {
     }
   })
 
-  it("carries background-shell request metadata into the typed continuation result", () => {
+  it("carries background-shell request metadata into the typed continuation result", async () => {
     const writes: Uint8Array[] = []
     const live = fakeSession("background-write")
     live.stream.write = (frame: Uint8Array) => { writes.push(frame) }
@@ -600,7 +636,7 @@ describe("deliverContinuationResults", () => {
       metadata,
     )
 
-    const kept = deliverContinuationResults(live, [{
+    const kept = await deliverContinuationResults(live, [{
       toolCallId,
       sessionId: "background-write",
       execId: 49,
@@ -620,7 +656,7 @@ describe("deliverContinuationResults", () => {
     expect(live.pending.has(49)).toBe(false)
   })
 
-  it("returns a sanitized OpenCode timeout as Cursor's typed aborted shell exit", () => {
+  it("returns a sanitized OpenCode timeout as Cursor's typed aborted shell exit", async () => {
     const writes: Uint8Array[] = []
     const live = fakeSession("timeout-write")
     live.stream.write = (frame: Uint8Array) => { writes.push(frame) }
@@ -640,7 +676,7 @@ describe("deliverContinuationResults", () => {
     )
     sessionManager.registerPending(12, live, "shell_stream", "bash", false, metadata)
 
-    const kept = deliverContinuationResults(live, [{
+    const kept = await deliverContinuationResults(live, [{
       toolCallId,
       sessionId: "timeout-write",
       execId: 12,
@@ -658,7 +694,7 @@ describe("deliverContinuationResults", () => {
       .not.toContain("shell_metadata")
   })
 
-  it("turns the native proposal result into CreatePlan success", () => {
+  it("turns the native proposal result into CreatePlan success", async () => {
     const writes: Uint8Array[] = []
     const live = fakeSession("native-plan")
     live.stream.write = (frame: Uint8Array) => { writes.push(frame) }
@@ -671,7 +707,7 @@ describe("deliverContinuationResults", () => {
       { interactionId: 7, planUri: "local://sample-plan.md" },
     )
 
-    const kept = deliverContinuationResults(live, [{ toolCallId: "result-408",
+    const kept = await deliverContinuationResults(live, [{ toolCallId: "result-408",
       sessionId: "native-plan",
       execId: 900_101,
       toolName: "write",
@@ -685,7 +721,7 @@ describe("deliverContinuationResults", () => {
     expect(response.create_plan_request_response.result.plan_uri).toBe("local://sample-plan.md")
   })
 
-  it("turns a failed native proposal into CreatePlan error", () => {
+  it("turns a failed native proposal into CreatePlan error", async () => {
     const writes: Uint8Array[] = []
     const live = fakeSession("native-plan-error")
     live.stream.write = (frame: Uint8Array) => { writes.push(frame) }
@@ -698,7 +734,7 @@ describe("deliverContinuationResults", () => {
       { interactionId: 8, planUri: "local://sample-plan.md" },
     )
 
-    deliverContinuationResults(live, [{ toolCallId: "result-435",
+    await deliverContinuationResults(live, [{ toolCallId: "result-435",
       sessionId: "native-plan-error",
       execId: 900_102,
       toolName: "write",
@@ -711,7 +747,7 @@ describe("deliverContinuationResults", () => {
     expect(response.create_plan_request_response.result.error.error).toBe("Plan artifact missing")
   })
 
-  it("closes and returns undefined when continuation write fails", () => {
+  it("closes and returns undefined when continuation write fails", async () => {
     const live = fakeSession("dead-write")
     live.stream.write = () => {
       throw new CursorRunInterruptedError("Cursor Run stream is no longer writable")
@@ -719,7 +755,7 @@ describe("deliverContinuationResults", () => {
     live.stream.isClosed = () => true
     sessionManager.registerPending(3, live, "read_result", "read")
 
-    const kept = deliverContinuationResults(live, [
+    const kept = await deliverContinuationResults(live, [
       { toolCallId: "result-457", sessionId: "dead-write", execId: 3, toolName: "read", output: "content" },
     ])
 
@@ -731,13 +767,13 @@ describe("deliverContinuationResults", () => {
     ])).toBeUndefined()
   })
 
-  it("clears bridged pending entries without writing exec frames", () => {
+  it("clears bridged pending entries without writing exec frames", async () => {
     const writes: Uint8Array[] = []
     const live = fakeSession("bridged")
     live.stream.write = (frame: Uint8Array) => { writes.push(frame) }
     sessionManager.registerPending(900_001, live, "todowrite", "todowrite", true)
 
-    const kept = deliverContinuationResults(live, [
+    const kept = await deliverContinuationResults(live, [
       { toolCallId: "result-475", sessionId: "bridged", execId: 900_001, toolName: "todowrite", output: "ok" },
     ])
 
@@ -746,7 +782,7 @@ describe("deliverContinuationResults", () => {
     expect(live.pending.has(900_001)).toBe(false)
   })
 
-  it("refreshes the mirrored todo snapshot from a host todoread result", () => {
+  it("refreshes the mirrored todo snapshot from a host todoread result", async () => {
     // Bridged Cursor TodoRead and direct host todoread share this path. Host
     // JSON is authoritative for later merge:true patches; prose/errors leave
     // the prior snapshot alone.
@@ -759,7 +795,7 @@ describe("deliverContinuationResults", () => {
     rememberMirroredTodos(openCodeSessionId, live.mirroredTodos)
     sessionManager.registerPending(900_002, live, "todoread", "todoread", true)
 
-    const kept = deliverContinuationResults(live, [
+    const kept = await deliverContinuationResults(live, [
       { toolCallId: "result-497",
         sessionId: "todoread-sess",
         execId: 900_002,
@@ -782,7 +818,7 @@ describe("deliverContinuationResults", () => {
 
     // Non-JSON host output must not wipe a useful prior.
     sessionManager.registerPending(900_003, live, "todoread", "todoread", true)
-    deliverContinuationResults(live, [
+    await deliverContinuationResults(live, [
       { toolCallId: "result-520",
         sessionId: "todoread-sess",
         execId: 900_003,

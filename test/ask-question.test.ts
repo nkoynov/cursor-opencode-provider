@@ -317,7 +317,7 @@ describe("bridged ask-question over a held-open Run", () => {
     expect(JSON.parse(toolCall.input).questions[0].question).toBe("Which cache should we use?")
     expect(session.pending.size).toBe(1)
 
-    const delivered = deliverContinuationResults(session, [{
+    const delivered = await deliverContinuationResults(session, [{
       toolCallId: toolCall.toolCallId,
       sessionId: session.sessionId,
       execId: 900_000,
@@ -343,7 +343,7 @@ describe("bridged ask-question over a held-open Run", () => {
     expect(writes).toHaveLength(1)
     const toolCall = parts.find((part) => part.type === "tool-call")
 
-    deliverContinuationResults(session, [{
+    await deliverContinuationResults(session, [{
       toolCallId: toolCall.toolCallId,
       sessionId: session.sessionId,
       execId: 900_000,

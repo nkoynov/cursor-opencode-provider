@@ -225,11 +225,13 @@ export function admitContextEpoch(input: AdmitContextEpochInput): AdmitContextEp
     workspaceRoot: nextSnap.workspaceRoot || existing.snapshot.workspaceRoot,
   }
   const updates = renderSourceUpdates(existing.snapshot, observedSnap, input)
-  const changed =
-    existing.snapshot.hostSystemHash !== observedSnap.hostSystemHash
-    || existing.snapshot.guidanceHash !== observedSnap.guidanceHash
-    || existing.snapshot.hostAgent !== observedSnap.hostAgent
-    || existing.snapshot.workspaceRoot !== observedSnap.workspaceRoot
+  const changedSources = [
+    existing.snapshot.hostSystemHash !== observedSnap.hostSystemHash ? "hostSystem" : "",
+    existing.snapshot.guidanceHash !== observedSnap.guidanceHash ? "guidance" : "",
+    existing.snapshot.hostAgent !== observedSnap.hostAgent ? "hostAgent" : "",
+    existing.snapshot.workspaceRoot !== observedSnap.workspaceRoot ? "workspaceRoot" : "",
+  ].filter(Boolean)
+  const changed = changedSources.length > 0
   if (changed) {
     existing.snapshot = observedSnap
   }
@@ -240,7 +242,8 @@ export function admitContextEpoch(input: AdmitContextEpochInput): AdmitContextEp
     if (changed || oneShots.length) {
       trace(
         `context epoch: ${changed ? "updated" : "unchanged"} conversationId=${conversationId} ` +
-          `checkpoint=1 updates=${updates.length} oneShots=${oneShots.length}`,
+          `checkpoint=1 updates=${updates.length} oneShots=${oneShots.length}` +
+          (changedSources.length ? ` changed=[${changedSources.join(",")}]` : ""),
       )
     }
     return {
