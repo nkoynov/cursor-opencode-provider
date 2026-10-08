@@ -251,6 +251,7 @@ import {
   assertCursorUserImageSupport,
   extractCursorPromptImages,
   extractCursorToolResultImages,
+  MAX_CURSOR_IMAGE_INPUT_BYTES,
   type CursorImageInput,
 } from "./image-input.js"
 import { getDocumentedCursorModelContext, resolveCursorModelSupportsImages } from "./model-metadata.js"
@@ -767,6 +768,11 @@ function rememberSentHistoryImageHashes(sessionKey: string | undefined, hashes: 
   }
 }
 
+/** Test helper: content hashes recorded after a successful held-Run image write. */
+export function snapshotSentHistoryImageHashesForTests(sessionKey: string): string[] {
+  return [...(sentHistoryImageHashesBySession.get(sessionKey) ?? [])]
+}
+
 type V3Part = LanguageModelV3StreamPart
 
 export function createCursorLanguageModel(
@@ -911,8 +917,29 @@ async function doStreamImpl(
     // Write pending results onto the held-open Run. A dead stream closes the
     // session and returns undefined so we fall through to history rebase
     // instead of pumping a connection that can no longer accept writes.
+    const tailMedia = trailingToolResults.reduce((n, r) => n + (r.media?.length ?? 0), 0)
+    const roles = prompt.slice(Math.max(0, prompt.length - 4)).map((m) => {
+      if (!Array.isArray(m.content)) return `${m.role}:scalar`
+      const kinds = m.content.map((p) => {
+        const part = p as unknown as Record<string, unknown>
+        if (part.type === "tool-result") {
+          const out = part.output as Record<string, unknown> | undefined
+          const value = out?.value
+          const nonText = Array.isArray(value)
+            ? value.filter((item) => item && typeof item === "object" && (item as { type?: string }).type !== "text").length
+            : 0
+          return `tool-result(${part.toolName},${typeof out?.type === "string" ? out.type : "?"},mediaish=${nonText})`
+        }
+        return String(part.type ?? "?")
+      })
+      return `${m.role}:[${kinds.join(",")}]`
+    })
+    trace(
+      `continuation: prompt-tail mediaParts=${tailMedia} supportsImages=${session.supportsImages} ` +
+        `roles=${roles.join(" | ")}`,
+    )
     const results = session.supportsImages
-      ? await decodeTrailingToolImages(trailingToolResults, callOptions.abortSignal)
+      ? await decodeTrailingToolImages(session, trailingToolResults, callOptions.abortSignal)
       : trailingToolResults
     const resultsAfterCheckpoint = steeredPrompt || session.resultsAfterCheckpoint
       ? resultsAwaitingCheckpoint(session, results)
@@ -1740,7 +1767,7 @@ async function startSession(
     )
   }
   const imageExtraction = resuming
-    ? { images: [], hashes: [], candidateCount: 0, duplicateCount: 0, userImageCount: 0 }
+    ? { images: [], hashes: [], candidateCount: 0, duplicateCount: 0, userImageCount: 0, omittedCount: 0 }
     : await extractCursorPromptImages(
         (fallbackReply
           ? prompt.filter((_, index) => index < fallbackReply.turnStart || index > fallbackReply.stopIndex)
@@ -1758,6 +1785,11 @@ async function startSession(
           signal: callOptions.abortSignal,
         },
       )
+  if (imageExtraction.omittedCount) {
+    userText = appendMidConversationMessage(userText,
+      `[${imageExtraction.omittedCount} historical tool image(s) could not be decoded; their pixels are unavailable.]`)
+    trace(`image input: omitted ${imageExtraction.omittedCount} unreadable tool image(s)`)
+  }
   if (!supportsImages && imageExtraction.candidateCount > 0) {
     trace(
       `image input: dropped ${imageExtraction.candidateCount} tool/assistant history image(s); ` +
@@ -2085,8 +2117,7 @@ async function startSession(
     session.heartbeatCancel?.()
     await waitForStreamWrites(session.stream)
     abortIfNeeded(next)
-    sessionManager.replaceStream(session, next)
-    session.runId = nextRunId
+    sessionManager.replaceStream(session, next, nextRunId)
     attachSessionHeartbeat(session)
   }
 
@@ -5549,10 +5580,8 @@ function normalizeCheckpointBytes(raw: unknown): Uint8Array | undefined {
 
 // ── Prompt extraction ──
 
-type ExtractedToolResult = {
+type ToolResultContent = {
   toolCallId: string
-  sessionId: string
-  execId: number
   toolName: string
   output: string
   error?: string
@@ -5566,22 +5595,27 @@ type ExtractedToolResult = {
   note?: string
 }
 
-function extractToolResults(prompt: LanguageModelV3CallOptions["prompt"]): ExtractedToolResult[] {
-  const out: ExtractedToolResult[] = []
+type ExtractedToolResult = ToolResultContent & { sessionId: string; execId: number }
+
+function correlateToolResults(results: ToolResultContent[]): ExtractedToolResult[] {
+  return results.flatMap(result => {
+    const parsed = parseExecIdFromToolCallId(result.toolCallId)
+    return parsed ? [{ ...result, ...parsed }] : []
+  })
+}
+
+function extractToolResultContent(prompt: LanguageModelV3CallOptions["prompt"]): ToolResultContent[] {
+  const out: ToolResultContent[] = []
   for (const msg of prompt) {
     if (msg.role !== "tool" || !Array.isArray(msg.content)) continue
     for (const part of msg.content) {
       const p = part as unknown as Record<string, unknown>
       if (p.type !== "tool-result") continue
       const toolCallId = (p.toolCallId as string) ?? ""
-      const parsed = parseExecIdFromToolCallId(toolCallId)
-      if (!parsed) continue
       const { text, isError, hostError } = toolResultOutputToText(p.output)
       const media = toolResultOutputMedia(p.output)
       out.push({
         toolCallId,
-        sessionId: parsed.sessionId,
-        execId: parsed.execId,
         toolName: (p.toolName as string) ?? "mcp",
         output: text,
         error: isError ? text : undefined,
@@ -5593,16 +5627,12 @@ function extractToolResults(prompt: LanguageModelV3CallOptions["prompt"]): Extra
   return out
 }
 
-/**
- * Tool results that form a live continuation: only the trailing run of `tool`
- * messages after the last non-tool message. Mid-prompt historical tool results
- * are ignored — they are conversation history, not replies for a held-open Run.
- */
-// OpenCode 2.x appends these host notes after the tool results of a step:
-// mid-turn system updates (skill / MCP availability changes) are lowered to a
-// user message wrapping `<system-update>`, plan-agent guidance uses
-// `<system-reminder>`, and tool-result media is re-sent as a user message
-// starting with this caption.
+function extractToolResults(prompt: LanguageModelV3CallOptions["prompt"]): ExtractedToolResult[] {
+  return correlateToolResults(extractToolResultContent(prompt))
+}
+
+// OpenCode appends host notes after tool results: system updates, plan-agent
+// reminders, and detached tool media with a synthetic caption.
 const SYSTEM_UPDATE_OPEN = "<system-update>"
 const SYSTEM_UPDATE_CLOSE = "</system-update>"
 const SYSTEM_REMINDER_OPEN = "<system-reminder>"
@@ -5670,8 +5700,11 @@ export function extractTrailingToolResults(
   // Continuations end with tool messages. Anything else (user/assistant)
   // means this is a fresh model call that merely carries tools in history.
   if (i === end - 1) return []
-  const results = extractToolResults(prompt.slice(i + 1, end))
-  if (media.length > 0) attributeTrailingMedia(results, media)
+  const contents = extractToolResultContent(prompt.slice(i + 1, end))
+  // Detached media includes host-owned calls too; filter correlation only
+  // after attribution so their attachments cannot migrate to our execs.
+  if (media.length > 0) attributeTrailingMedia(contents, media)
+  const results = correlateToolResults(contents)
   // A Run continuation only carries exec results, so the host notes go with
   // them; otherwise Cursor would never see e.g. a removed skill. Delivery puts
   // them on a result whose typed shape can hold them, or injects them.
@@ -5688,49 +5721,90 @@ const TOOL_MEDIA_PLACEHOLDER = "Media attached in the following user message."
 const MEDIA_READ_OUTPUTS = new Set(["Image read successfully", "PDF read successfully"])
 
 /**
- * OpenCode moves the media of every result in a step into one trailing
- * message, in result order. One result takes all of it. With several, each
- * media read takes its one part and the rest goes to the placeholder results;
- * when no placeholder settles it (results with text and media), the rest rides
- * on the last result, as host notes do, so Cursor still sees it this turn.
+ * Detached media loses tool ids. Only attribute slices whose boundaries are
+ * uniquely determined by OpenCode's read/placeholder markers and result order.
+ * Opaque tools may return any number of images; text alone proves no ownership.
  */
-function attributeTrailingMedia(results: ExtractedToolResult[], media: unknown[]): void {
-  const shares = results.map(() => 0)
-  if (results.length === 1) shares[0] = media.length
-  else {
-    let rest = media.length
-    results.forEach((r, index) => {
-      if (rest > 0 && MEDIA_READ_OUTPUTS.has(r.output)) { shares[index] = 1; rest-- }
-    })
-    const placeholders = results.flatMap((r, index) => r.output === TOOL_MEDIA_PLACEHOLDER ? [index] : [])
-    if (rest > 0 && placeholders.length === rest) for (const index of placeholders) shares[index] = 1
-    else if (rest > 0 && placeholders.length === 1) shares[placeholders[0]!] = rest
-    else if (rest > 0) {
-      let target = results.length - 1
-      while (target > 0 && MEDIA_READ_OUTPUTS.has(results[target]!.output)) target--
-      shares[target] = shares[target]! + rest
-      trace(`continuation: ${rest} tool-result media part(s) without a known owner ride on execId=${results[target]!.execId}`)
-    }
+function attributeTrailingMedia(results: ToolResultContent[], media: unknown[]): void {
+  if (results.length === 0) return
+  if (results.length === 1) {
+    if (results[0]!.toolName === "read" && !MEDIA_READ_OUTPUTS.has(results[0]!.output)) return
+    results[0]!.media = [...(results[0]!.media ?? []), ...media]
+    return
   }
-  let next = 0
+  const bounds = results.map(result => {
+    if (result.toolName === "read") {
+      const count = MEDIA_READ_OUTPUTS.has(result.output) ? 1 : 0
+      return { min: count, max: count }
+    }
+    if (result.output === TOOL_MEDIA_PLACEHOLDER) return { min: 1, max: media.length }
+    // These canonical tools have text output only. Opaque MCP tools remain
+    // unconstrained, even if another tool also returned descriptive text.
+    if (["glob", "grep", "ls", "edit", "write", "apply_patch", "todowrite", "todoread"].includes(result.toolName)) {
+      return { min: 0, max: 0 }
+    }
+    return { min: 0, max: media.length }
+  })
+  const sumMin = bounds.reduce((sum, bound) => sum + bound.min, 0)
+  const sumMax = bounds.reduce((sum, bound) => sum + bound.max, 0)
+  if (sumMin > media.length || sumMax < media.length) {
+    trace("continuation: detached media does not match result markers; retaining history fallback")
+    return
+  }
+  let prefixMin = 0
+  let prefixMax = 0
   results.forEach((result, index) => {
-    const share = shares[index]!
-    if (share === 0) return
-    results[index] = { ...result, media: [...(result.media ?? []), ...media.slice(next, next + share)] }
-    next += share
+    const bound = bounds[index]!
+    const suffixMin = sumMin - prefixMin - bound.min
+    const suffixMax = sumMax - prefixMax - bound.max
+    const startMin = Math.max(prefixMin, media.length - suffixMax - bound.max)
+    const startMax = Math.min(prefixMax, media.length - suffixMin - bound.min)
+    const endMin = Math.max(prefixMin + bound.min, media.length - suffixMax)
+    const endMax = Math.min(prefixMax + bound.max, media.length - suffixMin)
+    if (startMin === startMax && endMin === endMax && endMin > startMin) {
+      result.media = [...(result.media ?? []), ...media.slice(startMin, endMin)]
+    } else if (bound.max > 0 && (startMin !== startMax || endMin !== endMax)) {
+      result.output += "\n\n[Detached tool media has ambiguous ownership; images remain available in history.]"
+      trace(`continuation: ambiguous detached media owner tool=${result.toolName}`)
+    }
+    prefixMin += bound.min
+    prefixMax += bound.max
   })
 }
 
-/** Decode tool-result images for the exec results of a held-Run continuation. */
-async function decodeTrailingToolImages(
+/** Decode only image-bearing pending execs, under one continuation-wide budget. */
+export async function decodeTrailingToolImages(
+  session: CursorSession,
   results: ExtractedToolResult[],
   signal?: AbortSignal,
+  maxBytes = MAX_CURSOR_IMAGE_INPUT_BYTES,
 ): Promise<ExtractedToolResult[]> {
-  return Promise.all(results.map(async (result) => {
-    if (!result.media?.length) return result
-    const { images, hashes } = await extractCursorToolResultImages(result.media, { signal })
-    return images.length > 0 ? { ...result, images, imageHashes: hashes } : result
-  }))
+  const decoded: ExtractedToolResult[] = []
+  let remaining = Math.min(MAX_CURSOR_IMAGE_INPUT_BYTES, Math.max(0, maxBytes))
+  for (const result of results) {
+    signal?.throwIfAborted()
+    const pending = result.sessionId === session.sessionId ? session.pending.get(result.execId) : undefined
+    if (!session.supportsImages || result.error || !result.media?.length || !pending || pending.bridged
+      || (pending.resultField !== "read_result" && pending.resultField !== "mcp_result")) {
+      decoded.push(result)
+      continue
+    }
+    const { images, hashes, omittedCount } = await extractCursorToolResultImages(result.media, {
+      signal, maxBytes: remaining, maxImages: pending.resultField === "read_result" ? 1 : undefined,
+    })
+    remaining -= images.reduce((total, image) => total + image.data.length, 0)
+    const notice = omittedCount > 0
+      ? `[${omittedCount} tool-result image(s) omitted: decoding failed or the attachment budget was exceeded.]`
+      : undefined
+    decoded.push({
+      ...result, images, imageHashes: hashes,
+      ...(notice ? {
+        output: `${result.output}\n\n${notice}`,
+        ...(pending.resultField === "read_result" && images.length === 0 ? { error: notice } : {}),
+      } : {}),
+    })
+  }
+  return decoded
 }
 
 // A tool OpenCode interrupted (user stop, declined permission). 1.x's classic loop sends plain error text.
@@ -6033,7 +6107,10 @@ function toolResultOutputToText(output: unknown): { text: string; isError: boole
   if (typeof output === "string") return { text: output, isError: false }
   const o = output as Record<string, unknown>
   // LanguageModelV3 tool-result output: { type: "text"|"json"|"error-text"|..., value }
-  const isError = typeof o.type === "string" && (o.type as string).startsWith("error")
+  const isError = o.type === "execution-denied" || (typeof o.type === "string" && o.type.startsWith("error"))
+  if (o.type === "execution-denied") {
+    return { text: String(o.reason ?? "Tool execution denied"), isError: true }
+  }
   if (o.type === "text" || o.type === "error-text") {
     const text = String(o.value ?? "")
     const hostError = parseHostToolErrorEnvelope(text)
@@ -6047,6 +6124,7 @@ function toolResultOutputToText(output: unknown): { text: string; isError: boole
     // Media is returned separately by toolResultOutputMedia.
     const text = o.value
       .map((c) => {
+        if (!c || typeof c !== "object") return ""
         const cp = c as Record<string, unknown>
         return cp.type === "text" ? String(cp.text ?? "") : ""
       })
@@ -7045,6 +7123,7 @@ export function resetTurnStateForTests(): void {
   promptIdentityBySession.clear()
   undeliveredHostNoteBySession.clear()
   mirroredTodosBySession.clear()
+  sentHistoryImageHashesBySession.clear()
   resetContextEpochsForTests()
   cursorListsToolRequests = false
   hostInterrupts.clear()

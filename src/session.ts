@@ -860,7 +860,7 @@ export class SessionManager {
    * Callers must cancel the session heartbeat and wait for the old stream's
    * write chain before this, so an in-flight heartbeat cannot close the session.
    */
-  replaceStream(session: CursorSession, next: BidiStream): void {
+  replaceStream(session: CursorSession, next: BidiStream, runId?: string): void {
     if (session.closed) throw new CursorProtocolError("Cannot replace stream on a closed Cursor session")
     session.heartbeatCancel?.()
     session.terminalUnsubscribe?.()
@@ -868,7 +868,10 @@ export class SessionManager {
     session.deferredTerminalReason = null
     const old = session.stream
     session.stream = next
+    if (runId !== undefined) session.runId = runId
     session.frames = next.frames()[Symbol.asyncIterator]()
+    session.queuedFrame = undefined
+    session.carriedToolStep = undefined
     this.subscribeTerminal(session)
     try { old.destroy() } catch { /* already closed */ }
   }
@@ -915,6 +918,8 @@ export class SessionManager {
       if (this.isTerminalReason(reason)) this.putTombstone(key, reason)
     }
     session.pending.clear()
+    session.queuedFrame = undefined
+    session.carriedToolStep = undefined
     session.pumpOwner = null
     session.pumpActive = false
     session.displayToolCalls?.clear()

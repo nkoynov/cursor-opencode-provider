@@ -639,3 +639,12 @@
 ## 2026-10-08 — Retry cleanup after releasing pump ownership
 
 - Cleanup during an active pump must defer to its owner, but a canceled consumer can stop that pump without receiving a remote terminal event. Retry ordinary cleanup after the same owner releases it; keep pending tool turns and never release or close a newer owner's pump (`test/run-interruption.test.ts`).
+
+## 2026-10-08 — Preserve evidence before correlating media
+
+- Result correlation is a delivery filter, not an ownership filter. Keep host-owned results until attribution is complete, prove attachment slice boundaries, and use the actual typed result contract for denials and context updates. Review record: `docs/pr-42-46-review.md`.
+
+## 2026-10-08 — A timed-out read still owns the iterator operation
+
+- Racing an iterator read against a timer does not cancel that read. Keep its promise on the session until consumed, including late EOF/errors; every continuation and drain must use the same reader (`src/session.ts:922`, `test/parallel-pump.test.ts:322`).
+- Once a streamed host tool has been emitted, terminal recovery must finish the tool step before rebasing from its result. A checkpoint does not make replay of already-started host side effects safe (`src/language-model.ts:2863`, `test/parallel-pump.test.ts:351`).

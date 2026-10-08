@@ -291,6 +291,24 @@ describe("cursorModelFamily", () => {
   it("leaves Cursor Auto without a family", () => {
     expect(cursorModelFamily("default")).toBeUndefined()
   })
+
+  it("keeps context and speed suffixes out of the family", () => {
+    for (const [id, family] of [
+      ["claude-sonnet-4-1m", "claude-sonnet"],
+      ["gpt-5.4-1m", "gpt"],
+      ["gpt-5.6-sol-1m", "gpt-sol"],
+      ["composer-2.5-fast", "composer"],
+      ["grok-4.7-fast", "grok"],
+      ["claude-opus-5-5-1m-fast", "claude-opus"],
+    ] as const) expect(cursorModelFamily(id)).toBe(family)
+  })
+
+  it("groups Kimi minor versions and code speeds within their major family", () => {
+    expect(cursorModelFamily("kimi-k2.6")).toBe("kimi-k2")
+    expect(cursorModelFamily("kimi-k2.7-code")).toBe("kimi-k2")
+    expect(cursorModelFamily("kimi-k2.7-code-highspeed")).toBe("kimi-k2")
+    expect(cursorModelFamily("kimi-k3")).toBe("kimi-k3")
+  })
 })
 
 describe("modelInfoToConfig family", () => {
@@ -301,9 +319,14 @@ describe("modelInfoToConfig family", () => {
     expect(modelInfoToConfig({ id: "default", variants: [] }).family).toBeUndefined()
   })
 
-  it("prefers a family reported by Cursor", () => {
-    expect(modelInfoToConfig({ id: "claude-haiku-4-5", family: "claude-haiku-x", variants: [] }).family)
+  it("prefers a non-empty family supplied in cache metadata", () => {
+    expect(modelInfoToConfig({ id: "claude-haiku-4-5", family: "  claude-haiku-x  ", variants: [] }).family)
       .toBe("claude-haiku-x")
+  })
+
+  it("derives family when cached metadata contains an empty or whitespace family", () => {
+    expect(modelInfoToConfig({ id: "claude-haiku-4-5", family: "", variants: [] }).family).toBe("claude-haiku")
+    expect(modelInfoToConfig({ id: "gpt-5.6-luna", family: "   ", variants: [] }).family).toBe("gpt-luna")
   })
 
   it("keeps the wire model family on long-context and Fast entries", () => {
@@ -319,6 +342,23 @@ describe("modelInfoToConfig family", () => {
     }])
     expect(Object.keys(config).length).toBeGreaterThan(1)
     for (const entry of Object.values(config)) expect(entry.family).toBe("claude-opus")
+  })
+
+  it("maps pricing-fixture ids onto OpenCode small-model families", async () => {
+    // OpenCode 2.0 Model.small: gpt-luna, gemini-flash-lite, gemini-flash, claude-haiku;
+    // OpenCode 1.x getSmallModel: gemini-flash, gpt-nano, claude-haiku. Titles fall
+    // back to the session model when none of these appear. gemini-flash-lite is
+    // only required when the fixture includes a matching id.
+    const required = ["gpt-luna", "gpt-nano", "gemini-flash", "claude-haiku"] as const
+    const fixturePath = path.join(import.meta.dir, "fixtures/cursor-pricing-models.txt")
+    const ids = (await fs.readFile(fixturePath, "utf8"))
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#"))
+    const families = new Set(ids.map((id) => cursorModelFamily(id)).filter((f): f is string => !!f))
+    for (const family of required) {
+      expect(families.has(family), `fixture must include a model that maps to ${family}`).toBe(true)
+    }
   })
 })
 

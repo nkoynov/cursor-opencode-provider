@@ -7,14 +7,17 @@ const ORIGIN = "https://agentn.ping-test.cursor.sh"
 const PROXY_KEYS = ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"] as const
 
 async function listen(server: net.Server): Promise<number> {
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", resolve)
+  })
   const address = server.address()
   if (!address || typeof address === "string") throw new Error("expected TCP address")
   return address.port
 }
 
 describe("getSession cached-session ping failure", () => {
-  it("retires the session without aborting Runs still streaming on it", async () => {
+  it.each(["refused", "timeout", "callback-error", "throw"])("retires after a %s ping without aborting sibling Runs", async failure => {
     let release: () => void = () => {}
     const released = new Promise<void>((resolve) => { release = resolve })
     const server = http2.createServer()
@@ -54,8 +57,15 @@ describe("getSession cached-session ping failure", () => {
       })
       await firstChunk
 
-      client.ping = () => false
-      const error = await getSession(ORIGIN).catch((err: unknown) => err)
+      client.ping = (payloadOrCallback, callback?) => {
+        const done = typeof payloadOrCallback === "function" ? payloadOrCallback : callback
+        if (failure === "throw") throw new Error("ping failed")
+        if (failure === "callback-error" && typeof done === "function") {
+          done(new Error("ping failed"), 0, Buffer.alloc(8))
+        }
+        return failure !== "refused"
+      }
+      const error = await getSession(ORIGIN, { pingTimeoutMs: 10 }).catch((err: unknown) => err)
       expect(error).toMatchObject({ code: "CURSOR_PROXY_CONNECT_REJECTED" })
       expect(client.destroyed).toBe(false)
       expect(client.closed).toBe(true)

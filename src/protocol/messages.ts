@@ -450,6 +450,14 @@ export function createMessageTypes(): protobuf.Root {
     { id: 4, name: "model_call_id", type: "string" },
   ])
 
+  // agent.v1 ToolCallDeltaUpdate: keep the nested delta opaque; the pump
+  // needs its presence as generation progress, not its display-only content.
+  addType(root, "ToolCallDeltaUpdate", [
+    { id: 1, name: "call_id", type: "string" },
+    { id: 2, name: "tool_call_delta", type: "bytes" },
+    { id: 3, name: "model_call_id", type: "string" },
+  ])
+
   // agent.v1 StepStartedUpdate / StepCompletedUpdate: step_id is uint64 (T:4),
   // not string — wrong type made every step_completed frame throw
   // "index out of range" in decodeMessage.
@@ -462,10 +470,10 @@ export function createMessageTypes(): protobuf.Root {
     { id: 2, name: "step_duration_ms", type: "int64" },
   ])
 
-  // agent.v1 ToolRequestsListedUpdate (Cursor CLI 2026.10.01:
-  // "ToolRequestsListedUpdate|1 call_count 13"): sent once the model has
-  // finished generating a step's tool calls, with how many it requested.
-  addType(root, "ToolRequestsListed", [
+  // agent.v1 ToolRequestsListedUpdate — Cursor lists how many tool calls this
+  // generation will send so the client can place its step boundary (CLI does
+  // not need this; OpenCode's AI SDK step does). Field 27 on InteractionUpdate.
+  addType(root, "ToolRequestsListedUpdate", [
     { id: 1, name: "call_count", type: "uint32" },
   ])
 
@@ -482,9 +490,10 @@ export function createMessageTypes(): protobuf.Root {
       { id: 7, name: "partial_tool_call", type: "PartialToolCall" },
       { id: 13, name: "heartbeat", type: "Heartbeat" },
       { id: 14, name: "turn_ended", type: "TurnEnded" },
+      { id: 15, name: "tool_call_delta", type: "ToolCallDeltaUpdate" },
       { id: 16, name: "step_started", type: "StepStarted" },
       { id: 17, name: "step_completed", type: "StepCompleted" },
-      { id: 27, name: "tool_requests_listed", type: "ToolRequestsListed" },
+      { id: 27, name: "tool_requests_listed", type: "ToolRequestsListedUpdate" },
       { id: 6, name: "user_message_appended", type: "UserMessageAppendedUpdate" },
       { id: 23, name: "context_injection_state", type: "ContextInjectionStateUpdate" },
     ],
@@ -499,6 +508,7 @@ export function createMessageTypes(): protobuf.Root {
         "partial_tool_call",
         "heartbeat",
         "turn_ended",
+        "tool_call_delta",
         "step_started",
         "step_completed",
         "tool_requests_listed",
@@ -2183,11 +2193,11 @@ export function createMessageTypes(): protobuf.Root {
   ])
 
   addType(root, "AvailableModelVariant", [
-    { id: 1, name: "display_name", type: "string" },
-    { id: 2, name: "is_max_mode", type: "bool" },
-    { id: 3, name: "is_default_max_config", type: "bool" },
-    { id: 4, name: "is_default_non_max_config", type: "bool" },
-    { id: 5, name: "parameter_values", type: "AvailableModelParameterValue", repeated: true },
+    { id: 1, name: "parameter_values", type: "AvailableModelParameterValue", repeated: true },
+    { id: 2, name: "display_name", type: "string" },
+    { id: 3, name: "is_max_mode", type: "bool" },
+    { id: 4, name: "is_default_max_config", type: "bool" },
+    { id: 5, name: "is_default_non_max_config", type: "bool" },
   ])
 
   addType(root, "AvailableModelEntry", [
@@ -2197,7 +2207,8 @@ export function createMessageTypes(): protobuf.Root {
     { id: 9, name: "supports_thinking", type: "bool" },
     { id: 10, name: "supports_images", type: "bool" },
     { id: 14, name: "supports_max_mode", type: "bool" },
-    { id: 15, name: "context_token_limit", type: "uint32" },
+    { id: 15, name: "context_token_limit", type: "int32" },
+    { id: 16, name: "context_token_limit_for_max_mode", type: "int32" },
     { id: 17, name: "client_display_name", type: "string" },
     { id: 18, name: "server_model_name", type: "string" },
     { id: 29, name: "parameter_definitions", type: "AvailableModelParameterDefinition", repeated: true },
@@ -2205,7 +2216,8 @@ export function createMessageTypes(): protobuf.Root {
   ])
 
   addType(root, "AvailableModelsResponse", [
-    { id: 1, name: "models", type: "AvailableModelEntry", repeated: true },
+    { id: 1, name: "model_names", type: "string", repeated: true },
+    { id: 2, name: "models", type: "AvailableModelEntry", repeated: true },
   ])
 
   return root

@@ -2,11 +2,27 @@ import { describe, it, expect } from "bun:test"
 import {
   encodeMessage,
   decodeMessage,
+  decodeMessageSparse,
   getMessageTypes,
 } from "../src/protocol/messages.js"
 import { readAllFields } from "../src/protocol/struct.js"
+import { mapAvailableModelsResponse } from "../src/models.js"
 
 describe("message round-trip", () => {
+  it("encodes system context injection at Cursor's declared wire fields", () => {
+    const data = encodeMessage("ConversationAction", { inject_context_action: {
+      injection_id: "i", expected_run_id: "r", system_context: { producer: "opencode", content: "note" },
+    } })
+    expect(Array.from(data)).toEqual([
+      0x9a, 0x01, 0x18, // inject_context_action #19, 24 bytes
+      0x0a, 0x01, 0x69, // injection_id #1
+      0x12, 0x01, 0x72, // expected_run_id #2
+      0x22, 0x10, // system_context #4, 16 bytes
+      0x0a, 0x08, ...Buffer.from("opencode"), // producer #1
+      0x12, 0x04, ...Buffer.from("note"), // content #2
+    ])
+  })
+
   it("encodes cancellation reason at the CLI's field number", () => {
     const data = encodeMessage("CancelAction", { reason: "host_plan_agent_handoff" })
     const fields = readAllFields(data)
@@ -189,6 +205,41 @@ describe("message round-trip", () => {
     expect(decoded).toBeDefined()
   })
 
+  it("decodes canonical AvailableModels fields before catalog mapping", () => {
+    // Cursor CLI 2026.10.01: response names #1, models #2; max context #16;
+    // variant parameters #1, label #2, max #3, default max #4, default base #5.
+    // Constructed independently of this package's encoder from that descriptor.
+    const hex = "0a0a746573742d6d6f64656c12330a0a746573742d6d6f64656c78e0a7128001c0843df2011b0a0d0a07636f6e746578741202316d12044c6f6e67180120012800"
+    const bytes = Uint8Array.from(Buffer.from(hex, "hex"))
+    const decoded = decodeMessage<any>("AvailableModelsResponse", bytes)
+    expect(decoded.model_names).toEqual(["test-model"])
+    expect(decoded.models).toHaveLength(1)
+    expect(decoded.models[0]).toMatchObject({
+      name: "test-model",
+      context_token_limit: 300_000,
+      context_token_limit_for_max_mode: 1_000_000,
+      variants: [{
+        parameter_values: [{ id: "context", value: "1m" }],
+        display_name: "Long",
+        is_max_mode: true,
+        is_default_max_config: true,
+        is_default_non_max_config: false,
+      }],
+    })
+    expect(mapAvailableModelsResponse(decoded)[0]).toMatchObject({
+      id: "test-model",
+      maxContextForMaxMode: 1_000_000,
+      variants: [{
+        displayName: "Long",
+        parameterValues: [{ id: "context", value: "1m" }],
+        isDefaultMax: true,
+        isDefaultNonMax: false,
+      }],
+    })
+    const encoded = encodeMessage("AvailableModelsResponse", decodeMessageSparse("AvailableModelsResponse", bytes))
+    expect(Array.from(encoded)).toEqual(Array.from(bytes))
+  })
+
   it("ClientHeartbeat", () => {
     const data = encodeMessage("ClientHeartbeat", {})
     expect(data.length).toBe(0)
@@ -283,6 +334,27 @@ describe("message schema accuracy", () => {
     expect(fields).toContain("partial_tool_call")
     expect(fields).toContain("heartbeat")
     expect(fields).toContain("turn_ended")
+    expect(fields).toContain("tool_requests_listed")
+  })
+
+  it("InteractionUpdate decodes tool_requests_listed call_count", () => {
+    // Independent CLI wire fixture: InteractionUpdate #27, uint32 count #1.
+    const data = Uint8Array.of(0xda, 0x01, 0x02, 0x08, 0x03)
+    const decoded = decodeMessage<any>("InteractionUpdate", data)
+    expect(decoded.tool_requests_listed?.call_count).toBe(3)
+  })
+
+  it("decodes a zero count omitted from the ToolRequestsListedUpdate body", () => {
+    const decoded = decodeMessage<any>("InteractionUpdate", Uint8Array.of(0xda, 0x01, 0x00))
+    expect(decoded.tool_requests_listed?.call_count).toBe(0)
+  })
+
+  it("decodes CLI field 15 tool deltas without interpreting their nested content", () => {
+    const decoded = decodeMessage<any>("InteractionUpdate", Uint8Array.of(
+      0x7a, 0x07, 0x0a, 0x01, 0x61, 0x12, 0x02, 0x1a, 0x00,
+    ))
+    expect(decoded.tool_call_delta.call_id).toBe("a")
+    expect(decoded.tool_call_delta.tool_call_delta).toEqual(Uint8Array.of(0x1a, 0x00))
   })
 
   it("ExecServerMessage has all tool variants", () => {

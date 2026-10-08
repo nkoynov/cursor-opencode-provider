@@ -73,6 +73,8 @@ export type HandledInteraction = {
   variantField: number
   variantName: string
   outcome: "rejected" | "acknowledged" | "failed" | "bridged" | "approved"
+  /** Decoded model call id, including refusals and lifecycle acknowledgments. */
+  toolCallId?: string
   /**
    * Immediate reply for this query. Absent for bridged *synchronous* AskQuestion
    * or SwitchMode: Cursor blocks until the host tool returns, exactly as its own
@@ -316,7 +318,7 @@ function handleAskQuestionQuery(
   variantBytes: Uint8Array | undefined,
   options: HandleInteractionQueryOptions,
 ): HandledInteraction {
-  const base = { id, variantField: 3, variantName: "ask_question_interaction_query" } as const
+  const base = { id, variantField: 3, variantName: "ask_question_interaction_query", toolCallId: undefined as string | undefined }
   const reject = (reason: string): HandledInteraction => ({
     ...base,
     outcome: "rejected",
@@ -326,6 +328,7 @@ function handleAskQuestionQuery(
   if (!variantBytes) return reject(MISSING_QUERY_REASON)
   const decoded = decodeAskQuestionQuery(variantBytes)
   if (!decoded) return reject(MISSING_ARGS_REASON)
+  base.toolCallId = decoded.toolCallId
   if (!options.canBridgeAskQuestion) return reject(ASK_QUESTION_UNAVAILABLE_REASON)
 
   return {
@@ -364,7 +367,7 @@ function handleSwitchModeQuery(
   variantBytes: Uint8Array | undefined,
   options: HandleInteractionQueryOptions,
 ): HandledInteraction {
-  const base = { id, variantField: 4, variantName: "switch_mode_request_query" } as const
+  const base = { id, variantField: 4, variantName: "switch_mode_request_query", toolCallId: undefined as string | undefined }
   const reject = (reason: string): HandledInteraction => ({
     ...base,
     outcome: "rejected",
@@ -374,6 +377,7 @@ function handleSwitchModeQuery(
   if (!variantBytes) return reject(SWITCH_MODE_MISSING_QUERY_REASON)
   const decoded = decodeSwitchModeQuery(variantBytes)
   if (!decoded) return reject(SWITCH_MODE_MISSING_ARGS_REASON)
+  base.toolCallId = decoded.toolCallId
 
   const bridge = resolveSwitchModeBridge(decoded.args.targetModeId, {
     allowTools: options.allowTools === true,
@@ -503,7 +507,7 @@ function handleCreatePlanQuery(
   variantBytes: Uint8Array | undefined,
   options: HandleInteractionQueryOptions,
 ): HandledInteraction {
-  const base = { id, variantField: 7, variantName: "create_plan_request_query" } as const
+  const base = { id, variantField: 7, variantName: "create_plan_request_query", toolCallId: undefined as string | undefined }
   const reply = (result: Record<string, unknown>): HandledInteraction => ({
     ...base,
     outcome: result.error ? "failed" : "acknowledged",
@@ -519,6 +523,7 @@ function handleCreatePlanQuery(
   if (!variantBytes) return reply({ success: {}, plan_uri: "" })
   const decoded = decodeCreatePlanQuery(variantBytes)
   if (!decoded) return reply({ success: {}, plan_uri: "" })
+  base.toolCallId = decoded.toolCallId
 
   const bridge = resolveCreatePlanBridge({
     allowTools: options.allowTools === true,
@@ -655,7 +660,7 @@ function handleGenerateImageQuery(
   variantBytes: Uint8Array | undefined,
   options: HandleInteractionQueryOptions,
 ): HandledInteraction {
-  const base = { id, variantField: 12, variantName: "generate_image_request_query" } as const
+  const base = { id, variantField: 12, variantName: "generate_image_request_query", toolCallId: undefined as string | undefined }
   const reject = (reason: string): HandledInteraction => ({
     ...base,
     outcome: "rejected",
@@ -667,6 +672,7 @@ function handleGenerateImageQuery(
   if (!variantBytes) return reject("Missing generate image query")
   const decoded = decodeGenerateImageQuery(variantBytes)
   if (!decoded) return reject("Missing generate image arguments")
+  base.toolCallId = decoded.toolCallId
   if (!options.canSaveGeneratedImage) {
     return reject(
       "This OpenCode agent cannot save a generated image, so generating one would "
