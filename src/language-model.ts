@@ -3596,8 +3596,29 @@ export async function pump(
     )
     emitFinish(undefined, { unified: "tool-calls", raw: undefined })
   }
+  /**
+   * The Run ended after the held step's calls went out. They still run; the session closes when
+   * this pump ends, so the continuation rebases from their results instead of replaying the step.
+   */
+  const closeHeldToolStepAtRunEnd = (reason: string, failure?: CursorProviderError): void => {
+    if (failure) session.closeError = failure
+    session.deferredTerminalReason = failure ? "remote-error" : "remote-clean-close"
+    closeHeldToolStep(reason)
+  }
   let planHandoffCancellationRequested = false
   const replaySafety = new AttemptReplaySafety(session.sessionId)
+  /** The error a Connect end-of-stream frame carries; without one the Run was cut off. */
+  const endStreamFailure = (frame: Frame): CursorProviderError => {
+    let payload = ""
+    if (frame.payload.length > 0) {
+      try {
+        payload = new TextDecoder().decode(decodeFramePayload(frame))
+      } catch {
+        replaySafety.markBarrier("unknown-or-malformed-frame")
+      }
+    }
+    return payload ? connectFrameError(payload) : new CursorRunInterruptedError()
+  }
   const failRunProtocol = (message: string, code: string): never => {
     replaySafety.markBarrier("unknown-or-malformed-frame")
     const error = new CursorProtocolError(message, { code })
@@ -4295,8 +4316,9 @@ export async function pump(
       }
     } catch (error) {
       if (toolStep.hostCalls > 0) {
-        // Surface the failure on the next pass, after the step's calls ran, as before.
-        closeHeldToolStep("frame read failed", Promise.reject(error))
+        closeHeldToolStepAtRunEnd("frame read failed", error instanceof CursorProviderError
+          ? error
+          : new CursorRunInterruptedError(`Cursor Run frame stream interrupted: ${(error as Error).message}`, { cause: error }))
         return
       }
       closeOpenSpans()
@@ -4310,7 +4332,7 @@ export async function pump(
     }
     if (session.hostInterrupted) stopForHostInterrupt(next)
     if (toolStep.hostCalls > 0 && (next.done || next.value.flags & 0x02)) {
-      closeHeldToolStep("Run ended", Promise.resolve(next))
+      closeHeldToolStepAtRunEnd("Run ended", next.done ? undefined : endStreamFailure(next.value))
       return
     }
     if (next.done) {
@@ -4325,18 +4347,8 @@ export async function pump(
       // A successful agent turn has an explicit turn_ended update before the
       // Connect envelope closes. Reaching end-stream here means the Run was
       // interrupted, even if the HTTP status itself was 200.
-      let payload = ""
-      if (frame.payload.length > 0) {
-        try {
-          payload = new TextDecoder().decode(decodeFramePayload(frame))
-        } catch {
-          replaySafety.markBarrier("unknown-or-malformed-frame")
-        }
-      }
       closeOpenSpans()
-      const failure = payload
-        ? connectFrameError(payload)
-        : new CursorRunInterruptedError()
+      const failure = endStreamFailure(frame)
       if (planHandoffCancellationRequested && failure.origin === "server" && failure.code === "canceled"
         && session.pending.size === 0 && isHostPlanEntryPending(session.openCodeSessionId)) {
         // Cancellation is an explicit terminal acknowledgment, not TurnEnded.
