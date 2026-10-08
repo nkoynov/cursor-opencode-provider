@@ -50,6 +50,11 @@ export function takeLostRequests(
   return lost.requests
 }
 
+/** The user stopped the session: a request it lost stays dropped. */
+export function forgetLostTurn(sessionKey: string): void {
+  if (lostTurns.delete(sessionKey)) trace(`lost turn: dropped for sessionKey=${sessionKey} — the host stopped the session`)
+}
+
 /** The lost requests, then the live one unless it repeats one of them (a plain retry of the same prompt). */
 export function withLostRequests(requests: readonly string[], live: string): string[] {
   const all = requests.filter((request) => request && request !== ".")

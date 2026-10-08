@@ -17,6 +17,7 @@ import { resetConversationPersistenceForTests } from "../src/protocol/conversati
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { resetFrozenRequestContextsForTests } from "../src/context/frozen.js"
 import { closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
+import { notifyHostInterrupt } from "../src/host-interrupt.js"
 
 type Prompt = LanguageModelV3CallOptions["prompt"]
 type ScriptedFrame = Record<string, unknown> | { endStreamError: string }
@@ -230,6 +231,20 @@ describe("a turn whose Run failed before Cursor checkpointed the request", () =>
       const text = runText(cursor.runs.at(-1))
       expect(text).toEndWith(`</conversation_history>\n\n${CONTINUE}`)
       expect(text.split(REQUEST)).toHaveLength(2)
+    } finally {
+      cursor.restore()
+    }
+  })
+
+  it("drops the request when the user stops the session before the retry", async () => {
+    const cursor = fakeCursorRuns([failedFirstStep(), cleanTurn("done")])
+    try {
+      const { sessionKey } = checkpointedSession()
+      await step(sessionKey, [...history, user(REQUEST)] as Prompt)
+      notifyHostInterrupt(sessionKey, "user stopped")
+      await step(sessionKey, [...history, user(REQUEST), thoughtOnly("Writing the table."), user("Never mind, say hi.")] as Prompt)
+      expect(runText(cursor.runs[1])).toStartWith("Never mind, say hi.")
+      expect(runText(cursor.runs[1])).not.toContain(REQUEST)
     } finally {
       cursor.restore()
     }

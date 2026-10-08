@@ -213,7 +213,7 @@ import {
   toCursorProviderError,
 } from "./errors.js"
 import { recordFinalFailure } from "./host-retry.js"
-import { noteFailedTurn, resetLostTurnsForTests, takeLostRequests, withLostRequests } from "./lost-turns.js"
+import { forgetLostTurn, noteFailedTurn, resetLostTurnsForTests, takeLostRequests, withLostRequests } from "./lost-turns.js"
 import { readCache, cacheFilePath, resolveVariantParameters, resolveVariantMaxMode, extractCursorVariantParameters, resolveCursorWireModelId, type ModelInfo } from "./models.js"
 import { getFrozenRequestContext, getOrBuildRequestContext, resetFrozenRequestContextsForTests } from "./context/frozen.js"
 import { systemInstructionsRuleText, type SystemInstructions } from "./context/build.js"
@@ -2430,6 +2430,7 @@ onHostInterrupt((openCodeSessionId, reason, at) => {
     if (stop.at < at - HOST_INTERRUPT_MEMORY_MS) hostInterrupts.delete(id)
   }
   hostInterrupts.set(openCodeSessionId, { at, reason })
+  forgetLostTurn(openCodeSessionId)
   for (const session of sessionManager.openSessionsStoppedWith(openCodeSessionId)) {
     if (requestedBefore(session, at)) cancelForHostInterrupt(session, reason)
   }
@@ -4485,7 +4486,7 @@ export async function pump(
     }
     const iu = asm.interaction_update as Record<string, unknown> | undefined
     if (!iu?.heartbeat) order.progressAt = Date.now()
-    noteRunFrame(session, iu, !!asm.exec_server_message)
+    noteRunFrame(session, iu)
     // Output after a step's tool calls belongs to the next step.
     if (toolStep.hostCalls > 0 && (iu?.text_delta || iu?.thinking_delta || iu?.turn_ended)) {
       closeHeldToolStep("model output", Promise.resolve(next))

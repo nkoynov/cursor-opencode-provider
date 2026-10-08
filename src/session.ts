@@ -214,8 +214,8 @@ export type CursorSession = {
   carriedCheckpoint?: Uint8Array
   /** Cursor-side waits (AwaitShell) in flight: call id → how long the Run may stay silent. */
   cursorWaits?: Map<string, number>
-  /** When Cursor announced the tool call whose input its model is still writing (`partial_tool_call`). */
-  toolInputSince?: number
+  /** Tool calls Cursor announced (`partial_tool_call`) whose input its model is still writing: call id → when. */
+  composingToolCalls?: Map<string, number>
   /** When the Run last received any frame, heartbeats included. */
   lastFrameAt?: number
   /** Last checkpoint-derived context snapshot, independent of retry eligibility. */

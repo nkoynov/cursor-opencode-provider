@@ -141,14 +141,14 @@ describe("Cursor-side waits and the stall watchdog", () => {
   })
 })
 
-const partialToolCall = () => frame({
+const partialToolCall = (callId = "toolu_w") => frame({
   interaction_update: {
-    partial_tool_call: { call_id: "toolu_w", tool_call: { edit_tool_call: { args: { path: "/tmp/catalog.md" } } } },
+    partial_tool_call: { call_id: callId, tool_call: { edit_tool_call: { args: { path: "/tmp/catalog.md" } } } },
   },
 })
-const toolStarted = () => frame({
+const toolStarted = (callId = "toolu_w") => frame({
   interaction_update: {
-    tool_call_started: { call_id: "toolu_w", tool_call: { edit_tool_call: { args: { path: "/tmp/catalog.md" } } } },
+    tool_call_started: { call_id: callId, tool_call: { edit_tool_call: { args: { path: "/tmp/catalog.md" } } } },
   },
 })
 const thinking = (delta: string) => frame({ interaction_update: { thinking_delta: { text: delta } } })
@@ -166,7 +166,34 @@ describe("a tool input Cursor holds until the model has written it", () => {
     const parts: any[] = []
     await pump(session, controller(parts), ids)
     expect(parts.filter((part) => part.type === "finish")).toHaveLength(1)
-    expect(session.toolInputSince).toBeUndefined()
+    expect(session.composingToolCalls?.size ?? 0).toBe(0)
+  })
+
+  it("keeps holding for a parallel call announced before the previous call's exec", async () => {
+    const session = fakeSession("input-parallel", [
+      { frame: partialToolCall() },
+      { frame: toolStarted() },
+      { frame: partialToolCall("toolu_w2") },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: toolStarted("toolu_w2"), afterMs: 40 },
+      { frame: turnEnded() },
+    ])
+    await pump(session, controller(), ids)
+    expect(session.composingToolCalls?.size ?? 0).toBe(0)
+  })
+
+  it("keeps holding across thinking Cursor delivers before the call starts", async () => {
+    const session = fakeSession("input-thinking", [
+      { frame: partialToolCall() },
+      { frame: thinking("more") },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: toolStarted(), afterMs: 40 },
+      { frame: turnEnded() },
+    ])
+    await pump(session, controller(), ids)
   })
 
   it("still times out a silent stream while the input is written", async () => {
@@ -189,10 +216,10 @@ describe("a tool input Cursor holds until the model has written it", () => {
     await expect(pump(session, controller(), ids)).rejects.toMatchObject({ code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
   })
 
-  it("returns to the idle window when the model thinks again", async () => {
-    const session = fakeSession("input-then-thinking", [
+  it("returns to the idle window when the step ends without the call", async () => {
+    const session = fakeSession("input-step-done", [
       { frame: partialToolCall() },
-      { frame: thinking("more") },
+      { frame: frame({ interaction_update: { step_completed: { step_id: 1, step_duration_ms: 10 } } }) },
       { frame: heartbeat(), afterMs: 40 },
       { frame: heartbeat(), afterMs: 40 },
       { frame: turnEnded(), afterMs: 40 },
@@ -204,11 +231,11 @@ describe("a tool input Cursor holds until the model has written it", () => {
     const now = Date.now()
     const session = fakeSession("input-cap", [], {
       semanticDeadlineAt: now - 1,
-      toolInputSince: now - MAX_TOOL_INPUT_MS + 10,
+      composingToolCalls: new Map([["toolu_w", now - MAX_TOOL_INPUT_MS + 10]]),
       lastFrameAt: now,
     })
     expect(semanticDeadlineAt(session)).toBe(now + 10)
-    session.toolInputSince = now - 1_000
+    session.composingToolCalls!.set("toolu_w", now - 1_000)
     expect(semanticDeadlineAt(session)).toBe(now + IDLE_MS)
   })
 })
