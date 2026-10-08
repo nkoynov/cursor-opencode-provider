@@ -140,7 +140,7 @@ afterEach(() => {
   resetCheckpointsForTests()
 })
 
-describe("host notes on held-Run exec results", () => {
+describe("host notes on the exec results of a Run that cannot take an injection", () => {
   it("keeps a note out of a read's numbered file lines and adds it to the Run's next result", () => {
     const root = fs.mkdtempSync(path.join("/tmp", "cursor-host-notes-"))
     const file = path.join(root, "main.go")
@@ -562,6 +562,26 @@ describe("host notes a turn ends without delivering", () => {
 
     expect(await hostNoteAfterRestart(root, "ses_stopped")).toBe(NOTE)
   })
+
+  it("keeps an injected note Cursor did not deliver when a fresh turn supersedes a Run that never ends its turn", async () => {
+    root = fs.mkdtempSync(path.join("/tmp", "cursor-host-notes-"))
+    const prior = liveSession([])
+    prior.openCodeSessionId = "ses_superseded"
+    prior.runId = `run-${prior.sessionId}`
+    prior.steerInjections = [{ id: "note-1", text: NOTE, state: "queued", hostNote: true }]
+    prior.frames = {
+      next: async () => ({ done: false, value: { flags: 0x02, payload: new Uint8Array() } }),
+    } as CursorSession["frames"]
+    sessionManager.registerSession(prior)
+
+    expect(await preparePriorSessionForFreshTurn("ses_superseded", { timeoutMs: 1_000 })).toBe("settled-only")
+
+    const next = endsTurn(liveSession([]), root, "ses_superseded")
+    sessionManager.registerSession(next)
+    expect(await preparePriorSessionForFreshTurn("ses_superseded", { timeoutMs: 1_000 })).toBe("drained")
+
+    expect(await hostNoteAfterRestart(root, "ses_superseded")).toBe(NOTE)
+  })
 })
 
 describe("host notes injected into the held Run", () => {
@@ -605,19 +625,29 @@ describe("host notes injected into the held Run", () => {
     expect(live.steerInjections).toMatchObject([{ text: NOTE, state: "sent", hostNote: true }])
   })
 
-  it("leaves a note on a result of the step that can carry it", () => {
+  it("injects a note rather than appending it to a result of the step that could carry it", () => {
     const writes: Uint8Array[] = []
     const live = heldRun(writes)
-    sessionManager.registerPending(3, live, "mcp_result", "t3_thread_read")
+    sessionManager.registerPending(3, live, "mcp_result", "websearch")
+    sessionManager.registerPending(4, live, "shell_stream", "shell", false, {
+      shell_stream: true,
+      command: "cat build.log",
+      working_directory: "/tmp",
+    })
+    const longOutput = "search result line\n".repeat(2_000)
 
     deliverContinuationResults(live, extractTrailingToolResults(step(
-      toolResult(live, 3, "t3_thread_read", "{}"),
-      readResult(live, 4),
+      toolResult(live, 3, "websearch", longOutput),
+      toolResult(live, 4, "shell", "build ok\n"),
       hostNote(NOTE),
     )))
 
-    expect(injectedNotes(writes)).toEqual([])
-    expect(execMessages(writes)[0].mcp_result.success.content.at(-1).text.text).toBe(NOTE)
+    expect(decodeMessage<any>("AgentClientMessage", writes[0]).conversation_action.inject_context_action)
+      .toMatchObject({ user_context: { user_message: { text: NOTE } } })
+    const [mcp, ...shell] = execMessages(writes)
+    expect(mcp.mcp_result.success.content.map((item: any) => item.text.text)).toEqual([longOutput])
+    expect(shell.flatMap((message) => message.shell_stream?.stdout?.data ?? [])).toEqual(["build ok\n"])
+    expect(live.deferredNote).toBeUndefined()
   })
 
   it("injects a deferred note with the Run's next results", () => {

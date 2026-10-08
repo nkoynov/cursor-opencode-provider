@@ -920,7 +920,7 @@ async function doStreamImpl(
   // false "orphaned tool results" errors after Cursor turn_ended and OpenCode
   // started the next step with old tools still in the prompt body.
   let trailingToolResults = extractTrailingToolResults(prompt)
-  let steerMessages: string[] = []
+  let steerInjections: RunInjection[] = []
   let steeredPrompt = false
   if (trailingToolResults.length === 0 && mayBeUserStep(callOptions)) {
     const steered = extractLiveSteerResults(
@@ -942,7 +942,7 @@ async function doStreamImpl(
           (early.taken.length > 0 ? `, ${early.taken.length} already injected` : ""),
       )
       trailingToolResults = steered.results
-      steerMessages = early.remaining
+      steerInjections = remainingRunInjections(steered.injections, early.remaining)
       steeredPrompt = true
     }
   }
@@ -972,11 +972,10 @@ async function doStreamImpl(
     const results = session.supportsImages
       ? await decodeTrailingToolImages(trailingToolResults, callOptions.abortSignal)
       : trailingToolResults
-    if (steerMessages.length > 0) session = injectSteerMessages(session, steerMessages)
-    const resultsAfterCheckpoint = session && (steeredPrompt || session.resultsAfterCheckpoint)
+    const resultsAfterCheckpoint = steeredPrompt || session.resultsAfterCheckpoint
       ? resultsAwaitingCheckpoint(session, results)
       : undefined
-    if (session) session = deliverContinuationResults(session, results)
+    session = deliverContinuationResults(session, results, steerInjections)
     if (session && resultsAfterCheckpoint) session.resultsAfterCheckpoint = resultsAfterCheckpoint
     if (session) await refreshHeldSessionToolCatalog(session, callOptions)
   }
@@ -2255,6 +2254,7 @@ export async function preparePriorSessionForFreshTurn(
     // Cancel path closed the session (encode/write failure). Caller opens a
     // fresh Run on the same conversation_id — better than mid-exec supersede
     // with stranded pending, but turn_ended may be missing.
+    keepUndeliveredHostNote(prior)
     return cancelled > 0 || settledBridged > 0 ? "settled-only" : "none"
   }
 
@@ -2271,8 +2271,10 @@ export async function preparePriorSessionForFreshTurn(
   })
   trace(`fresh turn: prior session ${prior.sessionId} drain outcome=${outcome}`)
   if (outcome === "turn-ended") return "drained"
-  if (cancelled > 0 || settledBridged > 0) return "settled-only"
-  return outcome === "timeout" || outcome === "interrupted" ? "settled-only" : "busy"
+  const settled = cancelled > 0 || settledBridged > 0 || outcome === "timeout" || outcome === "interrupted"
+  // The new Run supersedes a prior that never reached turn_ended.
+  if (settled) keepUndeliveredHostNote(prior)
+  return settled ? "settled-only" : "busy"
 }
 
 /**
@@ -2878,6 +2880,7 @@ function buildSwitchModeContinuationFrame(
 export function deliverContinuationResults(
   session: CursorSession,
   trailingToolResults: ExtractedToolResult[],
+  steer: readonly RunInjection[] = [],
 ): CursorSession | undefined {
   const pendingResults = trailingToolResults.filter(
     (r) => r.sessionId === session.sessionId && session.pending.has(r.execId),
@@ -2889,11 +2892,15 @@ export function deliverContinuationResults(
   )
   let note = joinNotes([session.deferredNote, ...trailingToolResults.map((r) => r.note)])
   session.deferredNote = undefined
-  const noteCarrier = note === undefined ? undefined : findNoteCarrier(session, pendingResults)
-  if (note !== undefined && !noteCarrier && session.runId) {
+  if (note !== undefined && session.runId) {
     if (!injectHostNote(session, note)) return undefined
     note = undefined
   }
+  for (const injection of steer) {
+    const injected = injection.hostNote ? injectHostNote(session, injection.text) : injectSteerMessages(session, [injection.text])
+    if (!injected) return undefined
+  }
+  const noteCarrier = note === undefined ? undefined : findNoteCarrier(session, pendingResults)
   for (const r of pendingResults) {
     const claim = sessionManager.claim(session.sessionId, r.execId)
     if ("kind" in claim) {
@@ -5583,14 +5590,18 @@ function plainUserText(message: LanguageModelV3CallOptions["prompt"][number]): s
   return texts.join("\n")
 }
 
+/** A message for the held Run: the user's steer or a host note. */
+export type RunInjection = { text: string; hostNote?: true }
+
 /**
  * Plain-text user messages that arrived during a step, from the first one to
- * the end of the prompt, and the host notes among them. Host notes before the
- * first stay with the tool results. A message with an attachment is no steer.
+ * the end of the prompt, and the host notes among them, in prompt order. Host
+ * notes before the first stay with the tool results. A message with an
+ * attachment is no steer.
  */
 function trailingSteer(
   prompt: LanguageModelV3CallOptions["prompt"],
-): { start: number; messages: string[]; hostNote?: string } | undefined {
+): { start: number; messages: string[]; hostNote?: string; injections: RunInjection[] } | undefined {
   let start: number | undefined
   for (let i = prompt.length - 1; i >= 0; i--) {
     if (hostTailNote(prompt[i])) continue
@@ -5600,15 +5611,41 @@ function trailingSteer(
   if (start === undefined) return undefined
   const messages: string[] = []
   const hostNotes: string[] = []
+  const injections: RunInjection[] = []
   for (const message of prompt.slice(start)) {
     const hostNote = hostTailNote(message)
     if (hostNote) {
-      if (hostNote.text) hostNotes.push(hostNote.text)
+      if (hostNote.text) {
+        hostNotes.push(hostNote.text)
+        injections.push({ text: hostNote.text, hostNote: true })
+      }
     } else {
       messages.push(plainUserText(message)!)
+      injections.push({ text: messages.at(-1)! })
     }
   }
-  return { start, messages, hostNote: joinNotes(hostNotes) }
+  return { start, messages, hostNote: joinNotes(hostNotes), injections }
+}
+
+/**
+ * The steer's injections without the messages already injected while Cursor worked on the step.
+ * Those were sent first, so a text that occurs again is matched from the end.
+ */
+export function remainingRunInjections(
+  injections: readonly RunInjection[],
+  remainingMessages: readonly string[],
+): RunInjection[] {
+  const left = [...remainingMessages]
+  const kept: RunInjection[] = []
+  for (let i = injections.length - 1; i >= 0; i--) {
+    const injection = injections[i]!
+    if (injection.hostNote) kept.unshift(injection)
+    else if (left.at(-1) === injection.text) {
+      left.pop()
+      kept.unshift(injection)
+    }
+  }
+  return kept
 }
 
 /**
@@ -5623,7 +5660,7 @@ export function extractLiveSteerResults(
   sessionKey: string | undefined,
   wireModelId: string,
   incomingTools: ReadonlyArray<{ name?: string }> = [],
-): { results: ExtractedToolResult[]; messages: string[] } | undefined {
+): { results: ExtractedToolResult[]; messages: string[]; injections: RunInjection[] } | undefined {
   if (!sessionKey) return undefined
   const steer = trailingSteer(prompt)
   if (!steer) return undefined
@@ -5647,11 +5684,7 @@ export function extractLiveSteerResults(
   const answered = new Set(results.map((r) => r.execId))
   for (const execId of held.pending.keys()) if (!answered.has(execId)) return undefined
   if (results.some(isInterruptedToolResult)) return undefined
-  if (steer.hostNote) {
-    const last = results[results.length - 1]
-    results[results.length - 1] = { ...last, note: joinNotes([last.note, steer.hostNote]) }
-  }
-  return { results, messages: steer.messages }
+  return { results, messages: steer.messages, injections: steer.injections }
 }
 
 /**
@@ -5709,11 +5742,21 @@ function injectSteerMessages(session: CursorSession, messages: readonly string[]
 }
 
 /** OpenCode still promotes an early steer after the turn that answered it, as a new step. */
+/** Whether a text host note directly precedes the message at `start`. */
+function hostNoteBefore(prompt: LanguageModelV3CallOptions["prompt"], start: number): boolean {
+  for (let i = start - 1; i >= 0; i--) {
+    const note = hostTailNote(prompt[i])
+    if (!note) return false
+    if (note.text) return true
+  }
+  return false
+}
+
 function answeredEarlySteersOnly(callOptions: LanguageModelV3CallOptions): boolean {
   const sessionKey = opencodeSessionKey(callOptions)
   if (!sessionKey || sessionManager.findOpenByOpenCodeSessionId(sessionKey)?.pending.size) return false
   const steer = trailingSteer(callOptions.prompt)
-  if (!steer || steer.hostNote) return false
+  if (!steer || steer.hostNote || hostNoteBefore(callOptions.prompt, steer.start)) return false
   const { taken } = takeEarlySteers(sessionKey, steer.messages, (record) => record.answered, true)
   if (taken.length === 0) return false
   settleEarlySteers(sessionKey, taken)
@@ -5779,9 +5822,10 @@ function injectHostSteer(session: CursorSession, steer: HostSteer): boolean {
 }
 
 /**
- * Queue a host note no result of the step can carry on the held Run before its results. Cursor adds
- * it as a user message after them, where OpenCode puts it for other providers, so the model reads it
- * before its next step instead of a turn later.
+ * Queue the step's host notes on the held Run before its results. Cursor adds them as a user message
+ * after the results, where OpenCode puts them for other providers and Claude Code puts its own. On a
+ * result, a note would go wherever Cursor moves a long output: into an `agent-tools` file the model
+ * sees only a preview of.
  */
 function injectHostNote(session: CursorSession, note: string): CursorSession | undefined {
   const injection: SteerInjection = { id: crypto.randomUUID(), text: note, state: "sent", hostNote: true }
@@ -5798,7 +5842,7 @@ function injectHostNote(session: CursorSession, note: string): CursorSession | u
   }
   ;(session.steerInjections ??= []).push(injection)
   trace(
-    `continuation: no result could carry the host note; injected into the Run runId=${session.runId} ` +
+    `continuation: host note injected into the Run runId=${session.runId} ` +
       `id=${injection.id} noteLen=${note.length}`,
   )
   return session
@@ -6328,12 +6372,15 @@ function liveUserTurn(
 }
 
 /** OpenCode stores an answered early steer after the reply and its empty step adds no assistant message, so it can open the user turn. */
-function answeredSteersInUserTurn(
+export function answeredSteersInUserTurn(
   prompt: LanguageModelV3CallOptions["prompt"],
   answeredTexts: readonly string[],
 ): ReadonlySet<number> {
   const start = userTurnStart(prompt)
-  const found = messagesCarrying(prompt.slice(start).map(plainUserText), answeredTexts)
+  const found = messagesCarrying(
+    prompt.slice(start).map((message) => (hostTailNote(message) ? undefined : plainUserText(message))),
+    answeredTexts,
+  )
   if (found.size === prompt.length - start) return new Set()
   return new Set([...found].map((offset) => start + offset))
 }
