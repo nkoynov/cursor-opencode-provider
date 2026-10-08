@@ -1228,8 +1228,9 @@ export async function pumpWithRecovery(input: {
       // Cancellation cleanup inside pump() must keep an active owner alive.
       // Retry after releasing this owner so a stopped consumer with no pending
       // tools cannot leave its Run and heartbeat open. Pending tool turns and
-      // a newer pump owner still retain their session.
-      if (sessionManager.endPump(pumpedSession, pumpOwner)) {
+      // a newer pump owner still retain their session, and a host interrupt
+      // closes its Run itself after draining Cursor's checkpoint.
+      if (sessionManager.endPump(pumpedSession, pumpOwner) && !pumpedSession.hostInterrupted) {
         sessionManager.closeUnlessPending(pumpedSession)
       }
       if (!pumpedSession.closed && pumpedSession.pending.size > 0) void watchHeldRun(pumpedSession)

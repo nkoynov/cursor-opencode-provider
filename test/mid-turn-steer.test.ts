@@ -594,7 +594,7 @@ describe("doStream with a mid-turn user message", () => {
     const messages = clientMessages(held.writes)
     expect(injections(held.writes).map((action) => action.user_context.user_message.text)).toEqual(["also check 3.ts", NOTE, "then stop"])
     expect(messages.findIndex((message) => message.exec_client_message))
-      .toBeGreaterThan(messages.findLastIndex((message) => message.conversation_action))
+      .toBeGreaterThan(messages.map((message) => !!message.conversation_action).lastIndexOf(true))
     expect(JSON.stringify(execMessages(held.writes))).not.toContain("system-update")
   })
 

@@ -4,7 +4,7 @@ import fs from "node:fs"
 import http2 from "node:http2"
 import os from "node:os"
 import path from "node:path"
-import { APICallError, type LanguageModelV3CallOptions } from "@ai-sdk/provider"
+import { APICallError, type LanguageModelV3CallOptions, type LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { encodeFrame } from "../src/protocol/framing.js"
 import { decodeMessage } from "../src/protocol/messages.js"
@@ -185,7 +185,7 @@ describe("final failures OpenCode must not retry", () => {
         headers: { "x-opencode-session-id": "ses_refused" },
         tools: [{ type: "function", name: "bash", description: "Shell", inputSchema: { type: "object", properties: {} } }],
       } as LanguageModelV3CallOptions)
-      const consumed = (async () => { for await (const _ of result.stream) { /* drain */ } })()
+      const consumed = (async () => { for await (const _ of result.stream as unknown as AsyncIterable<LanguageModelV3StreamPart>) { /* drain */ } })()
       consumed.catch(() => {})
       for (let i = 0; i < 200 && (writes.length === 0 || session.pumpOwner == null); i++) await Bun.sleep(5)
       push(endStream(refusalEnvelope))
@@ -246,7 +246,7 @@ describe("final failures OpenCode must not retry", () => {
         headers: { "x-opencode-session-id": "ses_max_steps" },
         toolChoice: { type: "none" },
       } as LanguageModelV3CallOptions)
-      const error = await (async () => { for await (const _ of result.stream) { /* drain */ } })()
+      const error = await (async () => { for await (const _ of result.stream as unknown as AsyncIterable<LanguageModelV3StreamPart>) { /* drain */ } })()
         .then(() => undefined, (failure: unknown) => failure as Error)
       expect(runs).toBe(1)
       expect(error?.message).toStartWith("Cursor refused the request: Too many computers.")
