@@ -263,6 +263,18 @@ import {
   type CursorShellOutcome,
 } from "./shell-timeout.js"
 import { analyzeReplayFrame, AttemptReplaySafety, describeFrameLayout } from "./replay-safety.js"
+import {
+  aliasEarlyToolCall,
+  earlyRowCloseParts,
+  earlyRowEndPart,
+  earlyRowStartPart,
+  earlyToolRowState,
+  noteComposingToolCall,
+  predictEarlyToolName,
+  resetEarlyToolRowsForTests,
+  resolveEarlyToolCallId,
+  type EarlyToolRow,
+} from "./early-tool-rows.js"
 import { noteCursorWaitEnded, noteCursorWaitStarted, semanticDeadlineAt } from "./cursor-waits.js"
 import {
   deferToolExec,
@@ -1217,6 +1229,7 @@ export async function pumpWithRecovery(input: {
         )
         sessionManager.close(pumpedSession, "remote-error", failure)
         input.renewRejectedCredential()
+        closeEarlyToolRows(pumpedSession, input.controller, EARLY_ROW_RUN_REPLACED)
         session = await reopen(pumpedSession, failure)
         attempt--
         continue
@@ -1251,6 +1264,7 @@ export async function pumpWithRecovery(input: {
       const delayMs = retryDelayMs(failure, attempt + 1, retryPolicy)
       trace(`Run retry backoff: attempt=${attempt + 1}/${recoveries} delayMs=${delayMs}${capacity ? " (capacity)" : ""}`)
       await sleepForRetry(delayMs, input.abortSignal)
+      closeEarlyToolRows(pumpedSession, input.controller, EARLY_ROW_RUN_REPLACED)
       session = await reopen(pumpedSession, failure, checkpoint)
     } finally {
       stopSteers?.()
@@ -1265,6 +1279,28 @@ export async function pumpWithRecovery(input: {
       if (!pumpedSession.closed && pumpedSession.pending.size > 0) void watchHeldRun(pumpedSession)
     }
   }
+}
+
+const EARLY_ROW_RUN_REPLACED = "Cursor's stream was interrupted before this call was sent; the model continues on a new stream."
+
+/** The replacement Run composes its calls again under new ids. */
+function closeEarlyToolRows(
+  session: CursorSession,
+  controller: ReadableStreamDefaultController<V3Part>,
+  reason: string,
+): void {
+  const state = session.earlyToolRows
+  if (!state) return
+  try {
+    for (const row of state.open.values()) {
+      for (const part of earlyRowCloseParts(row, reason)) controller.enqueue(part as V3Part)
+      trace(`early tool row: closed toolCallId=${row.toolCallId} reason=${JSON.stringify(reason)}`)
+    }
+  } catch (error) {
+    trace(`early tool row: close after a failed Run not delivered err=${(error as Error).message}`)
+  }
+  state.open.clear()
+  state.composing.clear()
 }
 
 /** A recovery Run continues the same turn: same request, same tools run so far, same acceptance of a switch. */
@@ -2309,7 +2345,7 @@ export function cancelPendingExecsForFreshTurn(session: CursorSession): number {
     // instead kept the old Run alive beside the new Run on the same
     // conversation, with nothing left to close it.
     synthetic.push({
-      toolCallId: `cursor_${session.sessionId}_${execId}`,
+      toolCallId: pending.toolCallId ?? `cursor_${session.sessionId}_${execId}`,
       sessionId: session.sessionId,
       execId,
       toolName: pending.toolName ?? "unknown",
@@ -3705,6 +3741,81 @@ export async function pump(
     streamClosed = true
   }
 
+  const earlyRows = earlyToolRowState(session)
+  /** The Cursor call whose own exec is being handled; a refusal closes its early row with the reason. */
+  let execOwnCallId: string | undefined
+  const enqueueEarlyRowPart = (part: V3Part): void => {
+    if (streamClosed) return
+    try {
+      controller.enqueue(part)
+    } catch (e) {
+      streamClosed = true
+      trace(`pump: enqueue on closed controller (suppressing) err=${(e as Error).message}`)
+    }
+  }
+  const settleEarlyRows = (fallbackReason?: string): void => {
+    for (const [callId, row] of [...earlyRows.open]) {
+      const reason = row.settle ?? fallbackReason
+      if (!reason) continue
+      earlyRows.open.delete(callId)
+      for (const part of earlyRowCloseParts(row, reason)) enqueueEarlyRowPart(part as V3Part)
+      trace(`early tool row: closed toolCallId=${row.toolCallId} callId=${callId} reason=${JSON.stringify(reason)}`)
+    }
+  }
+  /**
+   * Open a row for the first call Cursor is still composing, once nothing
+   * before it in the step can end the host step first: no host call in this
+   * pass (a held exec then closes nothing), no held exec, and every other
+   * unfinished call already handled.
+   */
+  const openEarlyToolRows = (): void => {
+    const first = earlyRows.composing.entries().next().value
+    if (!first || streamClosed || earlyRows.open.size > 0) return
+    const [callId, call] = first
+    if (call.skipped || !session.allowTools || session.hostInterrupted) return
+    if (session.hostToolDialect?.filePathKey !== "path") return
+    if (toolStep.hostCalls > 0 || hasDeferredToolExecs(order)) return
+    if (!order.calls.every((entry) => entry.callId === callId || earlyRows.handled.has(entry.callId))) return
+    if (call.variant === "edit_tool_call" && typeof call.args.path !== "string") return
+    const toolName = predictEarlyToolName(call, {
+      advertised: advertisedToolNameSet,
+      permitted: session.permittedToolNames,
+      workspaceRoot: workspaceRootFromRequestContext(session.requestContext),
+    })
+    if (!toolName) {
+      call.skipped = true
+      return
+    }
+    const bridgedExecId = session.nextBridgedExecId++
+    const row: EarlyToolRow = { toolCallId: `cursor_${session.sessionId}_${bridgedExecId}`, toolName, bridgedExecId }
+    closeOpenSpans()
+    replaySafety.markBarrier("visible-tool-row")
+    earlyRows.open.set(callId, row)
+    enqueueEarlyRowPart(earlyRowStartPart(row) as V3Part)
+    trace(`early tool row: opened toolCallId=${row.toolCallId} toolName=${toolName} callId=${callId} variant=${call.variant}`)
+  }
+  /** The call's own exec arrived: it no longer composes, and its row closes unless the exec becomes its tool call. */
+  const noteEarlyRowExec = (callId: string): void => {
+    earlyRows.handled.add(callId)
+    earlyRows.composing.delete(callId)
+    const row = earlyRows.open.get(callId)
+    if (!row) return
+    row.settle ??= "Cursor sent this call as a different request."
+    execOwnCallId = callId
+  }
+  /** The early row of `callId` when the call runs as `toolName`; another tool closes it. */
+  const bindEarlyRow = (callId: string | undefined, toolName: string): EarlyToolRow | undefined => {
+    const row = callId ? earlyRows.open.get(callId) : undefined
+    if (!row) return undefined
+    if (row.toolName !== toolName) {
+      row.settle = `Cursor sent this call as \`${toolName}\`, which runs as a separate call.`
+      return undefined
+    }
+    earlyRows.open.delete(callId!)
+    trace(`early tool row: bound toolCallId=${row.toolCallId} toolName=${toolName} callId=${callId}`)
+    return row
+  }
+
   /** Reply on Cursor's correlated exec channel without exposing a host tool call. */
   const rejectExec = async (
     parsed: ParsedExecRequest,
@@ -3715,6 +3826,8 @@ export async function pump(
       reason,
       workspaceRootFromRequestContext(session.requestContext),
     )
+    const earlyRow = execOwnCallId ? earlyRows.open.get(execOwnCallId) : undefined
+    if (earlyRow) earlyRow.settle = reason
     const ok = await writeExecFrames(
       buildExecClientMessages({
         execId: parsed.id,
@@ -4018,6 +4131,7 @@ export async function pump(
   ) => {
     flushToollessText()
     closeOpenSpans()
+    settleEarlyRows("Cursor ended the step before sending this call.")
     const est = session.usageEstimate
     // OpenCode TUI/GUI replace each assistant message's tokens (they do not
     // sum occupancy) and the TUI footer requires tokens.output > 0. Cost is
@@ -4275,6 +4389,9 @@ export async function pump(
     }
 
     execMutates = false
+    execOwnCallId = undefined
+    settleEarlyRows()
+    openEarlyToolRows()
     let released = takeReadyToolExec(order)
     let waitForOrderMs: number | undefined
     if (!released && hasDeferredToolExecs(order)) {
@@ -4551,6 +4668,9 @@ export async function pump(
       const turnEnded = iu.turn_ended as Record<string, unknown>
       session.carriedCheckpoint = undefined
       session.toolCallOrder = undefined
+      for (const row of earlyRows.open.values()) row.settle ??= "Cursor ended the turn before sending this call."
+      earlyRows.composing.clear()
+      earlyRows.handled.clear()
       endingTurns.add(session)
       const injectionIds = (session.steerInjections ?? []).map((injection) => injection.id)
       const undelivered = (session.steerInjections ?? []).filter((injection) => injection.state !== "delivered")
@@ -4666,6 +4786,8 @@ export async function pump(
       trace("steer: Cursor appended a user message to the Run")
       endThinkingRun()
       if (textStarted) textSeparator = "\n\n"
+    } else if (iu?.partial_tool_call) {
+      noteComposingToolCall(earlyRows, iu.partial_tool_call as Record<string, unknown>)
     } else if (iu?.tool_call_started) {
       cacheDiagnostics.displayToolCalls++
       // Stash Cursor display ToolCall until exec claims it, or completed bridges it.
@@ -4721,6 +4843,12 @@ export async function pump(
       const discoveryError = displayNativeDiscoveryError(completed.tool_call as Record<string, unknown> | undefined)
       if (discoveryError) {
         trace(`display tool_call_completed: ERROR variant=get_mcp_tools_tool_call callId=${JSON.stringify(callId)} error=${JSON.stringify(discoveryError)}`)
+      }
+      if (callId) {
+        earlyRows.composing.delete(callId)
+        earlyRows.handled.delete(callId)
+        const earlyRow = earlyRows.open.get(callId)
+        if (earlyRow) earlyRow.settle ??= "Cursor finished this call without asking OpenCode to run it."
       }
       if (callId) session.editToolCalls?.delete(callId)
       if (callId) session.resultsAfterCheckpoint?.awaiting.delete(callId)
@@ -4792,7 +4920,8 @@ export async function pump(
               const snapshot = snapshotMirroredTodos(bridged.args.todos)
               if (snapshot !== undefined) storeMirroredTodos(session, snapshot)
             }
-            const execId = session.nextBridgedExecId++
+            const earlyRow = bindEarlyRow(callId, bridged.toolName)
+            const execId = earlyRow?.bridgedExecId ?? session.nextBridgedExecId++
             sessionManager.registerPending(
               execId,
               session,
@@ -4808,6 +4937,7 @@ export async function pump(
             )
             emittedHostTools++
             closeOpenSpans()
+            if (earlyRow) enqueueEarlyRowPart(earlyRowEndPart(earlyRow) as V3Part)
             safeEnqueue({
               type: "tool-call",
               toolCallId,
@@ -4935,9 +5065,11 @@ export async function pump(
           workspaceRoot: workspaceRootFromRequestContext(session.requestContext),
         })
         // An edit's private prerequisite read is not the call's own request; its write is.
-        if (displayCallId && !(parsed?.resultField === "read_result" && session.editToolCalls?.has(displayCallId))) {
-          toolStep.resolved.add(displayCallId)
-        }
+        const ownRequestCallId = displayCallId
+          && !(parsed?.resultField === "read_result" && session.editToolCalls?.has(displayCallId))
+          ? displayCallId
+          : undefined
+        if (ownRequestCallId) toolStep.resolved.add(ownRequestCallId)
         if (parsed) {
           execMutates = noteToolCallExec(
             order,
@@ -4958,6 +5090,7 @@ export async function pump(
             continue
           }
         }
+        if (ownRequestCallId) noteEarlyRowExec(ownRequestCallId)
         if (parsed) {
           const executableToolName = resolveCustomWebToolAlias(parsed.toolName, session.toolAliases)
           if (executableToolName !== parsed.toolName) {
@@ -5190,6 +5323,8 @@ export async function pump(
             trace(`exec: claimed display callId=${displayCallId}`)
           }
           const tc = buildToolCallPart(parsed, session.sessionId)
+          const earlyRow = bindEarlyRow(ownRequestCallId, tc.toolName)
+          if (earlyRow) tc.toolCallId = earlyRow.toolCallId
           if (
             parsed.resultField === "shell_stream"
             || parsed.resultField === "shell_result"
@@ -5209,6 +5344,11 @@ export async function pump(
             parsed.resultMetadata,
             displayCallId,
           )
+          if (earlyRow) {
+            session.pending.get(parsed.id)!.toolCallId = earlyRow.toolCallId
+            aliasEarlyToolCall(earlyRow.toolCallId, session.sessionId, parsed.id)
+            enqueueEarlyRowPart(earlyRowEndPart(earlyRow) as V3Part)
+          }
           // A direct host `todowrite` is a replace-all snapshot: it is the new
           // truth for later Cursor merge patches, which otherwise apply onto a
           // stale (or empty) mirrored list.
@@ -5611,7 +5751,7 @@ type ExtractedToolResult = ToolResultContent & { sessionId: string; execId: numb
 
 function correlateToolResults(results: ToolResultContent[]): ExtractedToolResult[] {
   return results.flatMap(result => {
-    const parsed = parseExecIdFromToolCallId(result.toolCallId)
+    const parsed = resolveEarlyToolCallId(result.toolCallId) ?? parseExecIdFromToolCallId(result.toolCallId)
     return parsed ? [{ ...result, ...parsed }] : []
   })
 }
@@ -7138,6 +7278,7 @@ export function resetTurnStateForTests(): void {
   sentHistoryImageHashesBySession.clear()
   resetContextEpochsForTests()
   cursorListsToolRequests = false
+  resetEarlyToolRowsForTests()
   hostInterrupts.clear()
   toolCallsOfStoppedTurns.clear()
   resetModelFallbackStopsForTests()
@@ -7159,7 +7300,7 @@ function extractUserText(lastUser: Record<string, unknown> | undefined): string 
   return "."
 }
 
-function foldStreamParts(parts: V3Part[]): LanguageModelV3GenerateResult {
+export function foldStreamParts(parts: V3Part[]): LanguageModelV3GenerateResult {
   let text = ""
   let reasoning = ""
   const content: LanguageModelV3GenerateResult["content"] = []
@@ -7173,7 +7314,7 @@ function foldStreamParts(parts: V3Part[]): LanguageModelV3GenerateResult {
   for (const part of parts) {
     if (part.type === "text-delta") text += part.delta
     else if (part.type === "reasoning-delta") reasoning += part.delta
-    else if (part.type === "tool-call") {
+    else if (part.type === "tool-call" && !part.providerExecuted) {
       content.push({
         type: "tool-call",
         toolCallId: part.toolCallId,

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- On OpenCode 2, a running tool row appears as soon as Cursor's model starts writing a file, instead of when the whole input is done, which for a large file is often 30 to 50 seconds later. The row shows `write` for a new or empty file and `edit` for an existing one in the workspace, and the call then runs under that row. A subagent card opens the same way as soon as Cursor announces the call, though Cursor currently announces a subagent only together with its whole prompt. A row opens only when nothing earlier in the step can end the step first, so the second of two parallel edits shows once the first has run, and a row whose call doesn't come (Cursor refused it, sent it as another tool, ended the turn, or the stream was replaced) closes at once as a failed call
+
 ### Changed
 
 - A Run starts without the HTTP/2 health-check ping when its connection received data in the last 10 seconds, as Cursor CLI does, which saves a round trip to Cursor on most Runs. If that connection turns out to be dead before Cursor answers (reset, refused stream, or a GOAWAY that excludes the Run), the Run is sent once more on a new connection; once Cursor has answered it is never sent again
