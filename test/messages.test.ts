@@ -7,6 +7,20 @@ import {
 import { readAllFields } from "../src/protocol/struct.js"
 
 describe("message round-trip", () => {
+  it("encodes system context injection at Cursor's declared wire fields", () => {
+    const data = encodeMessage("ConversationAction", { inject_context_action: {
+      injection_id: "i", expected_run_id: "r", system_context: { producer: "opencode", content: "note" },
+    } })
+    expect(Array.from(data)).toEqual([
+      0x9a, 0x01, 0x18, // inject_context_action #19, 24 bytes
+      0x0a, 0x01, 0x69, // injection_id #1
+      0x12, 0x01, 0x72, // expected_run_id #2
+      0x22, 0x10, // system_context #4, 16 bytes
+      0x0a, 0x08, ...Buffer.from("opencode"), // producer #1
+      0x12, 0x04, ...Buffer.from("note"), // content #2
+    ])
+  })
+
   it("encodes cancellation reason at the CLI's field number", () => {
     const data = encodeMessage("CancelAction", { reason: "host_plan_agent_handoff" })
     const fields = readAllFields(data)

@@ -175,6 +175,8 @@ export type CursorSession = {
    * (Cursor resets them per stream) can't cross-deliver results.
    */
   sessionId: string
+  /** AgentRunRequest.run_id, for context injections bound to this Run. */
+  runId?: string
   /**
    * Cursor conversation_id for this Run — used to store/echo
    * conversation_checkpoint_update (CLI parity).

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test"
+import { pathToFileURL } from "node:url"
 import { UnsupportedFunctionalityError } from "@ai-sdk/provider"
 import {
   assertCursorUserImageSupport,
@@ -10,6 +11,74 @@ import {
 } from "../src/image-input.js"
 
 describe("tool-result images", () => {
+  it("accepts AI SDK image-url parts with no mediaType", async () => {
+    const bytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    const part = { type: "image-url", url: `data:image/png;base64,${Buffer.from(bytes).toString("base64")}` }
+    expect((await extractCursorToolResultImages([part])).images[0]?.data).toEqual(bytes)
+    const history = [{ role: "tool", content: [{ type: "tool-result", output: { type: "content", value: [part] } }] }]
+    expect((await extractCursorHistoryImages(history, { supportsImages: true })).images[0]?.data).toEqual(bytes)
+  })
+
+  it("keeps decoding later images after a file attachment disappears", async () => {
+    const result = await extractCursorToolResultImages([
+      { type: "file", mediaType: "image/png", data: pathToFileURL("/nonexistent/cursor-review-image.png") },
+      { type: "file-data", mediaType: "image/png", data: "AQID" },
+    ])
+    expect(result.images).toHaveLength(1)
+    expect(result.images[0]?.data).toEqual(Uint8Array.from([1, 2, 3]))
+  })
+
+  it("recovers readable tool images when another historical attachment disappears", async () => {
+    const history = [{ role: "tool", content: [{ type: "tool-result", output: { type: "content", value: [
+      { type: "file", mediaType: "image/png", data: pathToFileURL("/nonexistent/cursor-review-image.png") },
+      { type: "image-data", mediaType: "image/png", data: "AQID" },
+    ] } }] }]
+    const result = await extractCursorHistoryImages(history, { supportsImages: true })
+    expect(result.images).toHaveLength(1)
+    expect(result.omittedCount).toBe(1)
+  })
+
+  it("honors cancellation even for inline tool media", async () => {
+    const controller = new AbortController()
+    controller.abort()
+    await expect(extractCursorToolResultImages([
+      { type: "file-data", mediaType: "image/png", data: "AQID" },
+    ], { signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" })
+  })
+
+  it("harvests every supported tool media shape on a recovery Run", async () => {
+    const result = await extractCursorHistoryImages([{
+      role: "tool", content: [{ type: "tool-result", output: {
+        type: "content", value: [
+          { type: "media", mediaType: "image/png", data: "AQID" },
+          { type: "image-data", mediaType: "image/png", data: "BAUG" },
+          { type: "file", mime: "image/png", uri: "data:image/png;base64,BwgJ" },
+        ],
+      } }],
+    }], { supportsImages: true })
+    expect(result.images.map(image => [...image.data])).toEqual([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+  })
+
+  it("decodes historical OpenCode 1 caption URLs after a new user turn", async () => {
+    const result = await extractCursorHistoryImages([
+      { role: "user", content: [
+        { type: "text", text: "Attached media from tool result:" },
+        { type: "file", mediaType: "image/png", url: "data:image/png;base64,AQID" },
+      ] },
+      { role: "user", content: [{ type: "text", text: "continue" }] },
+    ], { supportsImages: true })
+    expect(result.images[0]?.data).toEqual(Uint8Array.from([1, 2, 3]))
+  })
+
+  it("decodes the last media caption when a dead Run is rebased", async () => {
+    const caption = { role: "user", content: [
+      { type: "text", text: "Attached media from tool result:" },
+      { type: "file", mediaType: "image/png", url: "data:image/png;base64,AQID" },
+    ] }
+    const result = await extractCursorPromptImages([caption], caption, { supportsImages: true })
+    expect(result.images[0]?.data).toEqual(Uint8Array.from([1, 2, 3]))
+  })
+
   it("decodes host tool media and skips non-image or undecodable parts", async () => {
     const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9]).toString("base64")
     const { images, hashes } = await extractCursorToolResultImages([

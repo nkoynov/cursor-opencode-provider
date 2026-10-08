@@ -639,3 +639,7 @@
 ## 2026-10-08 — Retry cleanup after releasing pump ownership
 
 - Cleanup during an active pump must defer to its owner, but a canceled consumer can stop that pump without receiving a remote terminal event. Retry ordinary cleanup after the same owner releases it; keep pending tool turns and never release or close a newer owner's pump (`test/run-interruption.test.ts`).
+
+## 2026-10-08 — Preserve evidence before correlating media
+
+- Result correlation is a delivery filter, not an ownership filter. Keep host-owned results until attribution is complete, prove attachment slice boundaries, and use the actual typed result contract for denials and context updates. Review record: `docs/pr-42-46-review.md`.

@@ -16,6 +16,8 @@
 
 ### Fixed
 
+- Tool images stay with the correct result; unreadable or oversized images are reported without blocking other results, and recovery retains supported image formats
+- Host instruction updates survive image reads, and declined tool calls return errors instead of successes
 - Images read with the `read` tool reach the model in the same turn instead of a "Media attached" placeholder ([#42](https://github.com/oakimov/cursor-opencode-provider/pull/42) by [@nkoynov](https://github.com/nkoynov))
 - Canceling a response with no pending tools closes the Cursor Run after its active pump stops, instead of leaving the stream and heartbeat open; tool-result continuations still retain their Run
 - Tool-less title and summary Runs advertise an empty tool catalog (matching OpenCode's host-empty title/compaction Sends) instead of re-advertising the sticky set, so Cursor is not tempted to call tools on those turns

@@ -1663,6 +1663,18 @@ export function createMessageTypes(): protobuf.Root {
     { id: 3, name: "result", type: "AskQuestionResult" },
   ])
 
+  // Cursor CLI 2026.10.01 descriptors: system context is
+  // injected into the current Run without submitting another user turn.
+  addType(root, "SystemContextInjection", [
+    { id: 1, name: "producer", type: "string" },
+    { id: 2, name: "content", type: "string" },
+  ])
+  addType(root, "InjectContextAction", [
+    { id: 1, name: "injection_id", type: "string" },
+    { id: 2, name: "expected_run_id", type: "string" },
+    { id: 4, name: "system_context", type: "SystemContextInjection" },
+  ])
+
   addType(
     root,
     "ConversationAction",
@@ -1671,6 +1683,7 @@ export function createMessageTypes(): protobuf.Root {
       { id: 2, name: "resume_action", type: "ResumeAction" },
       { id: 3, name: "cancel_action", type: "CancelAction" },
       { id: 8, name: "async_ask_question_completion_action", type: "AsyncAskQuestionCompletionAction" },
+      { id: 19, name: "inject_context_action", type: "InjectContextAction" },
     ],
     [{
       name: "action",
@@ -1679,6 +1692,7 @@ export function createMessageTypes(): protobuf.Root {
         "resume_action",
         "cancel_action",
         "async_ask_question_completion_action",
+        "inject_context_action",
       ],
     }],
   )
