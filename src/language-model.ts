@@ -5580,11 +5580,21 @@ function injectSteerMessages(session: CursorSession, messages: readonly string[]
 }
 
 /** OpenCode still promotes an early steer after the turn that answered it, as a new step. */
+/** Whether a text host note directly precedes the message at `start`. */
+function hostNoteBefore(prompt: LanguageModelV3CallOptions["prompt"], start: number): boolean {
+  for (let i = start - 1; i >= 0; i--) {
+    const note = hostTailNote(prompt[i])
+    if (!note) return false
+    if (note.text) return true
+  }
+  return false
+}
+
 function answeredEarlySteersOnly(callOptions: LanguageModelV3CallOptions): boolean {
   const sessionKey = opencodeSessionKey(callOptions)
   if (!sessionKey || sessionManager.findOpenByOpenCodeSessionId(sessionKey)?.pending.size) return false
   const steer = trailingSteer(callOptions.prompt)
-  if (!steer || steer.hostNote) return false
+  if (!steer || steer.hostNote || hostNoteBefore(callOptions.prompt, steer.start)) return false
   const { taken } = takeEarlySteers(sessionKey, steer.messages, (record) => record.answered, true)
   if (taken.length === 0) return false
   settleEarlySteers(sessionKey, taken)

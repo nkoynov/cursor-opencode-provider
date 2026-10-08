@@ -21,6 +21,7 @@ type HeldSession = CursorSession & { writes: Uint8Array[] }
 
 const OPENCODE_SESSION = "ses_early"
 const REMINDER = "<system-reminder>\nKeep answers short.\n</system-reminder>"
+const NOTE = "<system-update>\n<subagent sessionID=\"ses_child\" state=\"completed\" description=\"Check\">\nThe code is ORCHID-1234.\n</subagent>\n</system-update>"
 
 function heldReads(id: string, execIds = [1, 2]): HeldSession {
   const writes: Uint8Array[] = []
@@ -224,6 +225,30 @@ describe("a message sent while Cursor works on the step", () => {
     expect((parts[1] as any).finishReason.unified).toBe("stop")
     expect(fetched).toEqual([])
     expect(held.writes.length).toBe(writesBefore)
+  })
+
+  it("still opens a Run for a host note OpenCode promotes just before a message the model already answered", async () => {
+    const held = heldReads("noted")
+    const injectionId = () => injections(held.writes)[0].injection_id
+    serve(held, [
+      () => {
+        announceHostSteer(hostSteer("change of plan"))
+        return serverFrame({ thinking_delta: { text: "waiting on the shell" } })
+      },
+      () => injectionState(injectionId(), { delivered: { step: 3 } }),
+      () => serverFrame({ text_delta: { text: "STEERED" } }),
+      turnEnded,
+    ])
+    await stream(readStep("noted") as Prompt)
+
+    const outcome = await stream([
+      ...readStep("noted"),
+      assistant("STEERED"),
+      user(NOTE),
+      user("change of plan", REMINDER),
+    ] as Prompt).catch((error: Error) => error)
+
+    expect(outcome instanceof Error ? outcome.message : outcome.parts.map((part) => part.type)).toBe("GetServerConfig network request failed")
   })
 
   it("starts its answer on a new paragraph when Cursor takes it after the model's text", async () => {
