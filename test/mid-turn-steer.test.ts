@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach } from "bun:test"
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import {
+  answeredSteersInUserTurn,
   extractLiveSteerResults,
   extractPromptHistory,
   extractTrailingToolResults,
@@ -165,6 +166,12 @@ describe("mid-turn user message after a complete step", () => {
     expect(steered.messages).toEqual(["also check 3.ts", "then stop"])
     expect(steered.injections).toEqual([{ text: "also check 3.ts" }, { text: NOTE, hostNote: true }, { text: "then stop" }])
     expect(steered.results.at(-1)!.note).toBeUndefined()
+  })
+
+  it("never takes a host note that quotes an answered steer for that steer", () => {
+    const quoting = `<system-update>\nInstructions from: /w/AGENTS.md\nRun tests.\nUse tabs.\n</system-update>`
+    const prompt = [user("look"), { role: "assistant", content: [{ type: "text", text: "done" }] }, user(quoting), user("Run tests.")] as Prompt
+    expect([...answeredSteersInUserTurn(prompt, ["Run tests."])]).toEqual([3])
   })
 
   it("leaves out the messages injected while Cursor worked on the step, keeping a later message with the same text", () => {

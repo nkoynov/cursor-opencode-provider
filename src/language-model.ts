@@ -6162,12 +6162,15 @@ function liveUserTurn(
 }
 
 /** OpenCode stores an answered early steer after the reply and its empty step adds no assistant message, so it can open the user turn. */
-function answeredSteersInUserTurn(
+export function answeredSteersInUserTurn(
   prompt: LanguageModelV3CallOptions["prompt"],
   answeredTexts: readonly string[],
 ): ReadonlySet<number> {
   const start = userTurnStart(prompt)
-  const found = messagesCarrying(prompt.slice(start).map(plainUserText), answeredTexts)
+  const found = messagesCarrying(
+    prompt.slice(start).map((message) => (hostTailNote(message) ? undefined : plainUserText(message))),
+    answeredTexts,
+  )
   if (found.size === prompt.length - start) return new Set()
   return new Set([...found].map((offset) => start + offset))
 }
