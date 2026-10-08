@@ -5,6 +5,7 @@ import { readAllFieldsStrict, type StrictRawField } from "./protocol/struct.js"
 export type ReplayBarrierReason =
   | "visible-text"
   | "visible-reasoning"
+  | "visible-tool-row"
   | "display-tool-lifecycle"
   | "non-control-exec"
   | "stateful-interaction"
