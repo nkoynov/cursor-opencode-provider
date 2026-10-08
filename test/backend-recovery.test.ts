@@ -14,7 +14,7 @@ import {
   CursorTransportError,
   isCapacityFailure,
 } from "../src/errors.js"
-import { semanticDeadlineAt } from "../src/cursor-waits.js"
+import { MAX_TOOL_INPUT_MS, semanticDeadlineAt } from "../src/cursor-waits.js"
 import { sessionFixture } from "./session-fixture.js"
 
 type TimedFrame = { frame: Frame; afterMs?: number }
@@ -138,6 +138,78 @@ describe("Cursor-side waits and the stall watchdog", () => {
     await expect(pump(session, controller(), ids)).rejects.toMatchObject({ code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
     expect(session.cursorWaits?.size ?? 0).toBe(0)
     expect(semanticDeadlineAt(session)).toBe(session.semanticDeadlineAt)
+  })
+})
+
+const partialToolCall = () => frame({
+  interaction_update: {
+    partial_tool_call: { call_id: "toolu_w", tool_call: { edit_tool_call: { args: { path: "/tmp/catalog.md" } } } },
+  },
+})
+const toolStarted = () => frame({
+  interaction_update: {
+    tool_call_started: { call_id: "toolu_w", tool_call: { edit_tool_call: { args: { path: "/tmp/catalog.md" } } } },
+  },
+})
+const thinking = (delta: string) => frame({ interaction_update: { thinking_delta: { text: delta } } })
+
+describe("a tool input Cursor holds until the model has written it", () => {
+  it("keeps the Run through heartbeats past the idle window", async () => {
+    const session = fakeSession("input-written", [
+      { frame: partialToolCall() },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: toolStarted(), afterMs: 40 },
+      { frame: turnEnded() },
+    ])
+    const parts: any[] = []
+    await pump(session, controller(parts), ids)
+    expect(parts.filter((part) => part.type === "finish")).toHaveLength(1)
+    expect(session.toolInputSince).toBeUndefined()
+  })
+
+  it("still times out a silent stream while the input is written", async () => {
+    const session = fakeSession("input-silent", [
+      { frame: partialToolCall() },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: toolStarted(), afterMs: IDLE_MS + 80 },
+    ])
+    await expect(pump(session, controller(), ids)).rejects.toMatchObject({ code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
+  })
+
+  it("returns to the idle window once the call has started", async () => {
+    const session = fakeSession("input-arrived", [
+      { frame: partialToolCall() },
+      { frame: toolStarted() },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: turnEnded(), afterMs: 40 },
+    ])
+    await expect(pump(session, controller(), ids)).rejects.toMatchObject({ code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
+  })
+
+  it("returns to the idle window when the model thinks again", async () => {
+    const session = fakeSession("input-then-thinking", [
+      { frame: partialToolCall() },
+      { frame: thinking("more") },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: turnEnded(), afterMs: 40 },
+    ])
+    await expect(pump(session, controller(), ids)).rejects.toMatchObject({ code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
+  })
+
+  it("gives the input at most MAX_TOOL_INPUT_MS from the announcement", () => {
+    const now = Date.now()
+    const session = fakeSession("input-cap", [], {
+      semanticDeadlineAt: now - 1,
+      toolInputSince: now - MAX_TOOL_INPUT_MS + 10,
+      lastFrameAt: now,
+    })
+    expect(semanticDeadlineAt(session)).toBe(now + 10)
+    session.toolInputSince = now - 1_000
+    expect(semanticDeadlineAt(session)).toBe(now + IDLE_MS)
   })
 })
 

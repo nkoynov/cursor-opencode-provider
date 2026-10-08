@@ -214,6 +214,10 @@ export type CursorSession = {
   carriedCheckpoint?: Uint8Array
   /** Cursor-side waits (AwaitShell) in flight: call id → how long the Run may stay silent. */
   cursorWaits?: Map<string, number>
+  /** When Cursor announced the tool call whose input its model is still writing (`partial_tool_call`). */
+  toolInputSince?: number
+  /** When the Run last received any frame, heartbeats included. */
+  lastFrameAt?: number
   /** Last checkpoint-derived context snapshot, independent of retry eligibility. */
   tokenDetails?: CursorConversationTokenDetails
   /** True only after this Run receives a checkpoint containing token details. */
@@ -419,6 +423,8 @@ export type ModelSwitchGuard = {
   toolRuns: Array<HostToolRun & { inOpenStep: boolean }>
   /** The turn's request as the host sent it, before provider reminders. */
   userText: string
+  /** Set when `userText` also carries requests of a failed turn Cursor never checkpointed: each request in order. */
+  requests?: string[]
   /** The context epoch before this turn admitted its host context, for a rollback to before the turn. */
   epochAtTurnStart?: ContextEpoch
 }

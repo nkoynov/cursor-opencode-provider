@@ -213,6 +213,7 @@ import {
   toCursorProviderError,
 } from "./errors.js"
 import { recordFinalFailure } from "./host-retry.js"
+import { noteFailedTurn, resetLostTurnsForTests, takeLostRequests, withLostRequests } from "./lost-turns.js"
 import { readCache, cacheFilePath, resolveVariantParameters, resolveVariantMaxMode, extractCursorVariantParameters, resolveCursorWireModelId, type ModelInfo } from "./models.js"
 import { getFrozenRequestContext, getOrBuildRequestContext, resetFrozenRequestContextsForTests } from "./context/frozen.js"
 import { systemInstructionsRuleText, type SystemInstructions } from "./context/build.js"
@@ -274,7 +275,7 @@ import {
   resolveEarlyToolCallId,
   type EarlyToolRow,
 } from "./early-tool-rows.js"
-import { noteCursorWaitEnded, noteCursorWaitStarted, semanticDeadlineAt } from "./cursor-waits.js"
+import { noteCursorWaitEnded, noteCursorWaitStarted, noteRunFrame, semanticDeadlineAt } from "./cursor-waits.js"
 import {
   deferToolExec,
   deferredToolExecIds,
@@ -1057,7 +1058,10 @@ async function doStreamImpl(
           activeSession.pumpActive = false
           trace(`pull: pump threw (cleaning up): ${(e as Error).message}`)
           // A Run the host stopped is drained and closed by its cancel.
-          if (!activeSession.hostInterrupted) sessionManager.close(activeSession)
+          if (!activeSession.hostInterrupted) {
+            sessionManager.close(activeSession)
+            noteFailedTurn(activeSession)
+          }
           recordFinalFailure(opencodeSessionKey(callOptions), e)
           try {
             controller.error(e instanceof Error ? e : new Error(String(e)))
@@ -1285,6 +1289,7 @@ function carryModelSwitchState(from: CursorSession, to: CursorSession): void {
   if (!guard || !to.modelSwitchGuard) return
   to.modelSwitchGuard.turnBase = guard.turnBase
   to.modelSwitchGuard.userText = guard.userText
+  to.modelSwitchGuard.requests = guard.requests
   to.modelSwitchGuard.epochAtTurnStart = guard.epochAtTurnStart
   to.modelSwitchGuard.toolRuns = guard.toolRuns.map((run) => ({ ...run, inOpenStep: false }))
 }
@@ -1644,6 +1649,17 @@ async function startSession(
       `model switch: reply to the stopped turn sessionKey=${sessionKey} ` +
         `${fallbackReply.override ? `accepts ${stop.servedModel} once` : "is a new request"} ` +
         `conversationId=${bound.conversationId} checkpoint=${conversationState?.length ?? 0}B`,
+    )
+  }
+  const lostRequests = liveTurn && sessionKey && !recovery && !fallbackReply
+    ? takeLostRequests(sessionKey, conversationId, conversationState)
+    : undefined
+  const turnRequests = lostRequests ? withLostRequests(lostRequests, liveTurn!.text) : undefined
+  if (turnRequests) {
+    userText = turnRequests.join("\n\n") || "."
+    trace(
+      `lost turn: carrying ${lostRequests!.length} request(s) Cursor never checkpointed into this Run ` +
+        `sessionKey=${sessionKey} conversationId=${conversationId}`,
     )
   }
   if (lifecycle) userText = textOnlyTurnText(baseSystemPrompt, userText)
@@ -2068,7 +2084,10 @@ async function startSession(
             toolRuns: [],
             userText: fallbackReply?.override
               ? fallbackReply.stop.userText
-              : (liveTurn?.text ?? (extractUserText(lastUser) || ".")),
+              : turnRequests
+                ? turnRequests.join("\n\n")
+                : (liveTurn?.text ?? (extractUserText(lastUser) || ".")),
+            ...(turnRequests ? { requests: turnRequests } : {}),
             epochAtTurnStart,
           },
         }
@@ -4466,6 +4485,7 @@ export async function pump(
     }
     const iu = asm.interaction_update as Record<string, unknown> | undefined
     if (!iu?.heartbeat) order.progressAt = Date.now()
+    noteRunFrame(session, iu, !!asm.exec_server_message)
     // Output after a step's tool calls belongs to the next step.
     if (toolStep.hostCalls > 0 && (iu?.text_delta || iu?.thinking_delta || iu?.turn_ended)) {
       closeHeldToolStep("model output", Promise.resolve(next))
@@ -7191,6 +7211,7 @@ export function resetTurnStateForTests(): void {
   hostInterrupts.clear()
   toolCallsOfStoppedTurns.clear()
   resetModelFallbackStopsForTests()
+  resetLostTurnsForTests()
   resetFrozenRequestContextsForTests()
 }
 
