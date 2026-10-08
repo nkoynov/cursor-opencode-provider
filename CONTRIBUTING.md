@@ -1,12 +1,6 @@
 # Contributing to cursor-opencode-provider
 
-> [!IMPORTANT]
-> Due to an increased number of pull requests, and because the project is currently going through a **major architectural redesign**, this repository is **temporarily not accepting new PRs** from the public. Only **invited collaborators** can open pull requests right now.
->
-> Want to contribute anyway?
->
-> - **Ideas** → [GitHub Discussions → Ideas](https://github.com/oakimov/cursor-opencode-provider/discussions/categories/ideas)
-> - **Bugs** → [GitHub issues](https://github.com/oakimov/cursor-opencode-provider/issues)
+External contributions are welcome. Start with an idea or bug report when the change is non-trivial (see below).
 
 ## Before you write code
 
@@ -29,7 +23,7 @@ Prefer, but do not require, relevant excerpts from the session transcript that s
 
 Issues without reproduction steps, model, or debug/host logs will be closed.
 
-## Development (invited collaborators)
+## Development
 
 ```bash
 bun install
@@ -42,7 +36,7 @@ Full commands, architecture, and release rules: [AGENTS.md](./AGENTS.md). Instal
 
 ## Pull requests
 
-During the freeze, only invited collaborators should open PRs. We strive for exceptional quality and consistency — mass-produced slop is not welcome. Keep at most **3 open PRs** per contributor at a time.
+We strive for exceptional quality and consistency — mass-produced slop is not welcome. Keep at most **3 open PRs** per contributor at a time.
 
 When opening one:
 
@@ -53,7 +47,7 @@ When opening one:
 - Link `Fixes #123` / `Closes #123` when applicable.
 - Update [CHANGELOG.md](./CHANGELOG.md) under `## [Unreleased]` for user-facing changes.
 - Prefer conventional-commit titles (`fix:`, `docs:`, `test:`, …).
-- Long AI-generated PR descriptions are not acceptable.
+- PR descriptions must be human-readable: concise, concrete, and written for people — not verbose and not in LLM speak.
 - **Bug fixes must not regress prompt caching** — confirm RequestContext / checkpoint continuity stays warm where it should (see `cache diagnosis:` lines in `CURSOR_PROVIDER_DEBUG` logs and [docs/cache-log-runbook.md](./docs/cache-log-runbook.md)).
 - **Consider both OpenCode 1.x and OpenCode 2.0** for every fix — apply or verify the change on both majors unless the bug is specific to one entrypoint.
 
