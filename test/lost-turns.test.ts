@@ -186,6 +186,21 @@ describe("a turn whose Run failed before Cursor checkpointed the request", () =>
     }
   })
 
+  it("finds the request in the history after the host moved its reminder to the newest message", async () => {
+    const cursor = fakeCursorRuns([failedFirstStep(), cleanTurn("done")])
+    try {
+      const { sessionKey } = checkpointedSession()
+      const reminder = { type: "text", text: "<system-reminder>\nBe concise.\n</system-reminder>" }
+      const withReminder = (text: string) => ({ role: "user", content: [{ type: "text", text }, reminder] })
+      await step(sessionKey, [...history, withReminder(REQUEST)] as Prompt)
+      await step(sessionKey, [...history, user(REQUEST), thoughtOnly("Writing the table."), withReminder(CONTINUE)] as Prompt)
+      expect(runText(cursor.runs[1])).toStartWith(`${REQUEST}\n<system-reminder>`)
+      expect(runText(cursor.runs[1])).toContain(CONTINUE)
+    } finally {
+      cursor.restore()
+    }
+  })
+
   it("sends it once when OpenCode retries the same prompt", async () => {
     const cursor = fakeCursorRuns([failedFirstStep(), cleanTurn("done")])
     try {

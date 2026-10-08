@@ -6762,12 +6762,18 @@ function liveUserTurn(
   return { start, text: texts.join("\n\n"), answered }
 }
 
-/** A user message of the prompt is the request, or its start (a request sent with notes after it). */
+/**
+ * A user message of the prompt starts the request. Only its first text part is compared: hosts add parts
+ * (claude-compat's `<system-reminder>`) to the newest user message only, so a stored message loses them.
+ */
 function promptHoldsRequest(prompt: LanguageModelV3CallOptions["prompt"], request: string): boolean {
   return prompt.some((message) => {
     if (message.role !== "user") return false
-    const text = extractUserText(message as unknown as Record<string, unknown>)
-    return !!text && text !== "." && (request === text || request.startsWith(`${text}\n\n`))
+    const first = typeof message.content === "string"
+      ? message.content
+      : (message.content.find((part) => part.type === "text") as { text?: string } | undefined)?.text
+    return !!first && first !== "." && request.startsWith(first)
+      && (request.length === first.length || request[first.length] === "\n")
   })
 }
 
