@@ -306,6 +306,11 @@ describe("modelInfoToConfig family", () => {
       .toBe("claude-haiku-x")
   })
 
+  it("derives family when Cursor reports an empty or whitespace family", () => {
+    expect(modelInfoToConfig({ id: "claude-haiku-4-5", family: "", variants: [] }).family).toBe("claude-haiku")
+    expect(modelInfoToConfig({ id: "gpt-5.6-luna", family: "   ", variants: [] }).family).toBe("gpt-luna")
+  })
+
   it("keeps the wire model family on long-context and Fast entries", () => {
     const config = modelsToConfig([{
       id: "claude-opus-5-5",
@@ -319,6 +324,23 @@ describe("modelInfoToConfig family", () => {
     }])
     expect(Object.keys(config).length).toBeGreaterThan(1)
     for (const entry of Object.values(config)) expect(entry.family).toBe("claude-opus")
+  })
+
+  it("maps pricing-fixture ids onto OpenCode small-model families", async () => {
+    // OpenCode 2.0 Model.small: gpt-luna, gemini-flash-lite, gemini-flash, claude-haiku;
+    // OpenCode 1.x getSmallModel: gemini-flash, gpt-nano, claude-haiku. Titles fall
+    // back to the session model when none of these appear. gemini-flash-lite is
+    // only required when the fixture includes a matching id.
+    const required = ["gpt-luna", "gpt-nano", "gemini-flash", "claude-haiku"] as const
+    const fixturePath = path.join(import.meta.dir, "fixtures/cursor-pricing-models.txt")
+    const ids = (await fs.readFile(fixturePath, "utf8"))
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#"))
+    const families = new Set(ids.map((id) => cursorModelFamily(id)).filter((f): f is string => !!f))
+    for (const family of required) {
+      expect(families.has(family), `fixture must include a model that maps to ${family}`).toBe(true)
+    }
   })
 })
 

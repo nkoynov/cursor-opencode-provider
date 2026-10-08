@@ -220,7 +220,9 @@ export function modelInfoToConfig(
       output,
     },
   }
-  const family = mi.family ?? cursorModelFamily(mi.id)
+  // Empty / whitespace Cursor-reported family must not block derivation.
+  const reported = typeof mi.family === "string" ? mi.family.trim() : ""
+  const family = reported || cursorModelFamily(mi.id)
   if (family) config.family = family
   const variantConfig = modelInfoVariants(mi, variants)
   if (variantConfig) config.variants = variantConfig

@@ -183,7 +183,7 @@ The docs fallback only fills static catalog metadata. It does not invent Cursor 
 
 #### Model families
 
-Each catalog entry carries a models.dev-style `family`: the Cursor model id without its version segments (`claude-haiku-4-5` → `claude-haiku`, `gpt-5.6-luna` → `gpt-luna`; `-1m` / `-fast` entries keep their model's family). OpenCode picks the small model for session titles and summaries by family (2.0: `gpt-luna`, `gemini-flash-lite`, `gemini-flash`, `claude-haiku`; 1.x: `gemini-flash`, `gpt-nano`, `claude-haiku`). With no family it uses the session's own model, so every title ran on the model you were coding with. To pick a different one, set the 2.0 `title` agent's `model` (1.x: `small_model`).
+Each catalog entry carries a models.dev-style `family`: the Cursor model id without its version segments (`claude-haiku-4-5` → `claude-haiku`, `gpt-5.6-luna` → `gpt-luna`; `-1m` / `-fast` entries keep their model's family). OpenCode picks the small model for session titles and summaries by family (2.0: `gpt-luna`, `gemini-flash-lite`, `gemini-flash`, `claude-haiku`; 1.x: `gemini-flash`, `gpt-nano`, `claude-haiku`). With no family it uses the session's own model, so every title ran on the model you were coding with. To pick a different one, set the 2.0 `title` agent's `model` (1.x: `small_model`). OpenCode 2's model-listing tool shows one entry per family unless asked for all.
 
 #### Image input
 
