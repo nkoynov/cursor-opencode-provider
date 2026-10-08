@@ -214,6 +214,14 @@ export type CursorSession = {
   carriedCheckpoint?: Uint8Array
   /** Cursor-side waits (AwaitShell) in flight: call id → how long the Run may stay silent. */
   cursorWaits?: Map<string, number>
+  /** Tool calls Cursor announced (`partial_tool_call`) whose input its model is still writing: call id → when. */
+  composingToolCalls?: Map<string, number>
+  /** Checkpoint the Run's user request was sent on; Cursor holds the request only once it sends a newer one. */
+  requestBase?: Uint8Array
+  /** The user request(s) the Run sent on `requestBase`, as the host wrote them. */
+  turnRequests?: string[]
+  /** When the Run last received any frame, heartbeats included. */
+  lastFrameAt?: number
   /** Last checkpoint-derived context snapshot, independent of retry eligibility. */
   tokenDetails?: CursorConversationTokenDetails
   /** True only after this Run receives a checkpoint containing token details. */
