@@ -15,6 +15,7 @@ import {
   decodeCreatePlanQuery,
   renderOpencodePlanMarkdown,
   resolveCreatePlanBridge,
+  createPlanHeldByClientReason,
   resolveHostPlanPath,
   slugifyPlanName,
   writeOpencodePlanFile,
@@ -212,6 +213,18 @@ describe("resolveCreatePlanBridge", () => {
     ).toEqual({ kind: "approve" })
   })
 
+  it("holds the plan without asking while the session's own rules deny edits", () => {
+    expect(
+      resolveCreatePlanBridge({ allowTools: true, hostAgent: "plan", hostEditsDenied: true, advertised }),
+    ).toEqual({ kind: "hold" })
+    expect(
+      resolveCreatePlanBridge({ allowTools: true, hostEditsDenied: true, advertised }),
+    ).toEqual({ kind: "ack" })
+    expect(
+      resolveCreatePlanBridge({ allowTools: false, hostAgent: "plan", hostEditsDenied: true, advertised }),
+    ).toEqual({ kind: "ack" })
+  })
+
   it("acknowledges without a prompt when nothing can ask, or outside plan mode", () => {
     expect(
       resolveCreatePlanBridge({ allowTools: true, planModeActive: true, advertised: ["read"] }),
@@ -398,6 +411,33 @@ describe("CreatePlan interaction #7", () => {
     expect(response.create_plan_request_response.result.success).toBeDefined()
     expect(response.create_plan_request_response.result.plan_uri).toBe("")
     expect(fs.existsSync(path.join(workspace, ".opencode", "plans"))).toBe(false)
+  })
+
+  it("writes and shows the plan but does not approve it in a client's own plan mode", () => {
+    fs.mkdirSync(path.join(workspace, ".git"))
+    const payload = createPlanPayload({
+      name: "Held Plan",
+      overview: "Waits for the client",
+      plan: "## Approach\n\nLeave plan mode first.\n",
+      todos: [],
+    })
+    const query = decodeMessage<any>("AgentServerMessage", payload).interaction_query
+    const handled = handleInteractionQuery(query, payload, {
+      workspaceRoot: workspace,
+      allowTools: true,
+      advertisedTools: ["question", "read", "write"],
+      hostAgent: "plan",
+      hostEditsDenied: true,
+    })
+    expect(handled.outcome).toBe("failed")
+    expect(handled.createPlan).toBeUndefined()
+    const result = decodeMessage<any>("AgentClientMessage", handled.reply!).interaction_response
+      .create_plan_request_response.result
+    const planPath = decodeURIComponent(new URL(result.plan_uri).pathname)
+    expect(fs.readFileSync(planPath, "utf-8")).toContain("# Held Plan")
+    expect(result.error.error).toBe(createPlanHeldByClientReason(planPath))
+    expect(handled.planReview).toContain("Leave plan mode first.")
+    expect(handled.planReview).toContain(`_Plan saved to ${planPath}_`)
   })
 
   it("acks empty args with an empty plan_uri", () => {
@@ -835,6 +875,39 @@ describe("CreatePlan execution approval over a held-open Run", () => {
     expect(textIndex).toBeLessThan(callIndex)
     const question = JSON.parse(parts[callIndex].input).questions[0].question as string
     expect(question).not.toContain("Implement it.")
+    sessionManager.close(session, "ordinary-cleanup")
+  })
+
+  it("shows the plan and answers Cursor without a prompt while the session's rules deny edits", async () => {
+    fs.mkdirSync(path.join(workspace, ".git"))
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const writes: Uint8Array[] = []
+    const parts: any[] = []
+    const session = planSession(
+      [
+        createPlanPayload({ name: "Held Plan", overview: "o", plan: "## Approach\n\nImplement it.\n", todos: [] }),
+        encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: { input_tokens: 3, output_tokens: 1 } } }),
+      ],
+      writes,
+      ["question", "read", "write"],
+    )
+    session.hostAgent = "plan"
+    session.hostEditsDenied = true
+    await pump(
+      session,
+      { enqueue(part: unknown) { parts.push(part) }, error() {} } as unknown as ReadableStreamDefaultController<any>,
+      { textId: "text", reasoningId: "reasoning" },
+    )
+
+    expect(parts.some((part: any) => part.type === "tool-call")).toBe(false)
+    const text = parts.filter((part: any) => part.type === "text-delta").map((part: any) => part.delta).join("")
+    expect(text).toContain("# Held Plan")
+    expect(text).toContain("Plan saved to ")
+    const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
+      .interaction_response.create_plan_request_response.result
+    expect(result.success).toBeUndefined()
+    expect(result.error.error).toContain("leaves plan mode in their client")
+    expect(getActiveCursorMode("create-plan-opencode-session")).toBe("plan")
     sessionManager.close(session, "ordinary-cleanup")
   })
 

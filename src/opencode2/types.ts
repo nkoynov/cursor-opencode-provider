@@ -345,10 +345,17 @@ export type SessionHooks = {
   readonly retry: SessionRetry
 }
 
-/** Only the `location.directory` field we actually read. */
+export type PermissionRule = {
+  readonly action: string
+  readonly resource: string
+  readonly effect: "allow" | "deny" | "ask"
+}
+
+/** Only the fields we actually read. */
 export type SessionInfo = {
   readonly id: string
   readonly location: { readonly directory: string }
+  readonly permissions?: readonly PermissionRule[]
 }
 
 export type SessionDomain = {

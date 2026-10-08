@@ -242,6 +242,7 @@ import {
   CURSOR_COMPACTION_OPTION,
   CURSOR_HISTORY_REWRITE_OPTION,
   CURSOR_HOST_AGENT_OPTION,
+  CURSOR_SESSION_EDITS_DENIED_OPTION,
 } from "./shared.js"
 import { isCompactionSession } from "./compaction-marker.js"
 import { resolveSessionWorkspaceRoot } from "./session-directory.js"
@@ -916,6 +917,7 @@ async function doStreamImpl(
     const resultsAfterCheckpoint = steeredPrompt || session.resultsAfterCheckpoint
       ? resultsAwaitingCheckpoint(session, results)
       : undefined
+    session.hostEditsDenied = hostEditsDeniedFromCallOptions(callOptions)
     session = deliverContinuationResults(session, results, {
       steer: steerInjections,
       hostAgent: hostAgentFromCallOptions(callOptions),
@@ -1635,6 +1637,7 @@ async function startSession(
     : takeActiveCursorModeReminder(sessionKey, {
         advertisedTools: cursorTools.map((tool) => tool.name),
         ...(hostAgent ? { hostAgent } : {}),
+        hostEditsDenied: hostEditsDeniedFromCallOptions(callOptions),
       })
   const hostPlanAgentNote = isCompaction || lifecycle
     ? undefined
@@ -1973,6 +1976,7 @@ async function startSession(
     stoppedWithSessionId: lifecycle ? undefined : sessionKey,
     checkpointRebaseEligible: !ephemeralRun && !resuming && !recovery && !!conversationState,
     hostAgent,
+    hostEditsDenied: hostEditsDeniedFromCallOptions(callOptions),
     stableSystemPromptHash: frozenSystemPromptHash,
     postCompactionRebase: isCompaction,
     toolCatalog: sessionKey ? snapshotToolCatalog(sessionKey) : structuredClone(tools),
@@ -2864,6 +2868,11 @@ function buildSwitchModeContinuationFrame(
  * the caller can rebase onto a fresh Run instead of pumping a dead stream.
  */
 /** Host primary agent of one request, as reported through provider options. */
+function hostEditsDeniedFromCallOptions(callOptions: LanguageModelV3CallOptions): boolean {
+  const providerOptions = callOptions.providerOptions?.cursor as Record<string, unknown> | undefined
+  return providerOptions?.[CURSOR_SESSION_EDITS_DENIED_OPTION] === true
+}
+
 function hostAgentFromCallOptions(callOptions: LanguageModelV3CallOptions): string | undefined {
   const providerOptions = callOptions.providerOptions?.cursor as Record<string, unknown> | undefined
   return typeof providerOptions?.[CURSOR_HOST_AGENT_OPTION] === "string"
@@ -5254,6 +5263,7 @@ export async function pump(
               ? { hostPlanFile: hostPlanFileFor(session.openCodeSessionId)! }
               : {}),
             ...(session.hostAgent ? { hostAgent: session.hostAgent } : {}),
+            hostEditsDenied: session.hostEditsDenied === true,
             ...(getActiveCursorMode(session.openCodeSessionId)
               ? { activeCursorModeId: getActiveCursorMode(session.openCodeSessionId)! }
               : {}),
@@ -5279,6 +5289,7 @@ export async function pump(
             `field=${handled.variantField} outcome=${handled.outcome}` +
             (handled.reply ? "" : " (deferred to host tool result)"),
         )
+        if (handled.planReview) emitText(handled.planReview)
         // Tag the Run for cache diagnosis: a first CreatePlan/SwitchMode can
         // coincide with a one-time upstream tools-category expansion. Set on
         // any outcome (acknowledged/approved/bridged) via presence, not kind.

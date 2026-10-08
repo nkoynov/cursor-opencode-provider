@@ -18,6 +18,7 @@ import {
   takeActiveCursorModeReminder,
   takeHostPlanAgentNote,
   PLAN_EXIT_BY_USER_REASON,
+  PLAN_EXIT_IN_CLIENT_REASON,
   PLAN_EXIT_VIA_CREATE_PLAN_REASON,
 } from "../src/protocol/switch-mode.js"
 import { parseDisplayToolCall, resolveBridgedOpenCodeToolCall } from "../src/protocol/tool-call-bridge.js"
@@ -137,6 +138,13 @@ describe("resolveSwitchModeBridge", () => {
       advertised: ["question", "read"],
       hostAgent: "plan",
     })).toEqual({ kind: "reject", reason: PLAN_EXIT_VIA_CREATE_PLAN_REASON })
+    // The client keeps plan mode as session rules: only the user leaves it there.
+    expect(resolveSwitchModeBridge("agent", {
+      allowTools: true,
+      advertised: ["question", "read"],
+      hostAgent: "plan",
+      hostEditsDenied: true,
+    })).toEqual({ kind: "reject", reason: PLAN_EXIT_IN_CLIENT_REASON })
     // Nothing can ask: the user leaves plan mode by switching agents.
     expect(resolveSwitchModeBridge("agent", {
       allowTools: true,

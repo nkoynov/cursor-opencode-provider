@@ -2,6 +2,7 @@ import {
   CURSOR_PROVIDER_ID,
   CURSOR_COMPACTION_OPTION,
   CURSOR_HOST_AGENT_OPTION,
+  CURSOR_SESSION_EDITS_DENIED_OPTION,
 } from "./shared.js"
 import { createSdk, cursorApiBaseURL, cursorGetServerConfigTelemetryEnabled, isCursorPackage } from "./plugin-core.js"
 import { opencode2PlanDir, opencodeGlobalCacheDir, setNativePlansDir } from "./context/paths.js"
@@ -46,6 +47,7 @@ import {
 import { createDirectMcpPlacement } from "./opencode2/mcp-direct.js"
 import { registerTodoTools } from "./opencode2/todo-tools.js"
 import { registerCursorImageSaveTool } from "./opencode2/image-save-tool.js"
+import { sessionRulesDenyEdits } from "./opencode2/session-permissions.js"
 import { OPENCODE_2_TOOL_DIALECT } from "./protocol/tools.js"
 import { clearSessionTodos } from "./todo-store.js"
 import { markCompactionSession } from "./compaction-marker.js"
@@ -432,9 +434,11 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
       try {
         const info = await ctx.session.get({ sessionID })
         markSessionDirectory(sessionID, info.location.directory)
+        return info
       } catch (error) {
         // Best effort — falls back to the static workspaceRoot above.
         trace(`session directory: session.get failed sessionID=${sessionID}: ${String(error)}`)
+        return undefined
       }
     }
 
@@ -456,7 +460,8 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
             setActiveCursorMode(event.sessionID, "agent")
           }
         }
-        await rememberSessionDirectory(event.sessionID)
+        const info = await rememberSessionDirectory(event.sessionID)
+        if (info && sessionRulesDenyEdits(info.permissions)) event.options[CURSOR_SESSION_EDITS_DENIED_OPTION] = true
       }),
     )
 

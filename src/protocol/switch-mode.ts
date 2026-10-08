@@ -80,6 +80,13 @@ export const PLAN_EXIT_VIA_CREATE_PLAN_REASON =
   "Leave plan mode by recording the finished plan with Cursor CreatePlan: the user is then " +
   "asked whether to switch to the build agent and start implementing. Do not implement before they approve."
 
+/** The client keeps plan mode as session rules: only the user leaves it, in the client. */
+export const PLAN_EXIT_IN_CLIENT_REASON =
+  "The user's client keeps this session in plan mode, which denies file edits until the user " +
+  "leaves plan mode there. Record the finished plan with Cursor CreatePlan, then tell the user " +
+  "it is ready and that they leave plan mode in their client to have it implemented. Do not " +
+  "implement before then."
+
 export type SwitchModeHostTool = "plan_enter" | "plan_exit"
 
 /**
@@ -178,6 +185,8 @@ export function resolveSwitchModeBridge(
     activeModeId?: string
     /** Host primary agent of this Run, when the host reported it. */
     hostAgent?: string
+    /** The session's own permission rules deny edits (the client keeps plan mode). */
+    hostEditsDenied?: boolean
   },
 ): SwitchModeBridge {
   const mapped = mapSwitchModeTarget(targetModeId)
@@ -211,7 +220,9 @@ export function resolveSwitchModeBridge(
   if (options.hostAgent === "plan") {
     return {
       kind: "reject",
-      reason: names.has("question") ? PLAN_EXIT_VIA_CREATE_PLAN_REASON : PLAN_EXIT_BY_USER_REASON,
+      reason: options.hostEditsDenied
+        ? PLAN_EXIT_IN_CLIENT_REASON
+        : names.has("question") ? PLAN_EXIT_VIA_CREATE_PLAN_REASON : PLAN_EXIT_BY_USER_REASON,
     }
   }
   return { kind: "approve" }
@@ -476,6 +487,8 @@ export function cursorModeSystemReminder(
     planStageAdvertised?: boolean
     /** The host `question` tool is advertised, so CreatePlan asks to start implementing. */
     questionAdvertised?: boolean
+    /** The session's own permission rules deny edits: only the user leaves plan mode, in the client. */
+    planHeldByClient?: boolean
   } = {},
 ): string | undefined {
   const id = normalizeSwitchModeId(targetModeId)
@@ -486,7 +499,9 @@ export function cursorModeSystemReminder(
   // Without either, CreatePlan asks through `question` whether to implement;
   // with no `question` either, the user leaves plan mode by switching agents.
   // Naming an unavailable tool would strand the model.
-  const leavePlan = options.planStageAdvertised
+  const leavePlan = options.planHeldByClient
+    ? "record the finished plan with Cursor CreatePlan, then tell the user it is ready: they leave plan mode in their client to have it implemented"
+    : options.planStageAdvertised
     ? "record the finished plan with Cursor CreatePlan. The host stage tool waits for the host plan review and does not return until the user accepts or declines. Do not call `plan_exit` to submit or skip that review, and do not implement until the tool returns success"
     : options.planExitAdvertised === false
       ? options.questionAdvertised
@@ -623,6 +638,8 @@ export function takeActiveCursorModeReminder(
     advertisedTools?: ReadonlySet<string> | Iterable<string>
     /** Host primary agent of this request; when known it, not the catalog, says whether planning ended. */
     hostAgent?: string
+    /** The session's own permission rules deny edits (the client keeps plan mode). */
+    hostEditsDenied?: boolean
   } = {},
 ): string | undefined {
   if (!sessionKey) return undefined
@@ -652,6 +669,7 @@ export function takeActiveCursorModeReminder(
           questionAdvertised: advertised.has("question"),
         }
       : {}),
+    planHeldByClient: options.hostEditsDenied === true,
   })
   if (state.firstTurn) state.firstTurn = false
   return reminder

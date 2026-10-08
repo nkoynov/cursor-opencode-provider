@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- In a client that keeps plan mode as the session's own permission rules (T3's OpenCode 2 plan mode denies edits on the session until the user leaves it), CreatePlan saves and shows the plan without asking whether to start implementing, and tells the model to end the turn: no answer there could lift the client's rule, so a "Yes" left every edit denied and the model fell back to writing files through the shell. SwitchMode out of plan mode and the plan-mode reminder point to leaving plan mode in the client the same way
 - A slow or failed health-check ping on the shared Cursor connection no longer aborts other chats streaming on it with "automatic retry unsafe" ([#47](https://github.com/oakimov/cursor-opencode-provider/pull/47) by [@moritzWa](https://github.com/moritzWa))
 - Under Bun, a Run that Cursor cancels before answering is no longer sent again on a new connection when it was the last Run on a connection being closed (after a failed health-check ping, a GOAWAY or the 15-minute rotation): only a lost connection counts as Cursor not having taken the Run
 - What Claude Opus 5.5 writes right before a tool call (for example the explanation before it asks you a question) shows as text again instead of disappearing into its thinking. Opus 5.5 returns that text as a progress-update thinking block, which Cursor streams like reasoning; a thinking block that follows a finished one before any text or tool call is now emitted as text

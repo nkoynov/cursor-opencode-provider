@@ -144,6 +144,10 @@ export type CursorPlanStageInput = {
  *             a plan review tool: write the plan, then ask with upstream
  *             `PlanExitTool`'s own prompt (OpenCode 1.x / 2.0 without
  *             `plan_exit`). Explicit "Yes" is execution approval.
+ * - `hold`    plan mode is active but the session's own rules deny edits: the
+ *             client keeps plan mode and only the user leaves it there, so no
+ *             approval here could start implementing. Write and show the plan;
+ *             the error tells the model to end the turn.
  * - `exit`    the host's `plan` agent is active, advertises `plan_exit`, and
  *             its own plan file is known: write the plan there and run the
  *             host `plan_exit` review. The host owns approval and execution;
@@ -160,6 +164,7 @@ export type CreatePlanBridge =
   | { kind: "stage" }
   | { kind: "ack" }
   | { kind: "approve" }
+  | { kind: "hold" }
   | { kind: "defer"; reason: string }
   | { kind: "exit"; planPath: string }
 
@@ -174,6 +179,16 @@ export const CREATE_PLAN_HOST_PLAN_WORKFLOW_REASON =
   "This host's plan agent owns the plan file and its approval. Write the plan where the " +
   "plan-mode instructions say, then call `plan_exit` to ask the user to approve it. Do " +
   "not implement until it is approved."
+
+/** CreatePlan in a client's own plan mode: the plan is saved and shown, and only the user leaves plan mode. */
+export function createPlanHeldByClientReason(planPath: string): string {
+  return `The plan is saved to ${planPath} and shown to the user. The user's client keeps this ` +
+    "session in plan mode, which denies file edits until the user leaves plan mode there, so " +
+    "nothing can be implemented in this turn. Do not edit files or write them through the shell, " +
+    "and make no further tool calls: end this turn with a short note that the plan is ready and " +
+    "that the user leaves plan mode in their client to have it implemented. If the user asks for " +
+    "changes, refine the plan and record it again."
+}
 
 /** Cursor-visible reason when the user wants the plan revised instead of run. */
 export const CREATE_PLAN_NOT_APPROVED_REASON =
@@ -205,6 +220,8 @@ export function resolveCreatePlanBridge(options: {
   planModeActive?: boolean
   /** The host's own plan file for this session, when the host defines one. */
   hostPlanFile?: string
+  /** The session's own permission rules deny edits (the client keeps plan mode). */
+  hostEditsDenied?: boolean
 }): CreatePlanBridge {
   // A lifecycle turn (title generation, compaction) runs alongside the real one
   // and must not write a second plan file or raise a second prompt.
@@ -222,6 +239,7 @@ export function resolveCreatePlanBridge(options: {
       : { kind: "defer", reason: CREATE_PLAN_HOST_PLAN_WORKFLOW_REASON }
   }
   const planModeActive = options.planModeActive === true || options.hostAgent === "plan"
+  if (planModeActive && options.hostEditsDenied) return { kind: "hold" }
   if (planModeActive && names.has("question")) return { kind: "approve" }
   return { kind: "ack" }
 }

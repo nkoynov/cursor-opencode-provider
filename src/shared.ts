@@ -15,6 +15,8 @@ export const CURSOR_COMPACTION_OPTION = "opencodeCompaction"
 export const CURSOR_HISTORY_REWRITE_OPTION = "opencodeHistoryRewrite"
 /** Current OpenCode primary agent; used to invalidate incompatible checkpoints. */
 export const CURSOR_HOST_AGENT_OPTION = "opencodeHostAgent"
+/** The host session's own permission rules deny edits: its client keeps plan mode itself (T3). */
+export const CURSOR_SESSION_EDITS_DENIED_OPTION = "opencodeSessionEditsDenied"
 export const TOKEN_EXPIRY_THRESHOLD_S = 300
 
 export const RUN_PATH = "/agent.v1.AgentService/Run"

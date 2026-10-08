@@ -1341,6 +1341,37 @@ describe("opencode2 setup", () => {
     expect(getActiveCursorMode("s-plan-agent")).toBe("chat")
   })
 
+  test("the session context marks a session whose own rules deny edits", async () => {
+    const { ctx, hooks } = fakeContext()
+    let permissions: Array<{ action: string; resource: string; effect: string }> = []
+    ctx.session.get = async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, location: { directory: "/w" }, permissions })
+    await plugin.setup(ctx)
+    const context = async () => {
+      const event: any = { sessionID: "s-rules", agent: "plan", model: { providerID: "cursor" }, options: {} }
+      await hooks.get("session.context")!(event)
+      return event.options.opencodeSessionEditsDenied
+    }
+
+    // T3's plan mode: everything allowed, then edits denied except the plan directory.
+    permissions = [
+      { action: "*", resource: "*", effect: "allow" },
+      { action: "edit", resource: "*", effect: "deny" },
+      { action: "edit", resource: "/home/u/.opencode/plan/*", effect: "allow" },
+    ]
+    expect(await context()).toBe(true)
+
+    permissions = [{ action: "*", resource: "*", effect: "allow" }]
+    expect(await context()).toBeUndefined()
+    permissions = [
+      { action: "edit", resource: "*", effect: "deny" },
+      { action: "*", resource: "*", effect: "ask" },
+    ]
+    expect(await context()).toBeUndefined()
+
+    ctx.session.get = async () => { throw new Error("gone") }
+    expect(await context()).toBeUndefined()
+  })
+
   test("the session hook records the session's real directory, not the daemon cwd", async () => {
     clearSessionDirectories()
     const { ctx, hooks, sessionLocations } = fakeContext()
