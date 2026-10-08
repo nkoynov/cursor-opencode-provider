@@ -1654,7 +1654,7 @@ async function startSession(
         `conversationId=${bound.conversationId} checkpoint=${conversationState?.length ?? 0}B`,
     )
   }
-  const lostRequests = liveTurn && sessionKey && !recovery && !fallbackReply
+  const lostRequests = liveTurn && sessionKey && !recovery && !fallbackReply?.override
     ? lostRequestsFor(sessionKey, conversationId, conversationState)
     : undefined
   const turnRequests = lostRequests ? withLostRequests(lostRequests, liveTurn!.text) : undefined
@@ -2076,8 +2076,15 @@ async function startSession(
     closeError: null,
     closed: false,
     requestedModelId: cursorModelId,
-    ...(liveTurn && sessionKey && !recovery && !fallbackReply && conversationState
-      ? { requestBase: conversationState, turnRequests: turnRequests ?? [liveTurn.text] }
+    ...(liveTurn && sessionKey && !recovery && conversationState
+      ? {
+          requestBase: conversationState,
+          turnRequests: turnRequests ?? (
+            !fallbackReply?.override ? [liveTurn.text]
+            : fallbackReply.stop.checkpointHoldsTurn ? []
+            : [fallbackReply.stop.userText]
+          ),
+        }
       : {}),
     // Every agent Run, including one that rebases a lost Run's tool results.
     ...(sessionKey && allowTools && !isCompaction && !isolateHelper

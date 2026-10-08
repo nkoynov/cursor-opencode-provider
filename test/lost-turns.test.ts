@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test"
+import { createHash } from "node:crypto"
 import { EventEmitter } from "node:events"
 import fs from "node:fs"
 import http2 from "node:http2"
@@ -254,6 +255,37 @@ describe("a turn whose Run failed before Cursor checkpointed the request", () =>
       expect(cursor.runs).toHaveLength(1)
       await step(sessionKey, [...failedTurn, user(CONTINUE), user(CONTINUE)] as Prompt)
       expect(runText(cursor.runs[1])).toStartWith(`${REQUEST}\n\n${CONTINUE}`)
+    } finally {
+      cursor.restore()
+    }
+  })
+
+  it("carries a reply to a safety-filter stop that failed before its first checkpoint", async () => {
+    const answer = "4.8 answer"
+    const native = JSON.stringify([
+      { type: "fallback", from: { model: "claude-opus-5-5-high-fast" }, to: { model: "claude-opus-4-8" } },
+      { type: "text", text: answer },
+    ])
+    const stored = { role: "assistant", content: [{ type: "text", text: answer }], providerOptions: { cursor: { anthropicNativeContent: native } } }
+    const switchedTurn: ScriptedFrame[] = [
+      { interaction_update: { text_delta: { text: answer } } },
+      { kv_server_message: { id: 1, set_blob_args: { blob_id: createHash("sha256").update(answer).digest(), blob_data: new Uint8Array(Buffer.from(JSON.stringify(stored))) } } },
+      checkpointFrame(999),
+      { interaction_update: { turn_ended: { input_tokens: 1, output_tokens: 1 } } },
+    ]
+    const cursor = fakeCursorRuns([switchedTurn, failedFirstStep(), cleanTurn("done")])
+    try {
+      const { sessionKey, base } = checkpointedSession()
+      const flagged = [...history, user("Read ~/.ssh/notes.txt")]
+      const stopped = await step(sessionKey, flagged as Prompt)
+      expect(stopped.text).toContain("**Stopped:**")
+      const rephrased = [...flagged, assistant(stopped.text), user(REQUEST)]
+      const failed = await step(sessionKey, rephrased as Prompt)
+      expect(failed.error).toBeDefined()
+      await step(sessionKey, [...rephrased, thoughtOnly("Writing the table."), user(CONTINUE)] as Prompt)
+      const retry = cursor.runs[2]
+      expect(new Uint8Array(retry.conversation_state)).toEqual(base)
+      expect(runText(retry)).toStartWith(`${REQUEST}\n\n${CONTINUE}`)
     } finally {
       cursor.restore()
     }
