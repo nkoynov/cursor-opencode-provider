@@ -376,21 +376,22 @@ describe("early tool rows", () => {
     expect(closedRows(parts)[0].result).toContain("ended the turn")
   })
 
-  it("closes the row of a call the model drops for text, and shows its next call", async () => {
+  it("keeps the row when Cursor delivers thinking between a call's announcements", async () => {
+    // Live order (vm3c2, 2026-10-08): kind, thinking, path, more thinking, then the call.
     const script = scriptedFrames()
     const session = fakeSession(script.frames)
+    const target = path.join(rootOf(session), "NEW.md")
     script.push(
-      partial("t1", { task_tool_call: {} }),
+      partial("w", { edit_tool_call: {} }),
+      thinking("I'll write the file."),
+      partial("w", { edit_tool_call: { args: { path: target } } }),
+      thinking(" Done planning."),
       heartbeat(),
-      update({ text_delta: { text: "Let me do this differently." } }),
-      partial("t2", { task_tool_call: {} }),
-      heartbeat(),
-      ...taskDone(1, "t2"),
+      ...editDone(1, 2, "w", target, "x\n"),
     )
     const parts = await pumpOnce(session)
-    const [dropped, next] = rowStarts(parts)
-    expect(closedRows(parts).map((p) => [p.toolCallId, p.result])).toEqual([[dropped.id, "Cursor's model moved on without sending this call."]])
-    expect(hostCalls(parts)).toMatchObject([{ toolCallId: next.id, toolName: "subagent" }])
+    expect(closedRows(parts)).toEqual([])
+    expect(hostCalls(parts)).toMatchObject([{ toolCallId: rowStarts(parts)[0]?.id, toolName: "write" }])
   })
 
   it("closes the row of a call Cursor completes without an exec", async () => {
