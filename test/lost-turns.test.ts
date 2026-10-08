@@ -291,6 +291,19 @@ describe("a turn whose Run failed before Cursor checkpointed the request", () =>
     }
   })
 
+  it("leaves the request out of a helper Run on the same session, whose prompt does not hold it", async () => {
+    const cursor = fakeCursorRuns([failedFirstStep(), cleanTurn("helper answer")])
+    try {
+      const { sessionKey, base } = checkpointedSession()
+      await step(sessionKey, [...history, user(REQUEST)] as Prompt)
+      await step(sessionKey, [SYSTEM, user("Summarize the user's preferences in one line.")] as Prompt)
+      expect(new Uint8Array(cursor.runs[1].conversation_state)).toEqual(base)
+      expect(runText(cursor.runs[1])).not.toContain(REQUEST)
+    } finally {
+      cursor.restore()
+    }
+  })
+
   it("drops the request when the user stops the session before the retry", async () => {
     const cursor = fakeCursorRuns([failedFirstStep(), cleanTurn("done")])
     try {
@@ -360,5 +373,6 @@ describe("lost turn records", () => {
     expect(withLostRequests([REQUEST, CONTINUE], CONTINUE)).toEqual([REQUEST, CONTINUE])
     expect(withLostRequests([REQUEST], REQUEST)).toEqual([REQUEST])
     expect(withLostRequests([REQUEST], ".")).toEqual([REQUEST])
+    expect(withLostRequests([`${REQUEST}\n\nThese tools already ran.`], REQUEST)).toEqual([`${REQUEST}\n\nThese tools already ran.`])
   })
 })

@@ -1654,9 +1654,12 @@ async function startSession(
         `conversationId=${bound.conversationId} checkpoint=${conversationState?.length ?? 0}B`,
     )
   }
-  const lostRequests = liveTurn && sessionKey && !recovery && !fallbackReply?.override
+  const requestText = userText
+  // A helper on the same session has its own prompt; only the session's own next turn still shows the request.
+  const lostFound = liveTurn && sessionKey && !recovery && !fallbackReply?.override
     ? lostRequestsFor(sessionKey, conversationId, conversationState)
     : undefined
+  const lostRequests = lostFound?.length && promptHoldsRequest(prompt, lostFound[0]!) ? lostFound : undefined
   const turnRequests = lostRequests ? withLostRequests(lostRequests, liveTurn!.text) : undefined
   if (turnRequests) {
     userText = turnRequests.join("\n\n") || "."
@@ -2080,9 +2083,9 @@ async function startSession(
       ? {
           requestBase: conversationState,
           turnRequests: turnRequests ?? (
-            !fallbackReply?.override ? [liveTurn.text]
-            : fallbackReply.stop.checkpointHoldsTurn ? []
-            : [fallbackReply.stop.userText]
+            !fallbackReply ? [liveTurn.text]
+            : fallbackReply.override && fallbackReply.stop.checkpointHoldsTurn ? []
+            : [requestText]
           ),
         }
       : {}),
@@ -6757,6 +6760,15 @@ function liveUserTurn(
     return text && text !== "." ? [text] : []
   })
   return { start, text: texts.join("\n\n"), answered }
+}
+
+/** A user message of the prompt is the request, or its start (a request sent with notes after it). */
+function promptHoldsRequest(prompt: LanguageModelV3CallOptions["prompt"], request: string): boolean {
+  return prompt.some((message) => {
+    if (message.role !== "user") return false
+    const text = extractUserText(message as unknown as Record<string, unknown>)
+    return !!text && text !== "." && (request === text || request.startsWith(`${text}\n\n`))
+  })
 }
 
 /** OpenCode stores an answered early steer after the reply and its empty step adds no assistant message, so it can open the user turn. */
