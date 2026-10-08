@@ -383,11 +383,11 @@ describe("decodeTrailingToolImages", () => {
   it("shares a byte budget across pending results and reports omitted images", async () => {
     const live = fakeSession("bounded-images")
     live.supportsImages = true
-    sessionManager.registerPending(1, live, "read_result", "read")
+    sessionManager.registerPending(1, live, "mcp_result", "badge_a")
     sessionManager.registerPending(2, live, "read_result", "read")
     const results = [1, 2].map(execId => ({
       toolCallId: `cursor_bounded-images_${execId}`, sessionId: live.sessionId, execId,
-      toolName: "read", output: "Image read successfully",
+      toolName: execId === 1 ? "badge_a" : "read", output: "Image read successfully",
       media: [{ type: "file-data", mediaType: "image/png", data: "AQID" }],
     }))
     const decoded = await decodeTrailingToolImages(live, results, undefined, 4)

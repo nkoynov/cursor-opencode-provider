@@ -4709,7 +4709,7 @@ export async function decodeTrailingToolImages(
     signal?.throwIfAborted()
     const pending = result.sessionId === session.sessionId ? session.pending.get(result.execId) : undefined
     if (!session.supportsImages || result.error || !result.media?.length || !pending || pending.bridged
-      || pending.resultField !== "read_result") {
+      || (pending.resultField !== "read_result" && pending.resultField !== "mcp_result")) {
       decoded.push(result)
       continue
     }
