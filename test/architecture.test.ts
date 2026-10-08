@@ -57,7 +57,7 @@ function importViolations(files: readonly string[], pattern: RegExp, runtimeOnly
 
 // Cursor's own agent.v1 Pi* exec types are native wire vocabulary. Detect the
 // external host family through its package/config identities, not that prefix.
-const FOREIGN_VOCABULARY = /MIMOCODE(?:_[A-Z_]+)?|KILO(?:_[A-Z_]+)?|PI_CODING_AGENT_DIR|PI_CONFIG_DIR|\bactor_id\b|\bhashline\b|xd:\/\/|\bMiMo\b|\bKilo\b|\boh-my-pi\b|\bOMP\b|\bDSH\b|DeepSeek Harness|deepseek-harness|@deepseek-ai\/|@earendil-works\/|@oh-my-pi\/|mimocode|kilocode|exit_plan_mode|ask_user_question|devin-opencode-provider|\bDevin\b|\bDevinPlugin\b|\bcreateDevin\b/
+const FOREIGN_VOCABULARY = /MIMOCODE(?:_[A-Z_]+)?|KILO(?:_[A-Z_]+)?|PI_CODING_AGENT_DIR|PI_CONFIG_DIR|\bactor_id\b|\bhashline\b|xd:\/\/|\bMiMo\b|\bKilo\b|\.kilo\b|checkpoint-writer|\bOCP\b|\bocp-|\boh-my-pi\b|\bOMP\b|\bDSH\b|DeepSeek Harness|deepseek-harness|@deepseek-ai\/|@earendil-works\/|@oh-my-pi\/|mimocode|kilocode|exit_plan_mode|ask_user_question|devin-opencode-provider|\bDevin\b|\bDevinPlugin\b|\bcreateDevin\b/
 
 const SOURCE_FILES = filesUnder("src", [".ts", ".d.ts"])
 const TEST_FILES = filesUnder("test", [".ts"])
@@ -97,6 +97,13 @@ describe("provider / compatibility-layer architecture", () => {
     expect(bridge).toContain('Symbol.for("opencode.host.event-bridge")')
     expect(bridge).not.toContain("opencode.compat.event-bridge")
     expect((bridge.match(/Symbol\.for\("opencode\.host\.event-bridge"\)/g) ?? []).length).toBe(1)
+  })
+
+  test("the structural host skills contract uses only the neutral symbol", () => {
+    const skills = source(path.join(ROOT, "src/context/skills-bridge.ts"))
+    expect(skills).toContain('Symbol.for("opencode.host.skills")')
+    expect(skills).not.toContain("opencode.compat.skills")
+    expect((skills.match(/Symbol\.for\("opencode\.host\.skills"\)/g) ?? []).length).toBe(1)
   })
 
   test("runtime modules do not statically import @opencode-ai/plugin", () => {
@@ -153,7 +160,7 @@ describe("provider / compatibility-layer architecture", () => {
   })
 
   test("foreign identity checks cover every host family and other providers", () => {
-    for (const name of ["mimocode", "kilocode", "PI_CODING_AGENT_DIR", "OMP", "@earendil-works/pi-ai", "@oh-my-pi/pi-ai", "@deepseek-ai/dsh-llm", "DSH", "Devin", "createDevin"]) {
+    for (const name of ["mimocode", "kilocode", ".kilo/plans", "checkpoint-writer", "OCP", "ocp-token", "PI_CODING_AGENT_DIR", "OMP", "@earendil-works/pi-ai", "@oh-my-pi/pi-ai", "@deepseek-ai/dsh-llm", "DSH", "Devin", "createDevin"]) {
       expect(FOREIGN_VOCABULARY.test(name)).toBe(true)
     }
   })

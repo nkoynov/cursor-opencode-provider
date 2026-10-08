@@ -24,17 +24,25 @@ export const IMAGE_PERMISSION_DENIED_PREFIX = "CursorImagePermissionDenied:"
 export type ImageSaveToolContext = {
   worktree: string
   directory: string
-  ask(input: {
+  /**
+   * Classic OpenCode 1.x `ToolContext.ask`. A host whose tool context has no
+   * permission prompt (OpenCode 2.0's public `ToolContext`) passes `null`
+   * explicitly: the commit then writes after containment, gated only by the
+   * tool's catalog permission. A missing `ask` is refused, never treated as
+   * permission.
+   */
+  ask: ((input: {
     permission: string
     patterns: string[]
     always: string[]
     metadata: Record<string, unknown>
-  }): Promise<void>
+  }) => Promise<void>) | null
 }
 
 export type ImageSaveResult = {
   title: string
   output: string
+  bytes: number
   attachments?: Array<{ type: "file"; mime: string; url: string; filename?: string }>
 }
 
@@ -154,30 +162,41 @@ export async function executeCursorImageSave(
   // case `assertExternalDirectory` exists for. Asking only for `edit` would
   // quietly skip a boundary the host enforces for every one of its own writes.
   const editPattern = path.relative(realRoot(workspace), contained.path)
-  try {
-    if (!isInsideProject(contained.path, workspace, ctx.directory)) {
-      const parentDir = path.dirname(contained.path)
-      const glob = path.join(parentDir, "*").replaceAll("\\", "/")
+  if (typeof ctx.ask === "function") {
+    try {
+      if (!isInsideProject(contained.path, workspace, ctx.directory)) {
+        const parentDir = path.dirname(contained.path)
+        const glob = path.join(parentDir, "*").replaceAll("\\", "/")
+        await ctx.ask({
+          permission: "external_directory",
+          patterns: [glob],
+          always: [glob],
+          metadata: { filepath: contained.path, parentDir },
+        })
+      }
       await ctx.ask({
-        permission: "external_directory",
-        patterns: [glob],
-        always: [glob],
-        metadata: { filepath: contained.path, parentDir },
+        permission: "edit",
+        patterns: [editPattern],
+        always: ["*"],
+        metadata: {
+          filepath: contained.path,
+          mime: image.mime,
+          bytes: image.data.length,
+          source: "cursor-generate-image",
+        },
       })
+    } catch (error) {
+      const reason = errorMessage(error)
+      trace(`image save: permission refused path=${JSON.stringify(contained.path)} reason=${reason}`)
+      throw new Error(`${IMAGE_PERMISSION_DENIED_PREFIX} ${reason}`)
     }
-    await ctx.ask({
-      permission: "edit",
-      patterns: [editPattern],
-      always: ["*"],
-      metadata: {
-        filepath: contained.path,
-        mime: image.mime,
-        bytes: image.data.length,
-        source: "cursor-generate-image",
-      },
-    })
-  } catch (error) {
-    const reason = errorMessage(error)
+  } else if (ctx.ask === null) {
+    trace(
+      `image save: host cannot prompt; writing after containment ` +
+        `path=${JSON.stringify(contained.path)}`,
+    )
+  } else {
+    const reason = "this host did not provide a permission prompt for the write"
     trace(`image save: permission refused path=${JSON.stringify(contained.path)} reason=${reason}`)
     throw new Error(`${IMAGE_PERMISSION_DENIED_PREFIX} ${reason}`)
   }
@@ -217,5 +236,6 @@ export async function executeCursorImageSave(
   return {
     title: editPattern,
     output: `Saved the generated image to ${contained.path} (${image.data.length} bytes).`,
+    bytes: image.data.length,
   }
 }

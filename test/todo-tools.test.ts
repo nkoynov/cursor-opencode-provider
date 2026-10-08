@@ -14,7 +14,7 @@ import {
   registerTodoTools,
   TODO_OUTPUT_SCHEMA,
 } from "../src/opencode2/todo-tools.js"
-import type { ToolDraft, ToolDefinition } from "../src/opencode2/types.js"
+import type { ToolDraft, ToolDefinition, ToolExecutionContext } from "../src/opencode2/types.js"
 
 const originalTodosGate = process.env[CURSOR_OPENCODE2_TODOS_ENV]
 
@@ -141,7 +141,13 @@ describe("registerTodoTools", () => {
         tools.set(tool.name, tool)
       },
     })
-    const ctx = { sessionID: "ses_exec" }
+    const ctx: ToolExecutionContext = {
+      sessionID: "ses_exec",
+      agent: "build",
+      messageID: "msg_exec",
+      id: "call_exec",
+      progress: async () => {},
+    }
     const written = await tools.get("todowrite")!.execute(
       { todos: [{ content: "ship", status: "in_progress", priority: "high" }] },
       ctx,
@@ -160,7 +166,7 @@ describe("registerTodoTools", () => {
   test("refuses a missing session id instead of sharing an empty-key list", async () => {
     const tools = new Map<string, ToolDefinition>()
     registerTodoTools({ add: (tool) => void tools.set(tool.name, tool) })
-    expect(tools.get("todowrite")!.execute({ todos: [{ content: "unsafe" }] }, {}))
+    expect(tools.get("todowrite")!.execute({ todos: [{ content: "unsafe" }] }, {} as ToolExecutionContext))
       .rejects.toThrow("did not provide a sessionID")
     expect(getSessionTodos("")).toEqual([])
   })

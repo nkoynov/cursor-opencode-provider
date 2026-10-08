@@ -15,8 +15,8 @@ import {
   CURSOR_PLAN_STAGE_TOOL,
   type CreatePlanBridge,
   type DecodedCreatePlanQuery,
-  createPlanApprovalQuestionInput,
   decodeCreatePlanQuery,
+  createPlanApprovalQuestionInput,
   renderPlanReviewMessage,
   resolveCreatePlanBridge,
   writeOpencodePlanFile,
@@ -89,24 +89,29 @@ export type HandledInteraction = {
    */
   switchMode?: DecodedSwitchModeQuery & {
     bridge: SwitchModeBridge
-    toolName?: SwitchModeHostTool | "question"
+    toolName?: SwitchModeHostTool
   }
   /**
-   * Present when CreatePlan needs a host tool: either a native plan stage that
-   * owns the write *and* the approval, or the emulated `question` prompt the
-   * provider raises after writing the plan itself. `planUri` is set only for
-   * the emulated path, where the provider already knows the file it wrote.
+   * Present when CreatePlan needs a host tool: a host plan-stage tool that
+   * owns the write *and* the review, the host's `plan_exit` review of the
+   * plan file the provider just wrote (`planUri` / `planPath` set), or the
+   * emulated `question` prompt after that write.
    */
   createPlan?: DecodedCreatePlanQuery & {
     bridge: CreatePlanBridge
-    toolName: typeof CURSOR_PLAN_STAGE_TOOL | "question"
+    toolName: typeof CURSOR_PLAN_STAGE_TOOL | "plan_exit" | "question"
     planUri?: string
-    /** Filesystem path of the plan the provider just wrote (emulated path). */
+    /** Filesystem path of the plan the provider just wrote. */
     planPath?: string
     questionInput?: ReturnType<typeof createPlanApprovalQuestionInput>
-    /** The plan to show the user before they approve it (emulated path only). */
+    /** The plan to show the user before the host review. */
     planReview?: string
   }
+  /**
+   * Cursor tool call id of a CreatePlan the host plan agent will record
+   * instead. Nothing was written, so its display must not be mirrored as a plan.
+   */
+  deferredCreatePlanToolCallId?: string
   /** Present when an image generation was approved: the target to expect. */
   generateImage?: DecodedGenerateImageQuery
 }
@@ -140,16 +145,18 @@ export type HandleInteractionQueryOptions = {
   workspaceRoot?: string
   /** True when the advertised host plan-stage tool is available. */
   canBridgeCreatePlan?: boolean
-  /**
-   * True when the provider has recorded an approved Cursor plan/spec mode for
-   * this session. A written plan then ends with an execution-approval prompt,
-   * which is the transition out of planning; outside plan mode there is none.
-   */
+  /** An approved switch into the host `plan` agent waits for this Run to end. */
+  hostPlanEntryPending?: boolean
+  /** Host primary agent this Run executes under, when the host reported it. */
+  hostAgent?: string
+  /** Provider-recorded Cursor plan/spec mode for the CreatePlan execution gate. */
   planModeActive?: boolean
+  /** The host's own plan file for this session, when the host defines one. */
+  hostPlanFile?: string
   /**
    * Cursor unified mode currently recorded for this session. A SwitchMode to
    * the mode already in effect needs no approval, matching Cursor's own IDE
-   * handler and keeping the plan-approval prompt from firing twice.
+   * handler and keeping the host's plan review from running twice.
    */
   activeCursorModeId?: string
 }
@@ -207,9 +214,9 @@ export function inspectInteractionQueryWire(
  * Bridged / persisted exceptions:
  * - AskQuestion (#3) → OpenCode `question` tool
  * - SwitchMode (#4) → OpenCode `plan_enter` / `plan_exit` when advertised
- * - CreatePlan (#7) → host-calculated plan file via hostPlansDir (project-config
- *   `plans/` in a git worktree, else host global data/plans); empty args still
- *   get the CLI empty-`plan_uri` success ack
+ * - CreatePlan (#7) → the host's plan file (session `Session.plan` file when
+ *   known, else a new file under hostPlansDir); empty args still get the CLI
+ *   empty-`plan_uri` success ack
  * - GenerateImage (#12) → approve when `cursor_image_save` is advertised
  */
 export function handleInteractionQuery(
@@ -367,6 +374,7 @@ function handleSwitchModeQuery(
     allowTools: options.allowTools === true,
     advertised: options.advertisedTools ?? [],
     ...(options.activeCursorModeId ? { activeModeId: options.activeCursorModeId } : {}),
+    ...(options.hostAgent ? { hostAgent: options.hostAgent } : {}),
   })
   if (bridge.kind === "reject") return reject(bridge.reason)
 
@@ -397,10 +405,10 @@ function handleSwitchModeQuery(
     switchMode: {
       ...decoded,
       bridge,
-      toolName: bridge.kind === "native" ? bridge.toolName : "question",
+      toolName: bridge.toolName,
     },
-    // Keep Cursor waiting until the host tool returns, matching CLI blocking on
-    // the mode-switch approval prompt.
+    // Keep Cursor waiting until the host plan tool returns: the host owns the
+    // mode-switch approval.
     reply: undefined,
   }
 }
@@ -509,16 +517,78 @@ function handleCreatePlanQuery(
   const bridge = resolveCreatePlanBridge({
     allowTools: options.allowTools === true,
     canStage: options.canBridgeCreatePlan === true,
-    planModeActive: options.planModeActive === true,
     advertised: options.advertisedTools ?? [],
+    hostPlanEntryPending: options.hostPlanEntryPending === true,
+    ...(options.hostAgent ? { hostAgent: options.hostAgent } : {}),
+    planModeActive: options.planModeActive === true,
+    ...(options.hostPlanFile ? { hostPlanFile: options.hostPlanFile } : {}),
   })
 
-  // The host plan-stage tool owns the write and the approval prompt together.
+  // The host's plan agent records and reviews the plan; write nothing here.
+  if (bridge.kind === "defer") {
+    return {
+      ...reply({ error: { error: bridge.reason }, plan_uri: "" }),
+      ...(decoded.toolCallId ? { deferredCreatePlanToolCallId: decoded.toolCallId } : {}),
+    }
+  }
+
+  // The host plan agent reviews its own plan file: record the plan there and
+  // hand it to the host plan_exit, which asks the user and, on approval,
+  // moves the session to its build agent.
+  if (bridge.kind === "exit") {
+    const written = writeOpencodePlanFile(decoded.args, options.workspaceRoot ?? "", Date.now(), bridge.planPath)
+    if (!written.ok) {
+      return reply({ error: { error: written.error }, plan_uri: "" })
+    }
+    return {
+      ...base,
+      outcome: "bridged",
+      createPlan: {
+        ...decoded,
+        bridge,
+        toolName: "plan_exit",
+        planUri: written.planUri,
+        planPath: written.planPath,
+        planReview: renderPlanReviewMessage(written.markdown, written.planPath),
+      },
+      reply: undefined,
+    }
+  }
+
+  // The host plan-stage tool owns the write and the review together.
   if (bridge.kind === "stage") {
     return {
       ...base,
       outcome: "bridged",
       createPlan: { ...decoded, bridge, toolName: CURSOR_PLAN_STAGE_TOOL },
+      reply: undefined,
+    }
+  }
+
+  if (bridge.kind === "approve") {
+    const workspaceRoot = options.workspaceRoot?.trim()
+    if (!workspaceRoot) {
+      return reply({
+        error: { error: "CreatePlan requires a workspace root to write the plan file" },
+        plan_uri: "",
+      })
+    }
+    const written = writeOpencodePlanFile(decoded.args, workspaceRoot, Date.now(), options.hostPlanFile)
+    if (!written.ok) {
+      return reply({ error: { error: written.error }, plan_uri: "" })
+    }
+    return {
+      ...base,
+      outcome: "bridged",
+      createPlan: {
+        ...decoded,
+        bridge,
+        toolName: "question",
+        planUri: written.planUri,
+        planPath: written.planPath,
+        questionInput: createPlanApprovalQuestionInput(written.planPath),
+        planReview: renderPlanReviewMessage(written.markdown, written.planPath),
+      },
       reply: undefined,
     }
   }
@@ -536,30 +606,14 @@ function handleCreatePlanQuery(
     })
   }
 
-  const written = writeOpencodePlanFile(decoded.args, workspaceRoot)
+  // The session's own plan file when known, as the host's plan agent uses it.
+  const written = writeOpencodePlanFile(decoded.args, workspaceRoot, Date.now(), options.hostPlanFile)
   if (!written.ok) {
     return reply({ error: { error: written.error }, plan_uri: "" })
   }
 
-  // The plan is on disk either way; only execution needs the user. Hold Cursor's
-  // query open while the host asks, exactly as the CLI blocks on its own prompt.
-  if (bridge.kind === "approve") {
-    return {
-      ...base,
-      outcome: "bridged",
-      createPlan: {
-        ...decoded,
-        bridge,
-        toolName: "question",
-        planUri: written.planUri,
-        planPath: written.planPath,
-        questionInput: createPlanApprovalQuestionInput(written.planPath),
-        planReview: renderPlanReviewMessage(written.markdown, written.planPath),
-      },
-      reply: undefined,
-    }
-  }
-
+  // Nothing advertised can ask: the plan is recorded where the host keeps
+  // plans. Execution starts only if the user later switches agents.
   return reply({ success: {}, plan_uri: written.planUri })
 }
 

@@ -47,3 +47,16 @@ export {
   resolveHostCacheDir,
   setHostCacheDirOverride,
 } from "./paths.js"
+export {
+  HOST_SKILLS_BRIDGE,
+  setHostSkillsBridgeForTests,
+  type HostSkill,
+  type OpenCodeSkillsBridge,
+} from "./skills-bridge.js"
+export {
+  agentSkillsForCursor,
+  hostSkillFiles,
+  rememberHostSkillFiles,
+  resetHostSkillFilesForTests,
+  skillToolAdvertised,
+} from "./skills.js"

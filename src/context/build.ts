@@ -15,7 +15,13 @@ import { collectProjectLayout } from "./layout.js"
 import { buildEnv } from "./env.js"
 import { ensureOpencodeProjectDir } from "./paths.js"
 import { holdCapabilityOverlay } from "./overlay.js"
-import { hostSkillFiles, hostSkillsForCursor } from "./host-skills.js"
+import {
+  agentSkillsForCursor,
+  applyAgentSkillsToContext,
+  hostSkillFiles,
+  loadBridgeSkills,
+  skillToolAdvertised,
+} from "./skills.js"
 import { traceRequestContextPaths } from "../debug.js"
 
 export type BuildRequestContextInput = {
@@ -31,6 +37,8 @@ export type BuildRequestContextInput = {
   mergedConfig?: OpencodeJson
   /** Host system context to deliver as the frozen system-instructions rule. */
   systemInstructions?: SystemInstructions
+  /** Optional host session id for `opencode.host.skills` list(). */
+  sessionID?: string
 }
 
 /**
@@ -121,7 +129,7 @@ export type DynamicRequestContextKey = typeof DYNAMIC_REQUEST_CONTEXT_KEYS[numbe
 
 /**
  * Derived from the system-instructions rule on every materialization (see
- * `host-skills.ts`); never kept on a frozen base.
+ * `skills.ts`); never kept on a frozen base.
  */
 export const HOST_DUPLICATED_REQUEST_CONTEXT_KEYS = [
   "agent_skills",
@@ -177,10 +185,29 @@ export async function buildRequestContext(
     git_status_info_complete: true,
   }
   const base = withSystemInstructions(workspace, input.systemInstructions)
-  const ctx = materializeRequestContext(base, dynamic, hostSkillFiles(workspaceRoot))
+  const skillLocations = await resolveSkillLocations(input, workspaceRoot)
+  const ctx = materializeRequestContext(base, dynamic, {
+    tools: input.tools,
+    ...skillLocations,
+  })
 
   traceRequestContextPaths("buildRequestContext", ctx)
   return ctx
+}
+
+/** Locations for path-desc materialization (bridge, then remembered OC2 files). */
+export async function resolveSkillLocations(
+  input: Pick<BuildRequestContextInput, "tools" | "sessionID">,
+  workspaceRoot: string,
+): Promise<{ bridgeSkills?: Awaited<ReturnType<typeof loadBridgeSkills>>; skillFiles?: ReturnType<typeof hostSkillFiles> }> {
+  if (!skillToolAdvertised(input.tools)) return {}
+  return {
+    bridgeSkills: await loadBridgeSkills({
+      workspaceRoot,
+      sessionID: input.sessionID,
+    }),
+    skillFiles: hostSkillFiles(workspaceRoot),
+  }
 }
 
 async function buildDynamicRequestContextFromDiscovery(
@@ -254,15 +281,22 @@ export async function buildDynamicRequestContext(
   return buildDynamicRequestContextFromDiscovery(input, workspaceRoot, config)
 }
 
+export type MaterializeRequestContextOptions = {
+  tools?: OpencodeToolDef[]
+  skillFiles?: ReadonlyMap<string, string>
+  bridgeSkills?: Awaited<ReturnType<typeof loadBridgeSkills>>
+}
+
 /**
  * Keep expensive workspace state frozen while replacing every live capability
- * field. `skillFiles` (host skill id → SKILL.md) turns the skill catalog in the
- * system-instructions rule into Cursor's `agent_skills`.
+ * field. Skill locations (bridge / OpenCode 2 files / OpenCode 1 catalog
+ * paths) turn the skill catalog in the system-instructions rule into Cursor's
+ * path-desc `agent_skills`.
  */
 export function materializeRequestContext(
   base: Record<string, unknown>,
   dynamic: Record<string, unknown>,
-  skillFiles?: ReadonlyMap<string, string>,
+  options?: MaterializeRequestContextOptions,
 ): Record<string, unknown> {
   const context = structuredClone(base)
   stripHostDuplicatedRequestContextFields(context)
@@ -270,11 +304,12 @@ export function materializeRequestContext(
   for (const key of DYNAMIC_REQUEST_CONTEXT_KEYS) {
     if (Object.hasOwn(dynamic, key)) context[key] = structuredClone(dynamic[key])
   }
-  const skills = hostSkillsForCursor(systemInstructionsRuleText(context), skillFiles)
-  if (skills.length > 0) {
-    context.agent_skills = skills
-    context.agent_skills_info_complete = true
-  }
+  const skills = agentSkillsForCursor(systemInstructionsRuleText(context), {
+    skillToolAdvertised: skillToolAdvertised(options?.tools),
+    skillFiles: options?.skillFiles,
+    bridgeSkills: options?.bridgeSkills,
+  })
+  applyAgentSkillsToContext(context, skills)
   return context
 }
 

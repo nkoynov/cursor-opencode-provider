@@ -39,6 +39,11 @@ export type RunRequestInput = {
   requestContext?: Record<string, unknown>
   /** Resume the supplied checkpoint instead of submitting another user turn. */
   action?: "user" | "resume"
+  /**
+   * Cursor mode of this user turn (`UserMessage.mode`, an `agent.v1.AgentMode`
+   * value). Cursor CLI sends its current mode on every user message.
+   */
+  mode?: number
 }
 
 /**
@@ -110,6 +115,7 @@ export function buildRunRequest(input: RunRequestInput): Uint8Array {
     text: transcript ? `${transcript}\n\n${input.text}` : input.text,
     message_id: msgId,
   }
+  if (input.mode !== undefined) userMessage.mode = input.mode
   if (input.images?.length) {
     userMessage.selected_context = {
       selected_images: input.images.map((image) => ({

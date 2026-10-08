@@ -11,14 +11,15 @@ import {
   snapshotMirroredTodosBySession,
 } from "../src/language-model.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
-import type { CursorSession, Frame } from "../src/session.js"
+import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
 import { CursorAuthError, CursorRetryExhaustedError } from "../src/errors.js"
 import { carryTurnEndedCounters, newOccupancyUsageLedger, occupancyStepUsage } from "../src/usage.js"
+import { sessionFixture } from "./session-fixture.js"
 
 function fakeSession(id: string, frames: Frame[], writes: Uint8Array[] = []): CursorSession {
   let index = 0
-  return {
+  return sessionFixture({
     sessionId: id,
     conversationId: `conv-${id}`,
     stream: {
@@ -31,6 +32,7 @@ function fakeSession(id: string, frames: Frame[], writes: Uint8Array[] = []): Cu
       }),
       destroy() {},
       isClosed: () => false,
+      onTerminal: () => () => {},
     },
     frames: {
       next: async () => index < frames.length
@@ -47,8 +49,7 @@ function fakeSession(id: string, frames: Frame[], writes: Uint8Array[] = []): Cu
     usageEstimate: { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 },
     pumpActive: false,
     heartbeat: null,
-    expiresAt: Date.now() + 10_000,
-  }
+  })
 }
 
 function controller(parts: unknown[]) {
@@ -56,7 +57,7 @@ function controller(parts: unknown[]) {
     enqueue(part: unknown) { parts.push(part) },
     close() {},
     error(error: unknown) { throw error },
-  } as ReadableStreamDefaultController<any>
+  } as unknown as ReadableStreamDefaultController<any>
 }
 
 function serverFrame(message: Record<string, unknown>, flags = 0): Frame {
@@ -75,7 +76,7 @@ function writeVarint(out: number[], value: number): void {
   out.push(remaining)
 }
 
-function lengthDelimitedField(field: number, bytes = new Uint8Array()): Uint8Array {
+function lengthDelimitedField(field: number, bytes: Uint8Array = new Uint8Array()): Uint8Array {
   const out: number[] = []
   writeVarint(out, (field << 3) | 2)
   writeVarint(out, bytes.length)
@@ -98,6 +99,83 @@ function fixed32Field(field: number, value = 0): Uint8Array {
 }
 
 describe("interrupted Cursor Run handling", () => {
+  it("closes a cancelled consumer's Run after the active pump stops", async () => {
+    const session = fakeSession("cancelled-consumer", [
+      serverFrame({ interaction_update: { thinking_delta: { text: "in flight" } } }),
+    ])
+    let destroyed = 0
+    session.stream.destroy = () => { destroyed++ }
+    const cancelledController = controller([])
+    cancelledController.enqueue = () => { throw new TypeError("Controller is already closed") }
+
+    await pumpWithRecovery({
+      initialSession: session,
+      controller: cancelledController,
+      recover: async () => { throw new Error("Cancellation must not retry") },
+    })
+
+    expect(session.pumpActive).toBe(false)
+    expect(session.closed).toBe(true)
+    expect(destroyed).toBe(1)
+  })
+
+  it("closes an aborted Run without pending tools after releasing pump ownership", async () => {
+    const session = fakeSession("aborted-consumer", [])
+    let destroyed = 0
+    session.stream.destroy = () => { destroyed++ }
+
+    await pumpWithRecovery({
+      initialSession: session,
+      controller: controller([]),
+      abortSignal: AbortSignal.abort(),
+      recover: async () => { throw new Error("Cancellation must not retry") },
+    })
+
+    expect(session.closed).toBe(true)
+    expect(destroyed).toBe(1)
+  })
+
+  it("keeps pending tool results deliverable when the consumer aborts", async () => {
+    const session = fakeSession("aborted-tool-turn", [])
+    sessionManager.registerPending(0, session, "read_result", "read")
+    try {
+      await pumpWithRecovery({
+        initialSession: session,
+        controller: controller([]),
+        abortSignal: AbortSignal.abort(),
+        recover: async () => { throw new Error("Cancellation must not retry") },
+      })
+
+      expect(session.closed).toBe(false)
+      expect(session.pumpActive).toBe(false)
+      expect(sessionManager.findByExecIds(session.sessionId, [0])).toBe(session)
+    } finally {
+      sessionManager.close(session)
+    }
+  })
+
+  it("ignores a prior consumer's late cancellation while the continuation pumps", async () => {
+    const session = fakeSession("late-prior-cancel", [
+      serverFrame({ interaction_update: { text_delta: { text: "continued" } } }),
+      serverFrame({ interaction_update: { turn_ended: { input_tokens: 1, output_tokens: 1 } } }),
+    ])
+    const next = session.frames.next.bind(session.frames)
+    session.frames.next = async () => {
+      expect(sessionManager.closeUnlessPending(session)).toBe(false)
+      expect(session.closed).toBe(false)
+      return next()
+    }
+    const parts: any[] = []
+    await pumpWithRecovery({
+      initialSession: session,
+      controller: controller(parts),
+      recover: async () => { throw new Error("Late cancellation must not retry") },
+    })
+
+    expect(parts.some((part) => part.type === "text-delta" && part.delta === "continued")).toBe(true)
+    expect(parts.filter((part) => part.type === "finish")).toHaveLength(1)
+  })
+
   it("awaits KV reply backpressure before consuming the next server frame", async () => {
     const blobId = new Uint8Array([1, 2, 3, 4])
     const session = fakeSession("kv-backpressure", [

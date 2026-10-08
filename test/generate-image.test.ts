@@ -222,6 +222,25 @@ describe("cursor_image_save is not a general file writer", () => {
     expect(calls).toHaveLength(0)
   })
 
+  it("commits after containment when the host declares it has no permission prompt", async () => {
+    const target = path.join(projectDir, "assets", "no-ask.png")
+    const result = await executeCursorImageSave(
+      { image_id: stage(target) },
+      { worktree: workspace, directory: workspace, ask: null },
+    )
+    expect(result.bytes).toBe(PNG.length)
+    expect(fs.readFileSync(target)).toEqual(Buffer.from(PNG))
+  })
+
+  it("refuses a host context that omits ask instead of writing unprompted", async () => {
+    const target = path.join(projectDir, "assets", "missing-ask.png")
+    await expect(executeCursorImageSave(
+      { image_id: stage(target) },
+      { worktree: workspace, directory: workspace } as never,
+    )).rejects.toThrow(IMAGE_PERMISSION_DENIED_PREFIX)
+    expect(fs.existsSync(target)).toBe(false)
+  })
+
   it("cannot be replayed to write the same image twice", async () => {
     const { ctx } = askRecorder()
     const id = stage(path.join(projectDir, "assets", "a.png"))

@@ -87,7 +87,7 @@ describe("canonical Cursor exec variant map", () => {
       variant.requestName,
       variant.resultField,
       variant.resultName,
-    ])).toEqual(CLI_EXEC_PAIRS)
+    ])).toEqual(CLI_EXEC_PAIRS.map((pair) => [...pair]))
   })
 
   it("has unique request ids/names and classifies every canonical variant", () => {

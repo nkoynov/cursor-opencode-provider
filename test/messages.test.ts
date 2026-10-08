@@ -7,6 +7,15 @@ import {
 import { readAllFields } from "../src/protocol/struct.js"
 
 describe("message round-trip", () => {
+  it("encodes cancellation reason at the CLI's field number", () => {
+    const data = encodeMessage("CancelAction", { reason: "host_plan_agent_handoff" })
+    const fields = readAllFields(data)
+    expect(fields).toHaveLength(1)
+    expect(fields[0]?.fn).toBe(1)
+    expect(fields[0]?.wt).toBe(2)
+    expect(new TextDecoder().decode(fields[0]?.bytes)).toBe("host_plan_agent_handoff")
+    expect(decodeMessage<any>("CancelAction", data).reason).toBe("host_plan_agent_handoff")
+  })
   it("ParameterValue", () => {
     const msg = { id: "effort", value: "high" }
     const data = encodeMessage("ParameterValue", msg)

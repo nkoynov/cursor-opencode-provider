@@ -40,7 +40,7 @@ function fields(b: Uint8Array): Array<[number, number, Uint8Array | number]> {
 function decodeValue(b: Uint8Array): unknown {
   const fs = fields(b)
   if (fs.length === 0) return null
-  const [fn, wt, v] = fs[0]
+  const [fn, , v] = fs[0]
   if (fn === 1) return null
   if (fn === 2) return new DataView((v as Uint8Array).buffer, (v as Uint8Array).byteOffset, 8).getFloat64(0, true)
   if (fn === 3) return new TextDecoder().decode(v as Uint8Array)

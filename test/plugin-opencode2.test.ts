@@ -24,13 +24,8 @@ import {
   resolveSessionWorkspaceRoot,
 } from "../src/session-directory.js"
 import {
-  flushPlanExecutionKickoff,
-  hasPlanExecutionKickoff,
-  queuePlanExecutionKickoff,
-  resetPlanExecutionKickoffForTests,
-} from "../src/plan-execution-kickoff.js"
-import {
   flushHostAgentModeSwitch,
+  isHostPlanEntryPending,
   queueHostAgentModeSwitch,
   resetHostAgentModeSwitchForTests,
 } from "../src/host-agent-mode.js"
@@ -38,8 +33,9 @@ import { registerCursorShellCall } from "../src/shell-timeout.js"
 import { sessionActivity } from "../src/activity.js"
 import { forgetEarlySteers, listenForHostSteers } from "../src/host-steer.js"
 import { onHostInterrupt } from "../src/host-interrupt.js"
-import { setHostCacheDirOverride } from "../src/context/paths.js"
-import { hostSkillFiles, resetHostSkillFilesForTests } from "../src/context/host-skills.js"
+import { stageCursorImage } from "../src/image-staging.js"
+import { hostPlansDir, opencode2PlanDir, setHostCacheDirOverride, setNativePlansDir } from "../src/context/paths.js"
+import { hostSkillFiles, resetHostSkillFilesForTests } from "../src/context/skills.js"
 import {
   BUSY_SETTLE_MS,
   pollBackgroundShells,
@@ -65,6 +61,13 @@ import type { ModelInfo } from "../src/models.js"
 
 const DAY_S = 86_400
 
+/** This plugin's setup always returns its cleanup; fail loudly if it stops doing so. */
+async function setupPlugin(ctx: Parameters<typeof plugin.setup>[0]): Promise<() => Promise<void> | void> {
+  const cleanup = await plugin.setup(ctx)
+  if (typeof cleanup !== "function") throw new Error("OpenCode 2.0 plugin setup returned no cleanup")
+  return cleanup
+}
+
 /** Cursor browser-login session JWT: 60-day life, issue time in `time`. */
 function sessionJwt(issuedAgoSec: number): string {
   const issued = Math.floor(Date.now() / 1000) - issuedAgoSec
@@ -86,7 +89,7 @@ function jwtExpiringIn(seconds: number): string {
 /** Run `body` with `fetch` answered by `respond`. */
 async function withFetch<T>(respond: (url: string) => Response, body: () => Promise<T>): Promise<T> {
   const realFetch = globalThis.fetch
-  globalThis.fetch = (async (input: RequestInfo | URL) => respond(String(input))) as typeof fetch
+  globalThis.fetch = (async (input: RequestInfo | URL) => respond(String(input))) as unknown as typeof fetch
   try {
     return await body()
   } finally {
@@ -644,9 +647,9 @@ function fakeContext(events: readonly unknown[] = []) {
 
 describe("opencode2 setup", () => {
   beforeEach(() => {
-    resetPlanExecutionKickoffForTests()
     resetHostAgentModeSwitchForTests()
     resetActiveCursorModesForTests()
+    setNativePlansDir(undefined)
     resetBackgroundShellNotices({ manualPolling: true })
   })
 
@@ -682,7 +685,7 @@ describe("opencode2 setup", () => {
       const { ctx, hooks } = fakeContext()
       const posted: any[] = []
       ctx.session.synthetic = async (input: any) => void posted.push(input)
-      const cleanup = await plugin.setup(ctx)
+      const cleanup = await setupPlugin(ctx)
       const executionID = "cursor_bg_notice"
       registerCursorShellCall(executionID, {
         background_shell_spawn: true,
@@ -720,7 +723,7 @@ describe("opencode2 setup", () => {
     const { ctx, hooks } = fakeContext()
     const posted: any[] = []
     ctx.session.synthetic = async (input: any) => void posted.push(input)
-    const cleanup = await plugin.setup(ctx)
+    const cleanup = await setupPlugin(ctx)
     const executionID = "cursor_fg_shell"
     registerCursorShellCall(executionID, { shell_stream: true, command: "true", working_directory: "/tmp", timeout_ms: 30_000 })
     await hooks.get("tool.execute.after")!({
@@ -747,7 +750,7 @@ describe("opencode2 setup", () => {
       watchBackgroundShell({ sessionID: "ses_stop", pid: process.pid, file, command: "make test", notifier })
       const { ctx } = fakeContext([{ type: "session.execution.interrupted", data: { sessionID: "ses_stop", reason: "user" } }])
       ctx.session.synthetic = notifier
-      const cleanup = await plugin.setup(ctx)
+      const cleanup = await setupPlugin(ctx)
       await new Promise((resolve) => setTimeout(resolve, 10))
       pollBackgroundShells(Date.now())
       expect(posted).toHaveLength(1)
@@ -764,7 +767,7 @@ describe("opencode2 setup", () => {
       const { ctx } = fakeContext([{ type: "session.execution.succeeded", data: { sessionID: "ses_gone" } }])
       const posted: any[] = []
       ctx.session.synthetic = async (input: any) => void posted.push(input)
-      const cleanup = await plugin.setup(ctx)
+      const cleanup = await setupPlugin(ctx)
       await cleanup()
       watchBackgroundShell({ sessionID: "ses_gone", pid: process.pid, file: finishedTerminalFile(dir, ""), command: "x", notifier: ctx.session.synthetic })
       pollBackgroundShells(Date.now() + BUSY_SETTLE_MS)
@@ -788,7 +791,7 @@ describe("opencode2 setup", () => {
       })
       const { ctx, registered, reloads, inventory } = fakeContext()
 
-      const cleanup = await plugin.setup(ctx)
+      const cleanup = await setupPlugin(ctx)
 
       expect(registered).toContain("provider.transform")
       expect(reloads).toEqual(["provider"])
@@ -823,7 +826,7 @@ describe("opencode2 setup", () => {
         schemaVersion: MODEL_CACHE_SCHEMA_VERSION,
       })
       const { ctx } = fakeContext()
-      const cleanup = await plugin.setup(ctx)
+      const cleanup = await setupPlugin(ctx)
       expect(readFileSync(path, "utf8")).toBe(existing)
       await cleanup()
     } finally {
@@ -835,9 +838,17 @@ describe("opencode2 setup", () => {
     }
   })
 
+  test("writes CreatePlan plans in OpenCode 2.0's Plan directory", async () => {
+    const { ctx } = fakeContext()
+    const cleanup = await setupPlugin(ctx)
+    expect(hostPlansDir()).toBe(opencode2PlanDir())
+    await cleanup()
+    expect(hostPlansDir()).not.toBe(opencode2PlanDir())
+  })
+
   test("puts MCP tools on the direct catalog without editing server config", async () => {
     const { ctx, transforms } = fakeContext()
-    const cleanup = await plugin.setup(ctx)
+    const cleanup = await setupPlugin(ctx)
     const servers: Record<string, { type: string; codemode?: boolean }> = {
       github: { type: "local" },
       executor: { type: "local", codemode: true },
@@ -935,7 +946,7 @@ describe("opencode2 setup", () => {
   test("sets up on a host without the mcp domain", async () => {
     const { ctx, registered } = fakeContext()
     delete ctx.mcp
-    const cleanup = await plugin.setup(ctx)
+    const cleanup = await setupPlugin(ctx)
     expect(registered).not.toContain("mcp.transform")
     expect(registered).toContain("provider.transform")
     await cleanup()
@@ -943,7 +954,7 @@ describe("opencode2 setup", () => {
 
   test("registers every domain it needs and returns a cleanup", async () => {
     const { ctx, registered, transforms } = fakeContext()
-    const cleanup = await plugin.setup(ctx)
+    const cleanup = await setupPlugin(ctx)
 
     expect(registered).toContain("integration.transform")
     expect(registered).toContain("provider.transform")
@@ -967,24 +978,52 @@ describe("opencode2 setup", () => {
       options?: { codemode?: boolean }
     }> = []
     transforms.get("tool")!({ add: (tool: { name: string; output?: unknown; options?: { codemode?: boolean } }) => tools.push(tool) })
-    // OpenCode 2 intentionally removed session todos; the provider fallback is
-    // opt-in through CURSOR_OPENCODE2_TODOS and is covered separately.
-    expect(tools).toEqual([])
+    expect(tools.map((tool) => tool.name)).toEqual(["cursor_image_save"])
+    expect(tools[0]?.options?.codemode).toBe(false)
+    expect(tools[0]?.output).toBeDefined()
   })
 
-  test("leaves permission-gated web and image tools to the OpenCode 2 host", async () => {
+  test("registers cursor_image_save and leaves web search to the host tool", async () => {
     const { ctx, transforms } = fakeContext()
     await plugin.setup(ctx)
-    const tools: Array<{ name: string }> = []
+    const tools: Array<{ name: string; options?: { permission?: string; codemode?: boolean } }> = []
     transforms.get("tool")!({
-      add: (tool: { name: string }) => tools.push(tool),
+      add: (tool: { name: string; options?: { permission?: string; codemode?: boolean } }) => tools.push(tool),
       get: (id: string) => id === "websearch"
         ? { id: "websearch", name: "websearch", description: "", input: {}, execute: async () => ({}) }
         : undefined,
     })
-    expect(tools).toEqual([])
+    expect(tools.map((t) => t.name)).toEqual(["cursor_image_save"])
+    expect(tools[0]?.options).toEqual({ codemode: false, permission: "edit" })
     expect(tools.map((t) => t.name)).not.toContain("custom_websearch")
-    expect(tools.map((t) => t.name)).not.toContain("cursor_image_save")
+  })
+
+  test("cursor_image_save commits staged bytes without a permission prompt", async () => {
+    const { ctx, transforms, sessionLocations } = fakeContext()
+    await plugin.setup(ctx)
+    let registered: {
+      execute: (
+        input: { image_id: string },
+        context: { sessionID: string },
+      ) => Promise<{ output: { bytes: number }; content: string }>
+    } | undefined
+    transforms.get("tool")!({ add: (tool: typeof registered) => {
+      registered = tool
+    } })
+    const workspace = mkdtempSync(join(tmpdir(), "oc2-img-ws-"))
+    const projectDir = mkdtempSync(join(tmpdir(), "oc2-img-proj-"))
+    sessionLocations.set("ses_img", workspace)
+    try {
+      const target = join(projectDir, "assets", "dot.png")
+      const png = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01])
+      const image_id = stageCursorImage({ path: target, projectDir, mime: "image/png", data: png })
+      const result = await registered!.execute({ image_id }, { sessionID: "ses_img" })
+      expect(result.output.bytes).toBe(png.length)
+      expect(readFileSync(target)).toEqual(Buffer.from(png))
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+      rmSync(projectDir, { recursive: true, force: true })
+    }
   })
 
   test.each(["id", "callID"] as const)("accepts the %s tool execution identifier", async (field) => {
@@ -1026,7 +1065,7 @@ describe("opencode2 setup", () => {
 
   test("cleanup disposes every registration", async () => {
     const { ctx, registered, disposed } = fakeContext()
-    const cleanup = await plugin.setup(ctx)
+    const cleanup = await setupPlugin(ctx)
     await (cleanup as () => Promise<void>)()
 
     expect(disposed.sort()).toEqual([...registered].sort())
@@ -1068,7 +1107,7 @@ describe("opencode2 setup", () => {
         models: [kept],
       })
 
-      const cleanup = await plugin.setup(ctx)
+      const cleanup = await setupPlugin(ctx)
       await ctx.provider.reload()
 
       expect(inventory.models.get("cursor/keep-me")?.name).toBe("Keep")
@@ -1099,7 +1138,7 @@ describe("opencode2 setup", () => {
         throw new Error("reload failed")
       }
 
-      const cleanup = await plugin.setup(ctx)
+      const cleanup = await setupPlugin(ctx)
       await new Promise((r) => setTimeout(r, 20))
 
       expect(inventory.providers.size).toBe(0)
@@ -1125,7 +1164,7 @@ describe("opencode2 setup", () => {
         return { type: "key", key: "already.a.jwt" }
       },
     }
-    const cleanup = await plugin.setup(ctx)
+    const cleanup = await setupPlugin(ctx)
     await new Promise((resolve) => setTimeout(resolve, 0))
     const before = resolves
     const event: any = { model: { providerID: "cursor", id: "m", modelID: "m" }, package: CURSOR_AISDK_PACKAGE, options: {} }
@@ -1242,7 +1281,7 @@ describe("opencode2 setup", () => {
         key: "new.account.jwt",
       })
 
-      const cleanup = await plugin.setup(ctx)
+      const cleanup = await setupPlugin(ctx)
       try {
         for (let i = 0; i < 100 && !inventory.models.has("cursor/new-account"); i++) {
           await new Promise((resolve) => setTimeout(resolve, 5))
@@ -1424,6 +1463,28 @@ describe("opencode2 setup", () => {
     expect(hostSkillFiles("/proj-skills")).toBeUndefined()
   })
 
+  test("model.request does not attribute another location's skills to the session", async () => {
+    clearSessionDirectories()
+    resetHostSkillFilesForTests()
+    const root = mkdtempSync(join(tmpdir(), "cursor-oc2-skill-scope-"))
+    const file = join(root, "SKILL.md")
+    writeFileSync(file, "Skill")
+    try {
+      const { ctx, hooks, sessionLocations } = fakeContext()
+      sessionLocations.set("s-moved", join(root, "moved"))
+      ctx.skill = { list: async () => ({ location: { directory: root }, data: [{ id: "same-id", path: file }] }) }
+      const cleanup = await setupPlugin(ctx)
+      try {
+        await hooks.get("session.model.request")!(modelRequest("s-moved"))
+        expect(hostSkillFiles(join(root, "moved"))).toBeUndefined()
+        expect(hostSkillFiles(root)?.get("same-id")).toBe(file)
+      } finally { await cleanup() }
+    } finally {
+      resetHostSkillFilesForTests()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   test("model.request leaves other providers' headers alone", async () => {
     clearSessionDirectories()
     const { ctx, hooks, sessionLocations } = fakeContext()
@@ -1448,54 +1509,30 @@ describe("opencode2 setup", () => {
     expect(getSessionDirectory("s-unknown")).toBeUndefined()
   })
 
-  test("installs a plan-execution kickoff via switchAgent + synthetic input", async () => {
-    resetPlanExecutionKickoffForTests()
-    const { ctx } = fakeContext()
-    const switched: string[] = []
-    const synthetic: Array<{ sessionID: string; text: string }> = []
-    const prompted: Array<{ sessionID: string; text: string }> = []
-    ctx.session.switchAgent = async ({ sessionID, agent }: { sessionID: string; agent: string }) => {
-      switched.push(`${sessionID}:${agent}`)
-    }
-    ctx.session.synthetic = async (input: { sessionID: string; text: string }) => {
-      synthetic.push(input)
-      return {}
-    }
-    ctx.session.prompt = async (input: { sessionID: string; text: string }) => {
-      prompted.push(input)
-      return {}
-    }
-    const cleanup = await plugin.setup(ctx)
-    expect(hasPlanExecutionKickoff()).toBe(true)
-    expect(queuePlanExecutionKickoff({ sessionID: "s-plan", planPath: "/tmp/plan.md" })).toBe(true)
-    expect(await flushPlanExecutionKickoff("s-plan", { terminal: true })).toBe(true)
-    expect(switched).toEqual(["s-plan:build"])
-    expect(synthetic).toEqual([{
-      sessionID: "s-plan",
-      text: "The plan at /tmp/plan.md has been approved, you can now edit files. Execute the plan",
-    }])
-    expect(prompted).toEqual([])
-    await cleanup()
-    expect(hasPlanExecutionKickoff()).toBe(false)
-  })
-
   test("maps Cursor modes onto the native OpenCode 2 plan and build agents", async () => {
     const { ctx } = fakeContext()
     const switched: string[] = []
+    const continued: string[] = []
     ctx.session.switchAgent = async ({ sessionID, agent }: { sessionID: string; agent: string }) => {
       switched.push(`${sessionID}:${agent}`)
     }
-    const cleanup = await plugin.setup(ctx)
+    ctx.session.synthetic = async ({ sessionID, text }: { sessionID: string; text: string }) => {
+      continued.push(`${sessionID}:${text.slice(0, 24)}`)
+      return {}
+    }
+    const cleanup = await setupPlugin(ctx)
 
     expect(queueHostAgentModeSwitch({
       sessionID: "s-mode",
       targetModeID: "spec",
       cursorSessionID: "run-plan",
     })).toBe(true)
+    expect(isHostPlanEntryPending("s-mode")).toBe(true)
     expect(await flushHostAgentModeSwitch("s-mode", {
       cursorSessionID: "run-plan",
       terminal: true,
     })).toBe(true)
+    expect(isHostPlanEntryPending("s-mode")).toBe(false)
 
     expect(queueHostAgentModeSwitch({
       sessionID: "s-mode",
@@ -1507,42 +1544,40 @@ describe("opencode2 setup", () => {
       terminal: true,
     })).toBe(true)
     expect(switched).toEqual(["s-mode:plan", "s-mode:build"])
+    expect(continued).toHaveLength(2)
 
     await cleanup()
     expect(queueHostAgentModeSwitch({ sessionID: "s-mode", targetModeID: "plan" })).toBe(false)
   })
 
-  test("falls back to prompt when the host lacks synthetic session input", async () => {
-    resetPlanExecutionKickoffForTests()
-    const { ctx } = fakeContext()
-    delete ctx.session.synthetic
-    const prompted: Array<{ sessionID: string; text: string }> = []
-    ctx.session.prompt = async (input: { sessionID: string; text: string }) => {
-      prompted.push(input)
-      return {}
-    }
-    const cleanup = await plugin.setup(ctx)
-    expect(queuePlanExecutionKickoff({ sessionID: "s-plan-old", planPath: "/tmp/old.md" })).toBe(true)
-    expect(await flushPlanExecutionKickoff("s-plan-old", { terminal: true })).toBe(true)
-    expect(prompted).toHaveLength(1)
-    await cleanup()
-  })
-
-  test("restores the plan agent when kickoff admission fails", async () => {
-    resetPlanExecutionKickoffForTests()
-    const { ctx } = fakeContext()
+  test("disposing an older setup keeps the switch and Plan directory of a newer one", async () => {
+    // OpenCode 2.0 sets the plugin up per location instance and again on a
+    // plugin reload, then disposes the older setup while the newer one runs.
     const switched: string[] = []
-    ctx.session.switchAgent = async ({ sessionID, agent }: { sessionID: string; agent: string }) => {
-      switched.push(`${sessionID}:${agent}`)
+    const setupWith = async (label: string) => {
+      const { ctx } = fakeContext()
+      ctx.session.switchAgent = async ({ sessionID, agent }: { sessionID: string; agent: string }) => {
+        switched.push(`${label}:${sessionID}:${agent}`)
+      }
+      ctx.session.synthetic = async () => ({})
+      return setupPlugin(ctx)
     }
-    ctx.session.synthetic = async () => {
-      throw new Error("inbox unavailable")
-    }
-    const cleanup = await plugin.setup(ctx)
-    expect(queuePlanExecutionKickoff({ sessionID: "s-plan-fail", planPath: "/tmp/fail.md" })).toBe(true)
-    expect(await flushPlanExecutionKickoff("s-plan-fail", { terminal: true })).toBe(false)
-    expect(switched).toEqual(["s-plan-fail:build", "s-plan-fail:plan"])
-    await cleanup()
+    const older = await setupWith("older")
+    const newer = await setupWith("newer")
+
+    await older()
+    expect(hostPlansDir()).toBe(opencode2PlanDir())
+    expect(queueHostAgentModeSwitch({
+      sessionID: "s-reload",
+      targetModeID: "agent",
+      cursorSessionID: "run",
+    })).toBe(true)
+    expect(await flushHostAgentModeSwitch("s-reload", { cursorSessionID: "run", terminal: true })).toBe(true)
+    expect(switched).toEqual(["newer:s-reload:build"])
+
+    await newer()
+    expect(hostPlansDir()).not.toBe(opencode2PlanDir())
+    expect(queueHostAgentModeSwitch({ sessionID: "s-reload", targetModeID: "agent" })).toBe(false)
   })
 
   test("shell create.before merges env for a matching pending command", async () => {
@@ -1688,7 +1723,7 @@ describe("opencode2 running tool tracking", () => {
     setHostCacheDirOverride(cacheDir)
     try {
       await writeCache(cacheDir, { models: [baseModel], fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION })
-      const cleanup = await plugin.setup(fakeContext(events).ctx)
+      const cleanup = await setupPlugin(fakeContext(events).ctx)
       try {
         for (let i = 0; i < 100 && !check(); i++) await new Promise((resolve) => setTimeout(resolve, 5))
       } finally {

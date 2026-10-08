@@ -85,4 +85,23 @@ describe("Cursor checkpoint tokenDetails", () => {
       usedTokens: 130_915,
     })
   })
+
+  it("retains raw checkpoint evidence but omits stale categories from display metadata", () => {
+    const wire = encodeMessage("ConversationStateStructure", {
+      token_details: {
+        used_tokens: 20_347, max_tokens: 256_000,
+        breakdown: {
+          total_used_tokens: 36_122, max_tokens: 256_000,
+          categories: [{ id: "conversation", label: "Conversation", estimated_tokens: 36_122 }],
+        },
+      },
+    })
+    const original = Uint8Array.from(wire)
+    const details = decodeConversationTokenDetails(wire)!
+    expect(details.breakdown?.totalUsedTokens).toBe(36_122)
+    expect(cursorContextUsageMetadata(details).usedTokens).toBe(20_347)
+    expect(cursorContextUsageMetadata(details).breakdown).toBeUndefined()
+    expect(wire).toEqual(original)
+    expect(cursorContextUsageMetadata({ ...details, usedTokens: 36_122, maxTokens: 128_000 }).breakdown).toBeUndefined()
+  })
 })

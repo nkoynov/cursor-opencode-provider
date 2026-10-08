@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test"
 import { CursorLocalCancellationError } from "../src/errors.js"
-import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
+import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { notifyHostInterrupt } from "../src/host-interrupt.js"
 import { announceHostSteer } from "../src/host-steer.js"
 import { createCursor } from "../src/index.js"
@@ -298,7 +298,7 @@ describe("host interrupt (OpenCode 2 Stop)", () => {
         headers: { "x-opencode-session-id": "ses_pull" },
         tools: [{ type: "function", name: "bash", description: "Shell", inputSchema: { type: "object", properties: {} } }],
       } as LanguageModelV3CallOptions)
-      const consumed = (async () => { for await (const _ of result.stream) { /* drain */ } })()
+      const consumed = (async () => { for await (const _ of result.stream as unknown as AsyncIterable<LanguageModelV3StreamPart>) { /* drain */ } })()
       consumed.catch(() => {})
       await until(() => execResults(session.writes).length > 0 && session.pumpOwner != null)
 

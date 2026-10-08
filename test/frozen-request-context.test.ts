@@ -6,7 +6,10 @@ import { createHash } from "node:crypto"
 import { buildRequestContextResult } from "../src/protocol/tools.js"
 import { decodeMessage } from "../src/protocol/messages.js"
 import { SYSTEM_INSTRUCTIONS_RULE_PATH } from "../src/context/build.js"
-import { rememberHostSkillFiles, resetHostSkillFilesForTests } from "../src/context/host-skills.js"
+import {
+  rememberHostSkillFiles,
+  resetHostSkillFilesForTests,
+} from "../src/context/skills.js"
 import {
   clearFrozenRequestContext,
   getFrozenRequestContext,
@@ -128,6 +131,7 @@ describe("frozen request_context", () => {
     resetConversationBlobsForTests()
     resetConversationPersistenceForTests()
     resetTurnStateForTests()
+    resetHostSkillFilesForTests()
   })
 
   it("builds once then reuses the same object across calls", async () => {
@@ -421,16 +425,23 @@ describe("frozen request_context", () => {
     await rm(skillDir, { recursive: true, force: true })
   })
 
-  describe("agent_skills from the host skill catalog", () => {
+  describe("agent_skills path-desc from the host skill catalog", () => {
     const catalog = (ids: string[]) => [
       "Host prompt",
       "Skills provide specialized instructions and workflows for specific tasks.",
       "<available_skills>",
-      ...ids.flatMap((id) => ["  <skill>", `    <id>${id}</id>`, `    <name>${id}</name>`, `    <description>Use for ${id}.</description>`, "  </skill>"]),
+      ...ids.flatMap((id) => [
+        "  <skill>",
+        `    <id>${id}</id>`,
+        `    <name>${id}</name>`,
+        `    <description>Use for ${id}.</description>`,
+        "  </skill>",
+      ]),
       "</available_skills>",
     ].join("\n")
     let skillRoot: string
     const file = (id: string) => path.join(skillRoot, id, "SKILL.md")
+    const skillTool = { name: "skill", description: "Load a skill", inputSchema: { type: "object", properties: {} } }
 
     beforeEach(async () => {
       resetHostSkillFilesForTests()
@@ -449,16 +460,23 @@ describe("frozen request_context", () => {
       ])
       const conversationId = "conv-agent-skills"
       const systemInstructions = { text: catalog(["alpha", "opencode", "unlisted-file"]), authoritative: true }
-      const first = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, systemInstructions })
+      const first = await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        systemInstructions,
+        tools: [skillTool],
+      })
       expect(first.context.agent_skills).toEqual([{ full_path: file("alpha"), description: "Use for alpha." }])
       expect(first.context.agent_skills_info_complete).toBe(true)
       expect(getFrozenRequestContext(conversationId)?.agent_skills).toBeUndefined()
 
-      const again = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, systemInstructions })
+      const again = await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        systemInstructions,
+        tools: [skillTool],
+      })
       expect(again.reused).toBe(true)
       expect(again.context).toBe(first.context)
       const wire = decodeMessage<any>("AgentClientMessage", encodeRequestContext(again.context))
-      // The decoder fills proto defaults: an empty content was never sent.
       expect(wire.exec_client_message.request_context_result.success.request_context.agent_skills)
         .toEqual([{ full_path: file("alpha"), content: "", description: "Use for alpha." }])
     })
@@ -472,19 +490,22 @@ describe("frozen request_context", () => {
       await getOrBuildRequestContext(conversationId, {
         workspaceRoot: root,
         systemInstructions: { text: catalog(["alpha"]), authoritative: true },
+        tools: [skillTool],
       })
       const recovered = await getOrBuildRequestContext(conversationId, {
         workspaceRoot: root,
         systemInstructions: { text: catalog(["alpha", "beta"]), authoritative: false },
+        tools: [skillTool],
       })
       expect((recovered.context.agent_skills as Array<{ full_path: string }>).map((s) => s.full_path))
         .toEqual([file("alpha")])
     })
 
-    it("sends no agent_skills without a catalog or without known files", async () => {
+    it("sends no agent_skills without a catalog, known files, or skill tool", async () => {
       const noFiles = await getOrBuildRequestContext("conv-agent-skills-nofiles", {
         workspaceRoot: root,
         systemInstructions: { text: catalog(["alpha"]), authoritative: true },
+        tools: [skillTool],
       })
       expect(noFiles.context.agent_skills).toBeUndefined()
       expect(noFiles.context.agent_skills_info_complete).toBeUndefined()
@@ -493,18 +514,33 @@ describe("frozen request_context", () => {
       const noCatalog = await getOrBuildRequestContext("conv-agent-skills-nocatalog", {
         workspaceRoot: root,
         systemInstructions: { text: "Host prompt without skills", authoritative: true },
+        tools: [skillTool],
       })
       expect(noCatalog.context.agent_skills).toBeUndefined()
+
+      const noTool = await getOrBuildRequestContext("conv-agent-skills-notool", {
+        workspaceRoot: root,
+        systemInstructions: { text: catalog(["alpha"]), authoritative: true },
+      })
+      expect(noTool.context.agent_skills).toBeUndefined()
     })
 
     it("drops a skill once the host no longer registers its file", async () => {
       rememberHostSkillFiles(root, [{ id: "alpha", path: file("alpha") }])
       const conversationId = "conv-agent-skills-removed"
       const systemInstructions = { text: catalog(["alpha"]), authoritative: true }
-      const first = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, systemInstructions })
+      const first = await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        systemInstructions,
+        tools: [skillTool],
+      })
       expect(first.context.agent_skills).toHaveLength(1)
       rememberHostSkillFiles(root, [])
-      const after = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, systemInstructions })
+      const after = await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        systemInstructions,
+        tools: [skillTool],
+      })
       expect(after.reused).toBe(false)
       expect(after.context.agent_skills).toBeUndefined()
     })

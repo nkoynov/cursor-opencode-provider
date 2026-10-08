@@ -68,6 +68,24 @@ export function normalizeSessionTodos(value: unknown): SessionTodo[] {
   return out
 }
 
+/** Fill omitted defaults before validation without dropping malformed entries. */
+export function normalizeOpencodeTodoArgs(args: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(args.todos)) return args
+  return {
+    ...args,
+    todos: args.todos.map((item, index) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return item
+      const todo = item as Record<string, unknown>
+      return {
+        ...todo,
+        ...(todo.id === undefined ? { id: String(index + 1) } : {}),
+        ...(todo.status === undefined ? { status: "pending" } : {}),
+        ...(todo.priority === undefined ? { priority: "medium" } : {}),
+      }
+    }),
+  }
+}
+
 export function getSessionTodos(sessionID: string): SessionTodo[] {
   return lists.get(sessionID)?.map((todo) => ({ ...todo })) ?? []
 }

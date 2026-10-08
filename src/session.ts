@@ -291,6 +291,11 @@ export type CursorSession = {
    */
   mirroredTodos?: Array<Record<string, unknown>>
   /**
+   * CreatePlan display calls whose plan was deferred to the host plan agent.
+   * Their completed display carries no recorded plan, so it is not mirrored.
+   */
+  deferredCreatePlanCalls?: Set<string>
+  /**
    * Legacy edit calls whose authoritative exec path is still in progress.
    * Cursor implements these as read -> whole-file write; retaining the path
    * lets the pump expose the final mutation to OpenCode as a targeted edit.

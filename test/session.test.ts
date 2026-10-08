@@ -2,13 +2,14 @@ import { describe, it, expect } from "bun:test"
 import { SessionManager, type CursorSession } from "../src/session.js"
 import { CursorProtocolError } from "../src/errors.js"
 import type { BidiStream, BidiTerminalEvent } from "../src/transport/connect.js"
+import { sessionFixture } from "./session-fixture.js"
 
 let _seq = 0
 function fakeSession(): CursorSession {
-  return {
+  return sessionFixture({
     sessionId: `sess_test_${++_seq}`,
     conversationId: `conv_test_${_seq}`,
-    stream: { write() {}, end() {}, frames: () => ({ [Symbol.asyncIterator]: () => ({ next: async () => ({ done: true, value: undefined }) }) }) as any, destroy() {}, isClosed: () => false },
+    stream: { write() {}, end() {}, frames: () => ({ [Symbol.asyncIterator]: () => ({ next: async () => ({ done: true, value: undefined }) }) }) as any, destroy() {}, isClosed: () => false, onTerminal: () => () => {} },
     frames: { next: async () => ({ done: true, value: undefined }) } as any,
     pending: new Map(),
     displayToolCalls: new Map(),
@@ -20,8 +21,7 @@ function fakeSession(): CursorSession {
     allowTools: false,
     pumpActive: false,
     heartbeat: null,
-    expiresAt: Date.now() + 10_000,
-  }
+  })
 }
 
 describe("SessionManager", () => {
@@ -153,7 +153,7 @@ describe("SessionManager", () => {
     const mgr = new SessionManager()
     const s = fakeSession()
     mgr.registerPending(5, s, "read_result")
-    s.expiresAt = Date.now() - 1 // registerPending touched it; force-expire
+    ;(s as CursorSession & { expiresAt?: number }).expiresAt = Date.now() - 1 // legacy expiry; force-expire
     expect(mgr.findByExecIds(s.sessionId, [5])).toBeUndefined()
   })
 
@@ -469,7 +469,7 @@ describe("SessionManager", () => {
     expect(unsubscribed).toBe(true)
     expect(s.stream).toBe(next)
     expect(s.frames).toBe(nextFrames)
-    expect(s.deferredTerminalReason).toBe(null)
+    expect(s.deferredTerminalReason as CursorSession["deferredTerminalReason"]).toBe(null)
     expect(mgr.isPumpOwner(s, owner)).toBe(true)
     expect(s.closed).toBe(false)
     expect(mgr.endPump(s, owner)).toBe(true)

@@ -389,7 +389,9 @@ describe("provenance through a Cursor Run", () => {
         end() {},
         destroy() {},
         frames: () => ({ [Symbol.asyncIterator]: () => frames }),
-      } as CursorSession["stream"],
+        isClosed: () => false,
+        onTerminal: () => () => {},
+      },
       frames,
       pending: new Map(),
       displayToolCalls: new Map(),
@@ -401,7 +403,6 @@ describe("provenance through a Cursor Run", () => {
       usageEstimate: { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 },
       pumpActive: true,
       heartbeat: null,
-      expiresAt: Date.now() + 10_000,
     } as unknown as CursorSession
   }
 

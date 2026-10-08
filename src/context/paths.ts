@@ -16,6 +16,12 @@ export type OpenCodePathBridge = {
   /** Optional host-owned cache root; absent means native OpenCode defaults. */
   globalCacheDir?: () => string
   configFileNames?: string[]
+  /**
+   * Optional host plan file for a session (the host's own plan location, which
+   * its `plan_exit` review reads). Absent on an installed bridge means the host
+   * defines none; without a bridge OpenCode's own location applies.
+   */
+  planFile?: (input: { worktree: string; vcs: boolean; created: number; slug: string }) => string | undefined
 }
 
 function pathBridge(): OpenCodePathBridge | undefined {
@@ -41,6 +47,32 @@ function openCodeGlobalCacheDir(env: HostPathEnv = process.env): string {
 function bridgeGlobalDataDir(): string | undefined {
   const value = pathBridge()?.globalDataDir?.()
   return typeof value === "string" && value.length > 0 ? path.resolve(value) : undefined
+}
+
+/**
+ * The plan file of a session: OpenCode's own `Session.plan` location
+ * (`<worktree>/.opencode/plans` in a VCS project, else `<data>/plans`, named
+ * `<created>-<slug>.md`), which its plan agent and `plan_exit` use. An injected
+ * host path bridge owns host paths, so with one installed only its `planFile`
+ * defines the location.
+ */
+export function hostPlanFilePath(
+  input: { worktree: string; vcs: boolean; created: number; slug: string },
+  env: HostPathEnv = process.env,
+): string | undefined {
+  const bridge = pathBridge()
+  if (bridge) {
+    if (typeof bridge.planFile !== "function") return undefined
+    const value = bridge.planFile(input)
+    return typeof value === "string" && value.length > 0 ? path.resolve(value) : undefined
+  }
+  const slug = input.slug.trim()
+  if (!slug || slug.includes("/") || slug.includes("\\") || slug.startsWith(".")) return undefined
+  if (!Number.isSafeInteger(input.created) || input.created <= 0) return undefined
+  const base = input.vcs
+    ? path.join(path.resolve(input.worktree), ".opencode", "plans")
+    : path.join(openCodeGlobalDataDir(env), "plans")
+  return path.join(base, `${input.created}-${slug}.md`)
 }
 
 function bridgeGlobalCacheDir(): string | undefined {
@@ -131,27 +163,50 @@ export function hostGlobalDataDir(env: HostPathEnv = process.env): string {
   return bridgeGlobalDataDir() ?? openCodeGlobalDataDir(env)
 }
 
+/** Entrypoint plan directories, newest last (see {@link setNativePlansDir}). */
+const nativePlansDirs: Array<{ dir: string }> = []
+
 /**
- * Directory for host plan files — always `<hostGlobalDataDir()>/plans`, and
- * never inside the user's repository.
- *
- * OpenCode's own `Session.plan` branches on VCS and puts plans in the worktree
- * (`<worktree>/.opencode/plans`) for a git project. The provider deliberately
- * does *not* mirror that branch. Writing there means a throwaway plan lands in
- * the user's tree untracked-but-unignored, and — because OpenCode installs
- * `@opencode-ai/plugin` into every `.opencode` directory it discovers walking up
- * from the cwd — creating that directory also bootstraps a project-local
- * `node_modules`. The provider must add nothing to a repository it did not
- * already contain.
- *
- * The global-data location is not a degraded fallback: it is the branch OpenCode
- * itself uses when there is no VCS, and its plan agent allow-lists that path for
- * `edit` / `external_directory` alongside the in-worktree one. {@link
- * hostGlobalDataDir} carries an optional injected host translation; without a
- * bridge it is the native OpenCode data root.
+ * Select the entrypoint's native OpenCode plan directory. OpenCode 2.0 sets its
+ * Plan directory ({@link opencode2PlanDir}); OpenCode 1.x keeps the default.
+ * The returned disposer removes only this selection, so an older plugin setup
+ * disposed after a newer one leaves the newer selection in place. `undefined`
+ * removes all.
  */
-export function hostPlansDir(_workspaceRoot?: string): string {
-  return path.join(hostGlobalDataDir(), "plans")
+export function setNativePlansDir(dir: string | undefined): () => void {
+  if (!dir) {
+    nativePlansDirs.length = 0
+    return () => {}
+  }
+  const entry = { dir: path.resolve(dir) }
+  nativePlansDirs.push(entry)
+  return () => {
+    const index = nativePlansDirs.lastIndexOf(entry)
+    if (index >= 0) nativePlansDirs.splice(index, 1)
+  }
+}
+
+/**
+ * OpenCode 2.0's Plan directory: `<home>/.opencode/plan`, where its Plan agent
+ * may write plan files (home is `OPENCODE_TEST_HOME`, else the OS home).
+ */
+export function opencode2PlanDir(env: HostPathEnv = process.env): string {
+  return path.join(env.OPENCODE_TEST_HOME ?? homedir(), ".opencode", "plan")
+}
+
+/**
+ * Directory for a new plan file when the session's own plan file
+ * ({@link hostPlanFilePath}) is not known.
+ *
+ * An injected host path bridge owns host paths: `<globalDataDir()>/plans`.
+ * Otherwise the native OpenCode location of the running entrypoint: OpenCode
+ * 2.0's Plan directory, or OpenCode 1.x's no-VCS `Session.plan` base
+ * (`<data>/plans`).
+ */
+export function hostPlansDir(_workspaceRoot?: string, env: HostPathEnv = process.env): string {
+  const bridged = bridgeGlobalDataDir()
+  if (bridged) return path.join(bridged, "plans")
+  return nativePlansDirs[nativePlansDirs.length - 1]?.dir ?? path.join(openCodeGlobalDataDir(env), "plans")
 }
 
 /**

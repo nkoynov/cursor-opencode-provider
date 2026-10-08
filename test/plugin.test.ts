@@ -20,10 +20,15 @@ import {
 } from "../src/shell-timeout.js"
 import { sessionActivity } from "../src/activity.js"
 import * as rootExports from "../src/index.js"
+import { hostPlanFileFor, resetHostPlanFilesForTests } from "../src/host-plan-file.js"
+import { HOST_PATH_BRIDGE } from "../src/context/paths.js"
 import {
-  hasPlanExecutionKickoff,
-  resetPlanExecutionKickoffForTests,
-} from "../src/plan-execution-kickoff.js"
+  flushHostAgentModeSwitch,
+  hostAgentSwitchPromptText,
+  isHostPlanEntryPending,
+  queueHostAgentModeSwitch,
+  resetHostAgentModeSwitchForTests,
+} from "../src/host-agent-mode.js"
 
 // Characters safeLabel must remove from emitted names/keys (issue #2).
 const INVALID = new RegExp("[()<>&\"'`]")
@@ -32,16 +37,145 @@ const variantParams = (params: Array<{ id: string; value: string }>) => ({
 })
 
 describe("package root exports", () => {
-  it("installs plan kickoff only when the host exposes session.promptAsync", async () => {
-    resetPlanExecutionKickoffForTests()
+  it("selects the host plan agent through session.promptAsync after the Run ends", async () => {
+    resetHostAgentModeSwitchForTests()
     await CursorPlugin({} as any)
-    expect(hasPlanExecutionKickoff()).toBe(false)
+    expect(queueHostAgentModeSwitch({ sessionID: "s", targetModeID: "plan", hostAgent: "build" })).toBe(false)
 
-    await CursorPlugin({
-      client: { session: { promptAsync: async () => ({ data: undefined }) } },
+    const calls: unknown[] = []
+    let agentReads = 0
+    const hooks = await CursorPlugin({
+      client: {
+        session: { promptAsync: async (args: unknown) => { calls.push(args) } },
+        app: {
+          agents: async () => {
+            agentReads++
+            await Bun.sleep(5)
+            return {
+              data: [
+                { name: "build", mode: "primary" },
+                { name: "plan", mode: "primary" },
+                { name: "explore", mode: "subagent" },
+                { name: "summary", mode: "primary", hidden: true },
+              ],
+            }
+          },
+        },
+      },
     } as any)
-    expect(hasPlanExecutionKickoff()).toBe(true)
-    resetPlanExecutionKickoffForTests()
+    // The agent list is read on the first Cursor request, not during plugin load.
+    expect(agentReads).toBe(0)
+    expect(queueHostAgentModeSwitch({ sessionID: "s", targetModeID: "plan", hostAgent: "build" })).toBe(false)
+    const params = { options: {} as Record<string, unknown> }
+    // The first request waits for the list, so a SwitchMode in its Run is accepted.
+    await hooks["chat.params"]!({ model: { providerID: "cursor" }, agent: "build" } as any, params as any)
+    expect(agentReads).toBe(1)
+    await hooks["chat.params"]!({ model: { providerID: "cursor" }, agent: "build" } as any, params as any)
+    expect(agentReads).toBe(1)
+
+    // Background/internal sessions are not switched.
+    expect(queueHostAgentModeSwitch({ sessionID: "bg", targetModeID: "plan", hostAgent: "summary" }))
+      .toBe(false)
+    expect(queueHostAgentModeSwitch({
+      sessionID: "s",
+      targetModeID: "plan",
+      cursorSessionID: "c",
+      hostAgent: "build",
+    })).toBe(true)
+    // The prompt switch continues the work itself, so the plan waits for it.
+    expect(isHostPlanEntryPending("s")).toBe(true)
+    expect(await flushHostAgentModeSwitch("s", { cursorSessionID: "c", terminal: true })).toBe(true)
+    expect(calls).toEqual([{
+      path: { id: "s" },
+      body: {
+        agent: "plan",
+        parts: [{ type: "text", text: hostAgentSwitchPromptText("plan"), synthetic: true }],
+      },
+    }])
+    resetHostAgentModeSwitchForTests()
+  })
+
+  it("resolves the session's own plan file once per session", async () => {
+    resetHostPlanFilesForTests()
+    const previous = (globalThis as Record<PropertyKey, unknown>)[HOST_PATH_BRIDGE]
+    const seen: unknown[] = []
+    ;(globalThis as Record<PropertyKey, unknown>)[HOST_PATH_BRIDGE] = {
+      projectConfigDirs: () => [],
+      globalConfigDirs: () => [],
+      planFile: (input: { worktree: string; vcs: boolean; created: number; slug: string }) => {
+        seen.push(input)
+        return `${input.worktree}/.host/plans/${input.created}-${input.slug}.md`
+      },
+    }
+    try {
+      const hooks = await CursorPlugin({
+        worktree: "/repo",
+        project: { worktree: "/repo", vcs: "git" },
+        client: {
+          session: {
+            promptAsync: async () => {},
+            get: async (args: { path: { id: string } }) => ({
+              data: { id: args.path.id, slug: "calm-wizard", time: { created: 17 } },
+            }),
+          },
+        },
+      } as any)
+      const params = { options: {} as Record<string, unknown> }
+      // Compaction turns never resolve it.
+      await hooks["chat.params"]!({ sessionID: "s", model: { providerID: "cursor" }, agent: "compaction" } as any, params as any)
+      expect(hostPlanFileFor("s")).toBeUndefined()
+      await hooks["chat.params"]!({ sessionID: "s", model: { providerID: "cursor" }, agent: "build" } as any, params as any)
+      await hooks["chat.params"]!({ sessionID: "s", model: { providerID: "cursor" }, agent: "plan" } as any, params as any)
+      expect(seen).toEqual([{ worktree: "/repo", vcs: true, created: 17, slug: "calm-wizard" }])
+      expect(hostPlanFileFor("s")).toBe("/repo/.host/plans/17-calm-wizard.md")
+    } finally {
+      if (previous === undefined) delete (globalThis as Record<PropertyKey, unknown>)[HOST_PATH_BRIDGE]
+      else (globalThis as Record<PropertyKey, unknown>)[HOST_PATH_BRIDGE] = previous
+      resetHostPlanFilesForTests()
+      resetHostAgentModeSwitchForTests()
+      }
+  })
+
+  it("looks a session's plan file up once when it has none, but retries a failed lookup", async () => {
+    resetHostPlanFilesForTests()
+    const previous = (globalThis as Record<PropertyKey, unknown>)[HOST_PATH_BRIDGE]
+    ;(globalThis as Record<PropertyKey, unknown>)[HOST_PATH_BRIDGE] = {
+      projectConfigDirs: () => [],
+      globalConfigDirs: () => [],
+    }
+    const reads: string[] = []
+    try {
+      const hooks = await CursorPlugin({
+        worktree: "/repo",
+        project: { worktree: "/repo", vcs: "git" },
+        client: {
+          session: {
+            promptAsync: async () => {},
+            get: async (args: { path: { id: string } }) => {
+              reads.push(args.path.id)
+              if (args.path.id === "flaky" && reads.length === 1) throw new Error("not ready")
+              return { data: { id: args.path.id, slug: "calm-wizard", time: { created: 17 } } }
+            },
+          },
+        },
+      } as any)
+      const params = { options: {} as Record<string, unknown> }
+      const call = (sessionID: string) => hooks["chat.params"]!(
+        { sessionID, model: { providerID: "cursor" }, agent: "build" } as any,
+        params as any,
+      )
+      // A bridge without `planFile` defines none: one lookup, then remembered.
+      await call("flaky")
+      await call("flaky")
+      await call("flaky")
+      expect(reads).toEqual(["flaky", "flaky"])
+      expect(hostPlanFileFor("flaky")).toBeUndefined()
+    } finally {
+      if (previous === undefined) delete (globalThis as Record<PropertyKey, unknown>)[HOST_PATH_BRIDGE]
+      else (globalThis as Record<PropertyKey, unknown>)[HOST_PATH_BRIDGE] = previous
+      resetHostPlanFilesForTests()
+      resetHostAgentModeSwitchForTests()
+      }
   })
 
   it("loads classic tools from a Windows absolute host path", async () => {
@@ -753,7 +887,7 @@ describe("loadModels on cache miss", () => {
         return new Response(INSTALLER_FIXTURE, { status: 200 })
       }
       throw new Error(`unexpected fetch: ${url}`)
-    }) as typeof fetch
+    }) as unknown as typeof fetch
   })
 
   afterEach(async () => {

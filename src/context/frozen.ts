@@ -3,11 +3,11 @@ import {
   buildRequestContext,
   materializeRequestContext,
   requestContextBase,
+  resolveSkillLocations,
   withSystemInstructions,
   type BuildRequestContextInput,
 } from "./build.js"
 import { clearContextEpoch, endContextEpoch, resetContextEpochsForTests } from "./epoch.js"
-import { hostSkillFiles } from "./host-skills.js"
 import {
   clearOverlayHold,
   resetOverlayHoldsForTests,
@@ -203,9 +203,13 @@ export async function getOrBuildRequestContext(
         )
       }
       const dynamic = await buildDynamicRequestContext(scoped)
+      const skillLocations = await resolveSkillLocations(scoped, scoped.workspaceRoot)
       const materialized = rememberMaterialized(
         conversationId,
-        materializeRequestContext(base, dynamic, hostSkillFiles(input.workspaceRoot)),
+        materializeRequestContext(base, dynamic, {
+          tools: scoped.tools,
+          ...skillLocations,
+        }),
       )
       trace(
         `request_context: materialized conversationId=${conversationId} ` +

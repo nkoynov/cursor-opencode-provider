@@ -114,7 +114,7 @@ describe("unary startup deadlines", () => {
         return new Response(INSTALLER_FIXTURE, { status: 200 })
       }
       return pendingFetchUntilAbort(init)
-    }) as typeof fetch
+    }) as unknown as typeof fetch
     try {
       const error = await unaryAvailableModels("secret-token", { timeoutMs: 10 })
         .then(() => undefined, (cause) => cause)
@@ -144,7 +144,7 @@ describe("unary startup deadlines", () => {
         value: () => new Promise<never>(() => {}),
       })
       return response
-    }) as typeof fetch
+    }) as unknown as typeof fetch
     try {
       const availableModelsError = await unaryAvailableModels("secret-token", { timeoutMs: 10 })
         .then(() => undefined, (cause) => cause)
@@ -173,7 +173,7 @@ describe("unary startup deadlines", () => {
         return new Response(INSTALLER_FIXTURE, { status: 200 })
       }
       return pendingFetchUntilAbort(init)
-    }) as typeof fetch
+    }) as unknown as typeof fetch
     try {
       const error = await fetchAgentUrl("secret-token", { timeoutMs: 10 })
         .then(() => undefined, (cause) => cause)
@@ -198,7 +198,7 @@ describe("unary startup deadlines", () => {
         value: () => new Promise<never>(() => {}),
       })
       return response
-    }) as typeof fetch
+    }) as unknown as typeof fetch
     try {
       const availableModelsError = await unaryAvailableModels("secret-token", { timeoutMs: 10 })
         .then(() => undefined, (cause) => cause)
@@ -218,7 +218,7 @@ describe("unary startup deadlines", () => {
     globalThis.fetch = (async () => {
       calls += 1
       throw new Error("unexpected fetch")
-    }) as typeof fetch
+    }) as unknown as typeof fetch
     try {
       for (const request of [
         unaryAvailableModels("secret-token", { timeoutMs: 0 }),
@@ -278,7 +278,7 @@ describe("explicit agent Run host overrides", () => {
 
     await expect(
       model.doStream({
-        prompt: [{ role: "user", content: "hello" }],
+        prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
       } as LanguageModelV3CallOptions),
     ).rejects.toThrow("Invalid Cursor agent base URL override")
   })
@@ -295,7 +295,7 @@ describe("explicit agent Run host overrides", () => {
         throw new Error("config down")
       }
       throw new Error(`unexpected fetch: ${url}`)
-    }) as typeof fetch
+    }) as unknown as typeof fetch
 
     try {
       const model = createCursor({
@@ -306,7 +306,7 @@ describe("explicit agent Run host overrides", () => {
 
       await expect(
         model.doStream({
-          prompt: [{ role: "user", content: "hello" }],
+          prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
         } as LanguageModelV3CallOptions),
       ).rejects.toThrow("GetServerConfig network request failed")
     } finally {
@@ -328,7 +328,7 @@ describe("explicit agent Run host overrides", () => {
         return new Response(responseBody, { status: 503, statusText: "Service Unavailable" })
       }
       throw new Error(`unexpected fetch: ${url}`)
-    }) as typeof fetch
+    }) as unknown as typeof fetch
 
     try {
       const expectHttpDiagnostics = async (request: Promise<unknown>) => {

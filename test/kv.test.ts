@@ -10,14 +10,17 @@ import {
 } from "../src/protocol/blob-store.js"
 import protobuf from "protobufjs"
 import type { CursorSession } from "../src/session.js"
+import { sessionFixture } from "./session-fixture.js"
 
 function fakeSession(conversationId = "conv-kv-test"): CursorSession {
-  return {
+  return sessionFixture({
     sessionId: "sess-kv",
     conversationId,
     stream: { write() {} } as any,
     frames: { next: async () => ({ done: true, value: undefined }) } as any,
     pending: new Map(),
+    displayToolCalls: new Map(),
+    nextBridgedExecId: 900_000,
     blobs: new Map(),
     toolDescriptors: [],
     requestContext: {},
@@ -25,8 +28,7 @@ function fakeSession(conversationId = "conv-kv-test"): CursorSession {
     allowTools: false,
     pumpActive: false,
     heartbeat: null,
-    expiresAt: Date.now() + 10_000,
-  }
+  })
 }
 
 function hash(byte: number): Uint8Array {
