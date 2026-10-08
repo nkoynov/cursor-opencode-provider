@@ -1144,6 +1144,10 @@ export async function pumpWithRecovery(input: {
       next.usageEstimate = { ...pumpedSession.usageEstimate }
       next.editToolCalls = new Map(pumpedSession.editToolCalls)
       next.pendingFollowUp = recovery.followUp
+      if (recovery.followUp !== undefined && pumpedSession.turnRequests) {
+        next.requestBase = recovery.checkpoint
+        next.turnRequests = pumpedSession.turnRequests
+      }
       // The resumed Run never saw these; its turn_ended sends them as a follow-up. One delivered
       // after the checkpoint it resumes from is lost with that checkpoint, so it goes too.
       // A host note goes with the resumed Run's next results instead.

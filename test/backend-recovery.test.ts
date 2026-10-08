@@ -253,6 +253,26 @@ describe("a tool input Cursor holds until the model has written it", () => {
   })
 })
 
+describe("a follow-up Run's request through recovery", () => {
+  it("stays the resumed Run's lost-turn request while the resume resends it", async () => {
+    const base = Uint8Array.from([0x0a, 0x01, 0x05])
+    let resumed: CursorSession | undefined
+    await pumpWithRecovery({
+      initialSession: fakeSession("follow-up", [{ frame: text("partial") }, { frame: endStreamError("internal") }], {
+        resumeCheckpoint: base,
+        pendingFollowUp: "the steer",
+        requestBase: base,
+        turnRequests: ["the steer"],
+      }),
+      controller: controller(),
+      retryPolicy: noDelay,
+      recover: async () => (resumed = fakeSession("follow-up-resumed", [{ frame: turnEnded() }])),
+    })
+    expect(Array.from(resumed?.requestBase ?? [])).toEqual(Array.from(base))
+    expect(resumed?.turnRequests).toEqual(["the steer"])
+  })
+})
+
 describe("resuming again from the checkpoint a Run resumed from", () => {
   const carried = Uint8Array.from([0x0a, 0x01, 0x07])
 
