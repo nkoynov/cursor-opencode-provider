@@ -28,7 +28,7 @@ import { pump, resetTurnStateForTests } from "../src/language-model.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { encodeFrame } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
-import { toolsToDescriptors } from "../src/protocol/tools.js"
+import { OPENCODE_2_TOOL_DIALECT, toolsToDescriptors } from "../src/protocol/tools.js"
 import { getCheckpoint, resetCheckpointsForTests, setCheckpoint } from "../src/protocol/checkpoint.js"
 import {
   peekConversationId,
@@ -463,6 +463,31 @@ describe("stopping a Run at the first switched step", () => {
     expect(stop.checkpointHoldsTurn).toBe(true)
     expect(stop.unrecordedTools).toEqual([])
     expect(getCheckpoint(peekConversationId(session.openCodeSessionId!))).toEqual(afterStep1)
+  })
+
+  it("closes a tool row open at the stop without counting it as a tool that ran", async () => {
+    const target = path.join(root, "NEW.md")
+    const script = scriptedFrames([
+      thinking("Writing it."),
+      frame({ interaction_update: { partial_tool_call: { call_id: "toolu_w", tool_call: { edit_tool_call: { args: { path: target } } } } } }),
+      kvSet(1, blob(assistantMessage({ fallback: FALLBACK, text: "" }))),
+      turnEnded,
+    ])
+    const session = fakeRun(script.frames)
+    const definitions = [{ name: "write", description: "Write" }, { name: "edit", description: "Edit" }]
+    session.toolCatalog = definitions
+    session.toolDescriptors = toolsToDescriptors(definitions, "opencode", [])
+    session.requestContext = { tools: session.toolDescriptors, env: { workspace_paths: [root] } }
+    session.hostToolDialect = OPENCODE_2_TOOL_DIALECT
+
+    const parts = await pass(session)
+
+    const row = parts.find((p) => p.type === "tool-input-start")
+    expect(row).toMatchObject({ toolName: "write", providerExecuted: true })
+    expect(parts.filter((p) => p.type === "tool-result" && p.isError).map((p) => p.toolCallId)).toEqual([row.id])
+    expect(finishes(parts)).toEqual(["stop"])
+    expect(visibleText(parts)).not.toContain("Already ran")
+    expect(peekModelFallbackStop(session.openCodeSessionId!)!.unrecordedTools).toEqual([])
   })
 
   it("acts on a switch the held-Run watcher read while the host still ran the step's tools", async () => {

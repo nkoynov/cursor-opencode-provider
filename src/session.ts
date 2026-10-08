@@ -13,6 +13,7 @@ import type { HostToolRun, ModelSwitch } from "./model-fallback.js"
 import type { ContextEpoch } from "./context/epoch.js"
 import type { OccupancyUsageLedger } from "./usage.js"
 import type { ToolCallOrder } from "./tool-call-order.js"
+import type { EarlyToolRowState } from "./early-tool-rows.js"
 
 export type Frame = { flags: number; payload: Uint8Array }
 
@@ -135,6 +136,8 @@ export type PendingExec = {
   resultMetadata?: Record<string, unknown>
   /** Cursor's tool_call_id for the exec; its tool_call_completed follows Cursor taking the result. */
   displayCallId?: string
+  /** The host's id for this call when an early tool row gave it one other than `cursor_<session>_<exec>`. */
+  toolCallId?: string
   /**
    * True when this pending entry was synthesized from a Cursor display-only
    * tool_call_* frame (no ExecServerMessage). Continuation must not write an
@@ -303,6 +306,8 @@ export type CursorSession = {
    * lets the pump expose the final mutation to OpenCode as a targeted edit.
    */
   editToolCalls?: Map<string, { path: string; completeRead?: boolean }>
+  /** Host tool rows shown while Cursor's model still writes a call's input (`early-tool-rows.ts`). */
+  earlyToolRows?: EarlyToolRowState
   /**
    * Host note (`<system-update>`, background completion) that no result could
    * carry and no injection into this Run delivered yet. It goes with the next
@@ -1003,7 +1008,7 @@ export class SessionManager {
     if (!source.isToolRunning) return false
     for (const [execId, pending] of session.pending) {
       if (pending.aborted) continue
-      if (source.isToolRunning(`cursor_${session.sessionId}_${execId}`)) return true
+      if (source.isToolRunning(pending.toolCallId ?? `cursor_${session.sessionId}_${execId}`)) return true
     }
     return false
   }

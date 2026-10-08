@@ -6,6 +6,8 @@
 
 - Cursor models see host skills the way Cursor presents them: RequestContext `agent_skills` with each skill's file path and description (no content), so matching skills can be loaded by reading the file when the host advertises `skill` ([#62](https://github.com/oakimov/cursor-opencode-provider/pull/62) by [@nkoynov](https://github.com/nkoynov))
 
+- On OpenCode 2, a running tool row appears as soon as Cursor's model starts writing a file or a subagent prompt, instead of when the whole input is done, which for a large file can be up to a minute later. The row shows `write` for a new or empty file, `edit` for an existing one in the workspace and the subagent card for a subagent; the call then runs under that row. A row opens only when nothing earlier in the step can end the step first, so the second of two parallel edits shows once the first has run, and a row whose call doesn't come (Cursor refused it, sent it as another tool, ended the turn, or the stream was replaced) closes at once as a failed call
+
 ### Changed
 
 - CreatePlan writes plans where OpenCode keeps them: the session's own plan file on OpenCode 1.x (`.opencode/plans/` in a git project, otherwise the data `plans/` folder) and the Plan directory (`~/.opencode/plan`) on OpenCode 2.0, instead of a provider-chosen folder
