@@ -3751,6 +3751,14 @@ export async function pump(
     row.settle ??= "Cursor sent this call as a different request."
     execOwnCallId = callId
   }
+  const abandonUnstartedCalls = (): void => {
+    for (const callId of [...earlyRows.composing.keys()]) {
+      if (order.calls.some((entry) => entry.callId === callId)) continue
+      earlyRows.composing.delete(callId)
+      const row = earlyRows.open.get(callId)
+      if (row) row.settle ??= "Cursor's model moved on without sending this call."
+    }
+  }
   /** The early row of `callId` when the call runs as `toolName`; another tool closes it. */
   const bindEarlyRow = (callId: string | undefined, toolName: string): EarlyToolRow | undefined => {
     const row = callId ? earlyRows.open.get(callId) : undefined
@@ -4568,6 +4576,8 @@ export async function pump(
     if ((iu?.text_delta || iu?.thinking_delta) && toolStep.hostCalls === 0 && !hasDeferredToolExecs(order)) {
       toolStep = { listed: undefined, resolved: new Set(), hostCalls: 0 }
     }
+    // The model writes no text while it writes a call's input: a call announced but never started was dropped.
+    if (iu?.text_delta || iu?.thinking_delta) abandonUnstartedCalls()
     if (iu?.text_delta) {
       const delta = iu.text_delta as Record<string, unknown>
       const text = (delta.text as string) ?? ""

@@ -376,6 +376,23 @@ describe("early tool rows", () => {
     expect(closedRows(parts)[0].result).toContain("ended the turn")
   })
 
+  it("closes the row of a call the model drops for text, and shows its next call", async () => {
+    const script = scriptedFrames()
+    const session = fakeSession(script.frames)
+    script.push(
+      partial("t1", { task_tool_call: {} }),
+      heartbeat(),
+      update({ text_delta: { text: "Let me do this differently." } }),
+      partial("t2", { task_tool_call: {} }),
+      heartbeat(),
+      ...taskDone(1, "t2"),
+    )
+    const parts = await pumpOnce(session)
+    const [dropped, next] = rowStarts(parts)
+    expect(closedRows(parts).map((p) => [p.toolCallId, p.result])).toEqual([[dropped.id, "Cursor's model moved on without sending this call."]])
+    expect(hostCalls(parts)).toMatchObject([{ toolCallId: next.id, toolName: "subagent" }])
+  })
+
   it("closes the row of a call Cursor completes without an exec", async () => {
     const script = scriptedFrames()
     const session = fakeSession(script.frames)
