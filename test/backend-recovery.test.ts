@@ -14,7 +14,7 @@ import {
   CursorTransportError,
   isCapacityFailure,
 } from "../src/errors.js"
-import { semanticDeadlineAt } from "../src/cursor-waits.js"
+import { MAX_TOOL_INPUT_MS, semanticDeadlineAt } from "../src/cursor-waits.js"
 import { sessionFixture } from "./session-fixture.js"
 
 type TimedFrame = { frame: Frame; afterMs?: number }
@@ -138,6 +138,138 @@ describe("Cursor-side waits and the stall watchdog", () => {
     await expect(pump(session, controller(), ids)).rejects.toMatchObject({ code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
     expect(session.cursorWaits?.size ?? 0).toBe(0)
     expect(semanticDeadlineAt(session)).toBe(session.semanticDeadlineAt)
+  })
+})
+
+const partialToolCall = (callId = "toolu_w") => frame({
+  interaction_update: {
+    partial_tool_call: { call_id: callId, tool_call: { edit_tool_call: { args: { path: "/tmp/catalog.md" } } } },
+  },
+})
+const toolStarted = (callId = "toolu_w") => frame({
+  interaction_update: {
+    tool_call_started: { call_id: callId, tool_call: { edit_tool_call: { args: { path: "/tmp/catalog.md" } } } },
+  },
+})
+const thinking = (delta: string) => frame({ interaction_update: { thinking_delta: { text: delta } } })
+
+describe("a tool input Cursor holds until the model has written it", () => {
+  it("keeps the Run through heartbeats past the idle window", async () => {
+    const session = fakeSession("input-written", [
+      { frame: partialToolCall() },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: toolStarted(), afterMs: 40 },
+      { frame: turnEnded() },
+    ])
+    const parts: any[] = []
+    await pump(session, controller(parts), ids)
+    expect(parts.filter((part) => part.type === "finish")).toHaveLength(1)
+    expect(session.composingToolCalls?.size ?? 0).toBe(0)
+  })
+
+  it("keeps holding for a parallel call announced before the previous call's exec", async () => {
+    const session = fakeSession("input-parallel", [
+      { frame: partialToolCall() },
+      { frame: toolStarted() },
+      { frame: partialToolCall("toolu_w2") },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: toolStarted("toolu_w2"), afterMs: 40 },
+      { frame: turnEnded() },
+    ])
+    await pump(session, controller(), ids)
+    expect(session.composingToolCalls?.size ?? 0).toBe(0)
+  })
+
+  it("keeps holding across thinking Cursor delivers before the call starts", async () => {
+    const session = fakeSession("input-thinking", [
+      { frame: partialToolCall() },
+      { frame: thinking("more") },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: toolStarted(), afterMs: 40 },
+      { frame: turnEnded() },
+    ])
+    await pump(session, controller(), ids)
+  })
+
+  it("still times out a silent stream while the input is written", async () => {
+    const session = fakeSession("input-silent", [
+      { frame: partialToolCall() },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: toolStarted(), afterMs: IDLE_MS + 80 },
+    ])
+    await expect(pump(session, controller(), ids)).rejects.toMatchObject({ code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
+  })
+
+  it("returns to the idle window once the call has started", async () => {
+    const session = fakeSession("input-arrived", [
+      { frame: partialToolCall() },
+      { frame: toolStarted() },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: turnEnded(), afterMs: 40 },
+    ])
+    await expect(pump(session, controller(), ids)).rejects.toMatchObject({ code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
+  })
+
+  it("returns to the idle window when the step ends without the call", async () => {
+    const session = fakeSession("input-step-done", [
+      { frame: partialToolCall() },
+      { frame: frame({ interaction_update: { step_completed: { step_id: 1, step_duration_ms: 10 } } }) },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: turnEnded(), afterMs: 40 },
+    ])
+    await expect(pump(session, controller(), ids)).rejects.toMatchObject({ code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
+  })
+
+  it("starts the idle window afresh when the step ends a long hold without the call", async () => {
+    const session = fakeSession("input-long-then-step-done", [
+      { frame: partialToolCall() },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: frame({ interaction_update: { step_completed: { step_id: 1, step_duration_ms: 10 } } }), afterMs: 10 },
+      { frame: turnEnded(), afterMs: 20 },
+    ])
+    const parts: any[] = []
+    await pump(session, controller(parts), ids)
+    expect(parts.filter((part) => part.type === "finish")).toHaveLength(1)
+  })
+
+  it("gives the input at most MAX_TOOL_INPUT_MS from the announcement", () => {
+    const now = Date.now()
+    const session = fakeSession("input-cap", [], {
+      semanticDeadlineAt: now - 1,
+      composingToolCalls: new Map([["toolu_w", now - MAX_TOOL_INPUT_MS + 10]]),
+      lastFrameAt: now,
+    })
+    expect(semanticDeadlineAt(session)).toBe(now + 10)
+    session.composingToolCalls!.set("toolu_w", now - 1_000)
+    expect(semanticDeadlineAt(session)).toBe(now + IDLE_MS)
+  })
+})
+
+describe("a follow-up Run's request through recovery", () => {
+  it("stays the resumed Run's lost-turn request while the resume resends it", async () => {
+    const base = Uint8Array.from([0x0a, 0x01, 0x05])
+    let resumed: CursorSession | undefined
+    await pumpWithRecovery({
+      initialSession: fakeSession("follow-up", [{ frame: text("partial") }, { frame: endStreamError("internal") }], {
+        resumeCheckpoint: base,
+        pendingFollowUp: "the steer",
+        requestBase: base,
+        turnRequests: ["the steer"],
+      }),
+      controller: controller(),
+      retryPolicy: noDelay,
+      recover: async () => (resumed = fakeSession("follow-up-resumed", [{ frame: turnEnded() }])),
+    })
+    expect(Array.from(resumed?.requestBase ?? [])).toEqual(Array.from(base))
+    expect(resumed?.turnRequests).toEqual(["the steer"])
   })
 })
 

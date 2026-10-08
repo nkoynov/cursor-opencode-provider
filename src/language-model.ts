@@ -213,6 +213,7 @@ import {
   toCursorProviderError,
 } from "./errors.js"
 import { recordFinalFailure } from "./host-retry.js"
+import { forgetLostTurn, lostRequestsFor, noteFailedTurn, resetLostTurnsForTests, withLostRequests } from "./lost-turns.js"
 import { readCache, cacheFilePath, resolveVariantParameters, resolveVariantMaxMode, extractCursorVariantParameters, resolveCursorWireModelId, type ModelInfo } from "./models.js"
 import { getFrozenRequestContext, getOrBuildRequestContext, resetFrozenRequestContextsForTests } from "./context/frozen.js"
 import { systemInstructionsRuleText, type SystemInstructions } from "./context/build.js"
@@ -275,7 +276,7 @@ import {
   resolveEarlyToolCallId,
   type EarlyToolRow,
 } from "./early-tool-rows.js"
-import { noteCursorWaitEnded, noteCursorWaitStarted, semanticDeadlineAt } from "./cursor-waits.js"
+import { noteCursorWaitEnded, noteCursorWaitStarted, noteRunFrame, semanticDeadlineAt } from "./cursor-waits.js"
 import {
   deferToolExec,
   deferredToolExecIds,
@@ -1084,7 +1085,10 @@ async function doStreamImpl(
           activeSession.pumpActive = false
           trace(`pull: pump threw (cleaning up): ${(e as Error).message}`)
           // A Run the host stopped is drained and closed by its cancel.
-          if (!activeSession.hostInterrupted) sessionManager.close(activeSession)
+          if (!activeSession.hostInterrupted) {
+            sessionManager.close(activeSession)
+            noteFailedTurn(activeSession)
+          }
           recordFinalFailure(opencodeSessionKey(callOptions), e)
           try {
             controller.error(e instanceof Error ? e : new Error(String(e)))
@@ -1167,6 +1171,10 @@ export async function pumpWithRecovery(input: {
       next.usageEstimate = { ...pumpedSession.usageEstimate }
       next.editToolCalls = new Map(pumpedSession.editToolCalls)
       next.pendingFollowUp = recovery.followUp
+      if (recovery.followUp !== undefined && pumpedSession.turnRequests) {
+        next.requestBase = recovery.checkpoint
+        next.turnRequests = pumpedSession.turnRequests
+      }
       // The resumed Run never saw these; its turn_ended sends them as a follow-up. One delivered
       // after the checkpoint it resumes from is lost with that checkpoint, so it goes too.
       // A host note goes with the resumed Run's next results instead.
@@ -1673,6 +1681,20 @@ async function startSession(
         `conversationId=${bound.conversationId} checkpoint=${conversationState?.length ?? 0}B`,
     )
   }
+  const requestText = userText
+  // A helper on the same session has its own prompt; only the session's own next turn still shows the request.
+  const lostFound = liveTurn && sessionKey && !recovery && !fallbackReply?.override
+    ? lostRequestsFor(sessionKey, conversationId, conversationState)
+    : undefined
+  const lostRequests = lostFound?.length && promptHoldsRequest(prompt, lostFound[0]!) ? lostFound : undefined
+  const turnRequests = lostRequests ? withLostRequests(lostRequests, liveTurn!.text) : undefined
+  if (turnRequests) {
+    userText = turnRequests.join("\n\n") || "."
+    trace(
+      `lost turn: carrying ${lostRequests!.length} request(s) Cursor never checkpointed into this Run ` +
+        `sessionKey=${sessionKey} conversationId=${conversationId}`,
+    )
+  }
   if (lifecycle) userText = textOnlyTurnText(baseSystemPrompt, userText)
   // After an approved SwitchMode, inject the Cursor CLI-shaped mode reminder
   // (same <system_reminder> contract the CLI uses after flipping unifiedMode).
@@ -2089,6 +2111,16 @@ async function startSession(
     closeError: null,
     closed: false,
     requestedModelId: cursorModelId,
+    ...(liveTurn && sessionKey && !recovery && conversationState
+      ? {
+          requestBase: conversationState,
+          turnRequests: turnRequests ?? (
+            !fallbackReply ? [liveTurn.text]
+            : fallbackReply.override && fallbackReply.stop.checkpointHoldsTurn ? []
+            : [requestText]
+          ),
+        }
+      : {}),
     // Every agent Run, including one that rebases a lost Run's tool results.
     ...(sessionKey && allowTools && !isCompaction && !isolateHelper
       ? {
@@ -2100,7 +2132,9 @@ async function startSession(
             toolRuns: [],
             userText: fallbackReply?.override
               ? fallbackReply.stop.userText
-              : (liveTurn?.text ?? (extractUserText(lastUser) || ".")),
+              : turnRequests
+                ? turnRequests.join("\n\n")
+                : (liveTurn?.text ?? (extractUserText(lastUser) || ".")),
             epochAtTurnStart,
           },
         }
@@ -2154,6 +2188,8 @@ async function startSession(
     await waitForStreamWrites(session.stream)
     abortIfNeeded(next)
     sessionManager.replaceStream(session, next, nextRunId)
+    session.requestBase = conversationState
+    session.turnRequests = undefined
     attachSessionHeartbeat(session)
   }
 
@@ -2442,6 +2478,7 @@ onHostInterrupt((openCodeSessionId, reason, at) => {
     if (stop.at < at - HOST_INTERRUPT_MEMORY_MS) hostInterrupts.delete(id)
   }
   hostInterrupts.set(openCodeSessionId, { at, reason })
+  forgetLostTurn(openCodeSessionId)
   for (const session of sessionManager.openSessionsStoppedWith(openCodeSessionId)) {
     if (requestedBefore(session, at)) cancelForHostInterrupt(session, reason)
   }
@@ -4509,6 +4546,7 @@ export async function pump(
     }
     const iu = asm.interaction_update as Record<string, unknown> | undefined
     if (!iu?.heartbeat) order.progressAt = Date.now()
+    noteRunFrame(session, iu)
     // Output after a step's tool calls belongs to the next step.
     if (toolStep.hostCalls > 0 && (iu?.text_delta || iu?.thinking_delta || iu?.turn_ended)) {
       closeHeldToolStep("model output", Promise.resolve(next))
@@ -4712,6 +4750,7 @@ export async function pump(
           cursorUsageCountersFromTurnEnded(turnEnded),
         )
         await session.reopenWithUserMessage(followUp, abortSignal)
+        session.turnRequests = undelivered.map((i) => i.text)
         endingTurns.delete(session)
         markEarlySteersAnswered(session.openCodeSessionId, injectionIds)
         trace("steer: sent undelivered message(s) as a follow-up Run")
@@ -6813,6 +6852,21 @@ function liveUserTurn(
   return { start, text: texts.join("\n\n"), answered }
 }
 
+/**
+ * A user message of the prompt starts the request. Only its first text part is compared: hosts add parts
+ * (claude-compat's `<system-reminder>`) to the newest user message only, so a stored message loses them.
+ */
+function promptHoldsRequest(prompt: LanguageModelV3CallOptions["prompt"], request: string): boolean {
+  return prompt.some((message) => {
+    if (message.role !== "user") return false
+    const first = typeof message.content === "string"
+      ? message.content
+      : (message.content.find((part) => part.type === "text") as { text?: string } | undefined)?.text
+    return !!first && first !== "." && request.startsWith(first)
+      && (request.length === first.length || request[first.length] === "\n")
+  })
+}
+
 /** OpenCode stores an answered early steer after the reply and its empty step adds no assistant message, so it can open the user turn. */
 export function answeredSteersInUserTurn(
   prompt: LanguageModelV3CallOptions["prompt"],
@@ -7282,6 +7336,7 @@ export function resetTurnStateForTests(): void {
   hostInterrupts.clear()
   toolCallsOfStoppedTurns.clear()
   resetModelFallbackStopsForTests()
+  resetLostTurnsForTests()
   resetFrozenRequestContextsForTests()
 }
 
