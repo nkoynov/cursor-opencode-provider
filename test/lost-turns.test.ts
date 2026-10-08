@@ -389,5 +389,7 @@ describe("lost turn records", () => {
     expect(withLostRequests([REQUEST], REQUEST)).toEqual([REQUEST])
     expect(withLostRequests([REQUEST], ".")).toEqual([REQUEST])
     expect(withLostRequests([`${REQUEST}\n\nThese tools already ran.`], REQUEST)).toEqual([`${REQUEST}\n\nThese tools already ran.`])
+    expect(withLostRequests([`${REQUEST}\n<system-reminder>x</system-reminder>`], REQUEST)).toHaveLength(1)
+    expect(withLostRequests([REQUEST], `${REQUEST} and more`)).toEqual([REQUEST, `${REQUEST} and more`])
   })
 })

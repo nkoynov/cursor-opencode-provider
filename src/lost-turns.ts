@@ -61,7 +61,7 @@ export function forgetLostTurn(sessionKey: string): void {
 /** The lost requests, then the live one unless it repeats one of them (a plain retry of the same prompt). */
 export function withLostRequests(requests: readonly string[], live: string): string[] {
   const all = requests.filter((request) => request && request !== ".")
-  const repeats = all.some((request) => request === live || request.startsWith(`${live}\n\n`))
+  const repeats = all.some((request) => request.startsWith(live) && (request.length === live.length || request[live.length] === "\n"))
   if (live && live !== "." && !repeats) all.push(live)
   return all
 }
