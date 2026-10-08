@@ -15,18 +15,18 @@ function sameBytes(a: Uint8Array | undefined, b: Uint8Array | undefined): boolea
 
 /**
  * Cursor stores a turn's first checkpoint only once the turn's first model step ends. A Run that fails
- * before that leaves the conversation on the previous turn's checkpoint, without the request; Cursor CLI
- * then sends the same request again, so the host's retry of this turn has to carry it.
+ * before that leaves the conversation on the checkpoint the request was sent on, without the request;
+ * Cursor CLI then sends the same request again, so the host's retry of this turn has to carry it.
  */
 export function noteFailedTurn(session: CursorSession): void {
   const key = session.openCodeSessionId
-  const guard = session.modelSwitchGuard
-  if (!key || !guard) return
+  if (!key) return
   lostTurns.delete(key)
-  if (!guard.turnBase || !sameBytes(guard.latestCheckpoint, guard.turnBase)) return
-  const requests = guard.requests ?? [guard.userText]
+  const base = session.requestBase
+  const requests = session.turnRequests ?? []
+  if (!base || (session.resumeCheckpoint && !sameBytes(session.resumeCheckpoint, base))) return
   if (requests.every((request) => !request || request === ".")) return
-  lostTurns.set(key, { conversationId: session.conversationId, base: guard.turnBase, requests })
+  lostTurns.set(key, { conversationId: session.conversationId, base, requests })
   for (const oldest of lostTurns.keys()) {
     if (lostTurns.size <= MAX_LOST_TURNS) break
     lostTurns.delete(oldest)
@@ -37,17 +37,20 @@ export function noteFailedTurn(session: CursorSession): void {
   )
 }
 
-/** The requests of the session's failed turn when the next Run starts from the checkpoint that turn started from. */
-export function takeLostRequests(
+/**
+ * The requests of the session's failed turn when the next Run starts from the checkpoint they were sent on.
+ * The record stays until the conversation moves past that checkpoint, so a Run that fails to open loses nothing.
+ */
+export function lostRequestsFor(
   sessionKey: string,
   conversationId: string,
   checkpoint: Uint8Array | undefined,
 ): string[] | undefined {
   const lost = lostTurns.get(sessionKey)
   if (!lost) return undefined
+  if (lost.conversationId === conversationId && sameBytes(lost.base, checkpoint)) return lost.requests
   lostTurns.delete(sessionKey)
-  if (lost.conversationId !== conversationId || !sameBytes(lost.base, checkpoint)) return undefined
-  return lost.requests
+  return undefined
 }
 
 /** The user stopped the session: a request it lost stays dropped. */

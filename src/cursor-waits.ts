@@ -54,10 +54,16 @@ export function noteRunFrame(session: CursorSession, update: Record<string, unkn
       composing.set(callId, now)
       trace(`tool input: Cursor announced call ${callId || "-"} — semantic deadline held while frames arrive, up to ${MAX_TOOL_INPUT_MS}ms`)
     }
-  } else if (update?.tool_call_started || update?.tool_call_completed) {
-    session.composingToolCalls?.delete(callIdOf(update.tool_call_started ?? update.tool_call_completed))
-  } else if (update?.step_completed || update?.turn_ended) {
-    session.composingToolCalls?.clear()
+  } else if (session.composingToolCalls?.size) {
+    if (update?.tool_call_started || update?.tool_call_completed) {
+      session.composingToolCalls.delete(callIdOf(update.tool_call_started ?? update.tool_call_completed))
+    } else if (update?.step_completed || update?.turn_ended) {
+      session.composingToolCalls.clear()
+    }
+    // The idle window runs from the end of the hold, not from the last progress before it.
+    if (session.composingToolCalls.size === 0) {
+      session.semanticDeadlineAt = Math.max(session.semanticDeadlineAt, now + session.policy.semanticIdleMs)
+    }
   }
 }
 

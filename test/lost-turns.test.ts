@@ -7,7 +7,7 @@ import path from "node:path"
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
 import { resetTurnStateForTests } from "../src/language-model.js"
-import { noteFailedTurn, resetLostTurnsForTests, takeLostRequests, withLostRequests } from "../src/lost-turns.js"
+import { lostRequestsFor, noteFailedTurn, resetLostTurnsForTests, withLostRequests } from "../src/lost-turns.js"
 import { sessionManager, type CursorSession } from "../src/session.js"
 import { encodeFrame } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
@@ -23,7 +23,7 @@ type Prompt = LanguageModelV3CallOptions["prompt"]
 type ScriptedFrame = Record<string, unknown> | { endStreamError: string }
 
 /** Cursor's Run endpoint: records each Run request and plays one scripted frame list per Run. */
-function fakeCursorRuns(script: ScriptedFrame[][]): { runs: any[]; restore: () => void } {
+function fakeCursorRuns(script: ScriptedFrame[][], refused = { requests: 0 }): { runs: any[]; restore: () => void } {
   const runs: any[] = []
   const connect = http2.connect
   ;(http2 as any).connect = () => {
@@ -31,6 +31,10 @@ function fakeCursorRuns(script: ScriptedFrame[][]): { runs: any[]; restore: () =
       closed: false,
       destroyed: false,
       request() {
+        if (refused.requests > 0) {
+          refused.requests--
+          throw new Error("connection refused")
+        }
         const stream: any = Object.assign(new EventEmitter(), {
           closed: false,
           destroyed: false,
@@ -236,6 +240,25 @@ describe("a turn whose Run failed before Cursor checkpointed the request", () =>
     }
   })
 
+  it("keeps the request for the next retry when a retry's Run fails to open", async () => {
+    const refused = { requests: 0 }
+    const cursor = fakeCursorRuns([failedFirstStep(), cleanTurn("done")], refused)
+    try {
+      const { sessionKey } = checkpointedSession()
+      const failedTurn = [...history, user(REQUEST), thoughtOnly("Writing the table.")]
+      await step(sessionKey, [...history, user(REQUEST)] as Prompt)
+      refused.requests = 100
+      const unopened = await step(sessionKey, [...failedTurn, user(CONTINUE)] as Prompt)
+      expect(unopened.error).toBeDefined()
+      refused.requests = 0
+      expect(cursor.runs).toHaveLength(1)
+      await step(sessionKey, [...failedTurn, user(CONTINUE), user(CONTINUE)] as Prompt)
+      expect(runText(cursor.runs[1])).toStartWith(`${REQUEST}\n\n${CONTINUE}`)
+    } finally {
+      cursor.restore()
+    }
+  })
+
   it("drops the request when the user stops the session before the retry", async () => {
     const cursor = fakeCursorRuns([failedFirstStep(), cleanTurn("done")])
     try {
@@ -269,27 +292,35 @@ describe("lost turn records", () => {
   const failed = (init: Partial<CursorSession>): CursorSession => ({
     openCodeSessionId: "ses_unit",
     conversationId: "conv-unit",
-    modelSwitchGuard: { turnBase: base, latestCheckpoint: base, stepOpen: false, toolRuns: [], userText: REQUEST },
+    requestBase: base,
+    turnRequests: [REQUEST],
     ...init,
   }) as CursorSession
   afterEach(() => resetLostTurnsForTests())
 
-  it("are taken once, only by a Run on the same conversation and checkpoint", () => {
+  it("are found by a Run on the same conversation and checkpoint until the conversation moves on", () => {
     noteFailedTurn(failed({}))
-    expect(takeLostRequests("ses_unit", "conv-other", base)).toBeUndefined()
-    expect(takeLostRequests("ses_unit", "conv-unit", base)).toBeUndefined()
+    expect(lostRequestsFor("ses_unit", "conv-other", base)).toBeUndefined()
+    expect(lostRequestsFor("ses_unit", "conv-unit", base)).toBeUndefined()
     noteFailedTurn(failed({}))
-    expect(takeLostRequests("ses_unit", "conv-unit", Uint8Array.from([1, 2, 4]))).toBeUndefined()
-    noteFailedTurn(failed({}))
-    expect(takeLostRequests("ses_unit", "conv-unit", Uint8Array.from(base))).toEqual([REQUEST])
-    expect(takeLostRequests("ses_unit", "conv-unit", base)).toBeUndefined()
+    expect(lostRequestsFor("ses_unit", "conv-unit", Uint8Array.from(base))).toEqual([REQUEST])
+    expect(lostRequestsFor("ses_unit", "conv-unit", base)).toEqual([REQUEST])
+    expect(lostRequestsFor("ses_unit", "conv-unit", Uint8Array.from([1, 2, 4]))).toBeUndefined()
+    expect(lostRequestsFor("ses_unit", "conv-unit", base)).toBeUndefined()
   })
 
-  it("are not kept for a turn without a starting checkpoint or with a newer one", () => {
-    noteFailedTurn(failed({ modelSwitchGuard: { latestCheckpoint: undefined, stepOpen: false, toolRuns: [], userText: REQUEST } }))
-    expect(takeLostRequests("ses_unit", "conv-unit", undefined)).toBeUndefined()
-    noteFailedTurn(failed({ modelSwitchGuard: { turnBase: base, latestCheckpoint: Uint8Array.from([9]), stepOpen: false, toolRuns: [], userText: REQUEST } }))
-    expect(takeLostRequests("ses_unit", "conv-unit", base)).toBeUndefined()
+  it("are kept when the Run's latest checkpoint is still the one its request was sent on", () => {
+    noteFailedTurn(failed({ resumeCheckpoint: Uint8Array.from(base), turnRequests: ["a steer follow-up"] }))
+    expect(lostRequestsFor("ses_unit", "conv-unit", base)).toEqual(["a steer follow-up"])
+  })
+
+  it("are not kept without a request, without its checkpoint, or after a newer checkpoint", () => {
+    noteFailedTurn(failed({ turnRequests: undefined }))
+    expect(lostRequestsFor("ses_unit", "conv-unit", base)).toBeUndefined()
+    noteFailedTurn(failed({ requestBase: undefined }))
+    expect(lostRequestsFor("ses_unit", "conv-unit", undefined)).toBeUndefined()
+    noteFailedTurn(failed({ resumeCheckpoint: Uint8Array.from([9]) }))
+    expect(lostRequestsFor("ses_unit", "conv-unit", base)).toBeUndefined()
   })
 
   it("join the live request unless it repeats one of them", () => {

@@ -213,7 +213,7 @@ import {
   toCursorProviderError,
 } from "./errors.js"
 import { recordFinalFailure } from "./host-retry.js"
-import { forgetLostTurn, noteFailedTurn, resetLostTurnsForTests, takeLostRequests, withLostRequests } from "./lost-turns.js"
+import { forgetLostTurn, lostRequestsFor, noteFailedTurn, resetLostTurnsForTests, withLostRequests } from "./lost-turns.js"
 import { readCache, cacheFilePath, resolveVariantParameters, resolveVariantMaxMode, extractCursorVariantParameters, resolveCursorWireModelId, type ModelInfo } from "./models.js"
 import { getFrozenRequestContext, getOrBuildRequestContext, resetFrozenRequestContextsForTests } from "./context/frozen.js"
 import { systemInstructionsRuleText, type SystemInstructions } from "./context/build.js"
@@ -1289,7 +1289,6 @@ function carryModelSwitchState(from: CursorSession, to: CursorSession): void {
   if (!guard || !to.modelSwitchGuard) return
   to.modelSwitchGuard.turnBase = guard.turnBase
   to.modelSwitchGuard.userText = guard.userText
-  to.modelSwitchGuard.requests = guard.requests
   to.modelSwitchGuard.epochAtTurnStart = guard.epochAtTurnStart
   to.modelSwitchGuard.toolRuns = guard.toolRuns.map((run) => ({ ...run, inOpenStep: false }))
 }
@@ -1652,7 +1651,7 @@ async function startSession(
     )
   }
   const lostRequests = liveTurn && sessionKey && !recovery && !fallbackReply
-    ? takeLostRequests(sessionKey, conversationId, conversationState)
+    ? lostRequestsFor(sessionKey, conversationId, conversationState)
     : undefined
   const turnRequests = lostRequests ? withLostRequests(lostRequests, liveTurn!.text) : undefined
   if (turnRequests) {
@@ -2073,6 +2072,9 @@ async function startSession(
     closeError: null,
     closed: false,
     requestedModelId: cursorModelId,
+    ...(liveTurn && sessionKey && !recovery && !fallbackReply && conversationState
+      ? { requestBase: conversationState, turnRequests: turnRequests ?? [liveTurn.text] }
+      : {}),
     // Every agent Run, including one that rebases a lost Run's tool results.
     ...(sessionKey && allowTools && !isCompaction && !isolateHelper
       ? {
@@ -2087,7 +2089,6 @@ async function startSession(
               : turnRequests
                 ? turnRequests.join("\n\n")
                 : (liveTurn?.text ?? (extractUserText(lastUser) || ".")),
-            ...(turnRequests ? { requests: turnRequests } : {}),
             epochAtTurnStart,
           },
         }
@@ -2142,6 +2143,8 @@ async function startSession(
     abortIfNeeded(next)
     sessionManager.replaceStream(session, next)
     session.runId = nextRunId
+    session.requestBase = conversationState
+    session.turnRequests = undefined
     attachSessionHeartbeat(session)
   }
 
@@ -4690,6 +4693,7 @@ export async function pump(
           cursorUsageCountersFromTurnEnded(turnEnded),
         )
         await session.reopenWithUserMessage(followUp, abortSignal)
+        session.turnRequests = undelivered.map((i) => i.text)
         endingTurns.delete(session)
         markEarlySteersAnswered(session.openCodeSessionId, injectionIds)
         trace("steer: sent undelivered message(s) as a follow-up Run")

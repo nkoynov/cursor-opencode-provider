@@ -227,6 +227,19 @@ describe("a tool input Cursor holds until the model has written it", () => {
     await expect(pump(session, controller(), ids)).rejects.toMatchObject({ code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
   })
 
+  it("starts the idle window afresh when the step ends a long hold without the call", async () => {
+    const session = fakeSession("input-long-then-step-done", [
+      { frame: partialToolCall() },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: frame({ interaction_update: { step_completed: { step_id: 1, step_duration_ms: 10 } } }), afterMs: 10 },
+      { frame: turnEnded(), afterMs: 20 },
+    ])
+    const parts: any[] = []
+    await pump(session, controller(parts), ids)
+    expect(parts.filter((part) => part.type === "finish")).toHaveLength(1)
+  })
+
   it("gives the input at most MAX_TOOL_INPUT_MS from the announcement", () => {
     const now = Date.now()
     const session = fakeSession("input-cap", [], {
