@@ -5,6 +5,19 @@ import { APICallError } from "@ai-sdk/provider"
 import type { LanguageModelV3, LanguageModelV3CallOptions, LanguageModelV3StreamResult, LanguageModelV3GenerateResult, LanguageModelV3StreamPart, LanguageModelV3Usage, LanguageModelV3FinishReason } from "@ai-sdk/provider"
 import type { CreateCursorOptions, CursorRetryOptions } from "./index.js"
 import {
+  PARALLEL_STEP_IDLE_MS,
+  createParallelStep,
+  isParallelStepProgressFrame,
+  noteListedCallCount,
+  noteParallelStepProgress,
+  noteToolRequestsListedSeen,
+  parallelStepCountMet,
+  recordParallelStepEmission,
+  resolveParallelStepCall,
+  shouldGuardCloseParallelStep,
+  shouldHoldParallelStep,
+} from "./parallel-step.js"
+import {
   bidiRunStream,
   CursorRunInterruptedError,
   normalizeAgentRunOrigin,
@@ -156,6 +169,7 @@ import {
 import { initializeConversationPersistence } from "./protocol/conversation-persistence.js"
 import {
   resolveContinuationPolicy,
+  readSessionFrame,
   sessionManager,
   type CursorSession,
   type Frame,
@@ -1885,31 +1899,6 @@ async function waitUntilNotPumping(
   return !sessionManager.isActivelyPumping(session)
 }
 
-function nextFrameWithTimeout(
-  frames: AsyncIterator<Frame>,
-  timeoutMs: number,
-): Promise<IteratorResult<Frame> | { done: true; timedOut: true }> {
-  return new Promise((resolve, reject) => {
-    let settled = false
-    const finish = (
-      value?: IteratorResult<Frame> | { done: true; timedOut: true },
-      error?: unknown,
-    ) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      if (error !== undefined) reject(error)
-      else resolve(value!)
-    }
-    const timer = setTimeout(() => finish({ done: true, timedOut: true }), timeoutMs)
-    timer.unref?.()
-    void frames.next().then(
-      value => finish(value),
-      error => finish(undefined, error),
-    )
-  })
-}
-
 /**
  * Read remaining frames on an idle held-open Run until `turn_ended`, a
  * response-requiring request we cannot answer without the host, or timeout.
@@ -1937,7 +1926,7 @@ export async function drainSessionUntilTurnEnded(
       const remainingMs = Math.max(1, deadlineAt - Date.now())
       let next: IteratorResult<Frame> | { done: true; timedOut: true }
       try {
-        next = await nextFrameWithTimeout(session.frames, remainingMs)
+        next = await readSessionFrame(session, remainingMs)
       } catch (error) {
         trace(
           `fresh turn drain: frame wait failed sessionId=${session.sessionId} ` +
@@ -2665,7 +2654,7 @@ async function nextFrameWithSemanticDeadline(
     )
   }
   try {
-    return await Promise.race([session.frames.next(), deadline])
+    return await Promise.race([readSessionFrame(session), deadline])
   } finally {
     if (timer) clearTimeout(timer)
     session.semanticDeadlineCancel = null
@@ -2674,10 +2663,14 @@ async function nextFrameWithSemanticDeadline(
 
 /**
  * Read the held-open stream, emitting stream parts, until the turn boundary:
- *  - a tool call (exec_server_message) → emit tool-call, finish "tool-calls",
- *    and KEEP the session open for the result on the next doStream call;
+ *  - tool call(s) for one Cursor generation → emit each tool-call as it
+ *    arrives; finish "tool-calls" once Cursor's listed count (field 27) is
+ *    met (or immediately when the process has never seen field 27); KEEP the
+ *    session open for results on the next doStream call;
  *  - turn_ended → finish "stop" and close the session;
- *  - transport EOF before turn_ended → throw for one fresh-Run recovery.
+ *  - transport EOF before turn_ended → throw for one fresh-Run recovery
+ *    (after host tools were already emitted, finish "tool-calls" instead and
+ *    let the continuation rebase).
  */
 export async function pump(
   session: CursorSession,
@@ -2830,6 +2823,102 @@ export async function pump(
     )
     if (ok) trace(`exec: REFUSED ${label} toolName=${parsed.toolName} id=${parsed.id} reason=${JSON.stringify(reason)}`)
     return ok
+  }
+
+  const ensureParallelStep = () => {
+    if (!session.parallelStep) session.parallelStep = createParallelStep()
+    return session.parallelStep
+  }
+
+  const clearParallelStep = () => {
+    const step = session.parallelStep
+    if (step) {
+      const prior = session.priorParallelStepCallIds ??= new Set<string>()
+      for (const callId of step.callIds) prior.add(callId)
+      session.parallelStep = undefined
+    }
+  }
+
+  /** Record a final disposition for a Cursor call id (emit, refuse, or internal). */
+  const disposeParallelCall = (callId: string | undefined) => {
+    if (!callId) return
+    if (session.priorParallelStepCallIds?.has(callId)) return
+    resolveParallelStepCall(
+      ensureParallelStep(),
+      callId,
+      session.priorParallelStepCallIds,
+    )
+  }
+
+  /**
+   * After a refuse / server-side completion: finish the AI SDK step if host
+   * tools were already emitted and the listed count is now met.
+   */
+  const closeIfParallelStepComplete = (): boolean => {
+    const step = session.parallelStep
+    if (!step || !parallelStepCountMet(step)) return false
+    if (step.emitted === 0) {
+      clearParallelStep()
+      return false
+    }
+    clearParallelStep()
+    emitFinish(undefined, { unified: "tool-calls", raw: undefined })
+    return true
+  }
+
+  /**
+   * After emitting a host tool-call: finish the AI SDK step, or keep pumping
+   * for more calls of this generation. Returns true when the caller must return
+   * from pump.
+   */
+  const finishStepOrContinue = (options?: {
+    callId?: string
+    humanGated?: boolean
+  }): boolean => {
+    const step = ensureParallelStep()
+    if (options?.callId) {
+      resolveParallelStepCall(step, options.callId, session.priorParallelStepCallIds)
+    }
+    recordParallelStepEmission(step)
+    if (shouldHoldParallelStep(step, { humanGatedWithoutCount: options?.humanGated })) {
+      trace(
+        `parallel-step: hold listed=${step.listedCount ?? "?"} ` +
+          `resolved=${step.resolved.size} emitted=${step.emitted}`,
+      )
+      return false
+    }
+    clearParallelStep()
+    emitFinish(undefined, { unified: "tool-calls", raw: undefined })
+    return true
+  }
+
+  /** Close a held step via the liveness guard (count unmet, no progress). */
+  const guardCloseParallelStep = (): boolean => {
+    const step = session.parallelStep
+    if (!step || step.emitted === 0) {
+      clearParallelStep()
+      return false
+    }
+    trace(
+      `parallel-step: guard-close listed=${step.listedCount ?? "?"} ` +
+        `resolved=${step.resolved.size} emitted=${step.emitted}`,
+    )
+    clearParallelStep()
+    emitFinish(undefined, { unified: "tool-calls", raw: undefined })
+    return true
+  }
+
+  /** Never reopen/replay a model attempt after emitting host side effects. */
+  const finishInterruptedTools = (
+    reason: "remote-error" | "remote-clean-close",
+    error?: CursorProviderError,
+  ): boolean => {
+    if (emittedHostTools === 0) return false
+    if (error) session.closeError = error
+    session.deferredTerminalReason = reason
+    clearParallelStep()
+    emitFinish(undefined, { unified: "tool-calls", raw: undefined })
+    return true
   }
 
   /**
@@ -3210,6 +3299,7 @@ export async function pump(
     // keeping the loop alive would discard frames the next pump needs.
     if (streamClosed) {
       trace(`pump: stream closed (consumer cancelled) pending=${session.pending.size}`)
+      clearParallelStep()
       sessionManager.closeUnlessPending(session)
       return
     }
@@ -3217,28 +3307,48 @@ export async function pump(
       // Stop feeding this ReadableStream, but keep the Run session if we still
       // owe Cursor an exec result (OpenCode aborts between tool-call turns).
       trace(`pump: abortSignal aborted pending=${session.pending.size}`)
+      clearParallelStep()
       sessionManager.closeUnlessPending(session)
       return
     }
 
     let next: IteratorResult<Frame>
     try {
-      next = session.pending.size === 0
-        ? await nextFrameWithSemanticDeadline(session)
-        : await session.frames.next()
+      if (session.parallelStep && shouldHoldParallelStep(session.parallelStep)) {
+        const step = session.parallelStep
+        const remainingMs = Math.max(1, PARALLEL_STEP_IDLE_MS - (Date.now() - step.lastProgressAt))
+        if (shouldGuardCloseParallelStep(step)) {
+          if (guardCloseParallelStep()) return
+          continue
+        }
+        const result = await readSessionFrame(session, remainingMs)
+        if ("timedOut" in result) {
+          if (guardCloseParallelStep()) return
+          continue
+        }
+        next = result
+      } else {
+        next = session.pending.size === 0
+          ? await nextFrameWithSemanticDeadline(session)
+          : await readSessionFrame(session)
+      }
     } catch (error) {
       closeOpenSpans()
+      // Host tools already emitted for this step: finishing with tool-calls lets
+      // the continuation rebase instead of replaying side effects.
       const failure = error instanceof CursorProviderError
         ? error
         : new CursorRunInterruptedError(
             `Cursor Run frame stream interrupted: ${(error as Error).message}`,
             { cause: error },
           )
+      if (finishInterruptedTools("remote-error", failure)) return
       throw finalizeFailure(failure)
     }
     if (next.done) {
       closeOpenSpans()
       trace("pump: frames iterator ended before turn_ended")
+      if (finishInterruptedTools("remote-clean-close")) return
       const failure = new CursorRunInterruptedError()
       throw finalizeFailure(failure)
     }
@@ -3260,6 +3370,7 @@ export async function pump(
       const failure = payload
         ? connectFrameError(payload)
         : new CursorRunInterruptedError()
+      if (finishInterruptedTools("remote-error", failure)) return
       if (planHandoffCancellationRequested && failure.origin === "server" && failure.code === "canceled"
         && session.pending.size === 0 && isHostPlanEntryPending(session.openCodeSessionId)) {
         // Cancellation is an explicit terminal acknowledgment, not TurnEnded.
@@ -3355,6 +3466,24 @@ export async function pump(
       textBreakPending = true
     }
 
+    if (
+      session.parallelStep
+      && isParallelStepProgressFrame({
+        toolRequestsListed: !!iu?.tool_requests_listed,
+        partialToolCall: !!iu?.partial_tool_call,
+        toolCallDelta: !!iu?.tool_call_delta,
+        toolCallStarted: !!iu?.tool_call_started,
+        // Completions reset progress only when they resolve a new call below.
+        // Setup probes are control traffic, like heartbeat/KV.
+        exec: !!esm && !esm.request_context_args && !esm.mcp_state_exec_args,
+        interactionQuery: !!interactionQuery,
+        textDelta: !!iu?.text_delta,
+        thinkingDelta: !!iu?.thinking_delta,
+      })
+    ) {
+      noteParallelStepProgress(session.parallelStep)
+    }
+
     try {
     // CLI: conversationCheckpointUpdate → replace agentStore conversation state.
     // Store opaque bytes keyed by conversation_id; next Run echoes them.
@@ -3386,6 +3515,15 @@ export async function pump(
     } else if (iu?.thinking_delta) {
       emitReasoning(((iu.thinking_delta as Record<string, unknown>).text as string) ?? "")
     } else if (iu?.turn_ended) {
+      if (emittedHostTools > 0) {
+        // Cursor ended before receiving the emitted calls' results. Let the
+        // host complete the step and process this terminal update next pass.
+        trace(`parallel-step: turn_ended with pending=${session.pending.size}; deferring terminal frame`)
+        session.pushbackFrame = frame
+        clearParallelStep()
+        emitFinish(undefined, { unified: "tool-calls", raw: undefined })
+        return
+      }
       trace(`turn_ended raw wire fields: ${debugWalkTurnEnded(payload)}`)
       const turnEnded = iu.turn_ended as Record<string, unknown>
       await persistTerminalCheckpoint()
@@ -3467,9 +3605,14 @@ export async function pump(
       }
       if (callId) session.editToolCalls?.delete(callId)
       // If exec already claimed this call_id, display map entry is gone — skip.
-      if (!callId || !session.displayToolCalls.has(callId)) {
+      if (callId && session.priorParallelStepCallIds?.has(callId)) {
+        session.displayToolCalls.delete(callId)
+        trace(`display tool_call_completed: ignore prior step callId=${callId}`)
+      } else if (!callId || !session.displayToolCalls.has(callId)) {
         if (callId) {
           trace(`display tool_call_completed: ignore (exec-handled or unknown) callId=${callId}`)
+          disposeParallelCall(callId)
+          if (closeIfParallelStepComplete()) return
         }
       } else {
         const stored = session.displayToolCalls.get(callId)!
@@ -3478,6 +3621,8 @@ export async function pump(
           (completed.tool_call as Record<string, unknown> | undefined) ?? stored
         if (!session.allowTools) {
           trace(`display tool_call_completed: SKIPPED (allowTools=false) callId=${callId}`)
+          disposeParallelCall(callId)
+          if (closeIfParallelStepComplete()) return
         } else {
           const display = parseDisplayToolCall(callId, toolCall, session.mirroredTodos)
           const advertised = advertisedToolNamesFromDescriptors(session.toolDescriptors)
@@ -3554,10 +3699,28 @@ export async function pump(
               toolName: bridged.toolName,
               input,
             } as V3Part)
-            emitFinish(undefined, { unified: "tool-calls", raw: undefined })
-            return
+            if (finishStepOrContinue({ callId })) return
+            continue
           }
+          // Server-side completion with no host bridge: counts toward the listed total.
+          disposeParallelCall(callId)
+          if (closeIfParallelStepComplete()) return
         }
+      }
+    } else if (iu?.tool_requests_listed) {
+      // Cursor listed how many tool calls this generation will send. OpenCode's
+      // step boundary waits for that many dispositions before finish tool-calls.
+      const listed = iu.tool_requests_listed as Record<string, unknown>
+      const callCount = typeof listed.call_count === "number"
+        ? listed.call_count
+        : typeof listed.call_count === "string"
+          ? Number(listed.call_count)
+          : undefined
+      noteToolRequestsListedSeen()
+      if (callCount !== undefined && Number.isFinite(callCount)) {
+        noteListedCallCount(ensureParallelStep(), callCount)
+        trace(`tool_requests_listed call_count=${callCount}`)
+        if (closeIfParallelStepComplete()) return
       }
     } else if (iu?.step_started) {
       cacheDiagnostics.stepStarts++
@@ -3728,6 +3891,8 @@ export async function pump(
         if (parsed) {
           if (parsed.localError) {
             if (!await rejectExec(parsed, parsed.localError, "invalid mapping")) return
+            disposeParallelCall(displayCallId)
+            if (closeIfParallelStepComplete()) return
             continue
           }
           // OpenCode throws "Tool call not allowed while generating summary"
@@ -3744,6 +3909,8 @@ export async function pump(
               trace(`exec: dropped ${toollessText.length} chars of tool-less narration before refused id=${parsed.id}`)
               toollessText = ""
             }
+            disposeParallelCall(displayCallId)
+            if (closeIfParallelStepComplete()) return
             continue
           }
           // Cursor writes a generated image with an ordinary write exec whose
@@ -3758,6 +3925,8 @@ export async function pump(
                 "This OpenCode agent cannot write binary file content. "
                 + "Do not retry this write with the same bytes."
               if (!await rejectExec(parsed, reason, "binary write unsupported")) return
+              disposeParallelCall(displayCallId)
+              if (closeIfParallelStepComplete()) return
               continue
             }
             const permittedForImage = session.permittedToolNames
@@ -3770,6 +3939,8 @@ export async function pump(
                 "This OpenCode agent cannot write binary file content on this turn. "
                 + "Do not retry this write with the same bytes."
               if (!await rejectExec(parsed, reason, "binary write not permitted")) return
+              disposeParallelCall(displayCallId)
+              if (closeIfParallelStepComplete()) return
               continue
             }
             const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
@@ -3789,6 +3960,8 @@ export async function pump(
               })
             } catch (error) {
               if (!await rejectExec(parsed, (error as Error).message, "binary write too large")) return
+              disposeParallelCall(displayCallId)
+              if (closeIfParallelStepComplete()) return
               continue
             }
             if (displayCallId) session.displayToolCalls.delete(displayCallId)
@@ -3819,8 +3992,8 @@ export async function pump(
               toolName: CURSOR_IMAGE_SAVE_TOOL,
               input: JSON.stringify({ image_id: imageId }),
             } as V3Part)
-            emitFinish(undefined, { unified: "tool-calls", raw: undefined })
-            return
+            if (finishStepOrContinue({ callId: displayCallId ?? toolCallId })) return
+            continue
           }
           // Cursor has native capabilities (Task, filesystem, shell, etc.) in
           // addition to the MCP descriptors sent by this provider. The model
@@ -3841,6 +4014,8 @@ export async function pump(
                 `advertised=[${advertisedToolNames.join(",")}]`,
             )
             if (!await rejectExec(parsed, reason, "unavailable tool")) return
+            disposeParallelCall(displayCallId)
+            if (closeIfParallelStepComplete()) return
             continue
           }
           // Epoch advertisement may keep tools the host filtered this turn
@@ -3861,11 +4036,15 @@ export async function pump(
                 `permitted=[${[...permittedToolNames].sort().join(",")}]`,
             )
             if (!await rejectExec(parsed, reason, "not permitted this turn")) return
+            disposeParallelCall(displayCallId)
+            if (closeIfParallelStepComplete()) return
             continue
           }
           if (recoverCorrelatedEditRead(parsed, displayCallId)) continue
           if (rejectMissingReadTarget(parsed)) {
             if (displayCallId) session.displayToolCalls.delete(displayCallId)
+            disposeParallelCall(displayCallId)
+            if (closeIfParallelStepComplete()) return
             continue
           }
           const currentTool = session.toolCatalog?.find((tool) => tool.name === parsed.toolName)
@@ -3875,6 +4054,8 @@ export async function pump(
               + "or use this tool's own input schema; do not retry the misplaced command."
             if (!await rejectExec(parsed, reason, "misplaced shell command")) return
             if (displayCallId) session.displayToolCalls.delete(displayCallId)
+            disposeParallelCall(displayCallId)
+            if (closeIfParallelStepComplete()) return
             continue
           }
           const missingArguments = missingRequiredToolArguments(currentTool, parsed.args)
@@ -3884,6 +4065,8 @@ export async function pump(
               + "arguments before retrying. Do not retry the same incomplete arguments or invent required values."
             if (!await rejectExec(parsed, reason, "missing required arguments")) return
             if (displayCallId) session.displayToolCalls.delete(displayCallId)
+            disposeParallelCall(displayCallId)
+            if (closeIfParallelStepComplete()) return
             continue
           }
           if (displayCallId) {
@@ -3928,8 +4111,8 @@ export async function pump(
             toolName: tc.toolName,
             input: tc.input,
           } as V3Part)
-          emitFinish(undefined, { unified: "tool-calls", raw: undefined })
-          return
+          if (finishStepOrContinue({ callId: displayCallId ?? tc.toolCallId })) return
+          continue
         }
         // Known Cursor-native exec variants with no safe OpenCode bridge are
         // soft-denied with a populated typed result or throw, so the turn
@@ -3958,6 +4141,8 @@ export async function pump(
             failRunProtocol("Cursor unsupported exec deny reply failed", RUN_REPLY_FAILED)
           }
           trace(`exec: SOFT-DENIED ${variant.requestName} id=${esmId}`)
+          disposeParallelCall(displayCallId)
+          if (closeIfParallelStepComplete()) return
           continue
         }
         // Never guess a response type for an unknown exec variant. Request and
@@ -4085,8 +4270,11 @@ export async function pump(
           toolName: "question",
           input,
         } as V3Part)
-        emitFinish(undefined, { unified: "tool-calls", raw: undefined })
-        return
+        if (finishStepOrContinue({
+          callId: ask.toolCallId || toolCallId,
+          humanGated: true,
+        })) return
+        continue
       }
       if (handled.outcome === "approved" && handled.switchMode) {
         // Approved without a host tool (entering plan without one, the mode
@@ -4125,6 +4313,8 @@ export async function pump(
           planHandoffCancellationRequested = true
           trace("host-agent-mode: cancelling Run for plan handoff")
         }
+        disposeParallelCall(handled.toolCallId)
+        if (closeIfParallelStepComplete()) return
         continue
       }
       if (handled.outcome === "bridged" && handled.switchMode) {
@@ -4166,8 +4356,11 @@ export async function pump(
           toolName,
           input,
         } as V3Part)
-        emitFinish(undefined, { unified: "tool-calls", raw: undefined })
-        return
+        if (finishStepOrContinue({
+          callId: sw.toolCallId || toolCallId,
+          humanGated: true,
+        })) return
+        continue
       }
       if (handled.outcome === "bridged" && handled.createPlan) {
         // A host plan-stage tool, the host plan_exit review of the plan the
@@ -4213,8 +4406,15 @@ export async function pump(
           toolName: plan.toolName,
           input: JSON.stringify(input),
         } as V3Part)
-        emitFinish(undefined, { unified: "tool-calls", raw: undefined })
-        return
+        if (finishStepOrContinue({
+          callId: plan.toolCallId || stageToolCallId,
+          humanGated: true,
+        })) return
+        continue
+      }
+      if (!handled.generateImage) {
+        disposeParallelCall(handled.toolCallId)
+        if (closeIfParallelStepComplete()) return
       }
     } else if (kv) {
       // KV blob channel: ack set_blob / answer get_blob, then keep pumping.
@@ -4252,7 +4452,10 @@ export async function pump(
       }
     }
     } catch (e) {
-      if (e instanceof CursorProviderError) throw e
+      if (e instanceof CursorProviderError) {
+        if (finishInterruptedTools("remote-error", e)) return
+        throw e
+      }
       if (requiredChannel) {
         failRunProtocol(`Cursor ${requiredChannel} request could not be handled`, RUN_REQUEST_UNSUPPORTED)
       }

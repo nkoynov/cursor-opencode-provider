@@ -442,6 +442,14 @@ export function createMessageTypes(): protobuf.Root {
     { id: 4, name: "model_call_id", type: "string" },
   ])
 
+  // agent.v1 ToolCallDeltaUpdate: keep the nested delta opaque; the pump
+  // needs its presence as generation progress, not its display-only content.
+  addType(root, "ToolCallDeltaUpdate", [
+    { id: 1, name: "call_id", type: "string" },
+    { id: 2, name: "tool_call_delta", type: "bytes" },
+    { id: 3, name: "model_call_id", type: "string" },
+  ])
+
   // agent.v1 StepStartedUpdate / StepCompletedUpdate: step_id is uint64 (T:4),
   // not string — wrong type made every step_completed frame throw
   // "index out of range" in decodeMessage.
@@ -452,6 +460,13 @@ export function createMessageTypes(): protobuf.Root {
   addType(root, "StepCompleted", [
     { id: 1, name: "step_id", type: "uint64" },
     { id: 2, name: "step_duration_ms", type: "int64" },
+  ])
+
+  // agent.v1 ToolRequestsListedUpdate — Cursor lists how many tool calls this
+  // generation will send so the client can place its step boundary (CLI does
+  // not need this; OpenCode's AI SDK step does). Field 27 on InteractionUpdate.
+  addType(root, "ToolRequestsListedUpdate", [
+    { id: 1, name: "call_count", type: "uint32" },
   ])
 
   // InteractionUpdate — the core streaming update message
@@ -466,10 +481,12 @@ export function createMessageTypes(): protobuf.Root {
       { id: 7, name: "partial_tool_call", type: "PartialToolCall" },
       { id: 13, name: "heartbeat", type: "Heartbeat" },
       { id: 14, name: "turn_ended", type: "TurnEnded" },
+      { id: 15, name: "tool_call_delta", type: "ToolCallDeltaUpdate" },
       { id: 16, name: "step_started", type: "StepStarted" },
       { id: 17, name: "step_completed", type: "StepCompleted" },
+      { id: 27, name: "tool_requests_listed", type: "ToolRequestsListedUpdate" },
     ],
-    [{ name: "update", fields: ["text_delta", "tool_call_started", "tool_call_completed", "thinking_delta", "partial_tool_call", "heartbeat", "turn_ended", "step_started", "step_completed"] }],
+    [{ name: "update", fields: ["text_delta", "tool_call_started", "tool_call_completed", "thinking_delta", "partial_tool_call", "heartbeat", "turn_ended", "tool_call_delta", "step_started", "step_completed", "tool_requests_listed"] }],
   )
 
   // ── Exec channel ──
