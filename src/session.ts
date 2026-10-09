@@ -1,6 +1,7 @@
 import type { BidiStream, BidiTerminalEvent } from "./transport/connect.js"
 import { trace } from "./debug.js"
 import { CursorProtocolError, type CursorProviderError } from "./errors.js"
+import { StreamWriteDrainError, writeStreamMessage } from "./stream-write.js"
 import { sessionActivity, type SessionActivitySource } from "./activity.js"
 import type {
   HostSubagentCatalog,
@@ -14,6 +15,7 @@ import type { ContextEpoch } from "./context/epoch.js"
 import type { OccupancyUsageLedger } from "./usage.js"
 import type { ToolCallOrder } from "./tool-call-order.js"
 import type { EarlyToolRowState } from "./early-tool-rows.js"
+import type { HostNoteBatch } from "./protocol/host-notes.js"
 
 export type Frame = { flags: number; payload: Uint8Array }
 
@@ -78,10 +80,12 @@ export function resolveContinuationPolicy(
       throw new CursorProtocolError(`Unknown Cursor continuation option: ${key}`)
     }
   }
+  // Read the deprecated alias once, without the deprecated typed accessor.
+  const legacySemanticIdleMs = (options as { softHealthMs?: unknown } | undefined)?.softHealthMs
   if (
     options?.semanticIdleMs !== undefined &&
-    options.softHealthMs !== undefined &&
-    options.semanticIdleMs !== options.softHealthMs
+    legacySemanticIdleMs !== undefined &&
+    options.semanticIdleMs !== legacySemanticIdleMs
   ) {
     throw new CursorProtocolError(
       "Cursor continuation semanticIdleMs and deprecated softHealthMs must match when both are set",
@@ -94,7 +98,7 @@ export function resolveContinuationPolicy(
   )
   const semanticIdleMs = positiveInteger(
     "semanticIdleMs",
-    options?.semanticIdleMs ?? options?.softHealthMs,
+    options?.semanticIdleMs ?? legacySemanticIdleMs,
     DEFAULT_CONTINUATION_POLICY.semanticIdleMs,
   )
   const hardCapMs = positiveInteger(
@@ -186,9 +190,9 @@ export type ContinuationClassification =
 
 export type DeliveryOutcome =
   | { kind: "delivered"; framesWritten: number }
-  | { kind: "duplicate"; reason: "in-flight" | "delivered"; framesWritten: 0 }
+  | { kind: "duplicate"; reason: "in-flight" | "delivered"; framesWritten: number }
   | { kind: "terminal"; reason: ContinuationTerminalReason; framesWritten: number }
-  | { kind: "missing"; reason: "missing-process-local-state"; framesWritten: 0 }
+  | { kind: "missing"; reason: "missing-process-local-state"; framesWritten: number }
 
 export type CursorSession = {
   /**
@@ -197,6 +201,8 @@ export type CursorSession = {
    * (Cursor resets them per stream) can't cross-deliver results.
    */
   sessionId: string
+  /** Host notes consumed by this Run's initial user action, retained for a rebase. */
+  userTurnHostNotes?: HostNoteBatch[]
   /**
    * Cursor conversation_id for this Run — used to store/echo
    * conversation_checkpoint_update (CLI parity).
@@ -241,6 +247,8 @@ export type CursorSession = {
     modelId?: string
     priorTokenDetails?: CursorConversationTokenDetails
     startedWithCheckpoint: boolean
+    /** Why a Run started without a checkpoint: a reset reason, `ephemeral`, or `no-checkpoint`. */
+    coldReason?: string
     requestContextReused: boolean
     requestContextHash: string
     systemPromptHash?: string
@@ -316,13 +324,6 @@ export type CursorSession = {
   editToolCalls?: Map<string, { path: string; completeRead?: boolean }>
   /** Host tool rows shown while Cursor's model still writes a call's input (`early-tool-rows.ts`). */
   earlyToolRows?: EarlyToolRowState
-  /**
-   * Host note (`<system-update>`, background completion) that no result could
-   * carry and no injection into this Run delivered yet. It goes with the next
-   * results this Run gets, or with the session's next user turn when the turn
-   * ends first.
-   */
-  deferredNote?: string
   /** AgentRunRequest.run_id of the Run on `stream`; Cursor checks injections against it. */
   runId?: string
   /** Mid-turn user messages and host notes injected into this Run, in send order. */
@@ -447,8 +448,6 @@ export type SteerInjection = {
   state: "sent" | "carried" | "queued" | "delivered" | "queued_for_next_turn" | "cancelled" | "rejected"
   /** A checkpoint arrived after Cursor answered this injection, so it holds the message and the step. */
   checkpointed?: boolean
-  /** A host note rather than a user message: one Cursor does not deliver waits for the next user turn, never a follow-up Run. */
-  hostNote?: true
 }
 
 type Tombstone = {
@@ -471,6 +470,8 @@ export function stoppedWith(session: CursorSession): string | undefined {
 }
 
 export class SessionManager {
+  /** A claimed result has one writer even while that writer awaits drain. */
+  private readonly delivering = new WeakSet<PendingExec>()
   // Composite key `${sessionId}:${execId}` → owning session. Composite keying
   // means two Run streams that both register an execId of 1 (Cursor resets
   // counters per stream) coexist instead of overwriting each other.
@@ -774,20 +775,22 @@ export class SessionManager {
     }
   }
 
-  deliverClaim(claim: ContinuationClaim, frames: readonly Uint8Array[]): DeliveryOutcome {
+  async deliverClaim(claim: ContinuationClaim, frames: readonly Uint8Array[]): Promise<DeliveryOutcome> {
     const { session, execId, pending } = claim
     const key = this.key(session.sessionId, execId)
-    if (
-      session.closed ||
-      this.byExecId.get(key) !== session ||
-      session.pending.get(execId) !== pending
-    ) {
+    const unavailable = (framesWritten: number): DeliveryOutcome | undefined => {
+      if (
+        !session.closed &&
+        this.byExecId.get(key) === session &&
+        session.pending.get(execId) === pending
+      ) return undefined
       const current = this.classify(session.sessionId, execId)
-      if (current.kind === "duplicate") return { ...current, framesWritten: 0 }
-      if (current.kind === "terminal") return { ...current, framesWritten: 0 }
-      return { kind: "missing", reason: "missing-process-local-state", framesWritten: 0 }
+      if (current.kind === "duplicate" || current.kind === "terminal") return { ...current, framesWritten }
+      return { kind: "missing", reason: "missing-process-local-state", framesWritten }
     }
-    if (pending.state !== "claimed") {
+    const invalid = unavailable(0)
+    if (invalid) return invalid
+    if (pending.state !== "claimed" || this.delivering.has(pending)) {
       return {
         kind: "duplicate",
         reason: pending.state === "delivered" ? "delivered" : "in-flight",
@@ -798,6 +801,7 @@ export class SessionManager {
       this.close(session, "hard-cap-expired")
       return { kind: "terminal", reason: "hard-cap-expired", framesWritten: 0 }
     }
+    this.delivering.add(pending)
 
     let framesWritten = 0
     try {
@@ -805,10 +809,22 @@ export class SessionManager {
         throw new CursorProtocolError("No result frames were produced")
       }
       for (const frame of frames) {
-        session.stream.write(frame)
+        try {
+          await writeStreamMessage(session.stream, frame, "continuation result")
+        } catch (error) {
+          // write() returned false before the drain failed: the bytes are buffered.
+          if (error instanceof StreamWriteDrainError) framesWritten++
+          throw error
+        }
         framesWritten++
+        // The Run can close or replace this pending exec while drain is awaited.
+        // Never send its remaining frames or apply approval/state to that owner.
+        const invalid = unavailable(framesWritten)
+        if (invalid) return invalid
       }
     } catch {
+      const invalid = unavailable(framesWritten)
+      if (invalid) return invalid
       const reason: ContinuationTerminalReason =
         framesWritten === 0 ? "result-write-failed" : "ambiguous-partial-write"
       this.close(session, reason)

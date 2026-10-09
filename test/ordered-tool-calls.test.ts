@@ -105,7 +105,7 @@ const calls = (parts: any[]) => parts.filter((p) => p.type === "tool-call").map(
 const finishes = (parts: any[]) => parts.filter((p) => p.type === "finish").map((p) => p.finishReason.unified)
 
 /** OpenCode ran the step's calls: hand every pending result back, as the next doStream does. */
-function deliverAll(session: CursorSession) {
+async function deliverAll(session: CursorSession) {
   const results = [...session.pending.entries()].map(([execId, pending]) => ({
     toolCallId: `cursor_${session.sessionId}_${execId}`,
     sessionId: session.sessionId,
@@ -113,7 +113,7 @@ function deliverAll(session: CursorSession) {
     toolName: pending.toolName ?? "bash",
     output: "ok",
   }))
-  expect(deliverContinuationResults(session, results)).toBe(session)
+  expect(await deliverContinuationResults(session, results)).toBe(session)
 }
 
 describe("ordered tool calls", () => {
@@ -141,7 +141,7 @@ describe("ordered tool calls", () => {
     expect(calls(first)).toEqual(["write#3"])
     expect(finishes(first)).toEqual(["tool-calls"])
 
-    deliverAll(session)
+    await deliverAll(session)
     const second = await pumpOnce(session)
     expect(calls(second)).toEqual(["bash#2"])
     expect(finishes(second)).toEqual(["tool-calls"])
@@ -165,14 +165,14 @@ describe("ordered tool calls", () => {
     const first = await pumpOnce(session)
     expect(calls(first)).toEqual(["read#1"])
 
-    deliverAll(session)
+    await deliverAll(session)
     const pumping = pumpOnce(session)
     await new Promise((resolve) => setTimeout(resolve, 50))
     script.push(editWrite(3, "edit", target))
     const second = await pumping
     expect(calls(second)).toEqual(["edit#3"])
 
-    deliverAll(session)
+    await deliverAll(session)
     const third = await pumpOnce(session)
     expect(calls(third)).toEqual(["bash#2"])
   })
@@ -192,10 +192,10 @@ describe("ordered tool calls", () => {
 
     const first = await pumpOnce(session)
     expect(calls(first)).toEqual(["read#1", "bash#2"])
-    deliverAll(session)
+    await deliverAll(session)
     const second = await pumpOnce(session)
     expect(calls(second)).toEqual(["bash#3"])
-    deliverAll(session)
+    await deliverAll(session)
     const third = await pumpOnce(session)
     expect(calls(third)).toEqual(["read#4"])
     expect(finishes(third)).toEqual(["tool-calls"])
@@ -219,7 +219,7 @@ describe("ordered tool calls", () => {
 
     const first = await pumpOnce(session)
     expect(calls(first)).toEqual(["bash#1"])
-    deliverAll(session)
+    await deliverAll(session)
     const startedAt = Date.now()
     const second = await pumpOnce(session)
     expect(calls(second)).toEqual(["read#2", "read#3"])
@@ -245,7 +245,7 @@ describe("ordered tool calls", () => {
 
     expect(calls(await pumpOnce(session))).toEqual(["write#5"])
     expect(session.toolCallOrder?.deferred.map((exec) => exec.execId)).toEqual([2, 3, 4])
-    deliverAll(session)
+    await deliverAll(session)
     const second = await pumpOnce(session)
     expect(calls(second)).toEqual(["read#2", "read#3", "read#4"])
     expect(finishes(second)).toEqual(["tool-calls"])

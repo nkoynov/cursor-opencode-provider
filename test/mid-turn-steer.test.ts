@@ -27,6 +27,8 @@ type HeldSession = CursorSession & { writes: Uint8Array[] }
 const OPENCODE_SESSION = "ses_steer"
 const MODEL = "cursor-test"
 const NOTE = "<system-update>\nInstructions from: /w/pkg/AGENTS.md\nIndent with tabs.\n</system-update>"
+/** The note as Cursor gets it: a host note is injected as plain text. */
+const NOTE_TEXT = "Instructions from: /w/pkg/AGENTS.md\nIndent with tabs."
 const ABORTED = JSON.stringify({ error: { type: "aborted", message: "Tool execution interrupted" }, content: [] })
 
 function heldSession(id: string, modelId?: string): HeldSession {
@@ -152,7 +154,7 @@ describe("mid-turn user message after a complete step", () => {
     expect(extractTrailingToolResults(prompt)).toEqual([])
 
     const steered = extractLiveSteerResults(prompt, OPENCODE_SESSION, MODEL)!
-    expect(steered.results.map((r) => [r.execId, r.note])).toEqual([[1, undefined], [2, undefined]])
+    expect(steered.results.map((r) => [r.execId, r.notes])).toEqual([[1, undefined], [2, undefined]])
     expect(steered.messages).toEqual(["also check 3.ts\nand 4.ts"])
   })
 
@@ -165,7 +167,7 @@ describe("mid-turn user message after a complete step", () => {
     )!
     expect(steered.messages).toEqual(["also check 3.ts", "then stop"])
     expect(steered.injections).toEqual([{ text: "also check 3.ts" }, { text: NOTE, hostNote: true }, { text: "then stop" }])
-    expect(steered.results.at(-1)!.note).toBeUndefined()
+    expect(steered.results.at(-1)!.notes).toBeUndefined()
   })
 
   it("never takes a host note that quotes an answered steer for that steer", () => {
@@ -342,7 +344,7 @@ describe("cases that stay a fresh turn", () => {
 })
 
 describe("doStream with a mid-turn user message", () => {
-  it("injects the message before the results and opens no new Run", async () => {
+  it("injects the message after the results and opens no new Run", async () => {
     const held = heldReads("stream")
     const injectionId = () => injections(held.writes)[0].injection_id
     serve(held, [
@@ -355,7 +357,9 @@ describe("doStream with a mid-turn user message", () => {
 
     expect(parts.at(-1)?.type).toBe("finish")
     const messages = clientMessages(held.writes)
-    expect(messages[0].conversation_action.inject_context_action).toMatchObject({
+    const injectedAt = messages.findIndex((message) => message.conversation_action?.inject_context_action)
+    expect(injectedAt).toBeGreaterThan(messages.map((message) => !!message.exec_client_message).lastIndexOf(true))
+    expect(messages[injectedAt].conversation_action.inject_context_action).toMatchObject({
       expected_run_id: "run_stream",
       user_context: { user_message: { text: "also check 3.ts" } },
     })
@@ -575,12 +579,12 @@ describe("doStream with a mid-turn user message", () => {
     }
 
     expect(outcomes).toEqual({
-      delivered: { injected: [NOTE, "also check 3.ts"], followUps: [] },
-      rejected: { injected: [NOTE, "also check 3.ts"], followUps: ["also check 3.ts"] },
+      delivered: { injected: [NOTE_TEXT, "also check 3.ts"], followUps: [] },
+      rejected: { injected: [NOTE_TEXT, "also check 3.ts"], followUps: ["also check 3.ts"] },
     })
   })
 
-  it("injects messages and host notes in prompt order, ahead of the step's results", async () => {
+  it("injects messages and host notes in prompt order, after the step's results", async () => {
     const held = heldReads("interleaved")
     serve(held, [
       () => injectionState(injections(held.writes)[0].injection_id, { delivered: { step: 2 } }),
@@ -592,9 +596,9 @@ describe("doStream with a mid-turn user message", () => {
     await streamSteer(held, steer("interleaved", user("also check 3.ts"), user(NOTE), user("then stop")))
 
     const messages = clientMessages(held.writes)
-    expect(injections(held.writes).map((action) => action.user_context.user_message.text)).toEqual(["also check 3.ts", NOTE, "then stop"])
-    expect(messages.findIndex((message) => message.exec_client_message))
-      .toBeGreaterThan(messages.map((message) => !!message.conversation_action).lastIndexOf(true))
+    expect(injections(held.writes).map((action) => action.user_context.user_message.text)).toEqual(["also check 3.ts", NOTE_TEXT, "then stop"])
+    expect(messages.findIndex((message) => message.conversation_action))
+      .toBeGreaterThan(messages.map((message) => !!message.exec_client_message).lastIndexOf(true))
     expect(JSON.stringify(execMessages(held.writes))).not.toContain("system-update")
   })
 
@@ -616,7 +620,7 @@ describe("doStream with a mid-turn user message", () => {
 })
 
 describe("doStream with a host note after a step of reads", () => {
-  it("injects the note into the held Run before the results", async () => {
+  it("injects the note into the held Run after the results", async () => {
     const held = heldReads("plain-note")
     serve(held, [
       () => injectionState(injections(held.writes)[0].injection_id, { delivered: { step: 2 } }),
@@ -626,10 +630,10 @@ describe("doStream with a host note after a step of reads", () => {
     const { parts, fetched } = await streamSteer(held, steer("plain-note", user(NOTE)))
 
     expect(parts.at(-1)?.type).toBe("finish")
-    const [first] = clientMessages(held.writes)
-    expect(first.conversation_action.inject_context_action).toMatchObject({
+    const messages = clientMessages(held.writes)
+    expect(messages.at(-1).conversation_action.inject_context_action).toMatchObject({
       expected_run_id: "run_plain-note",
-      user_context: { user_message: { text: NOTE } },
+      user_context: { user_message: { text: NOTE_TEXT } },
     })
     expect(execMessages(held.writes).map((message) => message.read_result.success.content)).toEqual(["alpha\nbeta", "alpha\nbeta"])
     expect(held.resultsAfterCheckpoint).toBeUndefined()

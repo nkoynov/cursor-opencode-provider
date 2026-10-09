@@ -63,7 +63,7 @@ describe("buildRunRequest checkpoint echo", () => {
     )
   })
 
-  it("replays history in the user message, not as root prompt messages, when no checkpoint is provided", () => {
+  it("carries seed history in the user text, never in root_prompt_messages_json", () => {
     const data = buildRunRequest({
       text: "hi",
       modelId: "m",
@@ -79,21 +79,20 @@ describe("buildRunRequest checkpoint echo", () => {
       "ConversationStateStructure",
       decoded.run_request.conversation_state,
     )
+    // A client root prompt stops Cursor rendering RequestContext rules.
     expect(cs.root_prompt_messages_json ?? []).toEqual([])
     const text: string = decoded.run_request.action.user_message_action.user_message.text
     expect(text.startsWith("<conversation_history>\n")).toBe(true)
-    expect(text).toContain("[User]\nearlier\n\n[Assistant]\nnoted\n</conversation_history>")
+    expect(text.endsWith("<user>\nearlier\n</user>\n\n<assistant>\nnoted\n</assistant>\n</conversation_history>\n\nhi")).toBe(true)
     expect(text).not.toContain("Be brief.")
-    expect(text.endsWith("</conversation_history>\n\nhi")).toBe(true)
   })
 
-  it("does not replay history when the Run resumes a checkpoint", () => {
-    const checkpoint = Uint8Array.from([0x0a, 0x01, 0x7f])
+  it("keeps a checkpointed Run's user text free of seed history", () => {
     const data = buildRunRequest({
       text: "follow up",
       modelId: "m",
       conversationId: "c",
-      conversationState: checkpoint,
+      conversationState: Uint8Array.from([0x0a, 0x01, 0x7f]),
       history: [{ role: "user", content: "earlier" }],
     })
     const decoded = decodeMessage<any>("AgentClientMessage", data)

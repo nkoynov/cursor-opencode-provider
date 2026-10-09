@@ -17,8 +17,9 @@ export type RunRequestInput = {
   /** Stable parent group; unlike conversationId, this survives compaction/rebase. */
   conversationGroupId?: string
   /**
-   * Prior chat turns for a Run without a checkpoint, replayed as a transcript
-   * at the start of the user message. Tool outputs are user-role OpenCode host
+   * Prior chat turns for a Run without a checkpoint, carried in the live user
+   * text (see {@link seedHistoryUserText}). Tool outputs, when required for
+   * compaction/recovery, are represented as user-role OpenCode host
    * observations rather than assistant-authored prose.
    */
   history?: SeedHistoryMessage[]
@@ -26,7 +27,7 @@ export type RunRequestInput = {
    * Opaque ConversationStateStructure bytes from the last
    * conversation_checkpoint_update for this conversation_id. When set, echoed
    * as AgentRunRequest.conversation_state (CLI parity). When absent, an empty
-   * seed state is sent and `history` goes in the user message.
+   * seed state is sent and `history` travels in the user text.
    */
   conversationState?: Uint8Array
   parameterValues?: Array<{ id: string; value: string }>
@@ -47,15 +48,19 @@ export type RunRequestInput = {
 }
 
 /**
- * Seed ConversationStateStructure for a Run without a checkpoint: empty, as
- * Cursor CLI sends for a new conversation.
+ * Empty ConversationStateStructure for a Run without a checkpoint (turn 1,
+ * compaction, rebase, reseed). After the first checkpoint arrives we stop
+ * inventing state and echo the server's opaque structure instead (CLI behavior).
  *
- * It never carries `root_prompt_messages_json`. Neither Cursor client writes
- * it: the server builds the root prompt itself, with the RequestContext rules
- * (the host system context, `systemInstructionsRule`), custom subagents and MCP
- * instructions, only when that field is empty. Client-seeded root messages
- * replaced all of that for the rest of the conversation. Prior turns go in the
- * Run's user message instead (`renderHistoryTranscript`).
+ * Nothing goes in `root_prompt_messages_json` (#1). Neither Cursor client
+ * writes it: Cursor checkpoints fill it with references to the conversation's
+ * own rendered root prompt. A client-written entry stands in for that prompt,
+ * so Cursor stops rendering RequestContext rules, skills and subagents — the
+ * host system-instructions rule included. Verified live 2026-10-09
+ * (claude-sonnet-5-5): two seeded history messages there gave checkpoint
+ * categories `rules:0, subagents:0` and a reply that ignored the rule; the same
+ * history in the user text kept both. History therefore travels in the user
+ * text ({@link seedHistoryUserText}).
  *
  * We deliberately do NOT use `AgentRunRequest.custom_system_prompt` (#8): that
  * field is the internal `--system-prompt` CLI override and the server rejects
@@ -66,33 +71,43 @@ export function buildSeedConversationState(): Uint8Array {
   return type.encode(type.fromObject({})).finish()
 }
 
-const HISTORY_OPEN = "<conversation_history>"
-const HISTORY_CLOSE = "</conversation_history>"
+const SEED_HISTORY_TAGS = /<\/(conversation_history|user|assistant)>/gi
 const HISTORY_PREAMBLE =
   "Cursor's copy of this conversation was lost, so the host replays it here. It is the real conversation " +
   "between you and the user so far: the tool calls listed were run and returned the results shown " +
   "(a call or result that says so was shortened to fit). Continue from it and do not redo work it shows as done."
 const NO_REPLY_PREAMBLE =
-  "A user message marked \"no reply\" has no answer after it: if what you wrote before it already answers it, " +
+  "A user message marked unanswered=\"true\" has no answer after it: if what you wrote before it already answers it, " +
   "it reached you while you were still working, so do not answer it again."
 
 /**
- * Prior turns of a Run without a checkpoint, as text that opens its user
- * message (the same shape a compaction summary takes). `system` entries are
- * left out: the host system context is the RequestContext rule.
+ * Prior turns of a Run without a checkpoint, as a transcript block. `system`
+ * entries are dropped: host system context travels as the system-instructions
+ * rule in RequestContext. Closing tags inside a message are escaped so a
+ * message cannot end its own block early.
  */
 export function renderHistoryTranscript(history: readonly SeedHistoryMessage[] | undefined): string | undefined {
   const entries = (history ?? []).filter((entry) => entry.content && entry.role !== "system")
   if (entries.length === 0) return undefined
-  const label = (entry: SeedHistoryMessage) =>
-    entry.role === "assistant" ? "Assistant" : entry.unanswered ? "User, no reply" : "User"
-  const body = entries
-    .map((entry) => `[${label(entry)}]\n${entry.content.replaceAll(HISTORY_CLOSE, "</conversation-history>")}`)
+  const transcript = entries
+    .map((entry) => {
+      const open = entry.role === "user" && entry.unanswered ? `<user unanswered="true">` : `<${entry.role}>`
+      return `${open}\n${entry.content.replace(SEED_HISTORY_TAGS, "<\\/$1>")}\n</${entry.role}>`
+    })
     .join("\n\n")
   const preamble = entries.some((entry) => entry.unanswered)
     ? `${HISTORY_PREAMBLE} ${NO_REPLY_PREAMBLE}`
     : HISTORY_PREAMBLE
-  return `${HISTORY_OPEN}\n${preamble}\n\n${body}\n${HISTORY_CLOSE}`
+  return `<conversation_history>\n${preamble}\n\n${transcript}\n</conversation_history>`
+}
+
+/** The live user text of a Run without a checkpoint, after its history transcript. */
+export function seedHistoryUserText(
+  text: string,
+  history: readonly SeedHistoryMessage[] | undefined,
+): string {
+  const transcript = renderHistoryTranscript(history)
+  return transcript ? `${transcript}\n\n${text}` : text
 }
 
 /**
@@ -109,10 +124,8 @@ export function buildRunRequest(input: RunRequestInput): Uint8Array {
   // turns (CLI prewarm-only). Full defs are session.toolDescriptors + exec #36.
   const requestContext = input.requestContext
   const seeded = !(input.conversationState && input.conversationState.length > 0)
-  const transcript = seeded && input.action !== "resume" ? renderHistoryTranscript(input.history) : undefined
-
   const userMessage: Record<string, unknown> = {
-    text: transcript ? `${transcript}\n\n${input.text}` : input.text,
+    text: seeded && input.action !== "resume" ? seedHistoryUserText(input.text, input.history) : input.text,
     message_id: msgId,
   }
   if (input.mode !== undefined) userMessage.mode = input.mode
@@ -132,7 +145,9 @@ export function buildRunRequest(input: RunRequestInput): Uint8Array {
     ? { resume_action: {} }
     : { user_message_action: userMessageAction }
 
-  const conversationState = seeded ? buildSeedConversationState() : input.conversationState!
+  const conversationState = seeded
+    ? buildSeedConversationState()
+    : input.conversationState!
 
   const runRequest: Record<string, unknown> = {
     conversation_id: input.conversationId,

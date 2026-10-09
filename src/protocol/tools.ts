@@ -1,7 +1,8 @@
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { encodeMessage } from "./messages.js"
+import { encodeMessage, getMessageTypes } from "./messages.js"
+import type { HookAdditionalContext } from "./host-notes.js"
 import type { CursorImageInput } from "../image-input.js"
 import { encodeJsonAsValue, decodeStructEntriesToJson, readAllFields } from "./struct.js"
 import { buildEnv } from "../context/env.js"
@@ -2068,56 +2069,6 @@ function mcpImageItems(images: readonly CursorImageInput[]): Array<Record<string
   return images.map((image) => ({ image: { data: image.data, mime_type: image.mimeType } }))
 }
 
-// Cursor shows a read's content to the model as numbered file lines, so a note
-// there would read as part of the file.
-const FILE_CONTENT_RESULTS = new Set(["read_result", "pi_read_result"])
-
-/** Whether this result's typed shape has a text slot for a host note after its parsed payload. */
-export function resultCanCarryNote(input: ToolResultInput): boolean {
-  const resultField = input.resultField || "mcp_result"
-  if (resultField === "shell_stream") return true
-  const typed = refusedExecResult(resultField, input) ?? buildTypedExecResult(
-    resultField,
-    input.output,
-    input.error,
-    input.toolName,
-    input.resultMetadata,
-    input.shellOutcome,
-    input.workspaceRoot,
-  )
-  return attachResultNote(resultField, typed, " ") !== undefined
-}
-
-function appendNote(text: unknown, note: string): string {
-  if (typeof text !== "string" || !text) return note
-  return `${text.endsWith("\n") ? text : `${text}\n`}\n${note}`
-}
-
-function attachResultNote(
-  resultField: string,
-  typed: Record<string, unknown>,
-  note: string,
-): Record<string, unknown> | undefined {
-  const { success, error, failure, rejected, permission_denied: denied } =
-    typed as Record<string, Record<string, unknown> | undefined>
-  if (error && typeof error.error === "string") return { ...typed, error: { ...error, error: appendNote(error.error, note) } }
-  if (rejected && typeof rejected.reason === "string") {
-    return { ...typed, rejected: { ...rejected, reason: appendNote(rejected.reason, note) } }
-  }
-  if (denied && typeof denied.error === "string") {
-    return { ...typed, permission_denied: { ...denied, error: appendNote(denied.error, note) } }
-  }
-  if (failure) return { ...typed, failure: { ...failure, stderr: appendNote(failure.stderr, note) } }
-  if (!success || FILE_CONTENT_RESULTS.has(resultField)) return undefined
-  if (Array.isArray(success.content)) {
-    return { ...typed, success: { ...success, content: [...success.content, { text: { text: note } }] } }
-  }
-  for (const slot of ["content", "stdout", "output", "final_message"]) {
-    if (typeof success[slot] === "string") return { ...typed, success: { ...success, [slot]: appendNote(success[slot], note) } }
-  }
-  return undefined
-}
-
 /**
  * Build one or more ExecClientMessage frames for a tool result.
  * Shell replies are a sequence of ShellStream oneofs under the same id —
@@ -2126,44 +2077,21 @@ function attachResultNote(
  * shell execs hang on heartbeats forever).
  */
 export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
-  return encodeExecResult(input).frames
-}
-
-/**
- * `buildExecClientMessages` with a host note appended after the parsed
- * payload. In the raw output the note would break parsing: an OpenCode 2 read
- * would reach Cursor with its header and line numbers. `noteCarried` is false
- * when the result shape has no text slot for it other than file content.
- */
-export function buildExecClientMessagesWithNote(
-  input: ToolResultInput,
-  note: string,
-): { frames: Uint8Array[]; noteCarried: boolean } {
-  return encodeExecResult(input, note)
-}
-
-function encodeExecResult(input: ToolResultInput, note?: string): { frames: Uint8Array[]; noteCarried: boolean } {
   const resultField = input.resultField || "mcp_result"
   const frames: Uint8Array[] = []
-  let noteCarried = false
 
   if (resultField === "shell_stream" && input.refusal && input.error) {
-    noteCarried = note !== undefined
-    const reason = note === undefined ? input.error : appendNote(input.error, note)
     // Cursor's own client answers a refused command with this one event: no start, no exit.
-    frames.push(encodeShellStream(input.execId, undefined, shellRefusal(input.refusal, reason, input.resultMetadata)))
+    frames.push(encodeShellStream(input.execId, undefined, shellRefusal(input.refusal, input.error, input.resultMetadata)))
   } else if (resultField === "shell_stream") {
-    noteCarried = note !== undefined
     // Real clients always emit Start → Stdout/Stderr* → Exit (capture/tests).
     frames.push(encodeShellStream(input.execId, undefined, { start: {} }))
     if (input.error) {
-      const stderr = note === undefined ? input.error : appendNote(input.error, note)
-      frames.push(encodeShellStream(input.execId, undefined, { stderr: { data: stderr } }))
+      frames.push(encodeShellStream(input.execId, undefined, { stderr: { data: input.error } }))
       frames.push(encodeShellStream(input.execId, input.executionTimeMs, { exit: { code: 1, aborted: false } }))
     } else {
-      const text = note === undefined ? input.output : appendNote(input.output, note)
-      if (text) {
-        frames.push(encodeShellStream(input.execId, undefined, { stdout: { data: text } }))
+      if (input.output) {
+        frames.push(encodeShellStream(input.execId, undefined, { stdout: { data: input.output } }))
       }
       if (input.shellOutcome?.kind === "backgrounded") {
         frames.push(encodeShellStream(input.execId, input.executionTimeMs, {
@@ -2205,9 +2133,7 @@ function encodeExecResult(input: ToolResultInput, note?: string): { frames: Uint
       input.workspaceRoot,
       execResultImages(resultField, input.images),
     )
-    const noted = note === undefined ? undefined : attachResultNote(resultField, typed, note)
-    noteCarried = noted !== undefined
-    clientMsg[resultField] = noted ?? typed
+    clientMsg[resultField] = typed
     frames.push(
       encodeMessage("AgentClientMessage", {
         exec_client_message: clientMsg,
@@ -2217,7 +2143,52 @@ function encodeExecResult(input: ToolResultInput, note?: string): { frames: Uint
 
   // Always close the exec stream — mirrors CLI agent-exec after every handler.
   frames.push(buildExecStreamClose(input.execId))
-  return { frames, noteCarried }
+  return frames
+}
+
+/**
+ * Attach host notes to an exec result as Cursor CLI postToolUse hook context:
+ * `ExecClientMessage.hook_additional_contexts` (#45) on a unary result, or a
+ * `ShellStream.hook_context` (#8) event after the stream's own events and
+ * before `stream_close` (CLI agent-exec hook wrapper). Cursor renders it as a
+ * system reminder on that tool result, so it never mixes into file content.
+ * Returns undefined when the frames carry no exec result (bridged
+ * interaction replies have no such field).
+ */
+export function attachHookAdditionalContexts(
+  frames: readonly Uint8Array[],
+  contexts: readonly HookAdditionalContext[],
+): Uint8Array[] | undefined {
+  const root = getMessageTypes()
+  const type = root.lookupType("AgentClientMessage")
+  const contextType = root.lookupType("HookAdditionalContext")
+  let shellStreamAt = -1
+  let shellStreamId = 0
+  for (let index = 0; index < frames.length; index++) {
+    const message = type.decode(frames[index]!)
+    const exec = (message as {
+      exec_client_message?: { id?: number; result?: string; hook_additional_contexts?: unknown[] }
+    }).exec_client_message
+    if (!exec?.result) continue
+    if (exec.result === "shell_stream") {
+      shellStreamAt = index
+      shellStreamId = exec.id ?? 0
+      continue
+    }
+    exec.hook_additional_contexts = contexts.map((context) => contextType.fromObject(context))
+    const out = [...frames]
+    out[index] = type.encode(message).finish()
+    return out
+  }
+  if (shellStreamAt === -1) return undefined
+  const out = [...frames]
+  out.splice(shellStreamAt + 1, 0, encodeMessage("AgentClientMessage", {
+    exec_client_message: {
+      id: shellStreamId,
+      shell_stream: { hook_context: { hook_additional_contexts: [...contexts] } },
+    },
+  }))
+  return out
 }
 
 /** ACM #5 exec_client_control_message { stream_close { id } }. */
@@ -3135,6 +3106,26 @@ function toolResultRoot(workspaceRoot: string | undefined): string | undefined {
   return trimmedRoot
     ? (isForeignAbsoluteToolPath(trimmedRoot) ? trimmedRoot : path.resolve(trimmedRoot))
     : undefined
+}
+
+/**
+ * OpenCode's read tool appends newly discovered instructions after the
+ * envelope's unnumbered `</content>`, in one `<system-reminder>` block.
+ * The numbered-body parser stops before that block, so callers must lift it
+ * out before the file text is encoded.
+ */
+export function extractOpenCodeReadInstruction(output: string): string | undefined {
+  if (!output.includes("<content>") || !output.includes("<system-reminder>")) return undefined
+  const contentHeaderIdx = output.indexOf("<content>")
+  const header = output.slice(0, contentHeaderIdx)
+  if (!header.includes("<path>") || !header.includes("<type>file</type>")) return undefined
+  const rest = output.slice(contentHeaderIdx + "<content>".length)
+  const closeAt = rest.search(/(?:^|\n)<\/content>(?:\n|$)/)
+  if (closeAt === -1) return undefined
+  const afterClose = rest.slice(closeAt).replace(/^(?:\n)?<\/content>/, "")
+  const match = /^\s*<system-reminder>\n([\s\S]*?)\n<\/system-reminder>/.exec(afterClose)
+  const body = match?.[1]?.trim()
+  return body ? body : undefined
 }
 
 /**

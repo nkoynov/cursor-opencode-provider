@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test, beforeEach } from "bun:test"
+import { describe, expect, test, beforeEach, afterEach, setSystemTime } from "bun:test"
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
@@ -61,11 +61,20 @@ import type { ModelInfo } from "../src/models.js"
 
 const DAY_S = 86_400
 
+const setupCleanups: Array<() => Promise<void> | void> = []
+
 /** This plugin's setup always returns its cleanup; fail loudly if it stops doing so. */
-async function setupPlugin(ctx: Parameters<typeof plugin.setup>[0]): Promise<() => Promise<void> | void> {
+async function setupPlugin(ctx: Parameters<typeof plugin.setup>[0]): Promise<() => Promise<void>> {
   const cleanup = await plugin.setup(ctx)
   if (typeof cleanup !== "function") throw new Error("OpenCode 2.0 plugin setup returned no cleanup")
-  return cleanup
+  let settled = false
+  const once = async () => {
+    if (settled) return
+    settled = true
+    await cleanup()
+  }
+  setupCleanups.push(once)
+  return once
 }
 
 /** Cursor browser-login session JWT: 60-day life, issue time in `time`. */
@@ -800,6 +809,12 @@ describe("opencode2 setup", () => {
     }
   })
 
+  afterEach(async () => {
+    const pending = setupCleanups.splice(0)
+    for (const cleanup of pending.reverse()) await cleanup()
+    setNativePlansDir(undefined)
+  })
+
   test("reloads the provider inventory from cache without writing opencode.json", async () => {
     const configDir = mkdtempSync(join(tmpdir(), "cursor-oc2-plugin-config-"))
     const cacheDir = mkdtempSync(join(tmpdir(), "cursor-oc2-plugin-cache-"))
@@ -1008,7 +1023,7 @@ describe("opencode2 setup", () => {
 
   test("registers cursor_image_save and leaves web search to the host tool", async () => {
     const { ctx, transforms } = fakeContext()
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
     const tools: Array<{ name: string; options?: { permission?: string; codemode?: boolean } }> = []
     transforms.get("tool")!({
       add: (tool: { name: string; options?: { permission?: string; codemode?: boolean } }) => tools.push(tool),
@@ -1023,7 +1038,7 @@ describe("opencode2 setup", () => {
 
   test("cursor_image_save commits staged bytes without a permission prompt", async () => {
     const { ctx, transforms, sessionLocations } = fakeContext()
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
     let registered: {
       execute: (
         input: { image_id: string },
@@ -1051,7 +1066,7 @@ describe("opencode2 setup", () => {
 
   test.each(["id", "callID"] as const)("accepts the %s tool execution identifier", async (field) => {
     const { ctx, hooks } = fakeContext()
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
 
     const executionID = `cursor_shell_${field}`
     registerCursorShellCall(executionID, {
@@ -1099,7 +1114,7 @@ describe("opencode2 setup", () => {
     setHostCacheDirOverride(cacheDir)
     try {
       const { ctx, inventory } = fakeContext()
-      await plugin.setup(ctx)
+      await setupPlugin(ctx)
       expect(inventory.providers.size).toBe(0)
     } finally {
       setHostCacheDirOverride(undefined)
@@ -1200,7 +1215,7 @@ describe("opencode2 setup", () => {
 
   test("the aisdk language hook resolves the wire model id", async () => {
     const { ctx, hooks } = fakeContext()
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
 
     const asked: string[] = []
     const event: any = {
@@ -1220,7 +1235,7 @@ describe("opencode2 setup", () => {
 
   test("the aisdk language hook ignores other providers", async () => {
     const { ctx, hooks } = fakeContext()
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
 
     const event: any = {
       model: { providerID: "anthropic", id: "x", modelID: "x" },
@@ -1245,7 +1260,7 @@ describe("opencode2 setup", () => {
     }
     ctx.integration.connection.resolve = async () => ({ type: "key", key: "already.a.jwt" })
 
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
     await new Promise((r) => setTimeout(r, 10))
     const beforeLogin = activeCalls
     expect(beforeLogin).toBeGreaterThan(0)
@@ -1367,12 +1382,37 @@ describe("opencode2 setup", () => {
     }
   })
 
+  test("keeps a parent lease active while a child form or permission prompt is open", async () => {
+    sessionActivity.clear()
+    const start = Date.now()
+    const { ctx } = fakeContext([
+      { type: "session.updated", data: { info: { id: "child", parentID: "parent" } } },
+      { type: "form.created", data: { form: { id: "frm_1", sessionID: "child", title: "Pick", fields: [] } } },
+      { type: "permission.asked", data: { id: "per_1", sessionID: "child", action: "bash", resources: [] } },
+      { type: "permission.replied", data: { sessionID: "child", requestID: "per_1", reply: "once" } },
+    ])
+    const cleanup = await setupPlugin(ctx)
+    try {
+      for (let i = 0; i < 100 && sessionActivity.lastActivityAt("parent") === undefined; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      setSystemTime(new Date(start + 3_600_000))
+      // The form is still open; the permission was answered.
+      expect(sessionActivity.lastActivityAt("parent")).toBe(start + 3_600_000)
+    } finally {
+      setSystemTime()
+      await cleanup()
+      sessionActivity.clear()
+    }
+  })
+
   test("the session hook records the compaction agent", async () => {
     clearCompactionSessions()
     const { ctx, hooks, sessionLocations } = fakeContext()
     sessionLocations.set("s-compact", "/proj")
     sessionLocations.set("s-normal", "/proj")
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
 
     const hook = hooks.get("session.context")!
     await hook({ sessionID: "s-compact", agent: "compaction", model: { providerID: "cursor" } })
@@ -1385,7 +1425,7 @@ describe("opencode2 setup", () => {
   test("the session context carries the active host agent into provider options", async () => {
     const { ctx, hooks, sessionLocations } = fakeContext()
     sessionLocations.set("s-plan-agent", "/proj")
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
 
     const event: any = {
       sessionID: "s-plan-agent",
@@ -1441,7 +1481,7 @@ describe("opencode2 setup", () => {
     clearSessionDirectories()
     const { ctx, hooks, sessionLocations } = fakeContext()
     sessionLocations.set("s1", "/home/user/projects/my-app")
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
 
     const hook = hooks.get("session.context")!
     await hook({ sessionID: "s1", agent: "build", model: { providerID: "cursor" } })
@@ -1461,7 +1501,7 @@ describe("opencode2 setup", () => {
     clearSessionDirectories()
     const { ctx, hooks, sessionLocations } = fakeContext()
     sessionLocations.set("s-dir", "/home/user/a b")
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
 
     const event = modelRequest("s-dir", "cursor", { "x-session-id": "s-dir" })
     await hooks.get("session.model.request")!(event)
@@ -1476,7 +1516,7 @@ describe("opencode2 setup", () => {
     clearSessionDirectories()
     const { ctx, hooks, sessionLocations } = fakeContext()
     sessionLocations.set("s-moved", "/home/user/new-project")
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
 
     const event = modelRequest("s-moved")
     await hooks.get("session.model.request")!(event)
@@ -1491,7 +1531,7 @@ describe("opencode2 setup", () => {
   test("model.request keeps the last known session directory when the lookup fails", async () => {
     clearSessionDirectories()
     const { ctx, hooks } = fakeContext()
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
     markSessionDirectory("s-known", "/home/user/known")
 
     const event = modelRequest("s-known")
@@ -1504,7 +1544,7 @@ describe("opencode2 setup", () => {
   test("model.request falls back to the plugin location when the session is unknown", async () => {
     clearSessionDirectories()
     const { ctx, hooks } = fakeContext()
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
 
     const event = modelRequest("s-missing")
     await hooks.get("session.model.request")!(event)
@@ -1533,7 +1573,7 @@ describe("opencode2 setup", () => {
           ],
         }),
       }
-      await plugin.setup(ctx)
+      await setupPlugin(ctx)
 
       // A compaction can be the first request after a restart; its Run carries the catalog too.
       await hooks.get("session.model.request")!({ ...modelRequest("s-skills"), kind: "compaction" })
@@ -1550,7 +1590,7 @@ describe("opencode2 setup", () => {
     const { ctx, hooks, sessionLocations } = fakeContext()
     sessionLocations.set("s-skills-fail", "/proj-skills")
     ctx.skill = { list: async () => { throw new Error("boom") } }
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
 
     const event = modelRequest("s-skills-fail")
     await hooks.get("session.model.request")!(event)
@@ -1585,7 +1625,7 @@ describe("opencode2 setup", () => {
     clearSessionDirectories()
     const { ctx, hooks, sessionLocations } = fakeContext()
     sessionLocations.set("s-other", "/proj")
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
 
     const event = modelRequest("s-other", "openai")
     await hooks.get("session.model.request")!(event)
@@ -1597,7 +1637,7 @@ describe("opencode2 setup", () => {
   test("a failed session lookup does not throw and leaves the directory unset", async () => {
     clearSessionDirectories()
     const { ctx, hooks } = fakeContext()
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
 
     const hook = hooks.get("session.context")!
     await hook({ sessionID: "s-unknown", agent: "build", model: { providerID: "cursor" } })
@@ -1678,7 +1718,7 @@ describe("opencode2 setup", () => {
 
   test("shell create.before merges env for a matching pending command", async () => {
     const { ctx, hooks } = fakeContext()
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
     const executionID = "cursor_shell_env"
     registerCursorShellCall(executionID, {
       background_shell_spawn: true,
@@ -1701,7 +1741,7 @@ describe("opencode2 setup", () => {
 
   test("shell execute.after sanitizes structured output and content blocks", async () => {
     const { ctx, hooks } = fakeContext()
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
     const executionID = "cursor_shell_blocks"
     registerCursorShellCall(executionID, {
       background_shell_spawn: true,
@@ -1733,7 +1773,7 @@ describe("opencode2 setup", () => {
     clearCompactionSessions()
     const { ctx, hooks, sessionLocations } = fakeContext()
     sessionLocations.set("s-c", "/proj")
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
     const event: any = {
       sessionID: "s-c",
       agent: "compaction",
@@ -1750,7 +1790,7 @@ describe("opencode2 setup", () => {
   test("session.generate explicitly clears the request-local compaction option", async () => {
     const { ctx, hooks, sessionLocations } = fakeContext()
     sessionLocations.set("s-g", "/proj")
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
     const event: any = {
       sessionID: "s-g",
       agent: "build",
@@ -1766,7 +1806,7 @@ describe("opencode2 setup", () => {
   test("session.title explicitly clears the request-local compaction option", async () => {
     const { ctx, hooks, sessionLocations } = fakeContext()
     sessionLocations.set("s-title", "/proj")
-    await plugin.setup(ctx)
+    await setupPlugin(ctx)
     const event: any = {
       sessionID: "s-title",
       model: { providerID: "cursor", id: "model" },

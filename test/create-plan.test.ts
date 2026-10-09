@@ -67,6 +67,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  setNativePlansDir(undefined)
   fs.rmSync(workspace, { recursive: true, force: true })
   fs.rmSync(sandboxHome, { recursive: true, force: true })
   if (previousHome === undefined) delete process.env.HOME
@@ -742,7 +743,7 @@ describe("CreatePlan through the host plan agent's plan_exit review", () => {
     return { session, writes, parts, hostPlanFile }
   }
 
-  function deliver(session: CursorSession, toolCallId: string, hostAgent: string, output: string) {
+  async function deliver(session: CursorSession, toolCallId: string, hostAgent: string, output: string) {
     return deliverContinuationResults(session, [{
       toolCallId,
       sessionId: session.sessionId,
@@ -770,7 +771,7 @@ describe("CreatePlan through the host plan agent's plan_exit review", () => {
   it("reports approval when the host leaves its plan agent", async () => {
     const { session, writes, parts, hostPlanFile } = await startHostPlan()
     const call = parts.find((part: any) => part.type === "tool-call")
-    deliver(session, call.toolCallId, "build", "User approved switching to build agent. Wait for further instructions.")
+    await deliver(session, call.toolCallId, "build", "User approved switching to build agent. Wait for further instructions.")
     const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
       .interaction_response.create_plan_request_response.result
     expect(result.success).toBeDefined()
@@ -783,7 +784,7 @@ describe("CreatePlan through the host plan agent's plan_exit review", () => {
     const { session, writes, parts } = await startHostPlan()
     const call = parts.find((part: any) => part.type === "tool-call")
     const refine = "User chose to stay in plan mode and continue refining the plan."
-    deliver(session, call.toolCallId, "plan", refine)
+    await deliver(session, call.toolCallId, "plan", refine)
     const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
       .interaction_response.create_plan_request_response.result
     expect(result.error.error).toBe(refine)
@@ -924,7 +925,7 @@ describe("CreatePlan execution approval over a held-open Run", () => {
     const switched: string[] = []
     setHostAgentModeSwitch(({ targetModeID }) => { switched.push(targetModeID) })
 
-    deliverContinuationResults(session, [{
+    await deliverContinuationResults(session, [{
       toolCallId: toolCall.toolCallId,
       sessionId: session.sessionId,
       execId: 900_000,
@@ -992,7 +993,7 @@ describe("CreatePlan execution approval over a held-open Run", () => {
     const switched: string[] = []
     setHostAgentModeSwitch(({ targetModeID }) => { switched.push(targetModeID) })
 
-    deliverContinuationResults(session, [{
+    await deliverContinuationResults(session, [{
       toolCallId: toolCall.toolCallId,
       sessionId: session.sessionId,
       execId: 900_000,
@@ -1012,7 +1013,7 @@ describe("CreatePlan execution approval over a held-open Run", () => {
 describe("CreatePlan approval delivery failure", () => {
   afterEach(() => resetHostAgentModeSwitchForTests())
 
-  it("keeps planning and queues no execution when delivering Yes fails", () => {
+  it("keeps planning and queues no execution when delivering Yes fails", async () => {
     setActiveCursorMode("create-plan-opencode-session", "plan")
     const session = planSession([], [], ["question"])
     sessionManager.registerPending(900_000, session, "create_plan_request_response", "question", false, {
@@ -1024,7 +1025,7 @@ describe("CreatePlan approval delivery failure", () => {
     const switched: string[] = []
     setHostAgentModeSwitch(({ targetModeID }) => { switched.push(targetModeID) })
     session.stream.write = () => { throw new Error("transport closed") }
-    expect(deliverContinuationResults(session, [{
+    expect(await deliverContinuationResults(session, [{
       toolCallId: "approval", sessionId: session.sessionId, execId: 900_000,
       toolName: "question", output: JSON.stringify({ answers: [["Yes"]] }),
     }])).toBeUndefined()
@@ -1050,11 +1051,11 @@ describe("CreatePlan through a host plan-stage tool", () => {
     return session
   }
 
-  it("reports approval when the host stage succeeds", () => {
+  it("reports approval when the host stage succeeds", async () => {
     setActiveCursorMode("create-plan-opencode-session", "plan")
     const writes: Uint8Array[] = []
     const session = stageSession(writes)
-    deliverContinuationResults(session, [{
+    await deliverContinuationResults(session, [{
       toolCallId: "stage-call", sessionId: session.sessionId, execId: 900_000,
       toolName: "cursor_plan_stage", output: "Plan approved by host stage",
     }] as any)
@@ -1066,22 +1067,22 @@ describe("CreatePlan through a host plan-stage tool", () => {
     sessionManager.close(session, "ordinary-cleanup")
   })
 
-  it("keeps planning when delivering a successful stage reply fails", () => {
+  it("keeps planning when delivering a successful stage reply fails", async () => {
     setActiveCursorMode("create-plan-opencode-session", "plan")
     const session = stageSession([])
     session.stream.write = () => { throw new Error("transport closed") }
-    expect(deliverContinuationResults(session, [{
+    expect(await deliverContinuationResults(session, [{
       toolCallId: "stage-call", sessionId: session.sessionId, execId: 900_000,
       toolName: "cursor_plan_stage", output: "Plan approved by host stage",
     }])).toBeUndefined()
     expect(getActiveCursorMode(session.openCodeSessionId)).toBe("plan")
   })
 
-  it("keeps planning with the host's reason when the stage review is declined", () => {
+  it("keeps planning with the host's reason when the stage review is declined", async () => {
     setActiveCursorMode("create-plan-opencode-session", "plan")
     const writes: Uint8Array[] = []
     const session = stageSession(writes)
-    deliverContinuationResults(session, [{
+    await deliverContinuationResults(session, [{
       toolCallId: "stage-call", sessionId: session.sessionId, execId: 900_000,
       toolName: "cursor_plan_stage", output: "", error: "Plan refinement requested.",
     }] as any)

@@ -3,13 +3,16 @@ import {
   buildLanguageModelV3UsageFromCounters,
   buildLanguageModelV3UsageFromTurnEnded,
   carryTurnEndedCounters,
+  emptyLanguageModelV3Usage,
   formatCursorCacheDiagnostics,
+  formatFinishTrace,
   formatCursorTokenCategories,
   formatTurnUsageValidation,
   flatUsageFromV3,
   newOccupancyUsageLedger,
   occupancyGrowthPart,
   occupancyStepUsage,
+  missingRulesWarning,
   occupancyValidationCounters,
   OPENCODE_DISPLAY_ONLY_COST_METADATA,
   turnEndedCounter,
@@ -236,9 +239,10 @@ describe("occupancyStepUsage", () => {
       second,
       details(160_000),
       "checkpoint-current-run",
+      "occupancy",
     )
     expect(validation).toContain("status=ok")
-    expect(validation).toContain("rawTotal=160000 sentTotal=160000 totalMatch=true")
+    expect(validation).toContain("occupancyTotal=160000 sentTotal=160000 totalMatch=true")
     expect(validation).toContain("cacheRatioMatch=true")
   })
 
@@ -537,11 +541,11 @@ describe("Cursor cache diagnostics", () => {
       },
     )).toBe(
       "cache diagnosis: sessionKey=ses_cache conversationId=conversation-cache " +
-      "conversationGroupId=group-cache model=cursor/default continuity=warm " +
+      "conversationGroupId=group-cache model=cursor/default continuity=warm coldReason=- " +
       "rawInput=50000 rawCacheRead=20000 " +
       "rawCacheWrite=5000 rawUncached=25000 rawReadRatio=40.0% rawWriteRatio=10.0% " +
       "priorContext=40000 currentContext=45000 contextDelta=5000 " +
-      "rawReadVsPriorContext=50.0% sameSizedCategoryTokens=10000 " +
+      "rawReadVsPriorContext=0.50x sameSizedCategoryTokens=10000 " +
       'categoryDelta={"system_prompt":0,"tools":0,"conversation":5000} ' +
       "toolsCategoryChurn=none " +
       "requestContext=reused requestContextHash=0123456789abcdef " +
@@ -567,6 +571,7 @@ describe("Cursor cache diagnostics", () => {
       {
         conversationId: "conversation-cold",
         startedWithCheckpoint: false,
+        coldReason: "interrupted-run",
         requestContextReused: false,
         requestContextHash: "abc",
         checkpointUpdates: 1,
@@ -578,7 +583,7 @@ describe("Cursor cache diagnostics", () => {
         execRequests: 1,
       },
     )
-    expect(line).toContain("continuity=cold")
+    expect(line).toContain("continuity=cold coldReason=interrupted-run ")
     expect(line).toContain("priorContext=unavailable")
     expect(line).toContain("rawReadVsPriorContext=n/a")
     expect(line).toContain("sameSizedCategoryTokens=unavailable")
@@ -770,5 +775,85 @@ describe("sticky-session cache diagnosis", () => {
       "RequestContext hash changed",
       "rawReadRatio=40.8%",
     ])
+  })
+})
+
+describe("formatFinishTrace", () => {
+  const zero = { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 }
+  // An occupancy snapshot as sent at a step boundary: the prior context as cache read, one output token.
+  const snapshotUsage = (used: number, prior: number) => ({
+    inputTokens: { total: used - 1, noCache: used - 1 - prior, cacheRead: prior, cacheWrite: 0 },
+    outputTokens: { total: 1, text: 1, reasoning: 0 },
+  })
+
+  it("labels TurnEnded counters raw and keeps the prior-turn prefix beside them", () => {
+    const usage = snapshotUsage(55_219, 0)
+    expect(formatFinishTrace({
+      reason: "stop",
+      usage,
+      turnEnded: { inputTokens: 1_143_126, outputTokens: 10_257, cacheRead: 1_087_808, cacheWrite: 0, reasoningTokens: 0 },
+      occupancy: { usedTokens: 55_219, priorUsedTokens: 0 },
+      estimate: zero,
+      source: "checkpoint-current-run",
+    })).toBe(
+      "finish: reason=stop v3In=55218 v3Out=1 v3CacheRead=0 v3CacheWrite=0 v3Reasoning=0 " +
+      "rawIn=1143126 rawOut=10257 rawCacheRead=1087808 rawCacheWrite=0 occupancyPrefixCache=0 " +
+      "source=checkpoint-current-run",
+    )
+  })
+
+  it("labels a tool-call snapshot as occupancy, not raw Cursor counters", () => {
+    const details = { usedTokens: 56_794, maxTokens: 256_000 }
+    const prior = { usedTokens: 56_522, maxTokens: 256_000 }
+    expect(formatFinishTrace({
+      reason: "tool-calls",
+      usage: snapshotUsage(details.usedTokens, prior.usedTokens),
+      occupancy: { usedTokens: 56_794, priorUsedTokens: 56_522 },
+      estimate: zero,
+      source: "occupancy-checkpoint-current-run",
+    })).toBe(
+      "finish: reason=tool-calls v3In=56793 v3Out=1 v3CacheRead=56522 v3CacheWrite=0 v3Reasoning=0 " +
+      "occupancyIn=56794 occupancyOut=1 occupancyCacheRead=56522 occupancyCacheWrite=0 " +
+      "source=occupancy-checkpoint-current-run",
+    )
+  })
+
+  it("labels the char/4 estimate before the first checkpoint as est", () => {
+    expect(formatFinishTrace({
+      reason: "tool-calls",
+      usage: emptyLanguageModelV3Usage(),
+      estimate: { ...zero, inputTokens: 63_265, outputTokens: 38 },
+      source: "intermediate-zero",
+    })).toBe(
+      "finish: reason=tool-calls v3In=0 v3Out=0 v3CacheRead=0 v3CacheWrite=0 v3Reasoning=0 " +
+      "estIn=63265 estOut=38 estCacheRead=0 estCacheWrite=0 source=intermediate-zero",
+    )
+  })
+})
+
+describe("missingRulesWarning", () => {
+  const details = (rules: number) => ({
+    usedTokens: 1_000 + rules, maxTokens: 256_000,
+    breakdown: {
+      totalUsedTokens: 1_000 + rules, maxTokens: 256_000,
+      categories: [
+        { id: "tools", label: "Tools", estimatedTokens: 1_000 },
+        { id: "rules", label: "Rules", estimatedTokens: rules },
+      ],
+    },
+  })
+
+  it("warns when Cursor counts no rules for a Run that sent the system-instructions rule", () => {
+    expect(missingRulesWarning(details(0), 40_437, "conv")).toBe(
+      "context warning: Cursor counted rules=0 although this Run sent the 40437-char " +
+      "system-instructions rule conversationId=conv — host instructions may not reach the model",
+    )
+  })
+
+  it("stays silent when rules were counted, no rule was sent, or the breakdown is stale or missing", () => {
+    expect(missingRulesWarning(details(11_622), 40_437, "conv")).toBeUndefined()
+    expect(missingRulesWarning(details(0), 0, "conv")).toBeUndefined()
+    expect(missingRulesWarning({ ...details(0), usedTokens: 5 }, 40_437, "conv")).toBeUndefined()
+    expect(missingRulesWarning({ usedTokens: 5, maxTokens: 256_000 }, 40_437, "conv")).toBeUndefined()
   })
 })

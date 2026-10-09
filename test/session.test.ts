@@ -1,5 +1,6 @@
-import { describe, it, expect } from "bun:test"
+import { describe, it, expect, setSystemTime } from "bun:test"
 import { SessionManager, type CursorSession } from "../src/session.js"
+import { SessionActivityTracker } from "../src/activity.js"
 import { CursorProtocolError } from "../src/errors.js"
 import type { BidiStream, BidiTerminalEvent } from "../src/transport/connect.js"
 import { sessionFixture } from "./session-fixture.js"
@@ -79,7 +80,7 @@ describe("SessionManager", () => {
     expect(mgr.findByExecIds(s.sessionId, [2])).toBe(s)
   })
 
-  it("claims and delivers each continuation result at most once", () => {
+  it("claims and delivers each continuation result at most once", async () => {
     const mgr = new SessionManager()
     const s = fakeSession()
     const writes: Uint8Array[] = []
@@ -90,7 +91,7 @@ describe("SessionManager", () => {
     expect("kind" in claim).toBe(false)
     expect(mgr.claim(s.sessionId, 7)).toMatchObject({ kind: "duplicate", reason: "in-flight" })
     if ("kind" in claim) throw new Error("expected continuation claim")
-    expect(mgr.deliverClaim(claim, [Uint8Array.of(1)])).toEqual({
+    expect(await mgr.deliverClaim(claim, [Uint8Array.of(1)])).toEqual({
       kind: "delivered",
       framesWritten: 1,
     })
@@ -98,7 +99,7 @@ describe("SessionManager", () => {
     expect(mgr.classify(s.sessionId, 7)).toMatchObject({ kind: "duplicate", reason: "delivered" })
   })
 
-  it("marks a partially written result terminal instead of replaying it", () => {
+  it("marks a partially written result terminal instead of replaying it", async () => {
     const mgr = new SessionManager()
     const s = fakeSession()
     let writes = 0
@@ -110,7 +111,7 @@ describe("SessionManager", () => {
     const claim = mgr.claim(s.sessionId, 8)
     if ("kind" in claim) throw new Error("expected continuation claim")
 
-    expect(mgr.deliverClaim(claim, [Uint8Array.of(1), Uint8Array.of(2)])).toEqual({
+    expect(await mgr.deliverClaim(claim, [Uint8Array.of(1), Uint8Array.of(2)])).toEqual({
       kind: "terminal",
       reason: "ambiguous-partial-write",
       framesWritten: 1,
@@ -119,6 +120,121 @@ describe("SessionManager", () => {
       kind: "terminal",
       reason: "ambiguous-partial-write",
     })
+  })
+
+  it("waits for drain before calling a backpressured continuation delivered", async () => {
+    const mgr = new SessionManager()
+    const s = fakeSession()
+    const pendingDrains: Array<() => void> = []
+    s.stream.write = () => false
+    s.stream.waitForDrain = () => new Promise<void>((resolve) => { pendingDrains.push(resolve) })
+    mgr.registerPending(9, s, "mcp_result")
+    const claim = mgr.claim(s.sessionId, 9)
+    if ("kind" in claim) throw new Error("expected continuation claim")
+
+    let settled = false
+    const delivery = mgr.deliverClaim(claim, [Uint8Array.of(1), Uint8Array.of(2)]).then((outcome) => {
+      settled = true
+      return outcome
+    })
+    const until = async (ready: () => boolean) => {
+      for (let i = 0; i < 20 && !ready(); i++) await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(ready()).toBe(true)
+    }
+    await until(() => pendingDrains.length === 1)
+    expect(settled).toBe(false)
+    expect(s.pending.get(9)?.state).toBe("claimed")
+    pendingDrains[0]!()
+    await until(() => pendingDrains.length === 2)
+    expect(settled).toBe(false)
+    pendingDrains[1]!()
+    await expect(delivery).resolves.toEqual({ kind: "delivered", framesWritten: 2 })
+    expect(mgr.classify(s.sessionId, 9)).toMatchObject({ kind: "duplicate", reason: "delivered" })
+  })
+
+  it("does not replay a continuation frame whose drain fails after the write is buffered", async () => {
+    const mgr = new SessionManager()
+    const s = fakeSession()
+    s.stream.write = () => false
+    s.stream.waitForDrain = () => Promise.reject(new Error("stalled"))
+    mgr.registerPending(10, s, "mcp_result")
+    const claim = mgr.claim(s.sessionId, 10)
+    if ("kind" in claim) throw new Error("expected continuation claim")
+
+    expect(await mgr.deliverClaim(claim, [Uint8Array.of(1), Uint8Array.of(2)])).toEqual({
+      kind: "terminal",
+      reason: "ambiguous-partial-write",
+      framesWritten: 1,
+    })
+    expect(mgr.classify(s.sessionId, 10)).toMatchObject({
+      kind: "terminal",
+      reason: "ambiguous-partial-write",
+    })
+    expect(mgr.claim(s.sessionId, 10)).toMatchObject({
+      kind: "terminal",
+      reason: "ambiguous-partial-write",
+    })
+  })
+
+  it("does not deliver the same claim twice while its write waits for drain", async () => {
+    const mgr = new SessionManager()
+    const s = fakeSession()
+    let writes = 0
+    let drain!: () => void
+    s.stream.write = () => { writes++; return writes !== 1 }
+    s.stream.waitForDrain = () => new Promise<void>((resolve) => { drain = resolve })
+    mgr.registerPending(11, s, "mcp_result")
+    const claim = mgr.claim(s.sessionId, 11)
+    if ("kind" in claim) throw new Error("expected continuation claim")
+    const first = mgr.deliverClaim(claim, [Uint8Array.of(1)])
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const duplicate = mgr.deliverClaim(claim, [Uint8Array.of(2)])
+    drain()
+    expect(await duplicate).toMatchObject({ kind: "duplicate", reason: "in-flight", framesWritten: 0 })
+    expect(await first).toMatchObject({ kind: "delivered", framesWritten: 1 })
+    expect(writes).toBe(1)
+    mgr.dispose()
+  })
+
+  for (const frameCount of [1, 2]) {
+    it(`keeps a closed Run terminal when drain resolves with ${frameCount} result frame(s)`, async () => {
+      const mgr = new SessionManager()
+      const s = fakeSession()
+      const writes: Uint8Array[] = []
+      let drain!: () => void
+      s.stream.write = (frame) => { writes.push(frame); return writes.length !== 1 }
+      s.stream.waitForDrain = () => new Promise<void>((resolve) => { drain = resolve })
+      mgr.registerPending(12, s, "mcp_result")
+      const claim = mgr.claim(s.sessionId, 12)
+      if ("kind" in claim) throw new Error("expected continuation claim")
+      const delivery = mgr.deliverClaim(claim, Array.from({ length: frameCount }, (_, i) => Uint8Array.of(i)))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      mgr.close(s, "hard-cap-expired")
+      drain()
+      expect(await delivery).toEqual({ kind: "terminal", reason: "hard-cap-expired", framesWritten: 1 })
+      expect(writes).toHaveLength(1)
+      expect(mgr.classify(s.sessionId, 12)).toMatchObject({ kind: "terminal", reason: "hard-cap-expired" })
+      mgr.dispose()
+    })
+  }
+
+  it("does not remove a replacement pending exec when an older claim finishes draining", async () => {
+    const mgr = new SessionManager()
+    const s = fakeSession()
+    let drain!: () => void
+    s.stream.write = () => false
+    s.stream.waitForDrain = () => new Promise<void>((resolve) => { drain = resolve })
+    mgr.registerPending(13, s, "mcp_result")
+    const claim = mgr.claim(s.sessionId, 13)
+    if ("kind" in claim) throw new Error("expected continuation claim")
+    const delivery = mgr.deliverClaim(claim, [Uint8Array.of(1)])
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    mgr.registerPending(13, s, "read_result")
+    drain()
+    expect(await delivery).toMatchObject({ kind: "missing", framesWritten: 1 })
+    expect(mgr.classify(s.sessionId, 13)).toMatchObject({ kind: "deliverable" })
+    expect(mgr.pendingFor(s.sessionId, 13)?.resultField).toBe("read_result")
+    mgr.dispose()
   })
 
   it("renews a pending-tool inactivity lease from descendant session activity", () => {
@@ -147,6 +263,41 @@ describe("SessionManager", () => {
       kind: "terminal",
       reason: "hard-cap-expired",
     })
+  })
+
+  it("holds a pending tool past the hard cap while the host waits on the user", () => {
+    const start = new Date("2026-10-09T00:00:00Z").getTime()
+    setSystemTime(new Date(start))
+    const tracker = new SessionActivityTracker()
+    const mgr = new SessionManager({
+      now: () => Date.now(),
+      activitySource: tracker,
+      setTimer: () => ({ unref() {} }) as unknown as ReturnType<typeof setTimeout>,
+      clearTimer: () => {},
+    })
+    try {
+      const s = fakeSession()
+      s.openCodeSessionId = "parent"
+      s.policy = { heartbeatMs: 10, semanticIdleMs: 50, hardCapMs: 100 }
+      tracker.linkSession("child", "parent")
+      mgr.registerPending(9, s, "read_result")
+      tracker.openPrompt("child", "per_1")
+
+      setSystemTime(new Date(start + 21 * 60_000))
+      mgr.sweepHardDeadlines()
+      expect(s.closed).toBe(false)
+
+      tracker.closePrompt("child", "per_1")
+      setSystemTime(new Date(start + 21 * 60_000 + 99))
+      mgr.sweepHardDeadlines()
+      expect(s.closed).toBe(false)
+      setSystemTime(new Date(start + 21 * 60_000 + 100))
+      mgr.sweepHardDeadlines()
+      expect(s.closed).toBe(true)
+    } finally {
+      setSystemTime()
+      mgr.dispose()
+    }
   })
 
   it("does not return an expired session", () => {

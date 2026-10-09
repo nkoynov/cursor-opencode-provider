@@ -152,7 +152,7 @@ const kinds = (parts: any[]) => parts
   .filter((p) => ["tool-input-start", "tool-input-end", "tool-call", "tool-result", "finish"].includes(p.type))
   .map((p) => p.type === "tool-call" && p.providerExecuted ? "tool-call(provider)" : p.type)
 
-function deliverAll(session: CursorSession) {
+async function deliverAll(session: CursorSession) {
   const results = [...session.pending.entries()].map(([execId, pending]) => ({
     toolCallId: pending.toolCallId ?? `cursor_${session.sessionId}_${execId}`,
     sessionId: session.sessionId,
@@ -160,7 +160,7 @@ function deliverAll(session: CursorSession) {
     toolName: pending.toolName ?? "write",
     output: "ok",
   }))
-  expect(deliverContinuationResults(session, results)).toBe(session)
+  expect(await deliverContinuationResults(session, results)).toBe(session)
 }
 
 describe("early tool rows", () => {
@@ -205,7 +205,7 @@ describe("early tool rows", () => {
       { role: "tool", content: [{ type: "tool-result", toolCallId: id, toolName: "write", output: { type: "error-text", value: "denied" } }] },
     ] as any)
     expect(results).toMatchObject([{ toolCallId: id, sessionId: session.sessionId, execId: 2, error: "denied" }])
-    expect(deliverContinuationResults(session, results)).toBe(session)
+    expect(await deliverContinuationResults(session, results)).toBe(session)
     expect(session.pending.size).toBe(0)
   })
 
@@ -307,7 +307,7 @@ describe("early tool rows", () => {
     expect(rowStarts(parts)).toEqual([])
     expect(hostCalls(parts).map((p) => p.toolName)).toEqual(["shell"])
 
-    deliverAll(session)
+    await deliverAll(session)
     script.push(heartbeat(), ...editDone(2, 3, "e", target, "x\n"))
     const next = await pumpOnce(session)
     expect(hostCalls(next)).toMatchObject([{ toolCallId: rowStarts(next)[0]?.id, toolName: "write" }])
@@ -327,7 +327,7 @@ describe("early tool rows", () => {
     const parts = await pumpOnce(session)
     expect(rowStarts(parts)).toEqual([])
 
-    deliverAll(session)
+    await deliverAll(session)
     script.push(completed("s", { shell_tool_call: { args: { command: "touch a" } } }), heartbeat())
     script.push(...editDone(2, 3, "e", target, "x\n"))
     const next = await pumpOnce(session)
@@ -354,7 +354,7 @@ describe("early tool rows", () => {
     expect(hostCalls(pass1)).toMatchObject([{ toolCallId: rowStarts(pass1)[0].id }])
     expect(closedRows(pass1)).toEqual([])
 
-    deliverAll(session)
+    await deliverAll(session)
     const { parts, controller } = collector()
     const pumping = pump(session, controller, { textId: "text", reasoningId: "reasoning" })
     script.push(heartbeat())

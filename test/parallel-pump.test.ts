@@ -103,12 +103,12 @@ describe("parallel tool-call pump", () => {
       toolCallId: p.toolCallId, sessionId: session.sessionId, execId: from + i + 1,
       toolName: p.toolName, output: "done",
     }))
-    expect(deliverContinuationResults(session, deliver(0))).toBe(session)
+    expect(await deliverContinuationResults(session, deliver(0))).toBe(session)
     expect(session.pending.size).toBe(0)
     expect(writes.length).toBeGreaterThanOrEqual(2)
     await pump(session, controller, ids)
     expect(toolCalls(parts)).toHaveLength(3)
-    expect(deliverContinuationResults(session, deliver(2))).toBe(session)
+    expect(await deliverContinuationResults(session, deliver(2))).toBe(session)
     await pump(session, controller, ids)
     expect(finishes(parts).map(p => p.finishReason.unified)).toEqual(["tool-calls", "tool-calls", "stop"])
   })
@@ -179,7 +179,7 @@ describe("parallel tool-call pump", () => {
       expect(finishes(parts)).toHaveLength(1)
       expect(session.toolCallOrder?.deferred.map(exec => exec.execId)).toEqual([2])
       const [bash] = toolCalls(parts)
-      expect(deliverContinuationResults(session, [{
+      expect(await deliverContinuationResults(session, [{
         toolCallId: bash!.toolCallId, sessionId: session.sessionId, execId: 1, toolName: "bash", output: "test",
       }])).toBe(session)
       await pump(session, controller, ids)

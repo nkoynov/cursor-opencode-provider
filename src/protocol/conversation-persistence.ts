@@ -26,7 +26,10 @@ export type PersistedConversation = {
   systemPromptHash?: string
   /** JSON-encoded TurnProvenance (what this provider emitted last). */
   turnProvenance?: string
-  /** Host note the last turn ended without delivering; the checkpoint does not hold it. */
+  /**
+   * Host note bodies the last turn ended without delivering (ordered; encoded
+   * via encodePersistedHostNotes). The Cursor checkpoint does not hold them.
+   */
   hostNote?: string
   /** Early steers the last turn answered; OpenCode records them after that answer. */
   answeredSteers?: string[]

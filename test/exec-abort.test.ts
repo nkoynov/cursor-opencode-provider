@@ -158,13 +158,13 @@ describe("Cursor's exec abort (ExecServerControlMessage.abort)", () => {
     expect(((await session.queuedFrame!).value as Frame).payload).toEqual(get.payload)
   })
 
-  it("drops the host's late result without a write and keeps the same Run", () => {
+  it("drops the host's late result without a write and keeps the same Run", async () => {
     const session = heldSession(scriptedFrames().frames)
     sessionManager.registerPending(1, session, "shell_stream", "shell")
     sessionManager.registerPending(2, session, "shell_stream", "shell")
     expect(sessionManager.markExecAborted(session, 1)).toBe(true)
 
-    const continued = deliverContinuationResults(session, [shellResult(session, 1), shellResult(session, 2)])
+    const continued = await deliverContinuationResults(session, [shellResult(session, 1), shellResult(session, 2)])
 
     expect(continued).toBe(session)
     expect([...new Set(execResults(session.writes).map((message) => message.id))]).toEqual([2])

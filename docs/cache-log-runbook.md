@@ -106,7 +106,7 @@ analyze:
 | `conversationGroupId` | Stable group derived from the OpenCode session. It should survive Cursor conversation-id rotation. |
 | `model` | Cursor wire model used for this Run. Compare cache ratios only within the same model/tier. |
 | `continuity=warm` | A checkpoint with prior token details was supplied to this Run. This is the normal cacheable continuation case. |
-| `continuity=cold` | No checkpoint was supplied. Zero or low cache read is expected. |
+| `continuity=cold` | No checkpoint was supplied. `coldReason` says why: a `conversation reset:` reason (`interrupted-run`, `foreign-history:…`, `checkpoint-unusable`, …), `ephemeral` (title/lifecycle Run), or `no-checkpoint` (first turn, or no restart snapshot). A rebuilt conversation still reads the cached system/tools/rules prefix; a cold Run with `rawCacheRead=0` on a large prefix deserves a look. |
 | `continuity=checkpoint-without-token-details` | A checkpoint was supplied, but it lacked a decodable prior token snapshot. Transport continuity may exist, but prior-context coverage cannot be computed. |
 
 Also inspect the outbound flags:
@@ -116,6 +116,17 @@ Also inspect the outbound flags:
 - `reset=true` or a `conversation reset:` line explains a new Cursor identity.
 - `resume=true` follows an interrupted Run and reuses the latest eligible
   checkpoint.
+- `continuation: … interrupted trailing tool result(s) […] heldRun=<reason>`
+  means a tool result arrived after its held Run had closed; `heldRun` names
+  why (`hard-cap-expired`, `remote-error`, `missing-process-local-state` after
+  a restart, …). The turn is rebuilt from host history (`interrupted-run`). A
+  permission or question prompt keeps the Run's lease alive, so
+  `hard-cap-expired` means ten minutes without any host activity.
+- `context warning: Cursor counted rules=0 although this Run sent the …
+  system-instructions rule` means the host system context (AGENTS.md, skills,
+  subagents) is probably missing from the model's prompt. Compare the Run's
+  `checkpoint: stored … categories=` with the conversation's earlier ones and
+  check that nothing wrote `root_prompt_messages_json`.
 - `compaction=true` and the subsequent `post-compaction-rebase` intentionally
   rotate Cursor conversation ids.
 - `conversation reset: reason=foreign-history:foreign-assistant` means the
@@ -190,20 +201,30 @@ Important fields:
 | `source=intermediate-zero` | Tool-call finish with no known checkpoint occupancy. Standard usage remains zero. |
 | `source=unavailable` | No checkpoint has ever supplied token details. Standard usage remains zero rather than pretending aggregate TurnEnded usage is context occupancy. |
 | `cursor=used/max(percent)` | Cursor's authoritative context occupancy. |
-| `rawTotal` | Aggregate `TurnEnded` input + output. This is request work, not necessarily current context occupancy. |
+| `occupancyTotal` | Occupancy-shaped validation counters: `usedTokens + 1` (the `output=1` snapshot). Every finish with token details validates against these. |
+| `rawTotal` | Only on a finish without token details: aggregate `TurnEnded` input + output, request work rather than context occupancy. |
 | `sentTotal` | AI SDK input + output sent to OpenCode. With token details, this must equal Cursor `usedTokens`. |
-| `rawCachedRatio` | For occupancy finishes: the sent split's cached share. TurnEnded request cache ratios are on `finish:` / cache diagnosis, not this field. |
-| `sentCachedRatio` | Occupancy `cacheRead + cacheWrite` / sent input. Equals `rawCachedRatio` on occupancy finishes. |
+| `occupancyCachedRatio` | For occupancy finishes: the sent split's cached share. TurnEnded request cache ratios are on `finish:` / cache diagnosis, never here. (`rawCachedRatio` appears instead only beside `rawTotal`.) |
+| `sentCachedRatio` | Occupancy `cacheRead + cacheWrite` / sent input. Equals `occupancyCachedRatio` on occupancy finishes. |
 | `breakdownMatch` | `true`: category sum and breakdown total match current occupancy/limit. `stale`: self-consistent breakdown with a different occupancy or limit. `false`: category sum disagrees with breakdown total. `unavailable`: no breakdown. |
 
-`finish:` is a compact duplicate of the final AI SDK and raw counters. Tool-call
-boundaries should show `source=occupancy-checkpoint-*` when a snapshot exists
-(or `intermediate-zero` with no snapshot); the final `TurnEnded` moves part of
-its occupancy between `v3CacheRead` and the other parts so the Run's output,
-cache writes and uncached input reach the TurnEnded counts. On occupancy
-finishes, `rawCacheRead` / `occupancyPrefixCache` are the previous finish's
-occupancy (the Run's checkpoint occupancy at its first finish) — not Cursor's
-TurnEnded `cache_read` (that only appears on `reason=stop`).
+`finish:` is a compact duplicate of the usage sent to OpenCode (`v3*`) and of
+the counters behind it, labelled by where they come from:
+
+- `raw*` (only with `reason=stop`): Cursor's `TurnEnded` counters for the whole
+  held Run, plus `occupancyPrefixCache` (the previous finish's occupancy).
+- `occupancy*` (tool-call boundaries with a snapshot,
+  `source=occupancy-checkpoint-*`): `occupancyIn` is current `usedTokens`,
+  `occupancyCacheRead` the previous finish's occupancy (the Run's checkpoint
+  occupancy at its first finish).
+- `est*` (`source=intermediate-zero`, before any checkpoint with token
+  details): the provider's char/4 estimate. Usage sent is zero.
+
+The final `TurnEnded` moves part of its occupancy between `v3CacheRead` and the
+other parts so the Run's output, cache writes and uncached input reach the
+TurnEnded counts. Two tool-call finishes with the same `v3In` are two steps with
+no checkpoint between them (occupancy is replaced, not summed, and carries `$0`
+cost metadata).
 
 ### 4. Interpret the cache diagnosis
 
@@ -217,13 +238,19 @@ rawWriteRatio = rawCacheWrite / rawInput
 
 Some Cursor Runs report `rawCacheWrite=0` and count new input as uncached. This
 is an upstream value, not evidence that the provider dropped writes.
+value, not evidence that the provider dropped writes: the provider decodes
+`TurnEnded` field 4 (`turn_ended raw wire fields: … f4:wt0=`), and some models
+report it (gpt-5.6-luna sent `f4=8201` on a cold call). Where writes are 0,
+new prefix tokens are billed as uncached input instead — `rawUncached` tracks
+the context the Run added (`currentContext` on a first turn, `contextDelta`
+on a warm one).
 
 | Field | Interpretation |
 |---|---|
 | `priorContext` | Cursor `usedTokens` decoded from the checkpoint supplied at Run start. |
 | `currentContext` | Latest known checkpoint `usedTokens` at Run end. |
 | `contextDelta` | Current minus prior occupancy. Negative values are possible after summarization/compaction; positive values include new user/tool/output context. |
-| `rawReadVsPriorContext` | Aggregate cache-read tokens divided by prior context. This asks how much read credit Cursor reported relative to the reusable starting context. It is not a bounded percentage and can exceed 100% when several internal calls reuse the prefix. |
+| `rawReadVsPriorContext` | Aggregate cache-read tokens as a multiple of prior context (`3.00x`). Each internal model call in the Run re-reads the prefix, so a Run with three generations (`pumpPasses=3`) reads about `3.00x`; one generation about `0.96x`–`1.00x`. A multiple well below the generation count on a warm Run is the low-reuse signal. |
 | `sameSizedCategoryTokens` | Sum of current categories whose token count exactly matches the prior checkpoint. This compares sizes only, not content identity. |
 | `categoryDelta` | Per-category token-count change (`current - prior`); `new`/`removed` indicate category appearance/disappearance. |
 | `toolsCategoryChurn` | `none`, `upstream-stable-overlay` (tools tokens moved while RequestContext overlay bytes were reused), or `client-overlay-changed` (tools moved and RequestContext was rebuilt). See `createPlanInTurn` / `switchModeInTurn` for the common in-turn trigger. |
@@ -328,6 +355,15 @@ per-call ratio.
 Low or zero cache read does not diagnose a regression here. For compaction,
 verify that `conversationGroupId` remains stable and that unchanged
 RequestContext hashes survive the rotations where applicable.
+
+### Slow first turn
+
+- `git: discovery elapsedMs=… statusMs=… statusComplete=…` times workspace
+  discovery; `git status` dominates on large repositories.
+- `git: \`status --porcelain -b\` timed out after 5000ms` means the Run was
+  sent `git_status_info_complete: false` and an empty status.
+- `workspace facts: reused ageMs=…` shows a second build within 30 s (the
+  title request and its turn) reusing the first discovery.
 
 ### Stale context snapshot
 

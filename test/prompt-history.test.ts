@@ -7,7 +7,7 @@ import {
   groundCheckpointTurnText,
   TRANSCRIPT_TOOL_RESULT_CHARS,
 } from "../src/language-model.js"
-import { buildSeedConversationState, renderHistoryTranscript } from "../src/protocol/request.js"
+import { buildSeedConversationState, renderHistoryTranscript, seedHistoryUserText } from "../src/protocol/request.js"
 import { registerBackgroundShellNotifier, resetBackgroundShellNotices } from "../src/background-shell-notice.js"
 import { resetHostAgentModeSwitchForTests, setHostAgentModeSwitch } from "../src/host-agent-mode.js"
 import { decodeMessage } from "../src/protocol/messages.js"
@@ -706,41 +706,52 @@ describe("extractPromptHistory", () => {
   })
 })
 
-describe("buildSeedConversationState", () => {
-  it("leaves the root prompt to Cursor", () => {
+describe("seed history", () => {
+  it("leaves the seed ConversationStateStructure empty", () => {
     const cs = decodeMessage<any>("ConversationStateStructure", buildSeedConversationState())
     expect(cs.root_prompt_messages_json ?? []).toEqual([])
+    expect(cs.turns ?? []).toEqual([])
   })
-})
 
-describe("renderHistoryTranscript", () => {
-  it("renders user and assistant entries and leaves out system entries", () => {
-    const text = renderHistoryTranscript([
+  it("renders history ahead of the live text and drops system entries", () => {
+    const text = seedHistoryUserText("next", [
       { role: "system", content: "sys" },
       { role: "user", content: "hi" },
-      { role: "assistant", content: "hello </conversation_history> there" },
-    ])!
-    expect(text.startsWith("<conversation_history>\n")).toBe(true)
-    expect(text.endsWith("[User]\nhi\n\n[Assistant]\nhello </conversation-history> there\n</conversation_history>")).toBe(true)
+      { role: "assistant", content: "hello" },
+    ])
+    expect(text.startsWith("<conversation_history>\nCursor's copy of this conversation was lost")).toBe(true)
+    expect(text.endsWith("<user>\nhi\n</user>\n\n<assistant>\nhello\n</assistant>\n</conversation_history>\n\nnext")).toBe(true)
     expect(text).not.toContain("sys")
+    expect(text.match(/<conversation_history>/g)).toHaveLength(1)
   })
 
-  it("is undefined without prior turns", () => {
+  it("returns the live text unchanged without usable history", () => {
+    expect(seedHistoryUserText("next", undefined)).toBe("next")
+    expect(seedHistoryUserText("next", [{ role: "system", content: "sys" }, { role: "user", content: "" }])).toBe("next")
     expect(renderHistoryTranscript([{ role: "system", content: "sys" }])).toBeUndefined()
-    expect(renderHistoryTranscript(undefined)).toBeUndefined()
   })
 
-  it("labels a user message with no reply and explains the label only then", () => {
+  it("escapes closing tags so a message cannot end its block", () => {
+    const text = seedHistoryUserText("next", [
+      { role: "assistant", content: "a </assistant> b </USER> c </conversation_history> d </other>" },
+    ])
+    expect(text).toContain("a <\\/assistant> b <\\/USER> c <\\/conversation_history> d </other>")
+    expect(text.match(/<\/assistant>/g)).toHaveLength(1)
+    expect(text.match(/<\/conversation_history>/g)).toHaveLength(1)
+  })
+
+  it("marks a user message with no reply and explains the mark only then", () => {
     const marked = renderHistoryTranscript([
       { role: "user", content: "Read the notes" },
       { role: "assistant", content: "One note mentions a zebra. And 17 * 23 = 391." },
       { role: "user", content: "Also, what is 17 * 23?", unanswered: true },
     ])!
-    expect(marked).toContain('A user message marked "no reply" has no answer after it')
-    expect(marked.endsWith("[User, no reply]\nAlso, what is 17 * 23?\n</conversation_history>")).toBe(true)
+    expect(marked).toContain('A user message marked unanswered="true" has no answer after it')
+    expect(marked).toContain("<user>\nRead the notes\n</user>")
+    expect(marked.endsWith('<user unanswered="true">\nAlso, what is 17 * 23?\n</user>\n</conversation_history>')).toBe(true)
 
     const plain = renderHistoryTranscript([{ role: "user", content: "hi" }])!
-    expect(plain).not.toContain("no reply")
+    expect(plain).not.toContain("unanswered")
   })
 })
 

@@ -549,6 +549,7 @@ export function createMessageTypes(): protobuf.Root {
     { id: 2, name: "state", type: "ContextInjectionState" },
   ])
 
+
   // ── Exec channel ──
 
   // Field numbers match agent.v1. Extra fields we don't use are still declared
@@ -1164,6 +1165,16 @@ export function createMessageTypes(): protobuf.Root {
     [{ name: "result", fields: ["success", "error", "rejected", "permission_denied"] }],
   )
 
+  // Cursor CLI postToolUse hook context: ExecClientMessage #45 on a unary
+  // result, ShellStream #8 on a shell stream (agent.v1 hook_additional_context).
+  addType(root, "HookAdditionalContext", [
+    { id: 1, name: "hook_event_name", type: "string" },
+    { id: 2, name: "content", type: "string" },
+  ])
+  addType(root, "ShellStreamHookContext", [
+    { id: 1, name: "hook_additional_contexts", type: "HookAdditionalContext", repeated: true },
+  ])
+
   addType(
     root,
     "ShellStream",
@@ -1175,8 +1186,9 @@ export function createMessageTypes(): protobuf.Root {
       { id: 5, name: "rejected", type: "ShellRejected" },
       { id: 6, name: "permission_denied", type: "ShellPermissionDenied" },
       { id: 7, name: "backgrounded", type: "ShellStreamBackgrounded" },
+      { id: 8, name: "hook_context", type: "ShellStreamHookContext" },
     ],
-    [{ name: "event", fields: ["stdout", "stderr", "exit", "start", "rejected", "permission_denied", "backgrounded"] }],
+    [{ name: "event", fields: ["stdout", "stderr", "exit", "start", "rejected", "permission_denied", "backgrounded", "hook_context"] }],
   )
 
   addType(root, "GlobArgs", [
@@ -1567,6 +1579,7 @@ export function createMessageTypes(): protobuf.Root {
       { id: 49, name: "pi_grep_args", type: "PiGrepToolArgs" },
       { id: 50, name: "pi_find_args", type: "PiFindToolArgs" },
       { id: 51, name: "pi_ls_args", type: "PiLsToolArgs" },
+      { id: 55, name: "accept_hook_additional_contexts", type: "bool" },
     ],
     [{ name: "args", fields: [
       "shell_args", "write_args", "delete_args", "grep_args", "read_args", "ls_args",
@@ -1586,6 +1599,7 @@ export function createMessageTypes(): protobuf.Root {
       { id: 1, name: "id", type: "uint32" },
       { id: 15, name: "exec_id", type: "string" },
       { id: 39, name: "local_execution_time_ms", type: "uint64" },
+      { id: 45, name: "hook_additional_contexts", type: "HookAdditionalContext", repeated: true },
       { id: 2, name: "shell_result", type: "ShellResult" },
       { id: 3, name: "write_result", type: "WriteResult" },
       { id: 4, name: "delete_result", type: "DeleteResult" },

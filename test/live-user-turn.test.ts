@@ -208,8 +208,8 @@ describe("the user turn of a fresh Run", () => {
 
     const { transcript, live } = splitTranscript(run)
     expect(live).toStartWith(`${QUESTION}\n\n${TASK_NOTE}`)
-    expect(transcript).toContain("[User]\nhello")
-    expect(transcript).toContain("[Assistant]\nHi.")
+    expect(transcript).toContain("<user>\nhello\n</user>")
+    expect(transcript).toContain("<assistant>\nHi.\n</assistant>")
     expect(transcript).not.toContain(QUESTION)
     expect(transcript).not.toContain("task_result")
     expect(transcript).not.toContain("no reply")
@@ -308,7 +308,7 @@ describe("the user turn of a fresh Run", () => {
     const { transcript, live } = splitTranscript(run)
     expect(live).toStartWith(QUESTION)
     expect(live).not.toContain(STEER)
-    expect(transcript).toContain(`[User, no reply]\n${STEER}`)
+    expect(transcript).toContain(`<user unanswered="true">\n${STEER}\n</user>`)
   })
 
   /** The last turn ended and saved its snapshot; then the provider restarted. */
@@ -352,7 +352,7 @@ describe("the user turn of a fresh Run", () => {
     const { transcript, live } = splitTranscript(run)
     expect(live).toStartWith(QUESTION)
     expect(live).not.toContain(STEER)
-    expect(transcript).toContain(`[User, no reply]\n${STEER}`)
+    expect(transcript).toContain(`<user unanswered="true">\n${STEER}\n</user>`)
   })
 
   it("sends a note and the user's first message of a new session together", async () => {

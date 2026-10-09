@@ -54,18 +54,18 @@ const toolResult = (sid: string, execId: number, toolName: string, value: string
 })
 
 /** Delivers one OpenCode tool result to a held Run and returns the frames Cursor receives. */
-function deliver(
+async function deliver(
   resultField: string,
   toolName: string,
   value: string,
   resultMetadata?: Record<string, unknown>,
-): any[] {
+): Promise<any[]> {
   const sid = `${resultField}_${Math.random().toString(36).slice(2)}`
   const writes: Uint8Array[] = []
   const held = heldSession(sid, writes)
   sessionManager.registerPending(1, held, resultField, toolName, false, resultMetadata, `call_${sid}`)
   const results = extractTrailingToolResults([toolResult(sid, 1, toolName, value)] as Prompt)
-  expect(deliverContinuationResults(held, results)).toBe(held)
+  expect(await deliverContinuationResults(held, results)).toBe(held)
   return writes.map((frame) => decodeMessage<any>("AgentClientMessage", frame))
 }
 
@@ -78,7 +78,7 @@ afterEach(() => {
 })
 
 describe("OpenCode 2 tool error envelope", () => {
-  it("is extracted as a failed result holding the host's message", () => {
+  it("is extracted as a failed result holding the host's message", async () => {
     const [result] = extractTrailingToolResults([toolResult("s", 1, "edit", DENIED_EDIT)] as Prompt)
     expect(result).toMatchObject({
       execId: 1,
@@ -88,12 +88,12 @@ describe("OpenCode 2 tool error envelope", () => {
     })
   })
 
-  it("keeps a failure with an empty message a failure", () => {
+  it("keeps a failure with an empty message a failure", async () => {
     const [result] = extractTrailingToolResults([toolResult("s", 1, "edit", envelope("tool.execution", ""))] as Prompt)
     expect(result!.error).toBe("OpenCode tool failed (tool.execution)")
   })
 
-  it("accepts OpenCode's optional status and response on the error", () => {
+  it("accepts OpenCode's optional status and response on the error", async () => {
     const value = JSON.stringify({
       error: { type: "provider.rate-limit", message: "slow down", status: 429, response: { body: "{}" } },
       content: [],
@@ -102,13 +102,13 @@ describe("OpenCode 2 tool error envelope", () => {
     expect(result!.error).toBe("slow down")
   })
 
-  it("keeps the output a tool produced before it failed after the message", () => {
+  it("keeps the output a tool produced before it failed after the message", async () => {
     const value = envelope("tool.execution", "Command failed", [{ type: "text", text: "partial line" }])
     const [result] = extractTrailingToolResults([toolResult("s", 1, "shell", value)] as Prompt)
     expect(result!.error).toBe("Command failed\n\npartial line")
   })
 
-  it("leaves completed output that only resembles the envelope a success", () => {
+  it("leaves completed output that only resembles the envelope a success", async () => {
     for (const value of [
       `${DENIED_EDIT}\nmore`,
       JSON.stringify({ error: { type: "permission.rejected", message: "x" }, content: [], exitCode: 0 }),
@@ -125,8 +125,8 @@ describe("OpenCode 2 tool error envelope", () => {
     }
   })
 
-  it("answers a denied edit with Cursor's permission_denied, not WriteSuccess", () => {
-    const write = execResult(deliver("write_result", "edit", DENIED_EDIT, { path: "/w/cli.py" }), "write_result")
+  it("answers a denied edit with Cursor's permission_denied, not WriteSuccess", async () => {
+    const write = execResult(await deliver("write_result", "edit", DENIED_EDIT, { path: "/w/cli.py" }), "write_result")
     expect(write.success).toBeUndefined()
     expect(write.permission_denied).toMatchObject({
       path: "/w/cli.py",
@@ -136,32 +136,32 @@ describe("OpenCode 2 tool error envelope", () => {
     })
   })
 
-  it("answers a user's rejection with feedback as Cursor's rejected, keeping the reason", () => {
-    const write = execResult(deliver("write_result", "edit", USER_FEEDBACK, { path: "/w/cli.py" }), "write_result")
+  it("answers a user's rejection with feedback as Cursor's rejected, keeping the reason", async () => {
+    const write = execResult(await deliver("write_result", "edit", USER_FEEDBACK, { path: "/w/cli.py" }), "write_result")
     expect(write).toEqual({ rejected: { path: "/w/cli.py", reason: "Edit util.py instead" } })
   })
 
-  it("answers a failed edit with WriteError", () => {
+  it("answers a failed edit with WriteError", async () => {
     const value = envelope("tool.execution", "oldString not found in content")
-    const write = execResult(deliver("write_result", "edit", value, { path: "/w/cli.py" }), "write_result")
+    const write = execResult(await deliver("write_result", "edit", value, { path: "/w/cli.py" }), "write_result")
     expect(write).toEqual({ error: { path: "/w/cli.py", error: "oldString not found in content" } })
   })
 
-  it("answers a failed or refused read with an error, not file content", () => {
+  it("answers a failed or refused read with an error, not file content", async () => {
     const failed = execResult(
-      deliver("read_result", "read", envelope("tool.execution", "File not found: /w/nope.py"), { path: "/w/nope.py" }),
+      await deliver("read_result", "read", envelope("tool.execution", "File not found: /w/nope.py"), { path: "/w/nope.py" }),
       "read_result",
     )
     expect(failed).toEqual({ error: { path: "/w/nope.py", error: "File not found: /w/nope.py" } })
     const denied = execResult(
-      deliver("read_result", "read", envelope("permission.rejected", "Permission denied: read"), { path: "/w/.env" }),
+      await deliver("read_result", "read", envelope("permission.rejected", "Permission denied: read"), { path: "/w/.env" }),
       "read_result",
     )
     expect(denied).toEqual({ rejected: { path: "/w/.env", reason: "Permission denied: read" } })
   })
 
-  it("answers a denied shell command with a lone permission_denied event, as Cursor's client does", () => {
-    const frames = deliver("shell_stream", "shell", DENIED_SHELL, {
+  it("answers a denied shell command with a lone permission_denied event, as Cursor's client does", async () => {
+    const frames = await deliver("shell_stream", "shell", DENIED_SHELL, {
       shell_stream: true,
       command: "rm -rf build",
       working_directory: "/w",
@@ -173,8 +173,8 @@ describe("OpenCode 2 tool error envelope", () => {
     expect(frames.at(-1).exec_client_control_message.stream_close.id).toBe(1)
   })
 
-  it("answers a failed shell call with stderr and a nonzero exit, not stdout and exit 0", () => {
-    const frames = deliver("shell_stream", "shell", envelope("tool.execution", "workdir does not exist: /nope"), {
+  it("answers a failed shell call with stderr and a nonzero exit, not stdout and exit 0", async () => {
+    const frames = await deliver("shell_stream", "shell", envelope("tool.execution", "workdir does not exist: /nope"), {
       shell_stream: true,
       command: "ls",
       working_directory: "/nope",
@@ -185,48 +185,48 @@ describe("OpenCode 2 tool error envelope", () => {
     expect(events.find((e) => e.exit).exit.code).toBe(1)
   })
 
-  it("answers shell_result and background spawns with their refusal arms", () => {
+  it("answers shell_result and background spawns with their refusal arms", async () => {
     const metadata = { command: "make", working_directory: "/w" }
-    expect(execResult(deliver("shell_result", "shell", DENIED_SHELL, metadata), "shell_result")).toMatchObject({
+    expect(execResult(await deliver("shell_result", "shell", DENIED_SHELL, metadata), "shell_result")).toMatchObject({
       permission_denied: { command: "make", working_directory: "/w", error: "Permission denied: shell" },
     })
     expect(execResult(
-      deliver("background_shell_spawn_result", "shell", envelope("permission.rejected", "not now"), metadata),
+      await deliver("background_shell_spawn_result", "shell", envelope("permission.rejected", "not now"), metadata),
       "background_shell_spawn_result",
     )).toEqual({ rejected: { command: "make", working_directory: "/w", reason: "not now" } })
   })
 
-  it("answers grep, MCP, ls, delete and Pi tools with their failure arms", () => {
+  it("answers grep, MCP, ls, delete and Pi tools with their failure arms", async () => {
     const failed = envelope("tool.execution", "boom")
-    expect(execResult(deliver("grep_result", "grep", failed), "grep_result")).toEqual({ error: { error: "boom" } })
-    expect(execResult(deliver("mcp_result", "github_search", failed), "mcp_result")).toMatchObject({ error: { error: "boom" } })
-    expect(execResult(deliver("mcp_result", "github_search", envelope("permission.rejected", "Permission denied: github_search")), "mcp_result"))
+    expect(execResult(await deliver("grep_result", "grep", failed), "grep_result")).toEqual({ error: { error: "boom" } })
+    expect(execResult(await deliver("mcp_result", "github_search", failed), "mcp_result")).toMatchObject({ error: { error: "boom" } })
+    expect(execResult(await deliver("mcp_result", "github_search", envelope("permission.rejected", "Permission denied: github_search")), "mcp_result"))
       .toMatchObject({ permission_denied: { error: "Permission denied: github_search" } })
-    expect(execResult(deliver("mcp_result", "github_search", USER_FEEDBACK), "mcp_result"))
+    expect(execResult(await deliver("mcp_result", "github_search", USER_FEEDBACK), "mcp_result"))
       .toMatchObject({ rejected: { reason: "Edit util.py instead" } })
     const ls = parseExecServerMessage({ id: 1, ls_args: { path: "src", tool_call_id: "tc" } })!
-    expect(execResult(deliver("ls_result", "read", envelope("permission.rejected", "Permission denied: read"), ls.resultMetadata), "ls_result"))
+    expect(execResult(await deliver("ls_result", "read", envelope("permission.rejected", "Permission denied: read"), ls.resultMetadata), "ls_result"))
       .toEqual({ rejected: { path: "/w/src", reason: "Permission denied: read" } })
-    expect(execResult(deliver("ls_result", "read", envelope("tool.execution", "EACCES: src"), ls.resultMetadata), "ls_result"))
+    expect(execResult(await deliver("ls_result", "read", envelope("tool.execution", "EACCES: src"), ls.resultMetadata), "ls_result"))
       .toEqual({ error: { path: "/w/src", error: "EACCES: src" } })
     const del = parseExecServerMessage({ id: 1, delete_args: { path: "/w/old.txt", tool_call_id: "tc" } })!
-    expect(execResult(deliver("delete_result", "shell", envelope("tool.execution", "busy"), del.resultMetadata), "delete_result"))
+    expect(execResult(await deliver("delete_result", "shell", envelope("tool.execution", "busy"), del.resultMetadata), "delete_result"))
       .toEqual({ error: { path: "/w/old.txt", error: "busy" } })
-    expect(execResult(deliver("delete_result", "shell", DENIED_SHELL, del.resultMetadata), "delete_result"))
+    expect(execResult(await deliver("delete_result", "shell", DENIED_SHELL, del.resultMetadata), "delete_result"))
       .toMatchObject({ permission_denied: { path: "/w/old.txt", client_visible_error: "Permission denied: shell" } })
-    expect(execResult(deliver("pi_edit_result", "edit", DENIED_EDIT), "pi_edit_result"))
+    expect(execResult(await deliver("pi_edit_result", "edit", DENIED_EDIT), "pi_edit_result"))
       .toEqual({ rejected: { reason: "Permission denied: edit" } })
-    expect(execResult(deliver("pi_bash_result", "shell", DENIED_SHELL), "pi_bash_result"))
+    expect(execResult(await deliver("pi_bash_result", "shell", DENIED_SHELL), "pi_bash_result"))
       .toEqual({ error: { error: "Permission denied: shell" } })
   })
 
-  it("answers an unknown tool with an error carrying OpenCode's message", () => {
+  it("answers an unknown tool with an error carrying OpenCode's message", async () => {
     const message = 'No tool named "frobnicate" is currently available. Please use a tool from the available tool list.'
-    expect(execResult(deliver("mcp_result", "frobnicate", envelope("tool.unknown", message)), "mcp_result"))
+    expect(execResult(await deliver("mcp_result", "frobnicate", envelope("tool.unknown", message)), "mcp_result"))
       .toMatchObject({ error: { error: message } })
   })
 
-  it("marks the envelope as a failed observation in replayed history", () => {
+  it("marks the envelope as a failed observation in replayed history", async () => {
     const history = extractPromptHistory([
       { role: "user", content: [{ type: "text", text: "edit cli.py" }] },
       { role: "assistant", content: [{ type: "tool-call", toolCallId: "cursor_h_1", toolName: "edit", input: "{}" }] },
