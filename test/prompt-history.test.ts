@@ -6,7 +6,7 @@ import {
   extractPromptHistory,
   groundCheckpointTurnText,
 } from "../src/language-model.js"
-import { buildSeedConversationState } from "../src/protocol/request.js"
+import { buildSeedConversationState, seedHistoryUserText } from "../src/protocol/request.js"
 import { resetHostAgentModeSwitchForTests, setHostAgentModeSwitch } from "../src/host-agent-mode.js"
 import { decodeMessage } from "../src/protocol/messages.js"
 
@@ -444,21 +444,36 @@ describe("extractPromptHistory", () => {
   })
 })
 
-describe("buildSeedConversationState history", () => {
-  it("embeds history into root_prompt_messages_json and drops system entries", () => {
-    const bytes = buildSeedConversationState({
-      history: [
-        { role: "system", content: "sys" },
-        { role: "user", content: "hi" },
-        { role: "assistant", content: "hello" },
-      ],
-    })
-    const cs = decodeMessage<any>("ConversationStateStructure", bytes)
-    const root = (cs.root_prompt_messages_json ?? []).map((s: string) => JSON.parse(s))
-    expect(root).toEqual([
+describe("seed history", () => {
+  it("leaves the seed ConversationStateStructure empty", () => {
+    const cs = decodeMessage<any>("ConversationStateStructure", buildSeedConversationState())
+    expect(cs.root_prompt_messages_json ?? []).toEqual([])
+    expect(cs.turns ?? []).toEqual([])
+  })
+
+  it("renders history ahead of the live text and drops system entries", () => {
+    expect(seedHistoryUserText("next", [
+      { role: "system", content: "sys" },
       { role: "user", content: "hi" },
       { role: "assistant", content: "hello" },
+    ])).toBe(
+      "<conversation_history>\n<user>\nhi\n</user>\n\n<assistant>\nhello\n</assistant>\n" +
+        "</conversation_history>\n\nnext",
+    )
+  })
+
+  it("returns the live text unchanged without usable history", () => {
+    expect(seedHistoryUserText("next", undefined)).toBe("next")
+    expect(seedHistoryUserText("next", [{ role: "system", content: "sys" }, { role: "user", content: "" }])).toBe("next")
+  })
+
+  it("escapes closing tags so a message cannot end its block", () => {
+    const text = seedHistoryUserText("next", [
+      { role: "assistant", content: "a </assistant> b </USER> c </conversation_history> d </other>" },
     ])
+    expect(text).toContain("a <\\/assistant> b <\\/USER> c <\\/conversation_history> d </other>")
+    expect(text.match(/<\/assistant>/g)).toHaveLength(1)
+    expect(text.match(/<\/conversation_history>/g)).toHaveLength(1)
   })
 })
 

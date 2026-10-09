@@ -26,6 +26,8 @@ export type CursorCacheDiagnosticStats = {
   conversationGroupId?: string
   modelId?: string
   startedWithCheckpoint: boolean
+  /** Why a Run started without a checkpoint: a reset reason, `ephemeral`, or `no-checkpoint`. */
+  coldReason?: string
   requestContextReused: boolean
   requestContextHash: string
   systemPromptHash?: string
@@ -226,6 +228,7 @@ export function formatCursorCacheDiagnostics(
     `conversationGroupId=${stats.conversationGroupId ?? "-"}`,
     `model=${stats.modelId ?? "-"}`,
     `continuity=${continuity}`,
+    `coldReason=${continuity === "cold" ? stats.coldReason ?? "unknown" : "-"}`,
     `rawInput=${rawInput}`,
     `rawCacheRead=${rawRead}`,
     `rawCacheWrite=${rawWrite}`,
@@ -235,7 +238,9 @@ export function formatCursorCacheDiagnostics(
     `priorContext=${prior?.usedTokens ?? "unavailable"}`,
     `currentContext=${current?.usedTokens ?? "unavailable"}`,
     `contextDelta=${contextDelta ?? "unavailable"}`,
-    `rawReadVsPriorContext=${prior ? usageRatio(rawRead, prior.usedTokens) : "n/a"}`,
+    // Several model calls in one Run each re-read the prefix, so this multiple
+    // routinely exceeds 1 and is not a percentage.
+    `rawReadVsPriorContext=${prior && prior.usedTokens > 0 ? `${(rawRead / prior.usedTokens).toFixed(2)}x` : "n/a"}`,
     `sameSizedCategoryTokens=${categoriesComparable ? sameSizedCategoryTokens : "unavailable"}`,
     `categoryDelta=${categoriesComparable && Object.keys(categoryDelta).length > 0 ? JSON.stringify(categoryDelta) : "unavailable"}`,
     `toolsCategoryChurn=${toolsCategoryChurn}`,
@@ -261,13 +266,20 @@ export function formatCursorCacheDiagnostics(
   ].join(" ")
 }
 
-/** One-line proof that Cursor, AI SDK, and projected OpenCode totals agree. */
+/**
+ * One-line proof that Cursor, AI SDK, and projected OpenCode totals agree.
+ * `counterKind` names what `counters` hold so the line labels them truthfully:
+ * Cursor's TurnEnded request counters (`raw*`) or the occupancy-shaped counters
+ * of {@link occupancyValidationCounters} (`occupancy*`).
+ */
 export function formatTurnUsageValidation(
   counters: CursorUsageCounters,
   usage: LanguageModelV3Usage,
   tokenDetails?: CursorConversationTokenDetails,
   contextSource?: CursorContextUsageSource,
+  counterKind: "turn-ended" | "occupancy" = "turn-ended",
 ): string {
+  const counterLabel = counterKind === "occupancy" ? "occupancy" : "raw"
   const input = usageCount(usage.inputTokens.total)
   const noCache = usageCount(usage.inputTokens.noCache)
   const cacheRead = usageCount(usage.inputTokens.cacheRead)
@@ -321,7 +333,7 @@ export function formatTurnUsageValidation(
     `status=${status}`,
     `source=${tokenDetails ? contextSource ?? "checkpoint-current-run" : "unavailable"}`,
     `cursor=${cursor}`,
-    `rawTotal=${rawTotal}`,
+    `${counterLabel}Total=${rawTotal}`,
     `sentTotal=${sentTotal}`,
     `totalMatch=${totalMatch}`,
     `input=${input}`,
@@ -335,10 +347,61 @@ export function formatTurnUsageValidation(
     `breakdownTotal=${breakdown?.totalUsedTokens ?? "unavailable"}`,
     `categorySum=${categorySum ?? "unavailable"}`,
     `breakdownMatch=${breakdownMatch ?? "unavailable"}`,
-    `rawCachedRatio=${usageRatio(rawCached, counters.inputTokens)}`,
+    `${counterLabel}CachedRatio=${usageRatio(rawCached, counters.inputTokens)}`,
     `sentCachedRatio=${usageRatio(sentCached, input)}`,
     `cacheRatioMatch=${cacheRatioMatch ?? "unavailable"}`,
   ].join(" ")
+}
+
+/**
+ * The `finish:` trace. `v3*` is the usage sent to OpenCode. The second group is
+ * labelled by where its numbers come from: `raw*` are Cursor's TurnEnded
+ * request counters (whole Run), `occupancy*` the checkpoint snapshot a
+ * tool-call boundary sends (`occupancyCacheRead` = prior turn's context), and
+ * `est*` the provider's char/4 estimate before any checkpoint arrived.
+ */
+export function formatFinishTrace(input: {
+  reason: string
+  usage: LanguageModelV3Usage
+  turnEnded?: CursorUsageCounters
+  occupancy?: { usedTokens: number; priorUsedTokens: number }
+  estimate: CursorUsageCounters
+  source: string
+}): string {
+  const { usage, turnEnded, occupancy, estimate } = input
+  const counters = turnEnded
+    ? `rawIn=${turnEnded.inputTokens} rawOut=${turnEnded.outputTokens} ` +
+      `rawCacheRead=${turnEnded.cacheRead} rawCacheWrite=${turnEnded.cacheWrite} ` +
+      (occupancy ? `occupancyPrefixCache=${occupancy.priorUsedTokens} ` : "")
+    : occupancy
+      ? `occupancyIn=${occupancy.usedTokens} occupancyOut=1 ` +
+        `occupancyCacheRead=${occupancy.priorUsedTokens} occupancyCacheWrite=0 `
+      : `estIn=${estimate.inputTokens} estOut=${estimate.outputTokens} ` +
+        `estCacheRead=${estimate.cacheRead} estCacheWrite=${estimate.cacheWrite} `
+  return `finish: reason=${input.reason} ` +
+    `v3In=${usage.inputTokens?.total ?? 0} v3Out=${usage.outputTokens?.total ?? 0} ` +
+    `v3CacheRead=${usage.inputTokens?.cacheRead ?? 0} v3CacheWrite=${usage.inputTokens?.cacheWrite ?? 0} ` +
+    `v3Reasoning=${usage.outputTokens?.reasoning ?? 0} ` +
+    counters +
+    `source=${input.source}`
+}
+
+/**
+ * A warning when Cursor's checkpoint counts no rules although this Run sent the
+ * system-instructions rule: the host system context (AGENTS.md, skills,
+ * subagents) is then likely absent from the model's prompt. Undefined when the
+ * breakdown is missing or stale, or when rules were counted.
+ */
+export function missingRulesWarning(
+  details: CursorConversationTokenDetails | undefined,
+  sentRuleChars: number,
+  conversationId: string,
+): string | undefined {
+  if (sentRuleChars <= 0) return undefined
+  const rules = currentCursorTokenBreakdown(details)?.categories.find((category) => category.id === "rules")
+  if (!rules || rules.estimatedTokens > 0) return undefined
+  return `context warning: Cursor counted rules=0 although this Run sent the ${sentRuleChars}-char ` +
+    `system-instructions rule conversationId=${conversationId} — host instructions may not reach the model`
 }
 
 /** OpenCode requires a usage object at every step boundary. */

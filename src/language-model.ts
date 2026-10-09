@@ -141,6 +141,7 @@ import { stageCursorImage } from "./image-staging.js"
 import { IMAGE_PERMISSION_DENIED_PREFIX } from "./image-save.js"
 import { getCheckpoint, setCheckpoint } from "./protocol/checkpoint.js"
 import {
+  currentCursorTokenBreakdown,
   cursorContextUsageMetadata,
   decodeConversationTokenDetails,
   type CursorContextUsageSource,
@@ -246,7 +247,9 @@ import {
   emptyLanguageModelV3Usage,
   formatCursorCacheDiagnostics,
   formatCursorTokenCategories,
+  formatFinishTrace,
   formatTurnUsageValidation,
+  missingRulesWarning,
   occupancyUsageFromTokenDetails,
   occupancyValidationCounters,
   OPENCODE_DISPLAY_ONLY_COST_METADATA,
@@ -821,8 +824,16 @@ async function doStreamImpl(
       // prompt onto a fresh conversation: its seed history includes the
       // completed tool result, so no result or advertised tool is lost and
       // Cursor can continue instead of deadlocking.
+      // Resuming the last checkpoint cannot take these results: Cursor
+      // checkpoints only after tool results, so that checkpoint predates the
+      // outstanding calls, and `resume_action` re-runs the model step, which
+      // asks for the tool again under a new call id. Verified live 2026-10-09
+      // (claude-sonnet-5-5): the resumed Run re-requested the same read.
       const ids = trailingToolResults.map((r) => `${r.sessionId}:${r.execId}`).join(",")
-      trace(`continuation: ${trailingToolResults.length} interrupted trailing tool result(s) [${ids}] — rebasing fresh Run`)
+      trace(
+        `continuation: ${trailingToolResults.length} interrupted trailing tool result(s) [${ids}] ` +
+          `heldRun=${describeHeldRunLoss(trailingToolResults)} — rebasing fresh Run`,
+      )
       session = await openSession({ recovery: { kind: "rebase" } })
     } else {
       // Fresh turn (prompt ends with user/assistant text). Historical tool
@@ -1096,6 +1107,8 @@ export type CursorRunRecovery =
   | { kind: "resume"; conversationId: string; checkpoint: Uint8Array }
 
 const heartbeatWritePendingBySession = new WeakMap<CursorSession, boolean>()
+/** Runs whose first current category breakdown was checked for missing rules. */
+const rulesCategoryChecked = new WeakSet<CursorSession>()
 const heartbeatGenerationBySession = new WeakMap<CursorSession, number>()
 
 function bumpHeartbeatGeneration(session: CursorSession): number {
@@ -1305,6 +1318,8 @@ async function startSession(
   }
   const conversationId = bound.conversationId
   const conversationGroupId = resolveConversationGroupId(sessionKey, conversationId)
+  const resetReason = forcedResetReason
+    ?? (recovery?.kind === "rebase" ? "interrupted-run" : (resetState.reason ?? "unknown"))
   if (bound.reset) {
     if (sessionKey) {
       await clearPersistedConversationState(cacheDir, sessionKey, bound.previousId).catch((error) => {
@@ -1312,7 +1327,7 @@ async function startSession(
       })
     }
     trace(
-      `conversation reset: reason=${forcedResetReason ?? (recovery?.kind === "rebase" ? "interrupted-run" : (resetState.reason ?? "unknown"))} ` +
+      `conversation reset: reason=${resetReason} ` +
         `sessionKey=${sessionKey ?? "(none)"} ` +
         `previousId=${bound.previousId ?? "-"} → conversationId=${conversationId}`,
     )
@@ -1658,6 +1673,9 @@ async function startSession(
       modelId: cursorModelId,
       priorTokenDetails,
       startedWithCheckpoint: !!conversationState,
+      ...(conversationState
+        ? {}
+        : { coldReason: ephemeralRun ? "ephemeral" : bound.reset ? resetReason : "no-checkpoint" }),
       requestContextReused,
       requestContextHash,
       systemPromptHash,
@@ -1780,6 +1798,15 @@ async function startSession(
  * OpenCode re-sends the full tool-result history on every continuation. Prefer
  * the newest result that still has a live pending exec on its tagged session.
  */
+/** Why the held Run for these results is gone, from the session manager's tombstones. */
+function describeHeldRunLoss(toolResults: Array<{ sessionId: string; execId: number }>): string {
+  const reasons = new Set(toolResults.map((r) => {
+    const classification = sessionManager.classify(r.sessionId, r.execId)
+    return classification.kind === "deliverable" ? "open" : classification.reason
+  }))
+  return [...reasons].join(",")
+}
+
 export function findContinuationSession(
   toolResults: Array<{ sessionId: string; execId: number }>,
 ): CursorSession | undefined {
@@ -3488,43 +3515,21 @@ export async function pump(
     const reasonLabel = typeof reason === "object" && reason && "unified" in reason
       ? String((reason as { unified?: string }).unified ?? "unknown")
       : String(reason)
-    const inTotal = usage.inputTokens?.total ?? 0
-    const outTotal = usage.outputTokens?.total ?? 0
-    const occupancySource = occupancyDetails
-      ? `occupancy-${contextSource ?? "unavailable"}`
-      : "intermediate-zero"
-    // Occupancy finishes never see Cursor TurnEnded cache_read. usageEstimate.cacheRead
-    // stays 0 for the whole Run, so logging it as rawCacheRead falsely reports 0% on
-    // every tool-call step. Prefer the V3 occupancy partition (prior prefix → cacheRead)
-    // and label the estimate separately from billed TurnEnded counters.
-    const occupancyPrefixCache = occupancyDetails
-      ? (session.cacheDiagnostics?.priorTokenDetails?.usedTokens ?? 0)
-      : undefined
-    const rawIn = te
-      ? turnEndedCounter(te, "input_tokens")
-      : occupancyDetails
-        ? occupancyDetails.usedTokens
-        : est.inputTokens
-    const rawOut = te
-      ? turnEndedCounter(te, "output_tokens")
-      : occupancyDetails
-        ? 1
-        : est.outputTokens
-    const rawCacheRead = te
-      ? turnEndedCounter(te, "cache_read")
-      : occupancyPrefixCache ?? est.cacheRead
-    const rawCacheWrite = te ? turnEndedCounter(te, "cache_write") : est.cacheWrite
-    trace(
-      `finish: reason=${reasonLabel} ` +
-        `v3In=${inTotal} v3Out=${outTotal} ` +
-        `v3CacheRead=${usage.inputTokens?.cacheRead ?? 0} v3CacheWrite=${usage.inputTokens?.cacheWrite ?? 0} ` +
-        `v3Reasoning=${usage.outputTokens?.reasoning ?? 0} ` +
-        `rawIn=${rawIn} rawOut=${rawOut} rawCacheRead=${rawCacheRead} rawCacheWrite=${rawCacheWrite} ` +
-        `${occupancyPrefixCache !== undefined ? `occupancyPrefixCache=${occupancyPrefixCache} ` : ""}` +
-        `source=${te
-          ? settledSource ?? (contextSource ?? "unavailable")
-          : occupancySource}`,
-    )
+    trace(formatFinishTrace({
+      reason: reasonLabel,
+      usage,
+      turnEnded: counters,
+      occupancy: occupancyDetails
+        ? {
+            usedTokens: occupancyDetails.usedTokens,
+            priorUsedTokens: session.cacheDiagnostics?.priorTokenDetails?.usedTokens ?? 0,
+          }
+        : undefined,
+      estimate: est,
+      source: te
+        ? settledSource ?? (contextSource ?? "unavailable")
+        : occupancyDetails ? `occupancy-${contextSource ?? "unavailable"}` : "intermediate-zero",
+    }))
     // Validate the usage we actually send. Occupancy finishes (tool-call and
     // TurnEnded/stop) use prior-prefix cacheRead — never compare that against
     // aggregate TurnEnded request cache ratios (false mismatch). Raw request
@@ -3538,6 +3543,7 @@ export async function pump(
         usage,
         occupancyDetails,
         contextSource,
+        "occupancy",
       ))
     } else if (counters) {
       trace(formatTurnUsageValidation(counters, usage, tokenDetails, contextSource))
@@ -3790,6 +3796,15 @@ export async function pump(
         trace(
           `checkpoint: stored ${bytes.length}B for conversationId=${session.conversationId}${context}`,
         )
+        if (tokenDetails && !rulesCategoryChecked.has(session) && currentCursorTokenBreakdown(tokenDetails)) {
+          rulesCategoryChecked.add(session)
+          const warning = missingRulesWarning(
+            tokenDetails,
+            systemInstructionsRuleText(session.requestContext)?.length ?? 0,
+            session.conversationId,
+          )
+          if (warning) trace(warning)
+        }
       }
     }
 

@@ -145,6 +145,48 @@ function endTurn(run: FakeRun, text: string): void {
   run.send({ interaction_update: { turn_ended: { input_tokens: 10, output_tokens: 2 } } })
 }
 
+describe("seeded Runs through a full provider Run", () => {
+  it("rebuilds a closed Run with the history in the user text and the system-instructions rule intact", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-seed-run-"))
+    cacheHttp2SessionForTests(ORIGIN, client)
+    try {
+      const file = path.join(root, "probe.txt")
+      fs.writeFileSync(file, "alpha\n")
+      const sessionKey = "ses_seed_rebuild"
+      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      onRun = (run, message) => {
+        if (!message.run_request) return
+        if (runs.indexOf(run) === 0) run.send({ exec_server_message: { id: 1, read_args: { path: file } } })
+        else endTurn(run, "Done.")
+      }
+      const initial: Prompt = [
+        { role: "system", content: "Host system prompt: build with bazel." },
+        { role: "user", content: [{ type: "text", text: "Read probe.txt." }] },
+      ]
+      const first = await collect(model, initial, sessionKey)
+      const call = first.find((part) => part.type === "tool-call") as { toolCallId: string; input: string }
+      // The held Run is gone when the result arrives (hard cap, process restart).
+      sessionManager.dispose()
+      const second = await collect(model, [
+        ...initial,
+        { role: "assistant", content: [{ type: "tool-call", toolCallId: call.toolCallId, toolName: "read", input: JSON.parse(call.input) }] },
+        { role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: "read", output: { type: "text", value: "alpha" } }] },
+      ] as Prompt, sessionKey)
+      expect(textOf(second)).toBe("Done.")
+      expect(runs).toHaveLength(2)
+      const request = runs[1]!.received.find((message) => message.run_request)!.run_request
+      const state = decodeMessage<Record<string, any>>("ConversationStateStructure", request.conversation_state)
+      expect(state.root_prompt_messages_json ?? []).toEqual([])
+      const text = request.action.user_message_action.user_message.text as string
+      expect(text).toStartWith("<conversation_history>\n<user>\nRead probe.txt.\n\nOpenCode host observation ")
+      expect(text).toContain("alpha\n</user>\n</conversation_history>\n\nContinue the interrupted turn")
+      const rules = request.action.user_message_action.request_context.rules as Array<{ content: string }>
+      expect(rules).toHaveLength(1)
+      expect(rules[0]!.content).toStartWith("Host system prompt: build with bazel.")
+    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+  }, 30_000)
+})
+
 describe("host notes through a full provider Run", () => {
   it("lifts read instructions when their pending result arrives with a fresh user message", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-host-notes-fresh-"))

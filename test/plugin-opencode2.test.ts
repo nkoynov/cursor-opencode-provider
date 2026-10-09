@@ -1,9 +1,10 @@
-import { describe, expect, test, beforeEach, afterEach } from "bun:test"
+import { describe, expect, test, beforeEach, afterEach, setSystemTime } from "bun:test"
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import plugin from "../src/plugin-opencode2.js"
 import { CursorPlugin } from "../src/plugin.js"
+import { sessionActivity } from "../src/activity.js"
 import { applyCursorProviderInventory, CURSOR_AISDK_PACKAGE, modelConfigEntryToInfo } from "../src/opencode2/catalog.js"
 import {
   accessTokenFromCredential,
@@ -1140,6 +1141,31 @@ describe("opencode2 setup", () => {
       else process.env.CURSOR_CLIENT_VERSION = previousVersion
       resetClientVersionCache()
       rmSync(cacheDir, { recursive: true, force: true })
+    }
+  })
+
+  test("keeps a parent lease active while a child form or permission prompt is open", async () => {
+    sessionActivity.clear()
+    const start = Date.now()
+    const { ctx } = fakeContext([
+      { type: "session.updated", data: { info: { id: "child", parentID: "parent" } } },
+      { type: "form.created", data: { form: { id: "frm_1", sessionID: "child", title: "Pick", fields: [] } } },
+      { type: "permission.asked", data: { id: "per_1", sessionID: "child", action: "bash", resources: [] } },
+      { type: "permission.replied", data: { sessionID: "child", requestID: "per_1", reply: "once" } },
+    ])
+    const cleanup = await setupPlugin(ctx)
+    try {
+      for (let i = 0; i < 100 && sessionActivity.lastActivityAt("parent") === undefined; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      setSystemTime(new Date(start + 3_600_000))
+      // The form is still open; the permission was answered.
+      expect(sessionActivity.lastActivityAt("parent")).toBe(start + 3_600_000)
+    } finally {
+      setSystemTime()
+      await cleanup()
+      sessionActivity.clear()
     }
   })
 

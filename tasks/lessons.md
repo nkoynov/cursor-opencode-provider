@@ -668,3 +668,16 @@
   persistence. When a user action is sent, remove only its captured batches;
   later arrivals must survive without replaying the earlier instructions
   (`test/host-notes.test.ts`).
+
+## 2026-10-09 — Checkpoint categories show what reached the prompt
+
+- Cursor's checkpoint `categories` are the evidence for what the model was
+  given. A drop that persists across a conversation (here `rules`, `skills`,
+  `mcp`, `subagents` to 0 after a rebuild) is a prompt-assembly failure, not
+  accounting noise: compare the first checkpoint of every rebuilt conversation
+  with its predecessor, then A/B the client field that differs before
+  explaining it away (`test/host-notes-run.test.ts`, seeded Runs).
+- Before re-designing a recovery path around a protocol action, check its live
+  semantics. `resume_action` looked like a cheaper rebuild but re-runs the
+  model step from the last checkpoint and re-requests the tool under a new id;
+  answering it would have needed guesswork or double execution.

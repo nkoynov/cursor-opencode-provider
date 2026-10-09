@@ -1,5 +1,6 @@
-import { describe, it, expect } from "bun:test"
+import { describe, it, expect, setSystemTime } from "bun:test"
 import { SessionManager, type CursorSession } from "../src/session.js"
+import { SessionActivityTracker } from "../src/activity.js"
 import { CursorProtocolError } from "../src/errors.js"
 import type { BidiStream, BidiTerminalEvent } from "../src/transport/connect.js"
 import { sessionFixture } from "./session-fixture.js"
@@ -262,6 +263,41 @@ describe("SessionManager", () => {
       kind: "terminal",
       reason: "hard-cap-expired",
     })
+  })
+
+  it("holds a pending tool past the hard cap while the host waits on the user", () => {
+    const start = new Date("2026-10-09T00:00:00Z").getTime()
+    setSystemTime(new Date(start))
+    const tracker = new SessionActivityTracker()
+    const mgr = new SessionManager({
+      now: () => Date.now(),
+      activitySource: tracker,
+      setTimer: () => ({ unref() {} }) as unknown as ReturnType<typeof setTimeout>,
+      clearTimer: () => {},
+    })
+    try {
+      const s = fakeSession()
+      s.openCodeSessionId = "parent"
+      s.policy = { heartbeatMs: 10, semanticIdleMs: 50, hardCapMs: 100 }
+      tracker.linkSession("child", "parent")
+      mgr.registerPending(9, s, "read_result")
+      tracker.openPrompt("child", "per_1")
+
+      setSystemTime(new Date(start + 21 * 60_000))
+      mgr.sweepHardDeadlines()
+      expect(s.closed).toBe(false)
+
+      tracker.closePrompt("child", "per_1")
+      setSystemTime(new Date(start + 21 * 60_000 + 99))
+      mgr.sweepHardDeadlines()
+      expect(s.closed).toBe(false)
+      setSystemTime(new Date(start + 21 * 60_000 + 100))
+      mgr.sweepHardDeadlines()
+      expect(s.closed).toBe(true)
+    } finally {
+      setSystemTime()
+      mgr.dispose()
+    }
   })
 
   it("does not return an expired session", () => {

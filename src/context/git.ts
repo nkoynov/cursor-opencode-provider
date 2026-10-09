@@ -1,15 +1,24 @@
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import path from "node:path"
+import { errorMessage, trace } from "../debug.js"
 
 const execFileAsync = promisify(execFile)
+const GIT_TIMEOUT_MS = 5_000
 
-async function git(cwd: string, args: string[]): Promise<string> {
+/** Trimmed stdout, or `undefined` when git failed or timed out. */
+async function git(cwd: string, args: string[]): Promise<string | undefined> {
+  const started = Date.now()
   try {
-    const { stdout } = await execFileAsync("git", args, { cwd, encoding: "utf-8", timeout: 5000 })
+    const { stdout } = await execFileAsync("git", args, { cwd, encoding: "utf-8", timeout: GIT_TIMEOUT_MS })
     return stdout.trim()
-  } catch {
-    return ""
+  } catch (error) {
+    const killed = (error as { killed?: boolean }).killed === true
+    trace(
+      `git: \`${args.join(" ")}\` ${killed ? `timed out after ${GIT_TIMEOUT_MS}ms` : "failed"} ` +
+        `elapsedMs=${Date.now() - started}${killed ? "" : `: ${errorMessage(error).split("\n")[0]}`}`,
+    )
+    return undefined
   }
 }
 
@@ -31,14 +40,19 @@ export type GitRepoInfo = {
   remote_url?: string
 }
 
-export async function collectGit(workspaceRoot: string): Promise<{
+export type GitFacts = {
   repositoryInfo: RepoInfo[]
   gitRepos: GitRepoInfo[]
-}> {
-  const root = await git(workspaceRoot, ["rev-parse", "--show-toplevel"])
-  if (!root) return { repositoryInfo: [], gitRepos: [] }
+  /** False when `git status` failed or timed out, so the status is not the real one. */
+  statusComplete: boolean
+}
 
-  const remotesRaw = await git(root, ["remote", "-v"])
+export async function collectGit(workspaceRoot: string): Promise<GitFacts> {
+  const started = Date.now()
+  const root = await git(workspaceRoot, ["rev-parse", "--show-toplevel"])
+  if (!root) return { repositoryInfo: [], gitRepos: [], statusComplete: true }
+
+  const remotesRaw = (await git(root, ["remote", "-v"])) ?? ""
   const remote_urls: string[] = []
   const remote_names: string[] = []
   for (const line of remotesRaw.split("\n")) {
@@ -57,7 +71,9 @@ export async function collectGit(workspaceRoot: string): Promise<{
   }
 
   const branch = (await git(root, ["rev-parse", "--abbrev-ref", "HEAD"])) || "HEAD"
+  const statusStarted = Date.now()
   const status = await git(root, ["status", "--porcelain", "-b"])
+  trace(`git: discovery elapsedMs=${Date.now() - started} statusMs=${Date.now() - statusStarted} statusComplete=${status !== undefined}`)
 
   const repositoryInfo: RepoInfo[] = [
     {
@@ -75,11 +91,11 @@ export async function collectGit(workspaceRoot: string): Promise<{
   const gitRepos: GitRepoInfo[] = [
     {
       path: root,
-      status: status.slice(0, 4000),
+      status: (status ?? "").slice(0, 4000),
       branch_name: branch,
       ...(primary ? { remote_url: primary } : {}),
     },
   ]
 
-  return { repositoryInfo, gitRepos }
+  return { repositoryInfo, gitRepos, statusComplete: status !== undefined }
 }

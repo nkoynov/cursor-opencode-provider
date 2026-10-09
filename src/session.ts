@@ -210,6 +210,8 @@ export type CursorSession = {
     modelId?: string
     priorTokenDetails?: CursorConversationTokenDetails
     startedWithCheckpoint: boolean
+    /** Why a Run started without a checkpoint: a reset reason, `ephemeral`, or `no-checkpoint`. */
+    coldReason?: string
     requestContextReused: boolean
     requestContextHash: string
     systemPromptHash?: string
