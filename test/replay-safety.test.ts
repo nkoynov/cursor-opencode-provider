@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test"
 import { analyzeReplayFrame, describeFrameLayout } from "../src/replay-safety.js"
+import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 
 function varint(value: number): number[] {
   const out: number[] = []
@@ -97,6 +98,8 @@ describe("Cursor CLI 2026.09.28 frame shapes", () => {
     ["1:2{27:2{1:0}}", update(27, [...varint(1 << 3), 2], []), {}],
     ["1:2{7:2{1:2,2:2,4:2},25:0}", update(7, [...callId, ...nested, ...lengthDelimited(4, new TextEncoder().encode("m"))]), { partial_tool_call: {} }],
     ["1:2{15:2{1:2,2:2,3:2},25:0}", update(15, [...callId, ...nested, ...lengthDelimited(3, new TextEncoder().encode("m"))]), {}],
+    // context_injection_state{injection_id, state} after an inject_context_action.
+    ["1:2{23:2{1:2,2:2}}", update(23, [...callId, ...lengthDelimited(2, Uint8Array.from(lengthDelimited(3)))], []), {}],
   ]
 
   for (const [layout, bytes, interactionUpdate] of cases) {
@@ -106,6 +109,18 @@ describe("Cursor CLI 2026.09.28 frame shapes", () => {
       expect(analyzeReplayFrame(frame, { interactionUpdate }).barrier).toBeUndefined()
     })
   }
+
+  it("decodes an injection state update as status without progress or a barrier", () => {
+    const frame = encodeMessage("AgentServerMessage", {
+      interaction_update: {
+        context_injection_state: { injection_id: "inj-1", state: { rejected: { reason: "run ended" } } },
+      },
+    })
+    const decoded = decodeMessage<any>("AgentServerMessage", frame).interaction_update
+    expect(decoded.context_injection_state.injection_id).toBe("inj-1")
+    expect(decoded.context_injection_state.state.rejected.reason).toBe("run ended")
+    expect(analyzeReplayFrame(frame, { interactionUpdate: decoded })).toEqual({ semanticProgress: false, barrier: undefined })
+  })
 
   it("keeps the barrier for an undeclared member or a repeated timing field", () => {
     // `grok_bot_nudge` #26 is not one this client accepts.

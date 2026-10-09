@@ -97,7 +97,7 @@ describe("parallel tool-call pump", () => {
       toolCallId: p.toolCallId, sessionId: session.sessionId, execId: i + 1,
       toolName: p.toolName, output: "done",
     }))
-    expect(deliverContinuationResults(session, results)).toBe(session)
+    expect(await deliverContinuationResults(session, results)).toBe(session)
     expect(session.pending.size).toBe(0)
     expect(writes.length).toBeGreaterThanOrEqual(3)
     await pump(session, controller, ids)

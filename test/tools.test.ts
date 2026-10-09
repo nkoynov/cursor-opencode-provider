@@ -20,6 +20,7 @@ import {
   buildMcpStateResult,
   buildTypedExecResult,
   unwrapReadOutput,
+  extractOpenCodeReadInstruction,
   buildCustomWebToolAliases,
   CUSTOM_WEBSEARCH_TOOL,
   resolveCustomWebToolAlias,
@@ -2016,6 +2017,32 @@ describe("unwrapReadOutput", () => {
   it("handles offset/pagination footer + trailing <system-reminder>", () => {
     // system-reminder sits after </content> and must be excluded entirely.
     expect(unwrapReadOutput(OPENCODE_READ_PAGED)).toBe("lineA\nlineB")
+  })
+
+  it("lifts the instruction after an unnumbered </content> and ignores media success text", () => {
+    expect(extractOpenCodeReadInstruction(OPENCODE_READ_PAGED)).toBe("loaded instruction text")
+    expect(extractOpenCodeReadInstruction(OPENCODE_READ_FULL)).toBeUndefined()
+    expect(extractOpenCodeReadInstruction("Image read successfully")).toBeUndefined()
+    expect(extractOpenCodeReadInstruction("PDF read successfully")).toBeUndefined()
+    const numberedCloser = [
+      "<path>/x</path>", "<type>file</type>", "<content>",
+      "1: before",
+      "2: </content>",
+      "3: after",
+      "", "(End of file - total 3 lines)", "</content>",
+      "", "<system-reminder>",
+      "Instructions from: /repo/AGENTS.md",
+      "</system-reminder>",
+    ].join("\n")
+    expect(unwrapReadOutput(numberedCloser)).toBe("before\n</content>\nafter")
+    expect(extractOpenCodeReadInstruction(numberedCloser)).toBe("Instructions from: /repo/AGENTS.md")
+    const reminderInBody = [
+      "<path>/x</path>", "<type>file</type>", "<content>",
+      "1: <system-reminder>",
+      "2: not an instruction",
+      "", "(End of file - total 2 lines)", "</content>",
+    ].join("\n")
+    expect(extractOpenCodeReadInstruction(reminderInBody)).toBeUndefined()
   })
 
   it("strips only the first N: prefix on a line that itself contains digits+colon", () => {

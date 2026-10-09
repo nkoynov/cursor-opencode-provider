@@ -49,9 +49,11 @@ export type ReplayFrameAnalysis = {
 // `InteractionUpdate` oneof members this client recognizes. Besides the
 // declared ones: `thinking_completed` #5 (duration), `token_delta` #8 (count),
 // `tool_call_delta` #15 (argument stream, like `partial_tool_call` #7),
-// `routed_model` #24 (display name) and `tool_requests_listed` #27 (count)
-// carry no output and no state. Other members stay barriers.
-const INTERACTION_UPDATE_FIELDS = new Set([1, 2, 3, 4, 5, 7, 8, 13, 14, 15, 16, 17, 24, 27])
+// `context_injection_state` #23 (status of a client injection, which Cursor
+// CLI only shows for queued steers), `routed_model` #24 (display name) and
+// `tool_requests_listed` #27 (count) carry no output and no state. Other
+// members stay barriers.
+const INTERACTION_UPDATE_FIELDS = new Set([1, 2, 3, 4, 5, 7, 8, 13, 14, 15, 16, 17, 23, 24, 27])
 /** `InteractionUpdate.message_started_at_ms` #25: a timestamp beside the oneof member. */
 const INTERACTION_UPDATE_STARTED_AT = 25
 const INTERACTION_QUERY_FIELDS = new Set([2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14])

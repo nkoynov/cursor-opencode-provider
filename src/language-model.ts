@@ -23,6 +23,7 @@ import {
   normalizeAgentRunOrigin,
   type BidiStream,
 } from "./transport/connect.js"
+import { waitForStreamWrites, writeStreamMessage as writeWithBackpressure } from "./stream-write.js"
 import { isDebugEnabled, trace, traceRequestContextPaths } from "./debug.js"
 import { isExchangeableApiKey } from "./auth.js"
 import { resolveBearerToken } from "./auth-renewal.js"
@@ -35,6 +36,8 @@ import {
   misplacedShellCommand,
   buildToolCallPart,
   buildExecClientMessages,
+  attachHookAdditionalContexts,
+  extractOpenCodeReadInstruction,
   execResultImages,
   buildReadRejectionMessages,
   buildUnsupportedExecDeny,
@@ -138,6 +141,7 @@ import { stageCursorImage } from "./image-staging.js"
 import { IMAGE_PERMISSION_DENIED_PREFIX } from "./image-save.js"
 import { getCheckpoint, setCheckpoint } from "./protocol/checkpoint.js"
 import {
+  currentCursorTokenBreakdown,
   cursorContextUsageMetadata,
   decodeConversationTokenDetails,
   type CursorContextUsageSource,
@@ -228,6 +232,14 @@ import {
   consumeCursorShellResult,
   registerCursorShellCall,
 } from "./shell-timeout.js"
+import {
+  type HostNoteBatch,
+  decodePersistedHostNotes,
+  encodePersistedHostNotes,
+  hostNoteHookContexts,
+  hostNoteText,
+  wrapHostNotesForCursor,
+} from "./protocol/host-notes.js"
 import { analyzeReplayFrame, AttemptReplaySafety, describeFrameLayout } from "./replay-safety.js"
 import { readAllFieldsStrict } from "./protocol/struct.js"
 import {
@@ -235,7 +247,9 @@ import {
   emptyLanguageModelV3Usage,
   formatCursorCacheDiagnostics,
   formatCursorTokenCategories,
+  formatFinishTrace,
   formatTurnUsageValidation,
+  missingRulesWarning,
   occupancyUsageFromTokenDetails,
   occupancyValidationCounters,
   OPENCODE_DISPLAY_ONLY_COST_METADATA,
@@ -255,6 +269,17 @@ let _availableModelsMtimeMs = -1
 // execution remains disabled for the summary turn itself.
 const toolCatalogBySession = new Map<string, OpencodeToolDef[]>()
 const sentHistoryImageHashesBySession = new Map<string, Set<string>>()
+/** Host note bodies a turn ended without delivering, for the session's next user turn. */
+let nextHostNoteOrder = 0
+const undeliveredHostNotesBySession = new Map<string, HostNoteBatch[]>()
+/**
+ * Host notes injected into a Run and not yet acknowledged, per OpenCode session
+ * and injection id. Cleared on `delivered`; anything else returns the notes to
+ * `undeliveredHostNotesBySession`, as Cursor SDK `Run.steer` reverts to a
+ * follow-up. The owning Run is kept so notes are released only once it can no
+ * longer deliver them.
+ */
+const hostNoteInjectionsBySession = new Map<string, Map<string, HostNoteBatch & { session: CursorSession }>>()
 // A compaction Run uses its own summary-agent system prompt. Its opaque Cursor
 // checkpoint must never become the base for the resumed normal agent: doing so
 // suppresses OpenCode's compacted prompt/system seed and makes Cursor narrate
@@ -657,6 +682,18 @@ function rememberSentHistoryImageHashes(sessionKey: string | undefined, hashes: 
   }
 }
 
+/** Test helper: the release `startSession` performs, then the host-note stores. */
+export function releaseHostNoteInjectionsForTests(sessionKey: string): {
+  inFlight: string[][]
+  undelivered: string[]
+} {
+  releaseHostNoteInjections(sessionKey, "run-closed")
+  return {
+    inFlight: [...(hostNoteInjectionsBySession.get(sessionKey)?.values() ?? [])].map((entry) => entry.notes),
+    undelivered: undeliveredHostNotes(sessionKey),
+  }
+}
+
 /** Test helper: content hashes recorded after a successful held-Run image write. */
 export function snapshotSentHistoryImageHashesForTests(sessionKey: string): string[] {
   return [...(sentHistoryImageHashesBySession.get(sessionKey) ?? [])]
@@ -766,30 +803,14 @@ async function doStreamImpl(
     // session and returns undefined so we fall through to history rebase
     // instead of pumping a connection that can no longer accept writes.
     const tailMedia = trailingToolResults.reduce((n, r) => n + (r.media?.length ?? 0), 0)
-    const roles = prompt.slice(Math.max(0, prompt.length - 4)).map((m) => {
-      if (!Array.isArray(m.content)) return `${m.role}:scalar`
-      const kinds = m.content.map((p) => {
-        const part = p as unknown as Record<string, unknown>
-        if (part.type === "tool-result") {
-          const out = part.output as Record<string, unknown> | undefined
-          const value = out?.value
-          const nonText = Array.isArray(value)
-            ? value.filter((item) => item && typeof item === "object" && (item as { type?: string }).type !== "text").length
-            : 0
-          return `tool-result(${part.toolName},${typeof out?.type === "string" ? out.type : "?"},mediaish=${nonText})`
-        }
-        return String(part.type ?? "?")
-      })
-      return `${m.role}:[${kinds.join(",")}]`
-    })
     trace(
       `continuation: prompt-tail mediaParts=${tailMedia} supportsImages=${session.supportsImages} ` +
-        `roles=${roles.join(" | ")}`,
+        `roles=${describePromptTail(prompt)}`,
     )
     const results = session.supportsImages
       ? await decodeTrailingToolImages(session, trailingToolResults, callOptions.abortSignal)
       : trailingToolResults
-    session = deliverContinuationResults(session, results, {
+    session = await deliverContinuationResults(session, results, {
       hostAgent: hostAgentFromCallOptions(callOptions),
     })
     if (session) await refreshHeldSessionToolCatalog(session, callOptions)
@@ -803,8 +824,16 @@ async function doStreamImpl(
       // prompt onto a fresh conversation: its seed history includes the
       // completed tool result, so no result or advertised tool is lost and
       // Cursor can continue instead of deadlocking.
+      // Resuming the last checkpoint cannot take these results: Cursor
+      // checkpoints only after tool results, so that checkpoint predates the
+      // outstanding calls, and `resume_action` re-runs the model step, which
+      // asks for the tool again under a new call id. Verified live 2026-10-09
+      // (claude-sonnet-5-5): the resumed Run re-requested the same read.
       const ids = trailingToolResults.map((r) => `${r.sessionId}:${r.execId}`).join(",")
-      trace(`continuation: ${trailingToolResults.length} interrupted trailing tool result(s) [${ids}] — rebasing fresh Run`)
+      trace(
+        `continuation: ${trailingToolResults.length} interrupted trailing tool result(s) [${ids}] ` +
+          `heldRun=${describeHeldRunLoss(trailingToolResults)} — rebasing fresh Run`,
+      )
       session = await openSession({ recovery: { kind: "rebase" } })
     } else {
       // Fresh turn (prompt ends with user/assistant text). Historical tool
@@ -812,6 +841,7 @@ async function doStreamImpl(
       const historicalResults = extractToolResults(prompt)
       if (historicalResults.length > 0) {
         trace(`fresh turn: reconciling ${historicalResults.length} historical tool result(s) with held pending calls`)
+        trace(`fresh turn: prompt-tail roles=${describePromptTail(prompt)}`)
       }
       // An in-session helper (title/memory/task child) that reuses the parent
       // OpenCode session id with a strictly smaller catalog must not cancel or
@@ -951,12 +981,51 @@ export async function pumpWithRecovery(input: {
             checkpoint: Uint8Array.from(checkpoint),
           }
         : { kind: "rebase" }
-    const next = await input.recover(recovery)
+    // Host notes the failed Run never acknowledged belong to this turn.
+    const unackedNotes = takeHostNoteInjections(pumpedSession)
+    const unackedNoteCount = unackedNotes.reduce((count, batch) => count + batch.notes.length, 0)
+    if (recovery.kind === "rebase" && pumpedSession.openCodeSessionId) {
+      // A replacement seed may omit old read outputs or have rewritten history.
+      // Restore notes before opening it; startSession removes only notes its
+      // actual seed contains. Initial user-action notes also need this transfer
+      // when the attempt failed before obtaining a checkpoint.
+      appendUndeliveredHostNotes(pumpedSession.openCodeSessionId, [
+        ...(pumpedSession.userTurnHostNotes ?? []), ...unackedNotes,
+      ])
+    }
+    let next: CursorSession
+    try {
+      next = await input.recover(recovery)
+    } catch (error) {
+      if (recovery.kind === "resume" && unackedNotes.length > 0 && pumpedSession.openCodeSessionId) {
+        appendUndeliveredHostNotes(pumpedSession.openCodeSessionId, unackedNotes)
+      }
+      throw error
+    }
     if (recovery.kind === "resume") {
+      next.userTurnHostNotes = pumpedSession.userTurnHostNotes
       next.usageEstimate = { ...pumpedSession.usageEstimate }
       next.editToolCalls = new Map(pumpedSession.editToolCalls)
       // mirroredTodos rides along via rememberMirroredTodos (per-OpenCode-
       // session, seeded in startSession) — no handoff needed here.
+      // The resumed Run continues the same turn, so the notes go to it.
+      // A failed write closes `next` and keeps the notes tracked against it,
+      // so the next recovery or user turn picks them up.
+      if (unackedNotes.length > 0) {
+        trace(`Run resume: re-injecting ${unackedNoteCount} unacknowledged host note(s)`)
+        for (const batch of unackedNotes) {
+          if (!await injectHostNotes(next, batch.notes, batch.order)) {
+            // A failed first batch must not discard later batches.
+            if (next.openCodeSessionId) {
+              appendUndeliveredHostNotes(next.openCodeSessionId,
+                unackedNotes.filter((other) => other.order > batch.order))
+            }
+            throw next.closeError ?? new CursorTransportError("Cursor host note injection write failed", { transient: false, replaySafe: false })
+          }
+        }
+      }
+    } else if (unackedNotes.length > 0) {
+      trace(`Run rebase: ${unackedNoteCount} unacknowledged host note(s) transferred to the replacement seed`)
     }
     input.onSession?.(next)
     return next
@@ -1038,6 +1107,8 @@ export type CursorRunRecovery =
   | { kind: "resume"; conversationId: string; checkpoint: Uint8Array }
 
 const heartbeatWritePendingBySession = new WeakMap<CursorSession, boolean>()
+/** Runs whose first current category breakdown was checked for missing rules. */
+const rulesCategoryChecked = new WeakSet<CursorSession>()
 const heartbeatGenerationBySession = new WeakMap<CursorSession, number>()
 
 function bumpHeartbeatGeneration(session: CursorSession): number {
@@ -1117,6 +1188,7 @@ async function startSession(
       return undefined
     })
     if (restored?.postCompactionRebase) rememberPostCompactionRebase(sessionKey)
+    restorePersistedHostNotes(sessionKey, restored?.hostNote)
     if (restored?.toolCatalog.length) restoreTurnToolCatalog(sessionKey, restored.toolCatalog)
     if (restored?.hostAgent || restored?.systemPromptHash) {
       rememberPromptIdentity(sessionKey, {
@@ -1246,6 +1318,8 @@ async function startSession(
   }
   const conversationId = bound.conversationId
   const conversationGroupId = resolveConversationGroupId(sessionKey, conversationId)
+  const resetReason = forcedResetReason
+    ?? (recovery?.kind === "rebase" ? "interrupted-run" : (resetState.reason ?? "unknown"))
   if (bound.reset) {
     if (sessionKey) {
       await clearPersistedConversationState(cacheDir, sessionKey, bound.previousId).catch((error) => {
@@ -1253,7 +1327,7 @@ async function startSession(
       })
     }
     trace(
-      `conversation reset: reason=${forcedResetReason ?? (recovery?.kind === "rebase" ? "interrupted-run" : (resetState.reason ?? "unknown"))} ` +
+      `conversation reset: reason=${resetReason} ` +
         `sessionKey=${sessionKey ?? "(none)"} ` +
         `previousId=${bound.previousId ?? "-"} → conversationId=${conversationId}`,
     )
@@ -1296,9 +1370,24 @@ async function startSession(
         ...(hostPlanFileFor(sessionKey) ? { hostPlanFile: hostPlanFileFor(sessionKey)! } : {}),
         server: resolveToolServerIdentity("plan_exit", "opencode", knownMcpServers).server,
       })
+  const history = extractPromptHistory(prompt, {
+    preserveTrailingUser: recovery?.kind === "rebase" && !checkpointUnusable,
+    // A foreign-history rebase replays the other model's tool results too.
+    toolResults: isCompaction || foreignHistory || checkpointUnusable ? "all" : (recovery?.kind === "rebase" ? "trailing" : "omit"),
+  })
+  const userTurnHostNotes = prepareUserTurnHostNotes({
+    sessionKey,
+    prompt,
+    startedWithCheckpoint,
+    isCompaction,
+    ephemeralRun,
+    resuming,
+    seedHistory: history,
+  })
   const oneShotReminders = [
     modeReminder,
     hostPlanAgentNote,
+    ...userTurnHostNotes.reminders,
   ].filter((part): part is string => !!part)
 
   // `systemPrompt` is the host system context composed for a seed Run (kept for
@@ -1351,13 +1440,6 @@ async function startSession(
       })
     }
   }
-  const history = extractPromptHistory(prompt, {
-    preserveTrailingUser: recovery?.kind === "rebase" && !checkpointUnusable,
-    // A foreign-history rebase replays every tool result: the other model's work
-    // exists only in OpenCode history, never in a Cursor checkpoint.
-    toolResults: isCompaction || foreignHistory || checkpointUnusable ? "all" : (recovery?.kind === "rebase" ? "trailing" : "omit"),
-  })
-
   await loadAvailableModels()
 
   // Resolve the region-specific Run stream origin once per process (memoized
@@ -1564,6 +1646,7 @@ async function startSession(
   try {
     await writeWithBackpressure(stream, reqBytes, "initial Run request")
     rememberSentHistoryImageHashes(sessionKey, imageExtraction.hashes)
+    userTurnHostNotes.sent()
   } catch (error) {
     stream.destroy()
     throw error
@@ -1590,6 +1673,9 @@ async function startSession(
       modelId: cursorModelId,
       priorTokenDetails,
       startedWithCheckpoint: !!conversationState,
+      ...(conversationState
+        ? {}
+        : { coldReason: ephemeralRun ? "ephemeral" : bound.reset ? resetReason : "no-checkpoint" }),
       requestContextReused,
       requestContextHash,
       systemPromptHash,
@@ -1604,6 +1690,7 @@ async function startSession(
       switchModeInTurn: false,
     },
     openCodeSessionId: ephemeralRun ? undefined : sessionKey,
+    userTurnHostNotes: userTurnHostNotes.carriedNotes,
     checkpointRebaseEligible: !ephemeralRun && !resuming && !recovery && !!conversationState,
     hostAgent,
     stableSystemPromptHash: frozenSystemPromptHash,
@@ -1711,6 +1798,15 @@ async function startSession(
  * OpenCode re-sends the full tool-result history on every continuation. Prefer
  * the newest result that still has a live pending exec on its tagged session.
  */
+/** Why the held Run for these results is gone, from the session manager's tombstones. */
+function describeHeldRunLoss(toolResults: Array<{ sessionId: string; execId: number }>): string {
+  const reasons = new Set(toolResults.map((r) => {
+    const classification = sessionManager.classify(r.sessionId, r.execId)
+    return classification.kind === "deliverable" ? "open" : classification.reason
+  }))
+  return [...reasons].join(",")
+}
+
 export function findContinuationSession(
   toolResults: Array<{ sessionId: string; execId: number }>,
 ): CursorSession | undefined {
@@ -1829,11 +1925,11 @@ export async function preparePriorSessionForFreshTurn(
       `fresh turn: delivering ${historicalPending.length} historical tool result(s) ` +
         `for pending exec(s) on prior session ${prior.sessionId}`,
     )
-    deliverContinuationResults(prior, historicalPending, { hostAgent: opts?.hostAgent })
+    await deliverContinuationResults(prior, historicalPending, { hostAgent: opts?.hostAgent })
     if (prior.closed) return "settled-only"
   }
 
-  const cancelled = cancelPendingExecsForFreshTurn(prior)
+  const cancelled = await cancelPendingExecsForFreshTurn(prior)
   if (cancelled > 0) {
     trace(
       `fresh turn: cancelled ${cancelled} pending exec(s) on prior session ${prior.sessionId} ` +
@@ -1871,7 +1967,7 @@ export async function preparePriorSessionForFreshTurn(
  *
  * @returns number of pendings successfully cancelled
  */
-export function cancelPendingExecsForFreshTurn(session: CursorSession): number {
+export async function cancelPendingExecsForFreshTurn(session: CursorSession): Promise<number> {
   if (session.closed || session.pending.size === 0) return 0
   const synthetic: ExtractedToolResult[] = []
   for (const [execId, pending] of session.pending.entries()) {
@@ -1894,7 +1990,7 @@ export function cancelPendingExecsForFreshTurn(session: CursorSession): number {
   }
   if (synthetic.length === 0) return 0
   const before = session.pending.size
-  const delivered = deliverContinuationResults(session, synthetic)
+  const delivered = await deliverContinuationResults(session, synthetic)
   if (!delivered || delivered.closed) {
     // deliverContinuationResults closes on encode/write failure after some
     // claims may already have succeeded.
@@ -2006,8 +2102,11 @@ export async function drainSessionUntilTurnEnded(
         }
       }
 
+      if (iu?.context_injection_state) applyContextInjectionState(session, iu.context_injection_state)
+
       if (iu?.turn_ended) {
         trace(`fresh turn drain: turn_ended raw wire fields: ${debugWalkTurnEnded(payload)}`)
+        keepUndeliveredHostNotes(session)
         if (session.openCodeSessionId) {
           await persistConversationState(
             session.cacheDir ?? opencodeGlobalCacheDir(),
@@ -2019,6 +2118,9 @@ export async function drainSessionUntilTurnEnded(
               postCompactionRebase: session.postCompactionRebase,
               hostAgent: session.hostAgent,
               systemPromptHash: session.stableSystemPromptHash,
+              hostNote: encodePersistedHostNotes(
+                undeliveredHostNotes(session.openCodeSessionId),
+              ),
             },
           ).catch((error) => {
             trace(
@@ -2262,12 +2364,33 @@ function hostAgentFromCallOptions(callOptions: LanguageModelV3CallOptions): stri
     : undefined
 }
 
-export function deliverContinuationResults(
+const continuationDeliveryChains = new WeakMap<CursorSession, Promise<CursorSession | undefined>>()
+
+export async function deliverContinuationResults(
+  session: CursorSession,
+  trailingToolResults: ExtractedToolResult[],
+  delivery: { hostAgent?: string } = {},
+): Promise<CursorSession | undefined> {
+  // Claim, result writes, state transitions and the step's note injection form
+  // one delivery. Serializing individual frames cannot prevent two callers
+  // from splitting a step's claims and each injecting the same notes.
+  const previous = continuationDeliveryChains.get(session)
+  const current = (previous ? previous.catch(() => undefined) : Promise.resolve())
+    .then(() => deliverContinuationResultsNow(session, trailingToolResults, delivery))
+  continuationDeliveryChains.set(session, current)
+  try {
+    return await current
+  } finally {
+    if (continuationDeliveryChains.get(session) === current) continuationDeliveryChains.delete(session)
+  }
+}
+
+async function deliverContinuationResultsNow(
   session: CursorSession,
   trailingToolResults: ExtractedToolResult[],
   /** Host primary agent of the request that carries these results. */
   delivery: { hostAgent?: string } = {},
-): CursorSession | undefined {
+): Promise<CursorSession | undefined> {
   const pendingResults = trailingToolResults.filter(
     (r) => r.sessionId === session.sessionId && session.pending.has(r.execId),
   )
@@ -2276,6 +2399,9 @@ export function deliverContinuationResults(
       `${pendingResults.length} pending for sessionId=${session.sessionId} ` +
       `pending={${[...session.pending.keys()].join(",")}}`,
   )
+  // Host notes that trailed this step: injected once, after its results.
+  const stepNotes = collectHostNoteBodies(trailingToolResults.flatMap((r) => r.notes ?? []))
+  let deliveredResults = 0
   for (const r of pendingResults) {
     const claim = sessionManager.claim(session.sessionId, r.execId)
     if ("kind" in claim) {
@@ -2428,9 +2554,7 @@ export function deliverContinuationResults(
           frames = buildExecClientMessages({
             execId: r.execId,
             resultField: pending.resultField,
-            output: pending.resultField === "read_result" && r.notes && r.output.endsWith(r.notes)
-              ? r.output.slice(0, -r.notes.length).trimEnd()
-              : shellResult?.output ?? r.output,
+            output: shellResult?.output ?? r.output,
             error: r.error,
             toolName: pending.toolName ?? r.toolName,
             resultMetadata: pending.resultMetadata,
@@ -2449,23 +2573,20 @@ export function deliverContinuationResults(
         return undefined
       }
     }
-    if (r.notes && !pending.bridged && (pending.resultField === "read_result" || r.error)) {
-      // Native read output is a content/data oneof; typed errors also discard
-      // output text. Inject updates before releasing the waiting executor.
-      frames.unshift(encodeMessage("AgentClientMessage", {
-        conversation_action: { inject_context_action: {
-          injection_id: crypto.randomUUID(),
-          ...(session.runId ? { expected_run_id: session.runId } : {}),
-          system_context: { producer: "opencode", content: r.notes },
-        } },
-      }))
-    }
-    const outcome = sessionManager.deliverClaim(claim, frames)
+    // A provider notice about this one result rides on it as postToolUse hook
+    // context (e.g. images a read could not keep).
+    const hookContexts = hostNoteHookContexts(r.notices ?? [])
+    const notedFrames = hookContexts.length > 0
+      ? attachHookAdditionalContexts(frames, hookContexts)
+      : undefined
+    if (notedFrames) frames = notedFrames
+    const outcome = await sessionManager.deliverClaim(claim, frames)
     if (outcome.kind !== "delivered") {
       trace(`continuation: delivery stopped execId=${r.execId} reason=${outcome.reason}`)
       if (outcome.kind === "duplicate") continue
       return undefined
     }
+    deliveredResults++
     // Cursor now holds these in the exec result; the next fresh Run must not
     // attach them again as history images.
     rememberSentHistoryImageHashes(session.openCodeSessionId, deliveredImageHashes)
@@ -2532,7 +2653,227 @@ export function deliverContinuationResults(
         `frames=${outcome.framesWritten} outLen=${r.output.length}`,
     )
   }
+  if (stepNotes.length > 0) {
+    if (deliveredResults === 0) {
+      // Every result of this step was already delivered, and its notes with it.
+      trace(`continuation: host notes belong to an already delivered step; not injected again count=${stepNotes.length}`)
+    } else if (!(await injectHostNotes(session, stepNotes))) {
+      return undefined
+    }
+  }
   return session
+}
+
+/**
+ * Add host notes to the running turn as Cursor SDK `Run.steer` does:
+ * `inject_context_action.user_context` with plain text, bound to this Run.
+ * Written after the step's results, so Cursor sees them before its next step.
+ */
+async function injectHostNotes(
+  session: CursorSession, notes: readonly string[], order = nextHostNoteOrder++,
+): Promise<boolean> {
+  const text = hostNoteText(notes)
+  if (!text) return true
+  const injectionId = crypto.randomUUID()
+  const sessionKey = session.openCodeSessionId
+  if (sessionKey) trackHostNoteInjection(sessionKey, injectionId, [...notes], session, order)
+  try {
+    await writeWithBackpressure(session.stream, encodeMessage("AgentClientMessage", {
+      conversation_action: {
+        inject_context_action: {
+          injection_id: injectionId,
+          ...(session.runId ? { expected_run_id: session.runId } : {}),
+          user_context: { user_message: { text, message_id: crypto.randomUUID() } },
+        },
+      },
+    }), "host note injection")
+    trace(`continuation: host notes injected id=${injectionId} count=${notes.length} chars=${text.length}`)
+    return true
+  } catch (error) {
+    // The notes stay tracked against this closed Run and reach the next one.
+    trace(`continuation: host note injection write failed id=${injectionId}: ${(error as Error).message}`)
+    sessionManager.close(session, "result-write-failed", toCursorProviderError(error, {
+      replaySafe: false, fallback: "Cursor host note injection write failed",
+    }))
+    return false
+  }
+}
+
+function trackHostNoteInjection(
+  sessionKey: string,
+  injectionId: string,
+  notes: string[],
+  session: CursorSession,
+  order: number,
+): void {
+  const entries = hostNoteInjectionsBySession.get(sessionKey) ?? new Map()
+  entries.set(injectionId, { notes, session, order })
+  hostNoteInjectionsBySession.delete(sessionKey)
+  hostNoteInjectionsBySession.set(sessionKey, entries)
+  while (hostNoteInjectionsBySession.size > MAX_TURN_STATE_SESSIONS) {
+    const oldest = hostNoteInjectionsBySession.keys().next().value as string | undefined
+    if (!oldest) break
+    hostNoteInjectionsBySession.delete(oldest)
+  }
+}
+
+/**
+ * `InteractionUpdate.context_injection_state` (#23) for an injection this
+ * provider sent. Same outcomes as Cursor SDK `Run.steer`: `delivered` hands
+ * the notes to the turn; `queued` waits; `queued_for_next_turn`, `cancelled`
+ * and `rejected` keep them for the session's next user turn.
+ */
+function applyContextInjectionState(session: CursorSession, value: unknown): void {
+  const update = value as { injection_id?: string; state?: Record<string, unknown> | null }
+  const [kind, detail] = Object.entries(update.state ?? {}).find(([, v]) => v != null) ?? ["unknown", undefined]
+  const reason = (detail as { reason?: string } | undefined)?.reason
+  trace(
+    `context_injection_state: id=${update.injection_id ?? ""} state=${kind}` +
+      (reason ? ` reason=${JSON.stringify(reason)}` : ""),
+  )
+  const sessionKey = session.openCodeSessionId
+  const entries = sessionKey ? hostNoteInjectionsBySession.get(sessionKey) : undefined
+  const entry = update.injection_id ? entries?.get(update.injection_id) : undefined
+  if (!sessionKey || !entries || !entry || kind === "queued" || kind === "unknown") return
+  entries.delete(update.injection_id!)
+  if (entries.size === 0) hostNoteInjectionsBySession.delete(sessionKey)
+  if (kind === "delivered") return
+  appendUndeliveredHostNotes(sessionKey, [{ notes: entry.notes, order: entry.order }])
+  trace(`continuation: host note injection ${kind}; kept for the next user turn sessionKey=${sessionKey}`)
+}
+
+/**
+ * Return unacknowledged injections to the next-user-turn store: those of
+ * `owner` when its turn ended, else those whose Run has closed.
+ */
+function releaseHostNoteInjections(sessionKey: string, reason: string, owner?: CursorSession): void {
+  const entries = hostNoteInjectionsBySession.get(sessionKey)
+  if (!entries) return
+  for (const [injectionId, entry] of entries) {
+    if (owner ? entry.session !== owner : !entry.session.closed) continue
+    entries.delete(injectionId)
+    appendUndeliveredHostNotes(sessionKey, [{ notes: entry.notes, order: entry.order }])
+    trace(`continuation: host note injection unacknowledged (${reason}); kept for the next user turn id=${injectionId}`)
+  }
+  if (entries.size === 0) hostNoteInjectionsBySession.delete(sessionKey)
+}
+
+/** Remove and return `owner`'s unacknowledged injections, oldest first. */
+function takeHostNoteInjections(owner: CursorSession): HostNoteBatch[] {
+  const sessionKey = owner.openCodeSessionId
+  const entries = sessionKey ? hostNoteInjectionsBySession.get(sessionKey) : undefined
+  if (!sessionKey || !entries) return []
+  const notes: HostNoteBatch[] = []
+  for (const [injectionId, entry] of entries) {
+    if (entry.session !== owner) continue
+    entries.delete(injectionId)
+    notes.push({ notes: entry.notes, order: entry.order })
+  }
+  if (entries.size === 0) hostNoteInjectionsBySession.delete(sessionKey)
+  return notes.sort((a, b) => a.order - b.order)
+}
+
+/** Notes the restart snapshot kept for this session's next user turn. */
+export function restorePersistedHostNotes(sessionKey: string, persisted: string | undefined): void {
+  const notes = decodePersistedHostNotes(persisted)
+  if (notes.length > 0) rememberUndeliveredHostNotes(sessionKey, [{ notes, order: nextHostNoteOrder++ }])
+}
+
+/**
+ * Host notes a new Run's user turn carries, as `<system_reminder>` blocks:
+ * notes no earlier Run delivered, then notes OpenCode placed before this user
+ * message (they exist only in host history, which a checkpointed Run does not
+ * resend). Call `sent()` once the Run request is written.
+ */
+export function prepareUserTurnHostNotes(input: {
+  sessionKey?: string
+  prompt: LanguageModelV3CallOptions["prompt"]
+  startedWithCheckpoint: boolean
+  isCompaction: boolean
+  ephemeralRun: boolean
+  resuming: boolean
+  /** The history actually seeded by a Run without a checkpoint. */
+  seedHistory?: readonly SeedHistoryMessage[]
+}): { reminders: string[]; carriedNotes: HostNoteBatch[]; sent: () => void } {
+  const { sessionKey, startedWithCheckpoint, isCompaction, ephemeralRun, resuming } = input
+  // Notes injected into a Run that closed without acknowledging them can no
+  // longer be delivered there; a still-open Run keeps its own.
+  if (sessionKey && !isCompaction && !ephemeralRun) releaseHostNoteInjections(sessionKey, "run-closed")
+  // An interrupted-turn resume carries no user message; notes wait for the next one.
+  const undelivered = isCompaction || ephemeralRun || resuming || !sessionKey
+    ? undefined
+    : undeliveredHostNotesBySession.get(sessionKey)
+  // Compaction/history rewrites can remove notes, and ordinary seeds omit tool
+  // results (including read instructions). Only omit a deferred note when its
+  // text really reaches Cursor in this Run's seed. The seed merges adjacent
+  // user-role entries and carries tool observations as user text, so a note
+  // can sit inside a larger entry: match its text, not whole entries.
+  const seededText = startedWithCheckpoint ? "" : (input.seedHistory ?? extractPromptHistory(input.prompt))
+    .filter((message) => message.role === "user")
+    .map((message) => message.content)
+    .join("\n\n")
+  const deferred = undelivered?.flatMap((batch) => batch.notes).filter((note) => !seededText.includes(note.trim())) ?? []
+  const turnBoundary = startedWithCheckpoint && !isCompaction && !ephemeralRun && !resuming
+    ? hostNotesBeforeUserTurn(input.prompt)
+    : []
+  if (turnBoundary.length > 0) {
+    trace(`fresh turn: ${turnBoundary.length} host note(s) before the user message ride with it`)
+  }
+  return {
+    carriedNotes: [
+      ...(undelivered ?? []),
+      ...(turnBoundary.length ? [{ notes: turnBoundary, order: nextHostNoteOrder++ }] : []),
+    ],
+    reminders: [
+      ...wrapHostNotesForCursor(deferred),
+      ...wrapHostNotesForCursor(turnBoundary),
+    ],
+    sent: () => {
+      if (sessionKey && undelivered?.length) {
+        forgetUndeliveredHostNotes(sessionKey, undelivered, startedWithCheckpoint ? "user-turn" : "seed-history")
+      }
+    },
+  }
+}
+
+function undeliveredHostNotes(sessionKey: string): string[] {
+  return (undeliveredHostNotesBySession.get(sessionKey) ?? []).flatMap((batch) => batch.notes)
+}
+
+function appendUndeliveredHostNotes(sessionKey: string, notes: readonly HostNoteBatch[]): void {
+  if (notes.length === 0) return
+  rememberUndeliveredHostNotes(sessionKey, [
+    ...(undeliveredHostNotesBySession.get(sessionKey) ?? []),
+    ...notes,
+  ])
+}
+
+function collectHostNoteBodies(notes: ReadonlyArray<string | undefined>): string[] {
+  return notes.filter((note): note is string => typeof note === "string" && note.length > 0)
+}
+
+/** At turn_ended, keep this Run's unacknowledged host notes for the next user turn. */
+function keepUndeliveredHostNotes(session: CursorSession): void {
+  if (session.openCodeSessionId) releaseHostNoteInjections(session.openCodeSessionId, "turn-ended", session)
+}
+
+function rememberUndeliveredHostNotes(sessionKey: string, notes: readonly HostNoteBatch[]): void {
+  undeliveredHostNotesBySession.delete(sessionKey)
+  undeliveredHostNotesBySession.set(sessionKey, [...new Set(notes)].sort((a, b) => a.order - b.order))
+  while (undeliveredHostNotesBySession.size > MAX_TURN_STATE_SESSIONS) {
+    const oldest = undeliveredHostNotesBySession.keys().next().value as string | undefined
+    if (!oldest) break
+    undeliveredHostNotesBySession.delete(oldest)
+  }
+}
+
+function forgetUndeliveredHostNotes(sessionKey: string, notes: readonly HostNoteBatch[], carrier: "user-turn" | "seed-history"): void {
+  const current = undeliveredHostNotesBySession.get(sessionKey)
+  if (!current) return
+  const remaining = current.filter((batch) => !notes.includes(batch))
+  if (remaining.length) undeliveredHostNotesBySession.set(sessionKey, remaining)
+  else undeliveredHostNotesBySession.delete(sessionKey)
+  trace(`continuation: undelivered host notes sent in the ${carrier} sessionKey=${sessionKey} count=${notes.length}`)
 }
 
 async function loadAvailableModels(): Promise<void> {
@@ -2564,7 +2905,8 @@ function resolveTelemetryEnabled(options: CreateCursorOptions): boolean {
 }
 
 function resolveExplicitAgentBaseURL(options: CreateCursorOptions): string | undefined {
-  const raw = options.agentBaseURL ?? options.baseURL
+  // Legacy `baseURL` aliases `agentBaseURL`; read it without the deprecated accessor.
+  const raw = options.agentBaseURL ?? (options as { baseURL?: string }).baseURL
   if (!raw) return undefined
   const normalized = normalizeAgentRunOrigin(raw)
   if (!normalized) {
@@ -2577,69 +2919,6 @@ function resolveExplicitAgentBaseURL(options: CreateCursorOptions): string | und
 
 function isTruthyEnv(value: string | undefined): boolean {
   return value === "1" || value === "true"
-}
-
-const streamWriteChains = new WeakMap<BidiStream, Promise<void>>()
-
-async function waitForStreamWrites(stream: BidiStream): Promise<void> {
-  const pending = streamWriteChains.get(stream)
-  if (pending) await pending.catch(() => undefined)
-}
-
-/**
- * Keep awaited protocol writes ordered per Run stream. In particular, a large
- * KV get_blob reply must drain before another KV reply or heartbeat is queued;
- * otherwise one heartbeat observes the backlog created by dozens of ignored
- * false write() results and reports the wrong operation as the failure.
- */
-async function writeWithBackpressure(
-  stream: BidiStream,
-  message: Uint8Array,
-  operation: string,
-): Promise<void> {
-  const previous = streamWriteChains.get(stream)
-  const current = (previous ? previous.catch(() => undefined) : Promise.resolve())
-    .then(() => writeWithBackpressureNow(stream, message, operation))
-  streamWriteChains.set(stream, current)
-  try {
-    await current
-  } finally {
-    if (streamWriteChains.get(stream) === current) streamWriteChains.delete(stream)
-  }
-}
-
-async function writeWithBackpressureNow(
-  stream: BidiStream,
-  message: Uint8Array,
-  operation: string,
-): Promise<void> {
-  let accepted: boolean | void
-  try {
-    accepted = stream.write(message)
-  } catch (cause) {
-    throw toCursorProviderError(cause, {
-      replaySafe: false,
-      fallback: `Cursor ${operation} write failed`,
-    })
-  }
-  if (accepted !== false) return
-  trace(`stream write backpressured: operation=${operation} bytes=${message.length}`)
-  if (!stream.waitForDrain) {
-    throw new CursorTransportError(`Cursor ${operation} write was backpressured`, {
-      transient: false,
-      replaySafe: false,
-      code: "CURSOR_WRITE_BACKPRESSURE",
-    })
-  }
-  try {
-    await stream.waitForDrain(5_000)
-    trace(`stream write drained: operation=${operation} bytes=${message.length}`)
-  } catch (cause) {
-    throw toCursorProviderError(cause, {
-      replaySafe: false,
-      fallback: `Cursor ${operation} backpressure drain failed`,
-    })
-  }
 }
 
 async function nextFrameWithSemanticDeadline(
@@ -2953,10 +3232,10 @@ export async function pump(
    * continue. External and otherwise ineligible reads retain OpenCode's normal
    * permission-aware path.
    */
-  const recoverCorrelatedEditRead = (
+  const recoverCorrelatedEditRead = async (
     parsed: ParsedExecRequest,
     displayCallId: string | undefined,
-  ): boolean => {
+  ): Promise<boolean> => {
     if (
       !displayCallId ||
       parsed.resultField !== "read_result" ||
@@ -3009,7 +3288,9 @@ export async function pump(
 
         const frames = buildCompleteEditReadMessages(parsed.id, absolutePath, requestedPath)
         if (!frames) return false
-        for (const frame of frames) session.stream.write(frame)
+        for (const frame of frames) {
+          await writeWithBackpressure(session.stream, frame, "complete edit read reply")
+        }
         const editCall = session.editToolCalls?.get(displayCallId)
         if (editCall) editCall.completeRead = true
         trace(
@@ -3017,7 +3298,10 @@ export async function pump(
             `path=${JSON.stringify(requestedPath)}; awaiting write_args`,
         )
         return true
-      } catch {
+      } catch (error) {
+        // Once reply bytes are buffered, falling back to a host read would
+        // answer the same exec again. Transport failures terminate the attempt.
+        rethrowTransportWriteFailure(error)
         parsed.resultMetadata = {
           ...parsed.resultMetadata,
           correlatedEditCallId: displayCallId,
@@ -3035,7 +3319,7 @@ export async function pump(
         resultMetadata: { path: requestedPath },
         workspaceRoot,
       })) {
-        session.stream.write(frame)
+        await writeWithBackpressure(session.stream, frame, "missing edit target reply")
       }
       trace(
         `exec: missing edit target treated as empty file id=${parsed.id} ` +
@@ -3043,6 +3327,7 @@ export async function pump(
       )
       return true
     } catch (e) {
+      rethrowTransportWriteFailure(e)
       const error = new Error(
         `Failed to recover Cursor edit read: ${(e as Error).message}`,
       )
@@ -3068,7 +3353,7 @@ export async function pump(
    * handshake read into an empty-file success. EACCES/EPERM and other stat
    * errors fall through to OpenCode so a genuine permission decision stands.
    */
-  const rejectMissingReadTarget = (parsed: ParsedExecRequest): boolean => {
+  const rejectMissingReadTarget = async (parsed: ParsedExecRequest): Promise<boolean> => {
     if (parsed.toolName !== "read") return false
     const requested = opencodePathArg(parsed.args) ?? ""
     if (!requested) return false
@@ -3085,7 +3370,7 @@ export async function pump(
     if (!readResult) return false
     try {
       for (const frame of buildReadRejectionMessages(parsed.id, readResult)) {
-        session.stream.write(frame)
+        await writeWithBackpressure(session.stream, frame, "missing read target reply")
       }
       const kind = Object.keys(readResult)[0]
       trace(
@@ -3094,6 +3379,7 @@ export async function pump(
       )
       return true
     } catch (e) {
+      rethrowTransportWriteFailure(e)
       const error = new Error(
         `Failed to reject Cursor read of a missing path: ${(e as Error).message}`,
       )
@@ -3229,43 +3515,21 @@ export async function pump(
     const reasonLabel = typeof reason === "object" && reason && "unified" in reason
       ? String((reason as { unified?: string }).unified ?? "unknown")
       : String(reason)
-    const inTotal = usage.inputTokens?.total ?? 0
-    const outTotal = usage.outputTokens?.total ?? 0
-    const occupancySource = occupancyDetails
-      ? `occupancy-${contextSource ?? "unavailable"}`
-      : "intermediate-zero"
-    // Occupancy finishes never see Cursor TurnEnded cache_read. usageEstimate.cacheRead
-    // stays 0 for the whole Run, so logging it as rawCacheRead falsely reports 0% on
-    // every tool-call step. Prefer the V3 occupancy partition (prior prefix → cacheRead)
-    // and label the estimate separately from billed TurnEnded counters.
-    const occupancyPrefixCache = occupancyDetails
-      ? (session.cacheDiagnostics?.priorTokenDetails?.usedTokens ?? 0)
-      : undefined
-    const rawIn = te
-      ? turnEndedCounter(te, "input_tokens")
-      : occupancyDetails
-        ? occupancyDetails.usedTokens
-        : est.inputTokens
-    const rawOut = te
-      ? turnEndedCounter(te, "output_tokens")
-      : occupancyDetails
-        ? 1
-        : est.outputTokens
-    const rawCacheRead = te
-      ? turnEndedCounter(te, "cache_read")
-      : occupancyPrefixCache ?? est.cacheRead
-    const rawCacheWrite = te ? turnEndedCounter(te, "cache_write") : est.cacheWrite
-    trace(
-      `finish: reason=${reasonLabel} ` +
-        `v3In=${inTotal} v3Out=${outTotal} ` +
-        `v3CacheRead=${usage.inputTokens?.cacheRead ?? 0} v3CacheWrite=${usage.inputTokens?.cacheWrite ?? 0} ` +
-        `v3Reasoning=${usage.outputTokens?.reasoning ?? 0} ` +
-        `rawIn=${rawIn} rawOut=${rawOut} rawCacheRead=${rawCacheRead} rawCacheWrite=${rawCacheWrite} ` +
-        `${occupancyPrefixCache !== undefined ? `occupancyPrefixCache=${occupancyPrefixCache} ` : ""}` +
-        `source=${te
-          ? settledSource ?? (contextSource ?? "unavailable")
-          : occupancySource}`,
-    )
+    trace(formatFinishTrace({
+      reason: reasonLabel,
+      usage,
+      turnEnded: counters,
+      occupancy: occupancyDetails
+        ? {
+            usedTokens: occupancyDetails.usedTokens,
+            priorUsedTokens: session.cacheDiagnostics?.priorTokenDetails?.usedTokens ?? 0,
+          }
+        : undefined,
+      estimate: est,
+      source: te
+        ? settledSource ?? (contextSource ?? "unavailable")
+        : occupancyDetails ? `occupancy-${contextSource ?? "unavailable"}` : "intermediate-zero",
+    }))
     // Validate the usage we actually send. Occupancy finishes (tool-call and
     // TurnEnded/stop) use prior-prefix cacheRead — never compare that against
     // aggregate TurnEnded request cache ratios (false mismatch). Raw request
@@ -3279,6 +3543,7 @@ export async function pump(
         usage,
         occupancyDetails,
         contextSource,
+        "occupancy",
       ))
     } else if (counters) {
       trace(formatTurnUsageValidation(counters, usage, tokenDetails, contextSource))
@@ -3309,6 +3574,9 @@ export async function pump(
       postCompactionRebase: session.postCompactionRebase,
       hostAgent: session.hostAgent,
       systemPromptHash: session.stableSystemPromptHash,
+      hostNote: encodePersistedHostNotes(
+        undeliveredHostNotes(session.openCodeSessionId),
+      ),
     }).catch((error) => {
       trace(`conversation persistence: terminal save failed sessionKey=${session.openCodeSessionId}: ${String(error)}`)
     })
@@ -3528,6 +3796,15 @@ export async function pump(
         trace(
           `checkpoint: stored ${bytes.length}B for conversationId=${session.conversationId}${context}`,
         )
+        if (tokenDetails && !rulesCategoryChecked.has(session) && currentCursorTokenBreakdown(tokenDetails)) {
+          rulesCategoryChecked.add(session)
+          const warning = missingRulesWarning(
+            tokenDetails,
+            systemInstructionsRuleText(session.requestContext)?.length ?? 0,
+            session.conversationId,
+          )
+          if (warning) trace(warning)
+        }
       }
     }
 
@@ -3546,6 +3823,7 @@ export async function pump(
         return
       }
       trace(`turn_ended raw wire fields: ${debugWalkTurnEnded(payload)}`)
+      keepUndeliveredHostNotes(session)
       const turnEnded = iu.turn_ended as Record<string, unknown>
       await persistTerminalCheckpoint()
       const checkpoint = session.resumeCheckpoint ?? getCheckpoint(session.conversationId)
@@ -3747,6 +4025,8 @@ export async function pump(
       cacheDiagnostics.stepStarts++
     } else if (iu?.step_completed) {
       cacheDiagnostics.stepCompletes++
+    } else if (iu?.context_injection_state) {
+      applyContextInjectionState(session, iu.context_injection_state)
     } else if (esm) {
       cacheDiagnostics.execRequests++
       const esmId = (esm.id as number) ?? 0
@@ -4061,8 +4341,8 @@ export async function pump(
             if (closeIfParallelStepComplete()) return
             continue
           }
-          if (recoverCorrelatedEditRead(parsed, displayCallId)) continue
-          if (rejectMissingReadTarget(parsed)) {
+          if (await recoverCorrelatedEditRead(parsed, displayCallId)) continue
+          if (await rejectMissingReadTarget(parsed)) {
             if (displayCallId) session.displayToolCalls.delete(displayCallId)
             disposeParallelCall(displayCallId)
             if (closeIfParallelStepComplete()) return
@@ -4515,8 +4795,10 @@ type ToolResultContent = {
   /** `media` decoded for the exec result, with content hashes in the same order. */
   images?: CursorImageInput[]
   imageHashes?: string[]
-  /** Host updates that a binary read cannot carry in its output oneof. */
-  notes?: string
+  /** Raw host note bodies that trailed the step (attached after typed result build). */
+  notes?: string[]
+  /** Notices about this result its typed shape cannot carry (hook context on this result). */
+  notices?: string[]
 }
 
 type ExtractedToolResult = ToolResultContent & { sessionId: string; execId: number }
@@ -4538,12 +4820,15 @@ function extractToolResultContent(prompt: LanguageModelV3CallOptions["prompt"]):
       const toolCallId = (p.toolCallId as string) ?? ""
       const { text, isError } = toolResultOutputToText(p.output)
       const media = toolResultOutputMedia(p.output)
+      const toolName = (p.toolName as string) ?? "mcp"
+      const instruction = toolName === "read" && !isError ? extractOpenCodeReadInstruction(text) : undefined
       out.push({
         toolCallId,
-        toolName: (p.toolName as string) ?? "mcp",
+        toolName,
         output: text,
         error: isError ? text : undefined,
         ...(media.length > 0 ? { media } : {}),
+        ...(instruction ? { notes: [instruction] } : {}),
       })
     }
   }
@@ -4561,6 +4846,10 @@ const SYSTEM_UPDATE_CLOSE = "</system-update>"
 const SYSTEM_REMINDER_OPEN = "<system-reminder>"
 const SYSTEM_REMINDER_CLOSE = "</system-reminder>"
 const TOOL_MEDIA_CAPTION = "Attached media from tool result:"
+// OpenCode 2 loads a nested AGENTS.md during a step as a synthetic user message
+// of `Instructions from: <absolute path>\n<content>` blocks (the same text
+// OpenCode 1 puts in a read's <system-reminder>). No marker reaches the provider.
+const OPENCODE_INSTRUCTIONS = /^Instructions from: (?:\/|[A-Za-z]:[\\/])/
 
 type HostTailNote = { text?: string; media?: unknown[] }
 
@@ -4579,7 +4868,7 @@ function hostTailNote(message: LanguageModelV3CallOptions["prompt"][number]): Ho
   for (const part of message.content) {
     if (part.type !== "text") return undefined
     const text = part.text.trim()
-    if (wrappedHostNote(text, SYSTEM_UPDATE_OPEN, SYSTEM_UPDATE_CLOSE)) {
+    if (wrappedHostNote(text, SYSTEM_UPDATE_OPEN, SYSTEM_UPDATE_CLOSE) || OPENCODE_INSTRUCTIONS.test(text)) {
       texts.push(text)
       append = true
       continue
@@ -4594,6 +4883,25 @@ function hostTailNote(message: LanguageModelV3CallOptions["prompt"][number]): Ho
   // Cursor to keep planning after the user already approved execution.
   if (!append) return reminderOnly ? {} : undefined
   return { text: texts.join("\n") }
+}
+
+/**
+ * Host notes between the previous reply and the closing user message, e.g. an
+ * OpenCode 2 `<system-update>` after MCP servers reconnect. The host's leading
+ * system prompt is never one of them. Empty unless the prompt ends with a
+ * user message that is not itself a note.
+ */
+export function hostNotesBeforeUserTurn(prompt: LanguageModelV3CallOptions["prompt"]): string[] {
+  const last = prompt.length - 1
+  if (last < 0 || prompt[last]!.role !== "user" || hostTailNote(prompt[last]!)) return []
+  const firstNonSystem = prompt.findIndex((message) => message.role !== "system")
+  const notes: string[] = []
+  for (let index = last - 1; index > firstNonSystem; index--) {
+    const note = hostTailNote(prompt[index]!)
+    if (!note) break
+    if (note.text) notes.unshift(note.text)
+  }
+  return notes
 }
 
 /**
@@ -4628,13 +4936,11 @@ export function extractTrailingToolResults(
   // after attribution so their attachments cannot migrate to our execs.
   if (media.length > 0) attributeTrailingMedia(contents, media)
   const results = correlateToolResults(contents)
-  // A Run continuation only carries exec results, so the host notes ride on the
-  // last one; otherwise Cursor would never see e.g. a removed skill.
+  // Read instructions occurred with their results, before the step's trailing
+  // updates. Keep that order when the delivery injects their combined text.
   const last = results.at(-1)
   if (last && notes.length > 0) {
-    results[results.length - 1] = {
-      ...last, output: [last.output, ...notes].filter(Boolean).join("\n\n"), notes: notes.join("\n\n"),
-    }
+    results[results.length - 1] = { ...last, notes: [...(last.notes ?? []), ...notes] }
   }
   return results
 }
@@ -4720,16 +5026,43 @@ export async function decodeTrailingToolImages(
     const notice = omittedCount > 0
       ? `[${omittedCount} tool-result image(s) omitted: decoding failed or the attachment budget was exceeded.]`
       : undefined
+    // A read that kept an image is encoded from its bytes, so output text would
+    // be dropped; its notice rides on that result as hook context instead.
+    const noticeAsContext = notice !== undefined && pending.resultField === "read_result" && images.length > 0
     decoded.push({
       ...result, images, imageHashes: hashes,
-      ...(notice ? {
+      ...(notice && !noticeAsContext ? {
         output: `${result.output}\n\n${notice}`,
-        notes: [result.notes, notice].filter(Boolean).join("\n\n"),
-        ...(pending.resultField === "read_result" && images.length === 0 ? { error: notice } : {}),
+        ...(pending.resultField === "read_result" ? { error: notice } : {}),
       } : {}),
+      ...(noticeAsContext ? { notices: [...(result.notices ?? []), notice] } : {}),
     })
   }
   return decoded
+}
+
+/** Debug summary of the last prompt messages: roles, part kinds, short text previews. */
+export function describePromptTail(prompt: LanguageModelV3CallOptions["prompt"], count = 4): string {
+  const preview = (text: string) => JSON.stringify(text.length > 60 ? `${text.slice(0, 60)}…` : text)
+  return prompt.slice(Math.max(0, prompt.length - count)).map((m) => {
+    if (!Array.isArray(m.content)) return `${m.role}:scalar${typeof m.content === "string" ? `(${preview(m.content)})` : ""}`
+    const kinds = m.content.map((p) => {
+      const part = p as unknown as Record<string, unknown>
+      if (part.type === "tool-result") {
+        const out = part.output as Record<string, unknown> | undefined
+        const value = out?.value
+        const nonText = Array.isArray(value)
+          ? value.filter((item) => item && typeof item === "object" && (item as { type?: string }).type !== "text").length
+          : 0
+        return `tool-result(${part.toolName},${typeof out?.type === "string" ? out.type : "?"},mediaish=${nonText})`
+      }
+      if (part.type === "text" && typeof part.text === "string") return `text(${preview(part.text)})`
+      return String(part.type ?? "?")
+    })
+    const options = (m as { providerOptions?: Record<string, unknown> }).providerOptions
+    const marks = options ? `{${Object.entries(options).map(([k, v]) => `${k}:${JSON.stringify(v).slice(0, 80)}`).join(";")}}` : ""
+    return `${m.role}${marks}:[${kinds.join(",")}]`
+  }).join(" | ")
 }
 
 /** Detect a host-owned canonical plan review, excluding Cursor exec replies. */
@@ -5072,9 +5405,14 @@ export function extractPromptHistory(
   const toolResults = options?.toolResults ?? "omit"
   let trailingToolStart = prompt.length
   if (toolResults === "trailing") {
+    // A rebased continuation may end with host notes after the step's results.
+    let notesStart = prompt.length
+    while (notesStart > 0 && hostTailNote(prompt[notesStart - 1]!)) notesStart--
+    trailingToolStart = notesStart
     while (trailingToolStart > 0 && prompt[trailingToolStart - 1]?.role === "tool") {
       trailingToolStart--
     }
+    if (trailingToolStart === notesStart) trailingToolStart = prompt.length
   }
   for (let messageIndex = 0; messageIndex < prompt.length; messageIndex++) {
     const m = prompt[messageIndex]!
@@ -5503,11 +5841,12 @@ export function resolveTurnConversationReset(input: {
   }
 
   // Diagnostics only: accept promptIdentity for remember without reminting.
-  if (sessionKey && input.promptIdentity) {
+  const legacyPromptIdentity = (input as { promptIdentity?: PromptIdentity }).promptIdentity
+  if (sessionKey && legacyPromptIdentity) {
     const previous = promptIdentityBySession.get(sessionKey)
     rememberPromptIdentity(sessionKey, {
       ...previous,
-      ...normalizePromptIdentity(input.promptIdentity),
+      ...normalizePromptIdentity(legacyPromptIdentity),
     })
   }
   if (sessionKey && postCompactionRebaseBySession.delete(sessionKey)) {
@@ -5522,6 +5861,8 @@ export function resetTurnStateForTests(): void {
   promptIdentityBySession.clear()
   mirroredTodosBySession.clear()
   sentHistoryImageHashesBySession.clear()
+  undeliveredHostNotesBySession.clear()
+  hostNoteInjectionsBySession.clear()
   resetContextEpochsForTests()
   resetFrozenRequestContextsForTests()
 }

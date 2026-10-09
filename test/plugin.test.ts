@@ -251,6 +251,27 @@ describe("session activity hooks", () => {
       sessionActivity.clear()
     }
   })
+
+  it("keeps a parent lease active while a child permission or question prompt is open", async () => {
+    const hooks = await CursorPlugin({} as any)
+    sessionActivity.clear()
+    const start = Date.now()
+    try {
+      await hooks.event?.({ event: { type: "session.updated", properties: { info: { id: "child", parentID: "parent" } } } as any })
+      await hooks.event?.({ event: { type: "permission.asked", properties: { id: "per_1", sessionID: "child" } } as any })
+      await hooks.event?.({ event: { type: "question.asked", properties: { id: "que_1", sessionID: "child" } } as any })
+      setSystemTime(new Date(start + 3_600_000))
+      expect(sessionActivity.lastActivityAt("parent")).toBe(start + 3_600_000)
+
+      await hooks.event?.({ event: { type: "permission.replied", properties: { sessionID: "child", requestID: "per_1", reply: "once" } } as any })
+      await hooks.event?.({ event: { type: "question.rejected", properties: { sessionID: "child", requestID: "que_1" } } as any })
+      setSystemTime(new Date(start + 7_200_000))
+      expect(sessionActivity.lastActivityAt("parent")).toBe(start + 3_600_000)
+    } finally {
+      setSystemTime()
+      sessionActivity.clear()
+    }
+  })
 })
 
 describe("modelInfoToConfig", () => {

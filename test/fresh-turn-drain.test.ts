@@ -132,11 +132,11 @@ describe("fresh-turn prior drain", () => {
     expect(parent.closed).toBe(true)
   })
 
-  it("cancelPendingExecsForFreshTurn writes an error result for each open exec", () => {
+  it("cancelPendingExecsForFreshTurn writes an error result for each open exec", async () => {
     const session = fakeSessionWithPayloads([])
     sessionManager.registerPending(0, session, "grep_result", "grep", false)
     sessionManager.registerPending(1, session, "read_result", "read", false)
-    expect(cancelPendingExecsForFreshTurn(session)).toBe(2)
+    expect(await cancelPendingExecsForFreshTurn(session)).toBe(2)
     expect(session.pending.size).toBe(0)
     expect(session.closed).toBe(false)
     const written = (session as CursorSession & { _written: Uint8Array[] })._written
@@ -146,7 +146,7 @@ describe("fresh-turn prior drain", () => {
     sessionManager.close(session, "ordinary-cleanup")
   })
 
-  it("refuses an abandoned CreatePlan review with the cancel reason, never an approval", () => {
+  it("refuses an abandoned CreatePlan review with the cancel reason, never an approval", async () => {
     const session = fakeSessionWithPayloads([])
     sessionManager.registerPending(900_000, session, "create_plan_request_response", "question", false, {
       interactionId: 1,
@@ -154,7 +154,7 @@ describe("fresh-turn prior drain", () => {
       planUri: "file:///tmp/plan.md",
     })
     sessionManager.registerPending(0, session, "grep_result", "grep", false)
-    expect(cancelPendingExecsForFreshTurn(session)).toBe(2)
+    expect(await cancelPendingExecsForFreshTurn(session)).toBe(2)
     expect(session.pending.size).toBe(0)
     const replies = (session as CursorSession & { _written: Uint8Array[] })._written
       .map((frame) => decodeMessage<any>("AgentClientMessage", frame))

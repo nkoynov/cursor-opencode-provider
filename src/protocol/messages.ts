@@ -484,10 +484,41 @@ export function createMessageTypes(): protobuf.Root {
       { id: 15, name: "tool_call_delta", type: "ToolCallDeltaUpdate" },
       { id: 16, name: "step_started", type: "StepStarted" },
       { id: 17, name: "step_completed", type: "StepCompleted" },
+      { id: 23, name: "context_injection_state", type: "ContextInjectionStateUpdate" },
       { id: 27, name: "tool_requests_listed", type: "ToolRequestsListedUpdate" },
     ],
-    [{ name: "update", fields: ["text_delta", "tool_call_started", "tool_call_completed", "thinking_delta", "partial_tool_call", "heartbeat", "turn_ended", "tool_call_delta", "step_started", "step_completed", "tool_requests_listed"] }],
+    [{ name: "update", fields: ["text_delta", "tool_call_started", "tool_call_completed", "thinking_delta", "partial_tool_call", "heartbeat", "turn_ended", "tool_call_delta", "step_started", "step_completed", "context_injection_state", "tool_requests_listed"] }],
   )
+
+  // Server status for an `inject_context_action` (InteractionUpdate #23).
+  // Cursor CLI only tracks it to show queued steer delivery; it carries no output.
+  addType(root, "ContextInjectionQueued", [])
+  addType(root, "ContextInjectionQueuedForNextTurn", [])
+  addType(root, "ContextInjectionCancelled", [])
+  addType(root, "ContextInjectionDelivered", [
+    { id: 1, name: "step", type: "int32" },
+    { id: 2, name: "delivery_batch_id", type: "string" },
+    { id: 3, name: "delivered_at_ms", type: "int64" },
+  ])
+  addType(root, "ContextInjectionRejected", [
+    { id: 1, name: "reason", type: "string" },
+  ])
+  addType(
+    root,
+    "ContextInjectionState",
+    [
+      { id: 1, name: "queued", type: "ContextInjectionQueued" },
+      { id: 2, name: "delivered", type: "ContextInjectionDelivered" },
+      { id: 3, name: "queued_for_next_turn", type: "ContextInjectionQueuedForNextTurn" },
+      { id: 4, name: "cancelled", type: "ContextInjectionCancelled" },
+      { id: 5, name: "rejected", type: "ContextInjectionRejected" },
+    ],
+    [{ name: "state", fields: ["queued", "delivered", "queued_for_next_turn", "cancelled", "rejected"] }],
+  )
+  addType(root, "ContextInjectionStateUpdate", [
+    { id: 1, name: "injection_id", type: "string" },
+    { id: 2, name: "state", type: "ContextInjectionState" },
+  ])
 
   // ── Exec channel ──
 
@@ -1076,6 +1107,16 @@ export function createMessageTypes(): protobuf.Root {
     [{ name: "result", fields: ["success", "error", "rejected", "permission_denied"] }],
   )
 
+  // Cursor CLI postToolUse hook context: ExecClientMessage #45 on a unary
+  // result, ShellStream #8 on a shell stream (agent.v1 hook_additional_context).
+  addType(root, "HookAdditionalContext", [
+    { id: 1, name: "hook_event_name", type: "string" },
+    { id: 2, name: "content", type: "string" },
+  ])
+  addType(root, "ShellStreamHookContext", [
+    { id: 1, name: "hook_additional_contexts", type: "HookAdditionalContext", repeated: true },
+  ])
+
   addType(
     root,
     "ShellStream",
@@ -1087,8 +1128,9 @@ export function createMessageTypes(): protobuf.Root {
       { id: 5, name: "rejected", type: "ShellRejected" },
       { id: 6, name: "permission_denied", type: "ShellPermissionDenied" },
       { id: 7, name: "backgrounded", type: "ShellStreamBackgrounded" },
+      { id: 8, name: "hook_context", type: "ShellStreamHookContext" },
     ],
-    [{ name: "event", fields: ["stdout", "stderr", "exit", "start", "rejected", "permission_denied", "backgrounded"] }],
+    [{ name: "event", fields: ["stdout", "stderr", "exit", "start", "rejected", "permission_denied", "backgrounded", "hook_context"] }],
   )
 
   addType(root, "GlobArgs", [
@@ -1469,6 +1511,7 @@ export function createMessageTypes(): protobuf.Root {
       { id: 49, name: "pi_grep_args", type: "PiGrepToolArgs" },
       { id: 50, name: "pi_find_args", type: "PiFindToolArgs" },
       { id: 51, name: "pi_ls_args", type: "PiLsToolArgs" },
+      { id: 55, name: "accept_hook_additional_contexts", type: "bool" },
     ],
     [{ name: "args", fields: [
       "shell_args", "write_args", "delete_args", "grep_args", "read_args", "ls_args",
@@ -1488,6 +1531,7 @@ export function createMessageTypes(): protobuf.Root {
       { id: 1, name: "id", type: "uint32" },
       { id: 15, name: "exec_id", type: "string" },
       { id: 39, name: "local_execution_time_ms", type: "uint64" },
+      { id: 45, name: "hook_additional_contexts", type: "HookAdditionalContext", repeated: true },
       { id: 2, name: "shell_result", type: "ShellResult" },
       { id: 3, name: "write_result", type: "WriteResult" },
       { id: 4, name: "delete_result", type: "DeleteResult" },
@@ -1695,9 +1739,16 @@ export function createMessageTypes(): protobuf.Root {
     { id: 1, name: "producer", type: "string" },
     { id: 2, name: "content", type: "string" },
   ])
+  // Cursor SDK `Run.steer` / CLI steering payload: a user message added to the
+  // running turn. `request_context` is optional and unused by the SDK.
+  addType(root, "UserContextInjection", [
+    { id: 1, name: "user_message", type: "UserMessage" },
+    { id: 2, name: "request_context", type: "RequestContext" },
+  ])
   addType(root, "InjectContextAction", [
     { id: 1, name: "injection_id", type: "string" },
     { id: 2, name: "expected_run_id", type: "string" },
+    { id: 3, name: "user_context", type: "UserContextInjection" },
     { id: 4, name: "system_context", type: "SystemContextInjection" },
   ])
 
