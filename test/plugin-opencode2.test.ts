@@ -1325,6 +1325,48 @@ describe("opencode2 setup", () => {
     }
   })
 
+  test("setup publishes the first discovery before returning when no cache exists", async () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), "cursor-oc2-cold-cache-"))
+    const previousApiBase = process.env.CURSOR_API_BASE_URL
+    const previousVersion = process.env.CURSOR_CLIENT_VERSION
+    setHostCacheDirOverride(cacheDir)
+    using server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        if (new URL(request.url).pathname.endsWith("/AvailableModels")) {
+          await new Promise((resolve) => setTimeout(resolve, 50))
+          return Response.json({
+            models: [{ name: "cold-model", client_display_name: "Cold Model", supports_agent: true, variants: [] }],
+          })
+        }
+        return Response.json({})
+      },
+    })
+    process.env.CURSOR_API_BASE_URL = server.url.origin
+    process.env.CURSOR_CLIENT_VERSION = "cli-test"
+    resetClientVersionCache()
+    try {
+      const { ctx, inventory } = fakeContext()
+      ctx.integration.connection.active = async () => ({ type: "credential", id: "c", label: "Cursor" })
+      ctx.integration.connection.resolve = async () => ({ type: "key", key: "cold.start.jwt" })
+
+      const cleanup = await setupPlugin(ctx)
+      try {
+        expect(inventory.models.has("cursor/cold-model")).toBe(true)
+      } finally {
+        await cleanup()
+      }
+    } finally {
+      setHostCacheDirOverride(undefined)
+      if (previousApiBase === undefined) delete process.env.CURSOR_API_BASE_URL
+      else process.env.CURSOR_API_BASE_URL = previousApiBase
+      if (previousVersion === undefined) delete process.env.CURSOR_CLIENT_VERSION
+      else process.env.CURSOR_CLIENT_VERSION = previousVersion
+      resetClientVersionCache()
+      rmSync(cacheDir, { recursive: true, force: true })
+    }
+  })
+
   test("the session hook records the compaction agent", async () => {
     clearCompactionSessions()
     const { ctx, hooks, sessionLocations } = fakeContext()

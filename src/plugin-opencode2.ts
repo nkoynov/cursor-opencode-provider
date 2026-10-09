@@ -586,6 +586,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
 
     const RETRY_INTERVAL_MS = 3_000
     const RETRY_WINDOW_MS = 300_000
+    const COLD_DISCOVERY_WAIT_MS = 10_000
     const startedAt = Date.now()
     const retry = setInterval(() => {
       if (modelsLoaded || Date.now() - startedAt > RETRY_WINDOW_MS) {
@@ -596,7 +597,19 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
     }, RETRY_INTERVAL_MS)
     ;(retry as unknown as { unref?: () => void }).unref?.()
 
-    void ensureModels().catch(() => {})
+    const firstDiscovery = ensureModels().catch(() => {})
+    if (!models.length) {
+      // Without a cached inventory, `opencode run` resolves its model as soon as setup returns.
+      let wait: ReturnType<typeof setTimeout> | undefined
+      await Promise.race([
+        firstDiscovery,
+        new Promise<void>((resolve) => {
+          wait = setTimeout(resolve, COLD_DISCOVERY_WAIT_MS)
+          ;(wait as unknown as { unref?: () => void }).unref?.()
+        }),
+      ])
+      clearTimeout(wait)
+    }
 
     const onCredentialSwitch = () => {
       modelsLoaded = false
