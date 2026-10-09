@@ -13,6 +13,14 @@ import {
 } from "../src/language-model.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { resetCursorShellCalls } from "../src/shell-timeout.js"
+import { toolsToDescriptors } from "../src/protocol/tools.js"
+import { resetConversationBindingsForTests, restoreConversationBinding } from "../src/protocol/conversation-bind.js"
+import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
+import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
+import { hydrateConversationState } from "../src/protocol/conversation-state.js"
+import { decodePersistedHostNotes } from "../src/protocol/host-notes.js"
+import fs from "node:fs"
+import path from "node:path"
 
 type Prompt = LanguageModelV3CallOptions["prompt"]
 
@@ -99,6 +107,9 @@ afterEach(() => {
   sessionManager.dispose()
   resetTurnStateForTests()
   resetCursorShellCalls()
+  resetConversationPersistenceForTests()
+  resetConversationBindingsForTests()
+  resetCheckpointsForTests()
 })
 
 describe("host notes in a steer step", () => {
@@ -141,6 +152,18 @@ describe("host notes in a steer step", () => {
     expect(releaseHostNoteInjectionsForTests(live.openCodeSessionId!)).toEqual({ inFlight: [], undelivered: [LATER] })
   })
 
+  it("injects a message an earlier delivery of the same results did not carry", async () => {
+    const writes: Uint8Array[] = []
+    const live = heldRun(writes)
+    sessionManager.registerSession(live)
+    const results = extractTrailingToolResults([user("go"), readResult(live, 1), user(NOTE)] as Prompt)
+
+    await deliverContinuationResults(live, results)
+    await deliverContinuationResults(live, results, { steer: [{ text: "also check b.ts" }, { text: LATER, hostNote: true }] })
+
+    expect(injected(writes).map((injection) => injection.text)).toEqual([NOTE_TEXT, "also check b.ts", LATER_TEXT])
+  })
+
   it("does not inject a step's notes or messages again when its results were already delivered", async () => {
     const writes: Uint8Array[] = []
     const live = heldRun(writes)
@@ -181,6 +204,44 @@ describe("host notes of a Run the host leaves", () => {
     expect(await preparePriorSessionForFreshTurn(prior.openCodeSessionId!, { timeoutMs: 1_000 })).toBe("settled-only")
 
     expect(releaseHostNoteInjectionsForTests(prior.openCodeSessionId!)).toEqual({ inFlight: [], undelivered: [NOTE] })
+  })
+})
+
+describe("host notes in the snapshot of a held Run", () => {
+  it("saves deferred and unacknowledged notes when the Run waits on its next tool call", async () => {
+    const root = fs.mkdtempSync(path.join("/tmp", "cursor-steer-notes-"))
+    try {
+      const writes: Uint8Array[] = []
+      const exec = {
+        flags: 0,
+        payload: encodeMessage("AgentServerMessage", {
+          exec_server_message: { id: 2, shell_stream_args: { command: "echo b", tool_call_id: "call-b" } },
+        }),
+      }
+      const checkpoint = { flags: 0, payload: encodeMessage("AgentServerMessage", { conversation_checkpoint_update: Uint8Array.from([7]) }) }
+      const live = heldRun(writes, [checkpoint, exec])
+      live.cacheDir = root
+      const tools = [{ name: "read", description: "Read" }, { name: "bash", description: "Run shell command" }]
+      live.toolCatalog = tools
+      live.toolDescriptors = toolsToDescriptors(tools, "opencode")
+      restoreConversationBinding(live.openCodeSessionId!, live.conversationId)
+      sessionManager.registerSession(live)
+      await deliverContinuationResults(live, extractTrailingToolResults([user("go"), readResult(live, 1), user(NOTE)] as Prompt))
+
+      await pump(live, collect(), { textId: "t", reasoningId: "r" })
+      expect(live.pending.size).toBe(1)
+      await new Promise((resolve) => setTimeout(resolve, 1_300))
+
+      const sessionKey = live.openCodeSessionId!
+      resetConversationPersistenceForTests()
+      resetConversationBindingsForTests()
+      resetCheckpointsForTests()
+      resetTurnStateForTests()
+      const restored = await hydrateConversationState(root, sessionKey)
+      expect(decodePersistedHostNotes(restored?.hostNote)).toEqual([NOTE])
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
   })
 })
 

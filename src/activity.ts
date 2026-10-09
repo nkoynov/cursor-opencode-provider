@@ -17,14 +17,33 @@ const ACTIVITY_RETENTION_MS = 24 * 60 * 60 * 1_000
  * stalled: the host emits no events until the user answers, so an open prompt
  * counts as current activity for its session and every ancestor.
  */
+type ActivityState = {
+  parentBySession: Map<string, string>
+  lastActivityBySession: Map<string, number>
+  sessionByRunningTool: Map<string, string>
+  /** Open host prompts: `${sessionId}\0${requestId}` → session id and when it opened. */
+  openPrompts: Map<string, OpenPrompt>
+}
+
+const newActivityState = (): ActivityState => ({
+  parentBySession: new Map(),
+  lastActivityBySession: new Map(),
+  sessionByRunningTool: new Map(),
+  openPrompts: new Map(),
+})
+
 export class SessionActivityTracker implements SessionActivitySource {
-  private readonly parentBySession = new Map<string, string>()
-  private readonly lastActivityBySession = new Map<string, number>()
-  constructor(
-    private readonly sessionByRunningTool = new Map<string, string>(),
-    /** Open host prompts: `${sessionId}\0${requestId}` → session id and when it opened. */
-    private readonly openPrompts = new Map<string, OpenPrompt>(),
-  ) {}
+  private readonly parentBySession: Map<string, string>
+  private readonly lastActivityBySession: Map<string, number>
+  private readonly sessionByRunningTool: Map<string, string>
+  private readonly openPrompts: Map<string, OpenPrompt>
+
+  constructor(state: ActivityState = newActivityState()) {
+    this.parentBySession = state.parentBySession
+    this.lastActivityBySession = state.lastActivityBySession
+    this.sessionByRunningTool = state.sessionByRunningTool
+    this.openPrompts = state.openPrompts
+  }
 
   linkSession(sessionId: string, parentId?: string): void {
     if (!sessionId) return
@@ -165,19 +184,12 @@ export class SessionActivityTracker implements SessionActivitySource {
 }
 
 // OpenCode 2 can evaluate the plugin and the AI SDK model as separate copies
-// of this module (one per Location), so the plugin's tool and prompt events
-// must reach the copy that holds the Run.
-const RUNNING_TOOLS = Symbol.for("cursor-opencode-provider.running-tools")
-const OPEN_PROMPTS = Symbol.for("cursor-opencode-provider.open-prompts")
-const globals = globalThis as typeof globalThis & {
-  [RUNNING_TOOLS]?: Map<string, string>
-  [OPEN_PROMPTS]?: Map<string, OpenPrompt>
-}
+// of this module (one per Location). The plugin's session, tool and prompt
+// events must reach the copy that holds the Run, so every copy shares one state.
+const ACTIVITY_STATE = Symbol.for("cursor-opencode-provider.session-activity-state")
+const globals = globalThis as typeof globalThis & { [ACTIVITY_STATE]?: ActivityState }
 
-export const sessionActivity = new SessionActivityTracker(
-  globals[RUNNING_TOOLS] ??= new Map(),
-  globals[OPEN_PROMPTS] ??= new Map(),
-)
+export const sessionActivity = new SessionActivityTracker(globals[ACTIVITY_STATE] ??= newActivityState())
 
 /**
  * Open or close a host prompt from an OpenCode event. OpenCode 1.x publishes

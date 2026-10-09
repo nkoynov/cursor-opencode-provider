@@ -265,6 +265,64 @@ describe("host notes through a full provider Run", () => {
     }
   }, 30_000)
 
+  it("does not repeat a deferred read instruction that the replayed history of a Run without a checkpoint holds", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-host-notes-replay-"))
+    cacheHttp2SessionForTests(ORIGIN, client)
+    try {
+      const sessionKey = `ses_replay_note_${Date.now()}`
+      const instruction = `Instructions from: ${path.join(root, "pkg", "AGENTS.md")}\nUse bazel.`
+      restorePersistedHostNotes(sessionKey, encodePersistedHostNotes([instruction]))
+      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      onRun = (run, message) => {
+        if (message.run_request) endTurn(run, "Use bazel.")
+      }
+      const callId = "call_replayed_read"
+      await collect(model, [
+        { role: "system", content: "Host system prompt." },
+        { role: "user", content: [{ type: "text", text: "Read pkg/probe.txt." }] },
+        { role: "assistant", content: [{ type: "tool-call", toolCallId: callId, toolName: "read", input: { filePath: "pkg/probe.txt" } }] },
+        { role: "tool", content: [{ type: "tool-result", toolCallId: callId, toolName: "read", output: {
+          type: "text", value: `<path>pkg/probe.txt</path>\n<type>file</type>\n<content>\n1: alpha\n</content>\n<system-reminder>\n${instruction}\n</system-reminder>`,
+        } }] },
+        { role: "assistant", content: [{ type: "text", text: "It says alpha." }] },
+        { role: "user", content: [{ type: "text", text: "Which build tool?" }] },
+      ] as Prompt, sessionKey)
+      const text = runs[0]!.received.find((message) => message.run_request)!.run_request.action.user_message_action.user_message.text as string
+      expect(text).toStartWith("<conversation_history>\n")
+      expect(text.split("Use bazel.")).toHaveLength(2)
+      expect(text).not.toContain("<system_reminder>")
+    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+  }, 30_000)
+
+  it("still sends a deferred read instruction when the replay budget cuts the result that carried it", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-host-notes-replay-cut-"))
+    cacheHttp2SessionForTests(ORIGIN, client)
+    try {
+      const sessionKey = `ses_replay_cut_${Date.now()}`
+      const instruction = `Instructions from: ${path.join(root, "pkg", "AGENTS.md")}\nUse bazel.`
+      restorePersistedHostNotes(sessionKey, encodePersistedHostNotes([instruction]))
+      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      onRun = (run, message) => {
+        if (message.run_request) endTurn(run, "Use bazel.")
+      }
+      const callId = "call_cut_read"
+      await collect(model, [
+        { role: "system", content: "Host system prompt." },
+        { role: "user", content: [{ type: "text", text: "Read pkg/big.txt." }] },
+        { role: "assistant", content: [{ type: "tool-call", toolCallId: callId, toolName: "read", input: { filePath: "pkg/big.txt" } }] },
+        { role: "tool", content: [{ type: "tool-result", toolCallId: callId, toolName: "read", output: {
+          type: "text", value: `<path>pkg/big.txt</path>\n<content>\n${"x".repeat(2_500_000)}\n</content>\n<system-reminder>\n${instruction}\n</system-reminder>`,
+        } }] },
+        { role: "assistant", content: [{ type: "text", text: "It is long." }] },
+        { role: "user", content: [{ type: "text", text: "Which build tool?" }] },
+      ] as Prompt, sessionKey)
+      const text = runs[0]!.received.find((message) => message.run_request)!.run_request.action.user_message_action.user_message.text as string
+      expect(text).toContain("more characters left out of this replay")
+      expect(text.split("Use bazel.")).toHaveLength(2)
+      expect(text).toContain("<system_reminder>")
+    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+  }, 30_000)
+
   it("injects a mid-step OpenCode 2 instruction once and carries a between-turns update with the next message", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-host-notes-run-"))
     cacheHttp2SessionForTests(ORIGIN, client)

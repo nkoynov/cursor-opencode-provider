@@ -1792,6 +1792,19 @@ async function startSession(
         ...(hostPlanFileFor(sessionKey) ? { hostPlanFile: hostPlanFileFor(sessionKey)! } : {}),
         server: resolveToolServerIdentity("plan_exit", "opencode", knownMcpServers).server,
       })
+  const historyOptions: PromptHistoryOptions = {
+    preserveTrailingUser: recovery?.kind === "rebase" && !checkpointUnusable,
+    // A Run without a checkpoint replays every call and result whole, as a
+    // resumed Claude Code session does, so the model keeps what it read and does
+    // not take its earlier work for undone. Only a replay over the context
+    // budget shortens its oldest inputs and results. A Run with a checkpoint
+    // sends no history, so it skips the tool results.
+    toolResults: conversationState ? "omit" : isCompaction ? "all" : "transcript",
+    trailingSteer: recovery?.kind === "rebase" && recovery.steer === true,
+    ...(recovery?.kind === "rebase" && recovery.toolCallIds ? { keepToolCallIds: recovery.toolCallIds } : {}),
+    ...(liveTurn ? { liveTurnStart: liveTurn.start, answeredSteers: liveTurn.answered } : {}),
+    ...(fallbackReply ? { omit: { start: fallbackReply.turnStart, end: fallbackReply.stopIndex } } : {}),
+  }
   const userTurnHostNotes = prepareUserTurnHostNotes({
     sessionKey,
     prompt,
@@ -1799,6 +1812,7 @@ async function startSession(
     isCompaction,
     ephemeralRun,
     resuming,
+    ...(startedWithCheckpoint || isCompaction || ephemeralRun || resuming ? {} : { seedHistory: extractPromptHistory(prompt, historyOptions) }),
     turnText: userText,
   })
   const oneShotReminders = [
@@ -1938,20 +1952,16 @@ async function startSession(
   })
 
   const history = extractPromptHistory(prompt, {
-    preserveTrailingUser: recovery?.kind === "rebase" && !checkpointUnusable,
-    // A Run without a checkpoint replays every call and result whole, as a
-    // resumed Claude Code session does, so the model keeps what it read and does
-    // not take its earlier work for undone. Only a replay over the context
-    // budget shortens its oldest inputs and results. A Run with a checkpoint
-    // sends no history, so it skips the tool results.
-    toolResults: conversationState ? "omit" : isCompaction ? "all" : "transcript",
-    trailingSteer: recovery?.kind === "rebase" && recovery.steer === true,
-    ...(recovery?.kind === "rebase" && recovery.toolCallIds ? { keepToolCallIds: recovery.toolCallIds } : {}),
-    ...(liveTurn ? { liveTurnStart: liveTurn.start, answeredSteers: liveTurn.answered } : {}),
-    ...(fallbackReply ? { omit: { start: fallbackReply.turnStart, end: fallbackReply.stopIndex } } : {}),
+    ...historyOptions,
     maxChars: replayContextBudget({ modelInfo, cursorModelId, maxMode }).budget * REPLAY_CHARS_PER_TOKEN
       - (systemPrompt?.length ?? 0) - userText.length,
   })
+  if (userTurnHostNotes.seededNotes.length > 0) {
+    // The replay budget can shorten the result that carried a note.
+    const replayedText = history.filter((message) => message.role === "user").map((message) => message.content).join("\n\n")
+    const cut = userTurnHostNotes.seededNotes.filter((note) => !replayedText.includes(note.trim()))
+    if (cut.length > 0) userText = appendMidConversationMessage(userText, wrapHostNotesForCursor(cut).join("\n\n"))
+  }
 
   if (foreignHistory || checkpointUnusable || (!conversationState && !isCompaction && !ephemeralRun && history.some((entry) => entry.role !== "system"))) {
     assertForeignHistoryRebaseFits({
@@ -3332,14 +3342,18 @@ async function deliverContinuationResultsNow(
         `frames=${outcome.framesWritten} outLen=${r.output.length}`,
     )
   }
-  if (deliveredResults === 0 && (stepNotes.length > 0 || delivery.steer?.length)) {
-    // Every result of this step was already delivered, and its notes and messages with it.
-    trace(`continuation: injections belong to an already delivered step; not injected again notes=${stepNotes.length} steer=${delivery.steer?.length ?? 0}`)
-    return session
+  // With no result delivered here, an earlier delivery of the same step carried its notes. A message sent
+  // mid-step may still be new to the Run: that delivery need not have carried it.
+  const stepDelivered = deliveredResults > 0
+  if (!stepDelivered && stepNotes.length > 0) {
+    trace(`continuation: host notes belong to an already delivered step; not injected again count=${stepNotes.length}`)
   }
-  if (stepNotes.length > 0 && !(await injectHostNotes(session, stepNotes))) return undefined
+  if (stepDelivered && stepNotes.length > 0 && !(await injectHostNotes(session, stepNotes))) return undefined
+  const sentSteers = new Set((session.steerInjections ?? []).map((injection) => injection.text))
+  const heldNotes = new Set(session.openCodeSessionId ? persistableHostNotes(session.openCodeSessionId) : [])
   // A message sent mid-step, and the notes OpenCode put around it, in OpenCode's order.
   for (const injection of delivery.steer ?? []) {
+    if (!stepDelivered && (injection.hostNote ? heldNotes.has(injection.text) : sentSteers.has(injection.text))) continue
     const injected = injection.hostNote
       ? await injectHostNotes(session, [injection.text])
       : await injectSteerMessages(session, [injection.text])
@@ -3528,7 +3542,7 @@ export function prepareUserTurnHostNotes(input: {
   seedHistory?: readonly SeedHistoryMessage[]
   /** The Run's user text: every user message since the model's last output, notes among them. */
   turnText?: string
-}): { reminders: string[]; carriedNotes: HostNoteBatch[]; sent: () => void } {
+}): { reminders: string[]; seededNotes: string[]; carriedNotes: HostNoteBatch[]; sent: () => void } {
   const { sessionKey, startedWithCheckpoint, isCompaction, ephemeralRun, resuming } = input
   // Notes injected into a Run that closed without acknowledging them can no
   // longer be delivered there; a still-open Run keeps its own.
@@ -3548,17 +3562,27 @@ export function prepareUserTurnHostNotes(input: {
     .join("\n\n")
   // Notes OpenCode put between the last reply and this message are already in it (`liveUserTurn`).
   const turnText = input.turnText ?? ""
-  const deferred = undelivered?.flatMap((batch) => batch.notes)
-    .filter((note) => !seededText.includes(note.trim()) && !turnText.includes(note.trim())) ?? []
+  const pending = undelivered?.flatMap((batch) => batch.notes).filter((note) => !turnText.includes(note.trim())) ?? []
+  const deferred = pending.filter((note) => !seededText.includes(note.trim()))
   return {
     carriedNotes: [...(undelivered ?? [])],
     reminders: wrapHostNotesForCursor(deferred),
+    seededNotes: pending.filter((note) => seededText.includes(note.trim())),
     sent: () => {
       if (sessionKey && undelivered?.length) {
         forgetUndeliveredHostNotes(sessionKey, undelivered, startedWithCheckpoint ? "user-turn" : "seed-history")
       }
     },
   }
+}
+
+/** What a restart while the Run is held would lose: deferred notes and notes not yet acknowledged, in order. */
+function persistableHostNotes(sessionKey: string): string[] {
+  const inFlight = [...(hostNoteInjectionsBySession.get(sessionKey)?.values() ?? [])]
+    .map(({ notes, order }) => ({ notes, order }))
+  return [...(undeliveredHostNotesBySession.get(sessionKey) ?? []), ...inFlight]
+    .sort((a, b) => a.order - b.order)
+    .flatMap((batch) => batch.notes)
 }
 
 function undeliveredHostNotes(sessionKey: string): string[] {
@@ -3706,6 +3730,7 @@ function scheduleHeldRunSave(session: CursorSession): void {
       postCompactionRebase: session.postCompactionRebase,
       hostAgent: session.hostAgent,
       systemPromptHash: session.stableSystemPromptHash,
+      hostNote: encodePersistedHostNotes(persistableHostNotes(sessionKey)),
       runInProgress: true,
     }).catch((error) => {
       trace(`conversation persistence: held Run save failed sessionKey=${sessionKey}: ${String(error)}`)

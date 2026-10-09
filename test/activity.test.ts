@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, setSystemTime } from "bun:test"
-import { applyHostPromptEvent, SessionActivityTracker } from "../src/activity.js"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
+import { applyHostPromptEvent, SessionActivityTracker, sessionActivity } from "../src/activity.js"
 
 afterEach(() => setSystemTime())
 
@@ -96,5 +99,29 @@ describe("applyHostPromptEvent", () => {
     applyHostPromptEvent(tracker, "permission.asked", undefined)
     applyHostPromptEvent(tracker, "form.created", { form: "nope" })
     expect(tracker.lastActivityAt("s")).toBeUndefined()
+  })
+})
+
+describe("sessionActivity across module copies", () => {
+  it("shares one state, so a child's prompt seen by the plugin's copy holds the parent Run in the model's copy", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-activity-copies-"))
+    const load = async (name: string): Promise<typeof import("../src/activity.js")> => {
+      fs.copyFileSync(new URL("../src/activity.ts", import.meta.url), path.join(dir, `${name}.ts`))
+      return await import(path.join(dir, `${name}.ts`))
+    }
+    const start = Date.now()
+    try {
+      const plugin = await load("plugin")
+      const model = await load("model")
+      expect(plugin.SessionActivityTracker).not.toBe(model.SessionActivityTracker)
+      expect(plugin.sessionActivity).not.toBe(model.sessionActivity)
+      plugin.sessionActivity.linkSession("child-copy", "parent-copy")
+      plugin.applyHostPromptEvent(plugin.sessionActivity, "permission.asked", { id: "per_copy", sessionID: "child-copy" })
+      setSystemTime(new Date(start + 3_600_000))
+      expect(model.sessionActivity.lastActivityAt("parent-copy")).toBe(start + 3_600_000)
+    } finally {
+      sessionActivity.clear()
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
