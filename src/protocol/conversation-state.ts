@@ -27,6 +27,7 @@ import {
 } from "./turn-provenance.js"
 import {
   deletePersistedConversation,
+  getPersistedAnsweredSteers,
   getPersistedTurnProvenance,
   loadPersistedConversation,
   persistConversation,
@@ -80,7 +81,7 @@ export async function hydrateConversationState(
 
 /** Early steers the session's last turn answered, from its restart snapshot. */
 export async function persistedAnsweredSteers(cacheDir: string, sessionKey: string): Promise<string[]> {
-  return [...(await loadPersistedConversation(cacheDir, sessionKey)).value?.answeredSteers ?? []]
+  return getPersistedAnsweredSteers(cacheDir, sessionKey)
 }
 
 /** Restore only turn provenance when its in-memory entry was evicted. */

@@ -13,7 +13,10 @@ import { encodeFrame } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { resetCheckpointsForTests, setCheckpoint } from "../src/protocol/checkpoint.js"
 import { resetConversationBindingsForTests, restoreConversationBinding } from "../src/protocol/conversation-bind.js"
-import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
+import {
+  resetConversationPersistenceForTests,
+  setConversationPersistenceHookForTests,
+} from "../src/protocol/conversation-persistence.js"
 import { persistConversationState } from "../src/protocol/conversation-state.js"
 import { opencodeGlobalCacheDir, setHostCacheDirOverride } from "../src/context/paths.js"
 import { resetFrozenRequestContextsForTests } from "../src/context/frozen.js"
@@ -339,6 +342,28 @@ describe("the user turn of a fresh Run", () => {
     expect(new Uint8Array(run.conversation_state)).toEqual(checkpoint())
     expect(userText(run)).toStartWith(QUESTION)
     expect(userText(run)).not.toContain(STEER)
+  })
+
+  it("checks answered steers after a restart without decoding the snapshot again", async () => {
+    const sessionKey = newSession({ checkpointed: true })
+    await savedBeforeRestart(sessionKey, { answeredSteers: [STEER] })
+    let decodes = 0
+    setConversationPersistenceHookForTests((phase) => { if (phase === "full-decode") decodes++ })
+    const turn = [
+      user("Read the docs"),
+      assistant("Read them, and the README too."),
+      user(STEER),
+      user(QUESTION),
+    ] as Prompt
+
+    const run = await step(sessionKey, turn)
+    expect(userText(run)).toStartWith(QUESTION)
+    expect(userText(run)).not.toContain(STEER)
+    expect(decodes).toBe(1)
+
+    const next = await step(sessionKey, [...turn, assistant("Yes."), user(SYSTEM_UPDATE), user("And the docs?")] as Prompt)
+    expect(splitTranscript(next).live).toStartWith(SYSTEM_UPDATE)
+    expect(decodes).toBe(1)
   })
 
   it("after a restart that lost the snapshot, sends the last message and replays the earlier ones as no reply", async () => {

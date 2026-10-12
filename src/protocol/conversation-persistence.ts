@@ -47,6 +47,7 @@ type ConversationHead = {
   conversationId: string
   updatedAt: number
   turnProvenance?: string
+  answeredSteers?: string[]
 }
 
 type ConversationStore = {
@@ -913,6 +914,7 @@ function conversationHead(value: PersistedConversation): ConversationHead {
     conversationId: value.conversationId,
     updatedAt: value.updatedAt,
     ...(value.turnProvenance ? { turnProvenance: value.turnProvenance } : {}),
+    ...(value.answeredSteers?.length ? { answeredSteers: [...value.answeredSteers] } : {}),
   }
 }
 
@@ -986,6 +988,16 @@ export async function getPersistedTurnProvenance(
   const head = (await getStore(cacheDir, sessionKey, now)).head
   if (!head?.turnProvenance || !isFresh(head, now)) return undefined
   return { conversationId: head.conversationId, turnProvenance: head.turnProvenance }
+}
+
+/** Early steers the current snapshot's turn answered, without decoding its payload. */
+export async function getPersistedAnsweredSteers(
+  cacheDir: string,
+  sessionKey: string,
+  now = Date.now(),
+): Promise<string[]> {
+  const head = (await getStore(cacheDir, sessionKey, now)).head
+  return head && isFresh(head, now) ? [...head.answeredSteers ?? []] : []
 }
 
 /** Replace one session's durable snapshot and refresh its 24-hour lease. */
