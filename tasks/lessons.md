@@ -730,3 +730,33 @@
   renewal even though tests starting with an empty SDK pass. Keep the current
   integration resolver after captured host options, and preserve other
   providers' SDKs (`test/plugin-opencode2.test.ts`).
+
+## 2026-10-12 — Streaming cache metadata needs explicit byte and handle ownership
+
+- A full-buffer protobuf reader is not necessarily a streaming parser:
+  `protobufjs.Reader.uint64()` accepted a fragmented value before its terminating
+  byte. Prefix inspection must distinguish incomplete varints/strings from
+  complete metadata (`test/conversation-maintenance.test.ts`).
+- Disposing a file stream can close an externally supplied descriptor despite
+  `autoClose: false` on a runtime. Feed the inflater with bounded positional
+  reads instead, settle read-ahead before returning the handle, and verify that
+  the same handle still reads the complete snapshot on Node and Bun
+  (`src/protocol/conversation-cache-header.ts`, `test/conversation-startup.mjs`).
+- `rename(src, dst)` ENOENT names either side. When another collector can
+  `rmdir` the shared destination directory, ENOENT does not prove the source
+  is gone; `lstat` the source before reporting it missing, and tolerate ENOENT
+  between `mkdir` and `chmod` of that directory
+  (`discardCacheCandidate`, `ensureCacheDirectory`).
+- A process-lifetime exemption from cleanup (pinning every loaded session)
+  silently disables periodic expiry on long-running servers. The per-file
+  operation queue already serializes in-process loads, writes and collection,
+  so a loaded session's snapshot can expire by its persisted age like any other.
+- A per-session store that caches the decoded snapshot duplicates the live
+  checkpoint/blob maps for every session the process ever touched. Keep only
+  the head (conversation id, timestamp, turn provenance) resident, hand the
+  loaded snapshot to its first reader, and re-read the durable copy after the
+  session's queued write (`takeConversation`).
+- Bun's `opendir` reads the directory lazily: a directory removed after
+  `opendir` throws `ENOENT scandir` from the `for await`, where Node yields no
+  entries. Iterate directories other collectors may remove through
+  `removableDirectoryEntries`, which treats ENOENT from either step as empty.

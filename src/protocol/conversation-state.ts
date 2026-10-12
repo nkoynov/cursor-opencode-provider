@@ -27,6 +27,7 @@ import {
 } from "./turn-provenance.js"
 import {
   deletePersistedConversation,
+  getPersistedTurnProvenance,
   loadPersistedConversation,
   persistConversation,
 } from "./conversation-persistence.js"
@@ -85,8 +86,8 @@ export async function persistedAnsweredSteers(cacheDir: string, sessionKey: stri
 /** Restore only turn provenance when its in-memory entry was evicted. */
 export async function hydrateTurnProvenance(cacheDir: string, sessionKey: string): Promise<void> {
   if (getTurnProvenance(sessionKey)) return
-  const persisted = (await loadPersistedConversation(cacheDir, sessionKey)).value
-  if (!persisted?.turnProvenance) return
+  const persisted = await getPersistedTurnProvenance(cacheDir, sessionKey)
+  if (!persisted) return
   const provenance = parseTurnProvenance(persisted.turnProvenance)
   if (provenance?.conversationId === persisted.conversationId) restoreTurnProvenance(sessionKey, provenance)
 }

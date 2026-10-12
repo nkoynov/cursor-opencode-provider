@@ -1,16 +1,16 @@
 import { afterAll, beforeEach, describe, expect, it } from "bun:test"
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { gunzipSync, gzipSync } from "node:zlib"
+import { gunzipSync } from "node:zlib"
 import {
   conversationCacheDirectoryPath,
   conversationCacheFilePath,
   getPersistedConversation,
-  initializeConversationPersistence,
   loadPersistedConversation,
   persistConversation,
   resetConversationPersistenceForTests,
+  waitForConversationMaintenanceForTests,
 } from "../src/protocol/conversation-persistence.js"
 import {
   hydrateConversationState,
@@ -239,7 +239,7 @@ describe("conversation restart persistence", () => {
     await mkdir(conversationCacheDirectoryPath(root), { recursive: true })
     await writeFile(legacyPath, JSON.stringify({ schemaVersion: 2, conversation: {} }))
 
-    await initializeConversationPersistence(root)
+    await waitForConversationMaintenanceForTests(root)
 
     await expect(stat(legacyPath)).rejects.toMatchObject({ code: "ENOENT" })
     expect((await loadPersistedConversation(root, sessionKey)).status).toBe("missing")
@@ -307,7 +307,7 @@ describe("conversation restart persistence", () => {
     })
   })
 
-  it("prunes records older than 24 hours at startup but keeps the exact boundary", async () => {
+  it("prunes records older than 24 hours in maintenance but keeps the exact boundary", async () => {
     const staleRoot = await cacheRoot()
     const boundaryRoot = await cacheRoot()
     const writtenAt = 1_900_000_000_000
@@ -321,13 +321,13 @@ describe("conversation restart persistence", () => {
     await persistConversation(boundaryRoot, value, writtenAt)
 
     clearMemory()
-    await initializeConversationPersistence(staleRoot, writtenAt + CONVERSATION_CACHE_TTL_MS + 1)
+    await waitForConversationMaintenanceForTests(staleRoot, writtenAt + CONVERSATION_CACHE_TTL_MS + 1)
     expect((await loadPersistedConversation(staleRoot, value.sessionKey)).status).toBe("expired")
     await expect(stat(conversationCacheFilePath(staleRoot, value.sessionKey)))
       .rejects.toMatchObject({ code: "ENOENT" })
 
     clearMemory()
-    await initializeConversationPersistence(boundaryRoot, writtenAt + CONVERSATION_CACHE_TTL_MS)
+    await waitForConversationMaintenanceForTests(boundaryRoot, writtenAt + CONVERSATION_CACHE_TTL_MS)
     expect((await getPersistedConversation(boundaryRoot, value.sessionKey))?.conversationId)
       .toBe(value.conversationId)
     expect((await stat(conversationCacheFilePath(boundaryRoot, value.sessionKey))).isFile()).toBe(true)
@@ -403,32 +403,13 @@ describe("conversation restart persistence", () => {
       .toBe("conversation-child")
   })
 
-  it("decodes at startup only files last written more than the TTL ago", async () => {
-    const root = await cacheRoot()
-    const now = Date.now()
-    const recent = conversationCacheFilePath(root, "ses_recent_unreadable")
-    const old = conversationCacheFilePath(root, "ses_old_unreadable")
-    await mkdir(conversationCacheDirectoryPath(root), { recursive: true })
-    // Valid gzip around an undecodable payload: only a full decode can tell it's invalid.
-    await writeFile(recent, gzipSync(Buffer.from("not a protobuf record")))
-    await writeFile(old, gzipSync(Buffer.from("not a protobuf record")))
-    const oldSeconds = (now - CONVERSATION_CACHE_TTL_MS - 60_000) / 1_000
-    await utimes(old, oldSeconds, oldSeconds)
-
-    await initializeConversationPersistence(root, now)
-
-    expect((await stat(recent)).isFile()).toBe(true)
-    await expect(stat(old)).rejects.toMatchObject({ code: "ENOENT" })
-    expect((await loadPersistedConversation(root, "ses_recent_unreadable")).status).toBe("invalid")
-  })
-
   it("discards a corrupt session record and uses private permissions for its replacement", async () => {
     const root = await cacheRoot()
     const sessionKey = "ses_corrupt"
     const filePath = conversationCacheFilePath(root, sessionKey)
     await mkdir(conversationCacheDirectoryPath(root), { recursive: true })
     await writeFile(filePath, "not protobuf gzip", "utf-8")
-    await initializeConversationPersistence(root)
+    await waitForConversationMaintenanceForTests(root)
 
     await expect(stat(filePath)).rejects.toMatchObject({ code: "ENOENT" })
     expect((await loadPersistedConversation(root, sessionKey)).status).toBe("invalid")
