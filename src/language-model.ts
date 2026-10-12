@@ -318,22 +318,24 @@ import {
 import { backgroundShellNoticesSupported, recordBackgroundShellRead } from "./background-shell-notice.js"
 import { readAllFieldsStrict } from "./protocol/struct.js"
 import {
-  carryTurnEndedCounters,
   cursorUsageCountersFromTurnEnded,
   emptyLanguageModelV3Usage,
   formatCursorCacheDiagnostics,
   formatCursorTokenCategories,
   formatFinishTrace,
   formatTurnUsageValidation,
-  newOccupancyUsageLedger,
-  occupancyGrowthPart,
-  occupancyStepUsage,
   missingRulesWarning,
   occupancyValidationCounters,
-  OPENCODE_DISPLAY_ONLY_COST_METADATA,
-  replacementOccupancyUsageLedger,
   turnEndedCounter,
 } from "./usage.js"
+import {
+  billingLedger,
+  cursorRunCost,
+  hostStepPrices,
+  nanoAiuForUsd,
+  shapeStepUsage,
+  turnEndedCostUsd,
+} from "./billing.js"
 
 /** Unknown frame layouts already traced in this process; each is logged once. */
 const unknownFrameLayouts = new Set<string>()
@@ -1207,12 +1209,6 @@ export async function pumpWithRecovery(input: {
       throw error
     }
     carryModelSwitchState(pumpedSession, next)
-    if (pumpedSession.usageLedger) {
-      next.usageLedger = replacementOccupancyUsageLedger(
-        pumpedSession.usageLedger,
-        next.cacheDiagnostics?.priorTokenDetails ?? next.tokenDetails,
-      )
-    }
     if (recovery.kind === "resume") {
       next.userTurnHostNotes = pumpedSession.userTurnHostNotes
       next.usageEstimate = { ...pumpedSession.usageEstimate }
@@ -2109,7 +2105,14 @@ async function startSession(
       `skillArgKey=${hostToolDialect.skillArgKey} tools=[${tools.map((t) => t.name).join(",")}]`,
   )
 
+  const billingCost = cursorRunCost(cursorModelId, parameterValues)
   const session: CursorSession = {
+    billing: {
+      // Title and other ephemeral Runs settle within themselves.
+      key: !ephemeralRun && sessionKey ? sessionKey : `run:${runId}`,
+      ...(billingCost ? { cost: billingCost } : {}),
+      prefixTokens: priorTokenDetails?.usedTokens ?? 0,
+    },
     sessionId: crypto.randomUUID(),
     conversationId,
     cacheDir,
@@ -2830,6 +2833,7 @@ export async function drainSessionUntilTurnEnded(
         // even though no OpenCode stream consumer will see this finish.
         const turnEnded = iu.turn_ended as Record<string, unknown>
         const counters = cursorUsageCountersFromTurnEnded(turnEnded)
+        recordTurnEndedCost(session, turnEnded)
         if (session.cacheDiagnostics) {
           trace(formatCursorCacheDiagnostics(
             counters,
@@ -4359,11 +4363,13 @@ export async function pump(
     const est = session.usageEstimate
     // OpenCode TUI/GUI replace each assistant message's tokens (they do not
     // sum occupancy) and the TUI footer requires tokens.output > 0. Cost is
-    // added per step-finish. Every finish is a checkpoint occupancy snapshot
-    // whose split prices that step (see occupancyStepUsage); the TurnEnded one
-    // also settles the Run against Cursor's cumulative counters. Keep exact
-    // request counters under providerMetadata.cursor.*Raw. Char/4
-    // usageEstimate stays traces-only.
+    // added per step-finish. Emit checkpoint occupancy snapshots at tool-call
+    // boundaries and once more at TurnEnded/stop, each billed through
+    // `src/billing.ts`. Held-Run TurnEnded counters are cumulative across
+    // every tool step, but this finish only spans the last generation slice —
+    // putting output_tokens/reasoning there makes host tok/s
+    // (generated/stepElapsed) absurd. Keep exact request counters under
+    // providerMetadata.cursor.*Raw. Char/4 usageEstimate stays traces-only.
     const tokenDetails = session.tokenDetails
     const occupancyDetails =
       tokenDetails && tokenDetails.usedTokens > 0 ? tokenDetails : undefined
@@ -4372,29 +4378,48 @@ export async function pump(
         ? "checkpoint-current-run"
         : "checkpoint-previous-turn"
       : undefined
+    // Bill the step (see `src/billing.ts`): a tool step is an estimate shaped
+    // like one model call; the turn's last step reconciles the catalog-priced
+    // aggregate counters. Either way its token total stays the occupancy snapshot.
+    const billing = session.billing
+    const shaped = occupancyDetails && !settledUsage
+      ? shapeStepUsage({
+          usedTokens: occupancyDetails.usedTokens,
+          prefixTokens: billing.prefixTokens,
+          prices: hostStepPrices(billing.cost, occupancyDetails.usedTokens - 1),
+          ...(te && billing.cost ? { targetUsd: billingLedger.outstanding(billing.key) } : {}),
+        })
+      : undefined
+    const stepCostUsd = shaped?.costUsd ?? 0
+    const usage = settledUsage ?? shaped?.usage ?? emptyLanguageModelV3Usage()
     const counters = te ? cursorUsageCountersFromTurnEnded(te) : undefined
-    const ledger = session.usageLedger ??= newOccupancyUsageLedger(cacheDiagnostics.priorTokenDetails)
-    const previousOccupancy = ledger.previousOccupancy
-    const usage = settledUsage ?? (
-      occupancyDetails
-        ? occupancyStepUsage(occupancyDetails, ledger, {
-            ...(counters ? { turnEnded: counters } : {}),
-            growth: occupancyGrowthPart(cacheDiagnostics.modelId),
-          })
-        : emptyLanguageModelV3Usage()
-    )
-    // TurnEnded stays a real (non-occupancyOnly) finish so hosts that collapse
-    // tool-boundary occupancy still keep one context snapshot for the sidebar.
+    const ledger = billingLedger.totals(billing.key)
+    // Metadata describes the total *if delivered*. Commit it only after the
+    // consumer accepts the finish, otherwise later turns must still settle it.
+    ledger.billedUsd += stepCostUsd
+    const estimatedUsd = billingLedger.estimated(billing.key) + (te ? 0 : stepCostUsd)
+    const billingMetadata = {
+      stepUsd: stepCostUsd,
+      estimate: !te,
+      sessionRealUsd: ledger.realUsd,
+      sessionBilledUsd: ledger.billedUsd,
+      ...(estimatedUsd > 0 ? { sessionEstimatedUsd: estimatedUsd } : {}),
+    }
+    // OpenCode 1.x bills `totalNanoAiu`; OpenCode 2 bills the same amount from
+    // the shaped tokens. TurnEnded stays a real (non-occupancyOnly) finish so
+    // hosts that collapse tool-boundary occupancy keep one context snapshot.
+    const copilot = { totalNanoAiu: nanoAiuForUsd(stepCostUsd) }
     const providerMetadata = te
-      ? {
-          ...OPENCODE_DISPLAY_ONLY_COST_METADATA,
-          ...cursorTurnEndedProviderMetadata(te, tokenDetails, contextSource),
-        }
+      ? (() => {
+          const metadata = cursorTurnEndedProviderMetadata(te, tokenDetails, contextSource)
+          return { copilot, ...metadata, cursor: { ...metadata.cursor, billing: billingMetadata } }
+        })()
       : {
-          ...OPENCODE_DISPLAY_ONLY_COST_METADATA,
+          copilot,
           cursor: {
             usageVersion: 3,
             occupancyOnly: true,
+            billing: billingMetadata,
             ...(occupancyDetails && contextSource
               ? { context: cursorContextUsageMetadata(occupancyDetails, contextSource) }
               : {}),
@@ -4408,7 +4433,10 @@ export async function pump(
       usage,
       turnEnded: counters,
       occupancy: occupancyDetails
-        ? { usedTokens: occupancyDetails.usedTokens, priorUsedTokens: previousOccupancy }
+        ? {
+            usedTokens: occupancyDetails.usedTokens,
+            priorUsedTokens: session.cacheDiagnostics?.priorTokenDetails?.usedTokens ?? 0,
+          }
         : undefined,
       estimate: est,
       source: te
@@ -4416,12 +4444,17 @@ export async function pump(
         : occupancyDetails ? `occupancy-${contextSource ?? "unavailable"}` : "intermediate-zero",
     }))
     // Validate the usage we actually send. Occupancy finishes (tool-call and
-    // TurnEnded/stop) split occupancy for cost — never compare that against
+    // TurnEnded/stop) use prior-prefix cacheRead — never compare that against
     // aggregate TurnEnded request cache ratios (false mismatch). Raw request
     // counters stay on `finish:` and cache diagnosis only.
     if (occupancyDetails) {
+      // The shaped split is the intended partition; validate totals against it.
+      const cached = (usage.inputTokens.cacheRead ?? 0) + (usage.inputTokens.cacheWrite ?? 0)
       trace(formatTurnUsageValidation(
-        occupancyValidationCounters(usage),
+        occupancyValidationCounters(
+          occupancyDetails,
+          { usedTokens: cached, maxTokens: occupancyDetails.maxTokens },
+        ),
         usage,
         occupancyDetails,
         contextSource,
@@ -4438,13 +4471,24 @@ export async function pump(
         cacheDiagnostics,
       ))
     }
-    const enqueued = safeEnqueue({
+    const delivered = safeEnqueue({
       type: "finish",
       usage,
       finishReason: reason,
       ...(providerMetadata ? { providerMetadata } : {}),
     } as V3Part)
-    if (enqueued && reason.unified === "tool-calls") scheduleHeldRunSave(session)
+    if (delivered && shaped && occupancyDetails) {
+      billingLedger.recordBilled(billing.key, shaped.costUsd, te ? undefined : billing)
+      billing.prefixTokens = occupancyDetails.usedTokens
+    }
+    const booked = billingLedger.totals(billing.key)
+    trace(
+      `billing: step=${te ? "turn-end" : "estimate"} pricing=${billing.cost ? "priced" : "unpriced"} ` +
+        `delivered=${delivered} stepUsd=${(delivered ? stepCostUsd : 0).toFixed(6)} ` +
+        `sessionRealUsd=${booked.realUsd.toFixed(6)} sessionBilledUsd=${booked.billedUsd.toFixed(6)} ` +
+        `sessionEstimatedUsd=${billingLedger.estimated(billing.key).toFixed(6)} key=${billing.key}`,
+    )
+    if (delivered && reason.unified === "tool-calls") scheduleHeldRunSave(session)
     if (reason.unified === "tool-calls" && hasDeferredToolExecs(order)) carryToolStep()
   }
 
@@ -4880,6 +4924,7 @@ export async function pump(
       trace(`turn_ended raw wire fields: ${debugWalkTurnEnded(payload)}`)
       keepUndeliveredHostNotes(session)
       const turnEnded = iu.turn_ended as Record<string, unknown>
+      recordTurnEndedCost(session, turnEnded)
       session.carriedCheckpoint = undefined
       session.toolCallOrder = undefined
       for (const row of earlyRows.open.values()) row.settle ??= "Cursor ended the turn before sending this call."
@@ -4921,10 +4966,6 @@ export async function pump(
         closeOpenSpans()
         textId = crypto.randomUUID()
         reasoningId = crypto.randomUUID()
-        carryTurnEndedCounters(
-          session.usageLedger ??= newOccupancyUsageLedger(cacheDiagnostics.priorTokenDetails),
-          cursorUsageCountersFromTurnEnded(turnEnded),
-        )
         await session.reopenWithUserMessage(followUp, abortSignal)
         session.turnRequests = undelivered.map((i) => i.text)
         endingTurns.delete(session)
@@ -4959,10 +5000,6 @@ export async function pump(
           )
           endingTurns.delete(session)
           assistantText = ""
-          carryTurnEndedCounters(
-            session.usageLedger ??= newOccupancyUsageLedger(cacheDiagnostics.priorTokenDetails),
-            cursorUsageCountersFromTurnEnded(turnEnded),
-          )
           continue
         } catch (error) {
           // Cursor already completed this turn. A failed nudge must not discard
@@ -6389,7 +6426,7 @@ function answeredSteerStream(): ReadableStream<V3Part> {
         type: "finish",
         finishReason: { unified: "stop", raw: undefined },
         usage: emptyLanguageModelV3Usage(),
-        providerMetadata: { ...OPENCODE_DISPLAY_ONLY_COST_METADATA, cursor: { usageVersion: 3, occupancyOnly: true } },
+        providerMetadata: { copilot: { totalNanoAiu: 0 }, cursor: { usageVersion: 3, occupancyOnly: true } },
       } as V3Part)
       controller.close()
     },
@@ -6796,6 +6833,22 @@ export function buildOpenCodeInteractionGuidance(
 export function estimateTokens(chars: number): number {
   if (!Number.isFinite(chars) || chars <= 0) return 0
   return Math.ceil(chars / 4)
+}
+
+/**
+ * Add the catalog-priced cost for a finished Run to its session's ledger. Called
+ * once per `TurnEnded`, including Runs no OpenCode step reports (a drained
+ * prior Run, a progress-only continuation); a later priced turn-end attempts to settle it.
+ */
+function recordTurnEndedCost(session: CursorSession, turnEnded: Record<string, unknown>): void {
+  const realUsd = turnEndedCostUsd(
+    session.billing.cost,
+    cursorUsageCountersFromTurnEnded(turnEnded),
+    session.tokenDetails?.usedTokens ?? 0,
+  )
+  if (realUsd === undefined) return
+  billingLedger.recordReal(session.billing.key, realUsd, session.billing)
+  trace(`billing: turn real=${realUsd.toFixed(6)} key=${session.billing.key}`)
 }
 
 /** Preserve exact request-local Cursor counters as diagnostics. */

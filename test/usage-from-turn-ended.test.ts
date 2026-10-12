@@ -1,20 +1,16 @@
 import { describe, expect, it } from "bun:test"
+import { shapeStepUsage } from "../src/billing.js"
 import {
   buildLanguageModelV3UsageFromCounters,
   buildLanguageModelV3UsageFromTurnEnded,
-  carryTurnEndedCounters,
   emptyLanguageModelV3Usage,
   formatCursorCacheDiagnostics,
   formatFinishTrace,
   formatCursorTokenCategories,
   formatTurnUsageValidation,
   flatUsageFromV3,
-  newOccupancyUsageLedger,
-  occupancyGrowthPart,
-  occupancyStepUsage,
   missingRulesWarning,
   occupancyValidationCounters,
-  OPENCODE_DISPLAY_ONLY_COST_METADATA,
   turnEndedCounter,
 } from "../src/usage.js"
 import { evaluateStickyCacheTurns, parseCacheDiagnosisLine, readRatio } from "./cache-diagnosis.js"
@@ -198,261 +194,167 @@ describe("buildLanguageModelV3UsageFromTurnEnded", () => {
   })
 })
 
-/** OpenCode 2.0.24 `SessionUsage.calculateCost` for one finish (single-tier model). */
-function openCodeCost(
-  usage: ReturnType<typeof occupancyStepUsage>,
-  rate: { input: number; output: number; cache_read: number; cache_write: number },
-): number {
-  return (
-    (usage.inputTokens.noCache ?? 0) * rate.input
-    + (usage.outputTokens.total ?? 0) * rate.output
-    + (usage.inputTokens.cacheRead ?? 0) * rate.cache_read
-    + (usage.inputTokens.cacheWrite ?? 0) * rate.cache_write
-  ) / 1_000_000
+/** The occupancy snapshot a step finish sends, with `prior` read from cache. */
+function occupancyUsage(
+  details: { usedTokens: number; maxTokens: number },
+  prior?: { usedTokens: number },
+) {
+  return shapeStepUsage({ usedTokens: details.usedTokens, prefixTokens: prior?.usedTokens ?? 0, prices: undefined }).usage
 }
 
-/** OpenCode 2.0.24 compaction's measured prompt (`input + cache.read + cache.write + output + reasoning`). */
-function measuredPrompt(usage: ReturnType<typeof occupancyStepUsage>): number {
-  const text = Math.max(0, (usage.outputTokens.total ?? 0) - (usage.outputTokens.reasoning ?? 0))
-  return (usage.inputTokens.noCache ?? 0) + (usage.inputTokens.cacheRead ?? 0)
-    + (usage.inputTokens.cacheWrite ?? 0) + text + (usage.outputTokens.reasoning ?? 0)
-}
-
-const details = (usedTokens: number) => ({ usedTokens, maxTokens: 1_000_000 })
-
-describe("occupancyStepUsage", () => {
-  it("keeps OpenCode 1.x's Copilot cost override at zero", () => {
-    expect(OPENCODE_DISPLAY_ONLY_COST_METADATA).toEqual({
-      copilot: { totalNanoAiu: 0 },
-    })
+describe("occupancy snapshot usage", () => {
+  it("reports the same diagnostic occupancy total for zero, one and populated snapshots", () => {
+    for (const usedTokens of [0, 1, 8_236, 22_767]) {
+      const details = { usedTokens, maxTokens: 256_000 }
+      const prior = { usedTokens: usedTokens + 10, maxTokens: 256_000 }
+      const counters = occupancyValidationCounters(details, prior)
+      expect(counters.inputTokens + counters.outputTokens).toBe(usedTokens)
+      expect(counters.cacheRead).toBeLessThanOrEqual(counters.inputTokens)
+      const validation = formatTurnUsageValidation(counters, occupancyUsage(details, prior), details, undefined, "occupancy")
+      expect(validation).toContain(`occupancyTotal=${usedTokens} sentTotal=${usedTokens}`)
+      expect(validation).toContain("status=ok")
+    }
   })
 
-  it("prices the previous finish's occupancy as a cache read and the growth as a cache write", () => {
-    const ledger = newOccupancyUsageLedger({ usedTokens: 123_651, maxTokens: 256_000 })
-    const first = occupancyStepUsage(details(153_744), ledger)
-    expect(first.inputTokens).toEqual({ total: 153_743, noCache: 0, cacheRead: 123_651, cacheWrite: 30_092 })
-    expect(first.outputTokens).toEqual({ total: 1, text: 1, reasoning: 0 })
-    const second = occupancyStepUsage(details(160_000), ledger)
-    expect(second.inputTokens).toEqual({ total: 159_999, noCache: 0, cacheRead: 153_744, cacheWrite: 6_255 })
+  it("does not report ok when diagnostic occupancy disagrees with the sent snapshot", () => {
+    const details = { usedTokens: 8_236, maxTokens: 256_000 }
+    const counters = { ...occupancyValidationCounters(details), inputTokens: 8_236 }
+    expect(formatTurnUsageValidation(counters, occupancyUsage(details), details, undefined, "occupancy")).toContain("status=mismatch")
+  })
+
+  it("places occupancy on a snapshot whose TUI sum equals usedTokens and output > 0", () => {
+    const details = { usedTokens: 153_744, maxTokens: 256_000 }
+    const prior = { usedTokens: 123_651, maxTokens: 256_000 }
+    const usage = occupancyUsage(details, prior)
+    expect(usage.outputTokens?.total).toBe(1)
+    expect(usage.outputTokens?.text).toBe(1)
+    expect(usage.outputTokens?.reasoning).toBe(0)
+    expect((usage.inputTokens?.total ?? 0) + (usage.outputTokens?.total ?? 0)).toBe(153_744)
+    expect(usage.inputTokens?.cacheRead).toBe(123_651)
+    expect(usage.inputTokens?.cacheWrite).toBe(0)
+    expect(usage.inputTokens?.noCache).toBe(153_744 - 1 - 123_651)
     const validation = formatTurnUsageValidation(
-      occupancyValidationCounters(second),
-      second,
-      details(160_000),
+      occupancyValidationCounters(details, prior),
+      usage,
+      details,
       "checkpoint-current-run",
       "occupancy",
     )
     expect(validation).toContain("status=ok")
-    expect(validation).toContain("occupancyTotal=160000 sentTotal=160000 totalMatch=true")
+    expect(validation).toContain("sentTotal=153744")
+    expect(validation).toContain("opencodeProjectedTotal=153744")
+  })
+
+  it("validates ok when Cursor's context shrank since the prior checkpoint", () => {
+    // Live: prior checkpoint 26,823 tokens, current 26,766.
+    const details = { usedTokens: 26_766, maxTokens: 256_000 }
+    const prior = { usedTokens: 26_823, maxTokens: 256_000 }
+    const usage = occupancyUsage(details, prior)
+    expect(usage.inputTokens?.total).toBe(26_765)
+    expect(usage.inputTokens?.cacheRead).toBe(26_765)
+    const validation = formatTurnUsageValidation(occupancyValidationCounters(details, prior), usage, details, "checkpoint-current-run", "occupancy")
+    expect(validation).toContain("status=ok")
     expect(validation).toContain("cacheRatioMatch=true")
   })
 
-  it("sends growth uncached only for models Cursor lists without a cache-write rate", () => {
-    expect(occupancyGrowthPart("claude-opus-5-5")).toBe("cacheWrite")
-    expect(occupancyGrowthPart("grok-4.7")).toBe("noCache")
-    expect(occupancyGrowthPart("not-a-cursor-model")).toBe("cacheWrite")
-    expect(occupancyGrowthPart(undefined)).toBe("cacheWrite")
-  })
-
-  it("starts a Run without a checkpoint from zero and sends growth uncached when asked", () => {
-    const ledger = newOccupancyUsageLedger()
-    const usage = occupancyStepUsage(details(40), ledger, { growth: "noCache" })
-    expect(usage.inputTokens).toEqual({ total: 39, noCache: 39, cacheRead: 0, cacheWrite: 0 })
-    expect(usage.outputTokens.total).toBe(1)
-  })
-
-  it("caps the cache read when Cursor's context shrank since the previous finish", () => {
-    // Live: prior checkpoint 26,823 tokens, current 26,766.
-    const usage = occupancyStepUsage(details(26_766), newOccupancyUsageLedger(details(26_823)))
-    expect(usage.inputTokens).toEqual({ total: 26_765, noCache: 0, cacheRead: 26_765, cacheWrite: 0 })
-    expect(formatTurnUsageValidation(occupancyValidationCounters(usage), usage, details(26_766)))
-      .toContain("status=ok")
-  })
-
-  it("emits empty usage and leaves the ledger alone when occupancy is not yet known", () => {
-    const ledger = newOccupancyUsageLedger(details(500))
-    expect(occupancyStepUsage({ usedTokens: 0, maxTokens: 256_000 }, ledger)).toEqual({
-      inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 },
-      outputTokens: { total: 0, text: 0, reasoning: 0 },
-    })
-    expect(ledger.previousOccupancy).toBe(500)
-  })
-
-  it("settles a held Run on its TurnEnded finish to Cursor's own counts", () => {
-    const ledger = newOccupancyUsageLedger(details(50_000))
-    const steps = [
-      occupancyStepUsage(details(60_000), ledger),
-      occupancyStepUsage(details(70_000), ledger),
-      // Cursor missed its cache once (a full rewrite) and generated 3,000 tokens.
-      occupancyStepUsage(details(80_000), ledger, {
-        turnEnded: { inputTokens: 200_000, outputTokens: 3_000, cacheRead: 135_000, cacheWrite: 64_990, reasoningTokens: 900 },
-      }),
-    ]
-    const sum = (pick: (usage: (typeof steps)[number]) => number | undefined) =>
-      steps.reduce((total, usage) => total + (pick(usage) ?? 0), 0)
-    expect(sum((usage) => usage.outputTokens.total)).toBe(3_000)
-    expect(sum((usage) => usage.inputTokens.cacheWrite)).toBe(64_990)
-    expect(sum((usage) => usage.inputTokens.noCache)).toBe(10)
-    expect(steps[2]!.inputTokens).toEqual({ total: 77_002, noCache: 10, cacheRead: 32_000, cacheWrite: 44_992 })
-    expect(steps.map(measuredPrompt)).toEqual([60_000, 70_000, 80_000])
-  })
-
-  it("moves an over-estimated cache write back to the cache read", () => {
-    const ledger = newOccupancyUsageLedger(details(10_000))
-    const usage = occupancyStepUsage(details(30_000), ledger, {
-      turnEnded: { inputTokens: 29_999, outputTokens: 1, cacheRead: 25_000, cacheWrite: 4_999, reasoningTokens: 0 },
-    })
-    expect(usage.inputTokens).toEqual({ total: 29_999, noCache: 0, cacheRead: 25_000, cacheWrite: 4_999 })
-  })
-
-  it("adds the counters of a Cursor turn the Run continued past", () => {
-    const ledger = newOccupancyUsageLedger(details(1_000))
-    carryTurnEndedCounters(ledger, { inputTokens: 1_000, outputTokens: 400, cacheRead: 1_000, cacheWrite: 0, reasoningTokens: 0 })
-    const usage = occupancyStepUsage(details(2_000), ledger, {
-      turnEnded: { inputTokens: 1_400, outputTokens: 200, cacheRead: 1_400, cacheWrite: 0, reasoningTokens: 0 },
-    })
-    expect(usage.outputTokens.total).toBe(600)
-    expect(usage.inputTokens).toEqual({ total: 1_400, noCache: 0, cacheRead: 1_400, cacheWrite: 0 })
-  })
-
-  it("leaves the split alone when TurnEnded carries no counters", () => {
-    const usage = occupancyStepUsage(details(2_000), newOccupancyUsageLedger(details(1_000)), {
-      turnEnded: { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 },
-    })
-    expect(usage.inputTokens).toEqual({ total: 1_999, noCache: 0, cacheRead: 1_000, cacheWrite: 999 })
-  })
-
-  it("keeps every finish's measured prompt at Cursor's occupancy, the same as before the split", () => {
-    let seed = 7
-    const random = (limit: number) => {
-      seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648
-      return seed % limit
-    }
-    for (let run = 0; run < 200; run++) {
-      const ledger = newOccupancyUsageLedger(random(3) === 0 ? undefined : details(random(400_000)))
-      if (random(4) === 0) {
-        carryTurnEndedCounters(ledger, {
-          inputTokens: random(900_000), outputTokens: random(9_000), cacheRead: random(900_000),
-          cacheWrite: random(90_000), reasoningTokens: 0,
-        })
-      }
-      const steps = 1 + random(8)
-      for (let step = 0; step < steps; step++) {
-        const used = random(5) === 0 ? random(3) : random(950_000)
-        const last = step === steps - 1
-        const usage = occupancyStepUsage(details(used), ledger, {
-          ...(last && random(5) > 0
-            ? {
-                turnEnded: {
-                  inputTokens: random(4_000_000), outputTokens: random(60_000), cacheRead: random(4_000_000),
-                  cacheWrite: random(900_000), reasoningTokens: random(1_000),
-                },
-              }
-            : {}),
-          growth: random(2) === 0 ? "cacheWrite" : "noCache",
-        })
-        // The old split sent occupancy - 1 as input and 1 as output: same sum, same measured steps.
-        expect(measuredPrompt(usage)).toBe(used)
-        expect((usage.inputTokens.total ?? 0) > 0).toBe(used >= 2)
-        if (used > 0) expect(usage.outputTokens.total).toBeGreaterThanOrEqual(1)
-        else expect(usage.outputTokens.total).toBe(0)
-        for (const part of [usage.inputTokens.noCache, usage.inputTokens.cacheRead, usage.inputTokens.cacheWrite]) {
-          expect(part).toBeGreaterThanOrEqual(0)
-        }
-      }
-    }
-  })
-
-  it("prices a long cold Run near list price instead of as fresh input every step", () => {
-    // Opus 5.5 list rates; context grows from 30K to 877K over 40 model calls.
-    const rate = { input: 4, output: 20, cache_read: 0.2, cache_write: 5 }
-    const occupancy = Array.from({ length: 40 }, (_, step) => Math.round(30_000 + step * (847_000 / 39)))
-    const outputPerStep = 400
-    const turnEnded = {
-      inputTokens: occupancy.reduce((total, used) => total + used - outputPerStep, 0),
-      outputTokens: outputPerStep * occupancy.length,
-      cacheRead: occupancy.slice(0, -1).reduce((total, used) => total + used, 0),
-      cacheWrite: 0,
-      reasoningTokens: 0,
-    }
-    turnEnded.cacheWrite = turnEnded.inputTokens - turnEnded.cacheRead
-    const listPrice = (
-      turnEnded.cacheRead * rate.cache_read + turnEnded.cacheWrite * rate.cache_write
-      + turnEnded.outputTokens * rate.output
-    ) / 1_000_000
-    const ledger = newOccupancyUsageLedger()
-    let cost = 0
-    let before = 0
-    occupancy.forEach((used, step) => {
-      const usage = occupancyStepUsage(details(used), ledger, step === occupancy.length - 1 ? { turnEnded } : {})
-      cost += openCodeCost(usage, rate)
-      before += ((used - 1) * rate.input + rate.output) / 1_000_000
-    })
-    expect(Math.abs(cost - listPrice) / listPrice).toBeLessThan(0.02)
-    expect(before / listPrice).toBeGreaterThan(8)
-  })
-
-  it("does not price a Run's new input twice when Cursor reports it uncached", () => {
-    const rate = { input: 4, output: 20, cache_read: 0.2, cache_write: 5 }
-    const occupancy = Array.from({ length: 40 }, (_, step) => Math.round(30_000 + step * (847_000 / 39)))
-    const inputTokens = occupancy.reduce((total, used) => total + used - 400, 0)
-    const cacheRead = occupancy.slice(0, -1).reduce((total, used) => total + used, 0)
-    const turnEnded = { inputTokens, outputTokens: 400 * occupancy.length, cacheRead, cacheWrite: 0, reasoningTokens: 0 }
-    const listPrice = (
-      cacheRead * rate.cache_read + (inputTokens - cacheRead) * rate.input + turnEnded.outputTokens * rate.output
-    ) / 1_000_000
-    const ledger = newOccupancyUsageLedger()
-    let cost = 0
-    const steps = occupancy.map((used, step) =>
-      occupancyStepUsage(details(used), ledger, step === occupancy.length - 1 ? { turnEnded } : {}))
-    for (const usage of steps) cost += openCodeCost(usage, rate)
-    // The growth went out as cache writes before TurnEnded said uncached; only the rate differs.
-    expect(cost / listPrice).toBeGreaterThan(1)
-    expect(cost / listPrice).toBeLessThan(1.15)
-    expect(steps.map(measuredPrompt)).toEqual(occupancy)
+  it("still totals usedTokens when no prior occupancy is known", () => {
+    const usage = occupancyUsage({ usedTokens: 40, maxTokens: 256_000 })
+    expect(usage.outputTokens?.total).toBe(1)
+    expect(usage.inputTokens?.total).toBe(39)
+    expect(usage.inputTokens?.cacheRead).toBe(0)
   })
 
   it("distinguishes stale category snapshots from occupancy accounting errors", () => {
     for (const usedTokens of [20_347, 40_000]) {
-      const stale = {
+      const details = {
         usedTokens, maxTokens: 256_000,
         breakdown: {
           totalUsedTokens: 36_122, maxTokens: 256_000,
           categories: [{ id: "conversation", label: "Conversation", estimatedTokens: 36_122 }],
         },
       }
-      const usage = occupancyStepUsage(stale, newOccupancyUsageLedger(details(36_122)))
-      const validation = formatTurnUsageValidation(occupancyValidationCounters(usage), usage, stale)
+      const prior = { usedTokens: 36_122, maxTokens: 256_000 }
+      const validation = formatTurnUsageValidation(
+        occupancyValidationCounters(details, prior), occupancyUsage(details, prior), details, undefined, "occupancy",
+      )
       expect(validation).toContain("status=ok")
       expect(validation).toContain(`sentTotal=${usedTokens} totalMatch=true`)
       expect(validation).toContain("breakdownTotal=36122 categorySum=36122 breakdownMatch=stale")
-      expect(formatCursorTokenCategories(stale)).toBe("unavailable")
-      const malformed = { ...stale, breakdown: { ...stale.breakdown, totalUsedTokens: 36_123 } }
-      const malformedUsage = occupancyStepUsage(malformed, newOccupancyUsageLedger(details(36_122)))
-      expect(formatTurnUsageValidation(occupancyValidationCounters(malformedUsage), malformedUsage, malformed))
-        .toContain("status=mismatch")
+      expect(formatCursorTokenCategories(details)).toBe("unavailable")
+      const malformed = { ...details, breakdown: { ...details.breakdown, totalUsedTokens: 36_123 } }
+      expect(formatTurnUsageValidation(
+        occupancyValidationCounters(malformed, prior), occupancyUsage(malformed, prior), malformed, undefined, "occupancy",
+      )).toContain("status=mismatch")
     }
   })
 
-  it("validates the TurnEnded finish against what it sends, not against request aggregates", () => {
-    const current = {
+  it("emits empty usage when occupancy is not yet known", () => {
+    expect(occupancyUsage({ usedTokens: 0, maxTokens: 256_000 })).toEqual({
+      inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 },
+      outputTokens: { total: 0, text: 0, reasoning: 0 },
+    })
+  })
+
+  it("validates TurnEnded/stop occupancy against prefix counters, not request aggregates", () => {
+    // Live self-verify shape: aggregate TurnEnded cache ratio ≠ prior-prefix
+    // occupancy ratio. Comparing those falsely flipped status=mismatch.
+    const details = {
       usedTokens: 89_575,
       maxTokens: 256_000,
       breakdown: {
         totalUsedTokens: 89_575,
         maxTokens: 256_000,
         categories: [
-          { id: "system_prompt", label: "System Prompt", estimatedTokens: 14_980 },
+          { id: "system_prompt", label: "System Prompt", estimatedTokens: 484 },
+          { id: "tools", label: "Tools", estimatedTokens: 7_732 },
+          { id: "rules", label: "Rules", estimatedTokens: 2_713 },
+          { id: "skills", label: "Skills", estimatedTokens: 2_512 },
+          { id: "mcp", label: "MCP", estimatedTokens: 636 },
+          { id: "subagents", label: "Subagents", estimatedTokens: 903 },
+          { id: "summarized_conversation", label: "Summarized", estimatedTokens: 0 },
           { id: "conversation", label: "Conversation", estimatedTokens: 74_595 },
         ],
       },
     }
-    const turnEnded = { inputTokens: 176_981, outputTokens: 322, cacheRead: 173_440, cacheWrite: 0, reasoningTokens: 0 }
-    const usage = occupancyStepUsage(current, newOccupancyUsageLedger(details(87_353)), { turnEnded })
-    expect(formatTurnUsageValidation(turnEnded, usage, current, "checkpoint-current-run")).toContain("status=mismatch")
-    const validation = formatTurnUsageValidation(occupancyValidationCounters(usage), usage, current, "checkpoint-current-run")
+    const prior = { usedTokens: 87_353, maxTokens: 256_000 }
+    const usage = occupancyUsage(details, prior)
+    const turnEndedCounters = {
+      inputTokens: 176_981,
+      outputTokens: 322,
+      cacheRead: 173_440,
+      cacheWrite: 0,
+      reasoningTokens: 0,
+    }
+
+    expect(formatTurnUsageValidation(
+      turnEndedCounters,
+      usage,
+      details,
+      "checkpoint-current-run",
+    )).toContain("status=mismatch")
+
+    const validation = formatTurnUsageValidation(
+      occupancyValidationCounters(details, prior),
+      usage,
+      details,
+      "checkpoint-current-run",
+      "occupancy",
+    )
     expect(validation).toContain("status=ok")
-    expect(validation).toContain("rawTotal=89575 sentTotal=89575 totalMatch=true")
+    expect(validation).toContain("sentTotal=89575")
+    expect(validation).toContain("totalMatch=true")
     expect(validation).toContain("breakdownMatch=true")
+    expect(validation).toContain("cacheRatioMatch=true")
+    expect(validation).toContain("occupancyTotal=89575")
+    expect(validation).toContain("occupancyCachedRatio=97.5% sentCachedRatio=97.5%")
+    expect(validation).not.toContain("rawTotal=")
+    expect(occupancyValidationCounters(details, prior)).toEqual({
+      inputTokens: 89_574,
+      outputTokens: 1,
+      cacheRead: 87_353,
+      cacheWrite: 0,
+      reasoningTokens: 0,
+    })
   })
 })
 
@@ -780,14 +682,9 @@ describe("sticky-session cache diagnosis", () => {
 
 describe("formatFinishTrace", () => {
   const zero = { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 }
-  // An occupancy snapshot as sent at a step boundary: the prior context as cache read, one output token.
-  const snapshotUsage = (used: number, prior: number) => ({
-    inputTokens: { total: used - 1, noCache: used - 1 - prior, cacheRead: prior, cacheWrite: 0 },
-    outputTokens: { total: 1, text: 1, reasoning: 0 },
-  })
 
   it("labels TurnEnded counters raw and keeps the prior-turn prefix beside them", () => {
-    const usage = snapshotUsage(55_219, 0)
+    const usage = occupancyUsage({ usedTokens: 55_219, maxTokens: 256_000 })
     expect(formatFinishTrace({
       reason: "stop",
       usage,
@@ -807,13 +704,13 @@ describe("formatFinishTrace", () => {
     const prior = { usedTokens: 56_522, maxTokens: 256_000 }
     expect(formatFinishTrace({
       reason: "tool-calls",
-      usage: snapshotUsage(details.usedTokens, prior.usedTokens),
+      usage: occupancyUsage(details, prior),
       occupancy: { usedTokens: 56_794, priorUsedTokens: 56_522 },
       estimate: zero,
       source: "occupancy-checkpoint-current-run",
     })).toBe(
       "finish: reason=tool-calls v3In=56793 v3Out=1 v3CacheRead=56522 v3CacheWrite=0 v3Reasoning=0 " +
-      "occupancyIn=56794 occupancyOut=1 occupancyCacheRead=56522 occupancyCacheWrite=0 " +
+      "occupancyIn=56793 occupancyOut=1 occupancyCacheRead=56522 occupancyCacheWrite=0 " +
       "source=occupancy-checkpoint-current-run",
     )
   })

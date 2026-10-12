@@ -681,3 +681,52 @@
   semantics. `resume_action` looked like a cheaper rebuild but re-runs the
   model step from the last checkpoint and re-requests the tool under a new id;
   answering it would have needed guesswork or double execution.
+
+## 2026-10-09 — Test independent dependency graphs
+
+- Reloading an entry module with a query string does not reload its dependencies. Reproductions involving class identity must load a separate dependency graph and assert different constructors; success-path deduplication alone does not validate a shared promise's rejection path (`test/process-shared.test.ts`).
+
+## 2026-10-09 — Check each host's cost formula, not one host's override
+
+- OpenCode 1.x honours `providerMetadata.copilot.totalNanoAiu`; OpenCode 2 has
+  no override and prices every step's tokens. A $0 override therefore hid the
+  cost on one host and billed every occupancy snapshot as a full prompt on the
+  other. Verify billing against both hosts' recorded session cost, not against
+  the provider's own metadata (`test/billing.test.ts` replicates both formulas).
+
+## 2026-10-09 — Settlement must follow delivery and preserve accounting bounds
+
+- Book a finish only after its consumer accepts it; otherwise the next turn
+  must still settle the amount. Separate module graphs share plain session
+  ledger data, while isolated test ledgers remain independent.
+- Price the bounded input/cache partition and do not let output occupancy alone
+  trigger a higher input tier. Aggregate TurnEnded counters cannot prove
+  per-call tier choices; document that estimate and the minimum/maximum and
+  rounding limits instead of promising an exact invoice match
+  (`test/billing.test.ts`).
+
+## 2026-10-10 — Missing terminal counters are unknown cost
+
+- Keep tool-step estimates owned by their Run. A cancellation or supersession
+  before TurnEnded cannot turn those charges into credit against another Run;
+  replace only the completing Run's estimates, including zero-cost completions.
+  Keep unresolved charges explicitly estimated (`test/billing.test.ts`,
+  `test/display-bridge-pump.test.ts`).
+- A reloaded plugin header does not prove the host replaced its cached SDK.
+  Check the running finish records after a full daemon restart before claiming
+  a rebuilt accounting implementation passed live validation.
+
+## 2026-10-11 — Diagnostics must check their own total
+
+- The footer's synthetic output token is part of checkpoint occupancy, not
+  additional occupancy. Diagnostic input must reserve that token, cap cached
+  input to the remaining partition, and reject a diagnostic total that differs
+  from the sent snapshot (`test/usage-from-turn-ended.test.ts`).
+
+## 2026-10-11 — Reproduce the host's hook order
+
+- Test provider hooks with a pre-populated SDK when the host's generic loader
+  runs first. Preserving that fallback can bypass per-request credential
+  renewal even though tests starting with an empty SDK pass. Keep the current
+  integration resolver after captured host options, and preserve other
+  providers' SDKs (`test/plugin-opencode2.test.ts`).

@@ -12,10 +12,11 @@ import type {
 import type { CursorConversationTokenDetails } from "./protocol/token-details.js"
 import type { HostToolRun, ModelSwitch } from "./model-fallback.js"
 import type { ContextEpoch } from "./context/epoch.js"
-import type { OccupancyUsageLedger } from "./usage.js"
 import type { ToolCallOrder } from "./tool-call-order.js"
 import type { EarlyToolRowState } from "./early-tool-rows.js"
 import type { HostNoteBatch } from "./protocol/host-notes.js"
+import type { OpenCodeModelCost } from "./pricing.js"
+import type { RunCostEstimate } from "./billing.js"
 
 export type Frame = { flags: number; payload: Uint8Array }
 
@@ -232,8 +233,15 @@ export type CursorSession = {
   tokenDetails?: CursorConversationTokenDetails
   /** True only after this Run receives a checkpoint containing token details. */
   tokenDetailsFresh?: boolean
-  /** What this Run's finishes have sent as usage; created at its first finish. */
-  usageLedger?: OccupancyUsageLedger
+  /** Cost reporting for this Run's steps (`src/billing.ts`). */
+  billing: RunCostEstimate & {
+    /** Ledger key: the OpenCode session, or this Run for an ephemeral one. */
+    key: string
+    /** Catalog cost entry; absent for a model Cursor publishes no rate for. */
+    cost?: OpenCodeModelCost
+    /** Context the previous billed step already sent: read from cache on the next one. */
+    prefixTokens: number
+  }
   /**
    * Run-lifetime cache evidence. Cursor exposes only aggregate cache counters at
    * TurnEnded, so retain the inputs and protocol activity needed to explain
@@ -897,6 +905,9 @@ export class SessionManager {
     session.deferredTerminalReason = null
     const old = session.stream
     session.stream = next
+    // Preserve session totals but give the replacement Run its own estimates.
+    session.billing.estimatedUsd = 0
+    delete session.billing.ledgerEpoch
     if (runId !== undefined) session.runId = runId
     session.frames = next.frames()[Symbol.asyncIterator]()
     session.queuedFrame = undefined

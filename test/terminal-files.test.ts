@@ -768,6 +768,7 @@ describe("terminal file reads", () => {
       toolDescriptors: toolsToDescriptors(definitions, "opencode", []),
       requestContext: { env: { workspace_paths: [root], terminals_folder: folder } },
       usageEstimate: { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 },
+      billing: { key: "run:test", prefixTokens: 0 },
       allowTools: true,
       pumpActive: true,
       heartbeat: null,

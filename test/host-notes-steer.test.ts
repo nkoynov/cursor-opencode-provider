@@ -52,6 +52,7 @@ function heldRun(writes: Uint8Array[], frames: Array<{ flags: number; payload: U
     toolDescriptors: [],
     requestContext: { env: { workspace_paths: ["/tmp"] } },
     usageEstimate: { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 },
+    billing: { key: "run:test", prefixTokens: 0 },
     allowTools: true,
     pumpActive: false,
     heartbeat: null,

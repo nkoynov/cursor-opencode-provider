@@ -54,6 +54,8 @@ Inside `opencode2`, run `/connect`, choose **Cursor**, then browser login or an 
 
 After auth, Cursor models appear in the picker from the in-memory inventory. The `<host-cache>/cursor-models.json` cache is still used as the discovery source; it is not copied into config.
 
+The plugin supplies its own Cursor SDK even when the host's generic package loader already created one. Each new Run resolves the active integration credential and applies on-demand renewal; a token captured by the generic loader or its options cannot bypass that resolver.
+
 ## From a local clone (`CURSOR_OPENCODE2_DEV_ENTRY`)
 
 ```bash
@@ -94,6 +96,7 @@ Prefer the `$OPENCODE_CONFIG_DIR/plugins/<name>/` package directory shown above.
 - **Unset `CURSOR_OPENCODE2_DEV_ENTRY` in production** so the daemon uses the published `aisdk:cursor-opencode-provider` package again.
 - **OpenCode does not install dependencies for local plugin files.** Keep the clone's `bun install` intact and load the plugin from inside the clone (a copied-out file will not resolve `protobufjs`).
 - **Rebuild after every change** (`bun run build`). The daemon reads `dist/`, not `src/`.
+- **Plugin reload does not refresh the running AI SDK.** The daemon caches SDKs and language models separately from plugin hooks. A new plugin `copy=#…` header can therefore appear while turns still use earlier code. Fully restart the daemon after rebuilding; for cost-reporting changes, confirm fresh `billing: step=` records on tool and final finishes.
 
 ## Workspace directory
 

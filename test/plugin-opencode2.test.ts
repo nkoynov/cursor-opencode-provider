@@ -1213,6 +1213,55 @@ describe("opencode2 setup", () => {
     if (typeof cleanup === "function") await cleanup()
   })
 
+  test("a preloaded Cursor SDK still resolves current credentials before opening a Run", async () => {
+    const { ctx, hooks } = fakeContext()
+    const cleanup = await setupPlugin(ctx)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    let resolves = 0
+    ctx.integration.connection = {
+      active: async () => ({ type: "credential", id: "current", label: "Cursor" }),
+      resolve: async () => {
+        resolves++
+        throw new Error("synthetic credential unavailable")
+      },
+    }
+    const fallback = { languageModel: () => ({ doStream: async () => ({ bypassed: true }) }) }
+    const event: any = {
+      model: { providerID: "cursor", id: "m", modelID: "m" },
+      package: CURSOR_AISDK_PACKAGE,
+      sdk: fallback,
+      options: {
+        apiKey: "stale.synthetic.token",
+        getAccessToken: async () => { throw new Error("stale resolver used") },
+        retry: { maxAttempts: 1 },
+      },
+    }
+    try {
+      await hooks.get("aisdk.sdk")!(event)
+      expect(event.sdk).not.toBe(fallback)
+      expect(resolves).toBe(0)
+      await expect(event.sdk.languageModel("m").doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "Respond briefly" }] }],
+      })).rejects.toThrow("synthetic credential unavailable")
+      expect(resolves).toBe(1)
+    } finally {
+      await cleanup()
+    }
+  })
+
+  test("the sdk hook preserves another provider's preloaded SDK", async () => {
+    const { ctx, hooks } = fakeContext()
+    const cleanup = await setupPlugin(ctx)
+    const sdk = { languageModel: () => ({}) }
+    try {
+      const event: any = { model: { providerID: "other" }, package: "other-provider", options: {}, sdk }
+      await hooks.get("aisdk.sdk")!(event)
+      expect(event.sdk).toBe(sdk)
+    } finally {
+      await cleanup()
+    }
+  })
+
   test("the aisdk language hook resolves the wire model id", async () => {
     const { ctx, hooks } = fakeContext()
     await setupPlugin(ctx)

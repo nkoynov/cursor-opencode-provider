@@ -14,7 +14,7 @@ import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
 import { CursorAuthError, CursorRetryExhaustedError } from "../src/errors.js"
-import { carryTurnEndedCounters, newOccupancyUsageLedger, occupancyStepUsage } from "../src/usage.js"
+import { billingLedger } from "../src/billing.js"
 import { sessionFixture } from "./session-fixture.js"
 
 function fakeSession(id: string, frames: Frame[], writes: Uint8Array[] = []): CursorSession {
@@ -292,51 +292,71 @@ describe("interrupted Cursor Run handling", () => {
     expect(parts.filter((part) => part.type === "finish")).toHaveLength(1)
   })
 
-  it("keeps the counters of a Cursor turn the interrupted Run continued past", async () => {
+  it("bills a Cursor turn the interrupted Run continued past on the recovered Run's last step", async () => {
+    const cost = { input: 2, output: 6, cache_read: 0.5 }
+    const key = "ses_carried_turn"
     const interrupted = fakeSession("carried-first", [])
-    interrupted.usageLedger = newOccupancyUsageLedger()
-    carryTurnEndedCounters(interrupted.usageLedger, { inputTokens: 400, outputTokens: 30, cacheRead: 400, cacheWrite: 0, reasoningTokens: 0 })
+    interrupted.billing = { key, cost, prefixTokens: 0 }
+    // 400 cached input and 30 output at the rates above.
+    billingLedger.recordReal(key, 380e-6, interrupted.billing)
     const recovered = fakeSession("carried-second", [
       serverFrame({ interaction_update: { turn_ended: { input_tokens: 400, cache_read: 400, output_tokens: 50 } } }),
     ])
+    recovered.billing = { key, cost, prefixTokens: 0 }
     recovered.tokenDetails = { usedTokens: 1_000, maxTokens: 256_000 }
     const parts: any[] = []
 
-    await pumpWithRecovery({
-      initialSession: interrupted,
-      controller: controller(parts),
-      abortSignal: undefined,
-      recover: async () => recovered,
-    })
+    try {
+      await pumpWithRecovery({
+        initialSession: interrupted,
+        controller: controller(parts),
+        abortSignal: undefined,
+        recover: async () => recovered,
+      })
 
-    const finish = parts.find((part) => part.type === "finish")
-    expect(finish.usage.outputTokens.total).toBe(80)
-    expect(finish.usage.inputTokens.total + finish.usage.outputTokens.total).toBe(1_000)
+      const finish = parts.find((part) => part.type === "finish")
+      expect(finish.usage.inputTokens.total + finish.usage.outputTokens.total).toBe(1_000)
+      expect(Math.abs(finish.providerMetadata.cursor.billing.stepUsd - 880e-6)).toBeLessThan(1e-6)
+      expect(Math.abs(billingLedger.outstanding(key))).toBeLessThan(1e-6)
+    } finally {
+      billingLedger.clear()
+    }
   })
 
-  it("does not price a carried turn's tool steps again after recovery", async () => {
+  it("does not bill a carried turn's tool steps again after recovery", async () => {
+    const cost = { input: 2, output: 6, cache_read: 0.5 }
+    const key = "ses_carried_tools"
     const interrupted = fakeSession("carried-tools-first", [])
-    interrupted.usageLedger = newOccupancyUsageLedger()
-    occupancyStepUsage({ usedTokens: 600, maxTokens: 256_000 }, interrupted.usageLedger)
-    carryTurnEndedCounters(interrupted.usageLedger, { inputTokens: 600, outputTokens: 40, cacheRead: 0, cacheWrite: 600, reasoningTokens: 0 })
-    occupancyStepUsage({ usedTokens: 800, maxTokens: 256_000 }, interrupted.usageLedger)
+    interrupted.billing = { key, cost, prefixTokens: 0 }
+    billingLedger.recordBilled(key, 200e-6, interrupted.billing)
+    billingLedger.recordReal(key, 380e-6, interrupted.billing)
+    // A tool step after the carried turn, whose counters never arrive.
+    billingLedger.recordBilled(key, 100e-6, interrupted.billing)
     const recovered = fakeSession("carried-tools-second", [
       serverFrame({ interaction_update: { turn_ended: { input_tokens: 400, cache_read: 400, output_tokens: 50 } } }),
     ])
+    recovered.billing = { key, cost, prefixTokens: 0 }
     recovered.tokenDetails = { usedTokens: 1_000, maxTokens: 256_000 }
     const parts: any[] = []
 
-    await pumpWithRecovery({
-      initialSession: interrupted,
-      controller: controller(parts),
-      abortSignal: undefined,
-      recover: async () => recovered,
-    })
+    try {
+      await pumpWithRecovery({
+        initialSession: interrupted,
+        controller: controller(parts),
+        abortSignal: undefined,
+        recover: async () => recovered,
+      })
 
-    // The carried turn's own finish already sent 599 cache-write tokens and 1 output token.
-    const finish = parts.find((part) => part.type === "finish")
-    expect(finish.usage.inputTokens).toEqual({ total: 911, noCache: 0, cacheRead: 910, cacheWrite: 1 })
-    expect(finish.usage.outputTokens.total).toBe(89)
+      const finish = parts.find((part) => part.type === "finish")
+      expect(finish.usage.inputTokens.total + finish.usage.outputTokens.total).toBe(1_000)
+      // Both turns' real cost, less the carried turn's step already billed.
+      expect(Math.abs(finish.providerMetadata.cursor.billing.stepUsd - 680e-6)).toBeLessThan(1e-6)
+      // The unconfirmed step stays billed as an estimate.
+      expect(Math.abs(billingLedger.totals(key).billedUsd - 980e-6)).toBeLessThan(1e-6)
+      expect(Math.abs(billingLedger.estimated(key) - 100e-6)).toBeLessThan(1e-12)
+    } finally {
+      billingLedger.clear()
+    }
   })
 
   it("recovers after idempotent checkpoint and control-plane activity", async () => {
@@ -781,10 +801,9 @@ describe("interrupted Cursor Run handling", () => {
 
     const finish = parts.find((part) => part.type === "finish")
     expect(finish.usage.inputTokens.total + finish.usage.outputTokens.total).toBe(150)
-    expect(finish.usage.inputTokens).toEqual({ total: 100, noCache: 85, cacheRead: 10, cacheWrite: 5 })
     expect(finish.usage.outputTokens).toEqual({
-      total: 50,
-      text: 50,
+      total: 1,
+      text: 1,
       reasoning: 0,
     })
     expect(finish.providerMetadata.cursor).toMatchObject({
@@ -843,14 +862,14 @@ describe("interrupted Cursor Run handling", () => {
         + finish.usage.inputTokens.cacheRead
         + finish.usage.inputTokens.cacheWrite,
     ).toBe(finish.usage.inputTokens.total)
-    // A cold Run whose TurnEnded counts outgrow its occupancy: the occupancy
-    // goes to the dearest parts first, output then uncached input.
+    // Held-Run TurnEnded counters are cumulative; this finish only covers the
+    // last generation slice. Display usage is checkpoint occupancy (output=1)
+    // so host tok/s stays sane. Exact request counters stay under *Raw.
     expect(finish.usage.outputTokens).toEqual({
-      total: 3_206,
-      text: 3_206,
+      total: 1,
+      text: 1,
       reasoning: 0,
     })
-    expect(finish.usage.inputTokens).toEqual({ total: 27_244, noCache: 27_244, cacheRead: 0, cacheWrite: 0 })
     expect(finish.providerMetadata.copilot).toEqual({ totalNanoAiu: 0 })
     expect(finish.providerMetadata.cursor).toMatchObject({
       inputTokensRaw: 330_222,
@@ -911,10 +930,9 @@ describe("interrupted Cursor Run handling", () => {
 
     const finish = parts.find((part) => part.type === "finish")
     expect(finish.usage.inputTokens.total + finish.usage.outputTokens.total).toBe(103_144)
-    expect(finish.usage.inputTokens).toEqual({ total: 101_753, noCache: 21_881, cacheRead: 79_872, cacheWrite: 0 })
     expect(finish.usage.outputTokens).toEqual({
-      total: 1_391,
-      text: 1_391,
+      total: 1,
+      text: 1,
       reasoning: 0,
     })
     expect(finish.providerMetadata.copilot).toEqual({ totalNanoAiu: 0 })

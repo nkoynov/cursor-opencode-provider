@@ -272,13 +272,12 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
     // ── AI SDK wiring ────────────────────────────────────────
     await track(
       ctx.aisdk.hook("sdk", async (event) => {
-        if (event.sdk) return
         if (!isCursorPackage(event.package, event.model.providerID)) return
+        // The host's generic loader runs before plugin hooks and may already
+        // have created a Cursor SDK with a captured token. Own our package's
+        // SDK so current integration credentials are resolved on every Run.
         event.sdk = createSdk({
           name: event.model.providerID || CURSOR_PROVIDER_ID,
-          // Resolved per Run open: this SDK lives as long as the daemon, so
-          // a token captured here would outlive its expiry.
-          getAccessToken: (request) => requireCursorAccessToken(ctx.integration, request),
           // Static fallback only. This hook fires once per model/package, not
           // per session, and 2.0 runs one daemon across many projects — the
           // real per-request directory comes from `x-opencode-directory`
@@ -286,6 +285,9 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
           workspaceRoot,
           cacheDir,
           ...event.options,
+          // Keep after host options: a captured resolver/token must not bypass
+          // the integration's current credential and renewal path.
+          getAccessToken: (request) => requireCursorAccessToken(ctx.integration, request),
           // Keep after `event.options` so the OC2 plugin always selects the
           // `path`/`shell` dialect when advertised schemas are opaque.
           defaultDialect: OPENCODE_2_TOOL_DIALECT,

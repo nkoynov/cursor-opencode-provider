@@ -15,6 +15,7 @@ import {
 } from "../src/language-model.js"
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
 import { createCursor } from "../src/index.js"
+import { billingLedger } from "../src/billing.js"
 import { getCheckpoint, setCheckpoint } from "../src/protocol/checkpoint.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { analyzeReplayFrame } from "../src/replay-safety.js"
@@ -57,6 +58,7 @@ function heldSession(id: string, modelId?: string): HeldSession {
     pumpActive: false,
     heartbeat: null,
     cacheDiagnostics: modelId ? { modelId } : undefined,
+    billing: { key: `run:${id}`, prefixTokens: 0 },
     writes,
   } as unknown as HeldSession
   sessionManager.registerSession(session)
@@ -411,10 +413,11 @@ describe("doStream with a mid-turn user message", () => {
     ])
   })
 
-  it("settles the finish against both Cursor turns when a steer goes out as a follow-up Run", async () => {
+  it("bills both Cursor turns on the last step when a steer goes out as a follow-up Run", async () => {
     const held = heldReads("rejected-usage")
     held.resumeCheckpoint = new Uint8Array([1])
     held.tokenDetails = { usedTokens: 1_000, maxTokens: 256_000 }
+    held.billing = { key: OPENCODE_SESSION, cost: { input: 2, output: 6, cache_read: 0.5 }, prefixTokens: 0 }
     const ended = (output: number) => () => serverFrame({ turn_ended: { input_tokens: 400, cache_read: 400, output_tokens: output } })
     held.reopenWithUserMessage = async () => {
       serve(held, [() => serverFrame({ text_delta: { text: "ok" } }), ended(50)])
@@ -428,12 +431,18 @@ describe("doStream with a mid-turn user message", () => {
       ended(30),
     ])
 
-    const { parts } = await streamSteer(held, steer("rejected-usage", user("also check 3.ts")))
+    try {
+      const { parts } = await streamSteer(held, steer("rejected-usage", user("also check 3.ts")))
 
-    const finish = parts.at(-1) as any
-    expect(finish.type).toBe("finish")
-    expect(finish.usage.outputTokens.total).toBe(80)
-    expect(finish.usage.inputTokens.total + finish.usage.outputTokens.total).toBe(1_000)
+      const finishes = parts.filter((part) => part.type === "finish") as any[]
+      expect(finishes).toHaveLength(1)
+      expect(finishes[0].usage.inputTokens.total + finishes[0].usage.outputTokens.total).toBe(1_000)
+      // (400 × 0.5 + 30 × 6) + (400 × 0.5 + 50 × 6) per million.
+      expect(Math.abs(finishes[0].providerMetadata.cursor.billing.stepUsd - 880e-6)).toBeLessThan(1e-6)
+      expect(Math.abs(billingLedger.outstanding(OPENCODE_SESSION))).toBeLessThan(1e-6)
+    } finally {
+      billingLedger.clear()
+    }
   })
 
   it("fails the turn instead of sending a follow-up from a checkpoint older than the results, and drops it", async () => {

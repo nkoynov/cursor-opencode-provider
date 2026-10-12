@@ -45,6 +45,7 @@ function heldReads(id: string, execIds = [1, 2]): HeldSession {
     toolDescriptors: [],
     requestContext: { env: { workspace_paths: ["/w"] } },
     usageEstimate: { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 },
+    billing: { key: "run:test", prefixTokens: 0 },
     allowTools: true,
     pumpActive: false,
     heartbeat: null,

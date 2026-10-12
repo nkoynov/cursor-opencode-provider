@@ -50,6 +50,13 @@ wiping earlier lines. Independently, once the file reaches 10 MiB the next
 bounded. Truncate the override path yourself before a clean run; save a copy
 before comparing two host processes.
 
+For OpenCode 2, a plugin reload can append a new header without replacing the
+daemon's cached SDK or language model. Fully restart the daemon after a rebuild.
+For the current cost-reporting implementation, every finish logs `billing:
+step=` with delivery status and confirmed, billed and unconfirmed estimated
+session costs. New plugin headers without these records do not validate the
+rebuilt billing implementation.
+
 Record these facts with every reproduction:
 
 - OpenCode session id (`ses_…`);
@@ -185,9 +192,10 @@ Every completed Run emits `turn usage validation:`. Begin with `status`:
 - `status=mismatch` means a usage partition/total check failed or Cursor's
   category sum disagreed with its own breakdown total. Inspect the individual
   checks before attributing it to provider accounting. Occupancy finishes
-  (tool-call and TurnEnded/stop) validate against the split they send
-  (`occupancyStepUsage`); aggregate TurnEnded request ratios live on
-  `finish:` / `cache diagnosis:` and are not required to equal it. Preserve the complete line and
+  (tool-call and TurnEnded/stop) validate against
+  occupancy-shaped counters (`output=1`, `cacheRead=prior`); aggregate
+  TurnEnded request ratios live on `finish:` / `cache diagnosis:` and are not
+  required to equal the occupancy prefix ratio. Preserve the complete line and
   the preceding checkpoint/TurnEnded lines before changing cache behavior.
 
 Important fields:
@@ -196,35 +204,56 @@ Important fields:
 |---|---|
 | `source=checkpoint-current-run` | Current Run supplied fresh `tokenDetails`; preferred. |
 | `source=checkpoint-previous-turn` | No fresh details arrived, so the last snapshot is retained and marked stale in provider metadata. |
-| `source=occupancy-checkpoint-current-run` | Tool-call finish published the current Run's occupancy snapshot. |
+| `source=occupancy-checkpoint-current-run` | Tool-call finish published the current Run's occupancy snapshot, billed as a one-call estimate (see `billing:` below). |
 | `source=occupancy-checkpoint-previous-turn` | Tool-call finish published the prior checkpoint occupancy because this Run has not yet received token details. |
 | `source=intermediate-zero` | Tool-call finish with no known checkpoint occupancy. Standard usage remains zero. |
 | `source=unavailable` | No checkpoint has ever supplied token details. Standard usage remains zero rather than pretending aggregate TurnEnded usage is context occupancy. |
 | `cursor=used/max(percent)` | Cursor's authoritative context occupancy. |
-| `occupancyTotal` | Occupancy-shaped validation counters: `usedTokens + 1` (the `output=1` snapshot). Every finish with token details validates against these. |
+| `occupancyTotal` | Occupancy-shaped validation counters: exactly `usedTokens`, split into `usedTokens - 1` input and one output token (both zero for an empty snapshot). Every finish with token details validates against these; disagreement with `sentTotal` is a mismatch. |
 | `rawTotal` | Only on a finish without token details: aggregate `TurnEnded` input + output, request work rather than context occupancy. |
 | `sentTotal` | AI SDK input + output sent to OpenCode. With token details, this must equal Cursor `usedTokens`. |
-| `occupancyCachedRatio` | For occupancy finishes: the sent split's cached share. TurnEnded request cache ratios are on `finish:` / cache diagnosis, never here. (`rawCachedRatio` appears instead only beside `rawTotal`.) |
-| `sentCachedRatio` | Occupancy `cacheRead + cacheWrite` / sent input. Equals `occupancyCachedRatio` on occupancy finishes. |
+| `occupancyCachedRatio` | Cached input divided by `usedTokens - 1`, with the cached prefix bounded to the available input. TurnEnded request cache ratios are on `finish:` / cache diagnosis, never here. (`rawCachedRatio` appears instead only beside `rawTotal`.) |
+| `sentCachedRatio` | Occupancy (`cacheRead` + `cacheWrite`) / sent input. Should match `occupancyCachedRatio`. |
 | `breakdownMatch` | `true`: category sum and breakdown total match current occupancy/limit. `stale`: self-consistent breakdown with a different occupancy or limit. `false`: category sum disagrees with breakdown total. `unavailable`: no breakdown. |
 
 `finish:` is a compact duplicate of the usage sent to OpenCode (`v3*`) and of
 the counters behind it, labelled by where they come from:
 
 - `raw*` (only with `reason=stop`): Cursor's `TurnEnded` counters for the whole
-  held Run, plus `occupancyPrefixCache` (the previous finish's occupancy).
+  held Run, plus `occupancyPrefixCache` (the prior turn's context).
 - `occupancy*` (tool-call boundaries with a snapshot,
-  `source=occupancy-checkpoint-*`): `occupancyIn` is current `usedTokens`,
-  `occupancyCacheRead` the previous finish's occupancy (the Run's checkpoint
-  occupancy at its first finish).
+  `source=occupancy-checkpoint-*`): `occupancyIn` is current `usedTokens - 1` (zero for an empty snapshot),
+  `occupancyCacheRead` / `occupancyCacheWrite` the split the step was billed
+  with — the previous step's context as cache read (see `billing:`).
 - `est*` (`source=intermediate-zero`, before any checkpoint with token
   details): the provider's char/4 estimate. Usage sent is zero.
 
-The final `TurnEnded` moves part of its occupancy between `v3CacheRead` and the
-other parts so the Run's output, cache writes and uncached input reach the
-TurnEnded counts. Two tool-call finishes with the same `v3In` are two steps with
-no checkpoint between them (occupancy is replaced, not summed, and carries `$0`
-cost metadata).
+The final `TurnEnded` attempts to settle the catalog-priced balance once. Two
+tool-call finishes with the same `v3In` are two steps with no checkpoint between
+them: occupancy is replaced, while each delivered step can add an estimated cost.
+
+Every attempted finish is followed by a `billing:` line. `delivered=false`
+means the consumer rejected the finish and neither its charge nor its cached
+prefix was recorded:
+
+| Field | Meaning |
+|---|---|
+| `step=estimate` | A tool-call step billed as one model call: the previous step's context as cache read, the rest new input. |
+| `step=turn-end` | The turn's last step, billed what is outstanding after `billing: turn real=…` added the catalog-priced aggregate cost. |
+| `stepUsd` | What this step bills on both hosts (OpenCode 2 from its tokens, OpenCode 1.x from `copilot.totalNanoAiu`). |
+| `sessionRealUsd` / `sessionBilledUsd` | Confirmed catalog-priced cost and accepted host charges for the OpenCode session (in memory, since provider start). |
+| `sessionEstimatedUsd` | Unconfirmed charges owned by Runs that have not supplied terminal counters. Only the matching Run's counters replace its estimates; interrupted Runs do not create credits against later Runs. |
+| `delivered` | Whether the stream consumer accepted the finish; ledger totals contain accepted finishes only. |
+| `pricing=unpriced` | No published rate (`default`/Auto): nothing is billed. |
+
+The outstanding balance is `sessionRealUsd + sessionEstimatedUsd -
+sessionBilledUsd`, including rounding and the minimum/maximum charge the
+snapshot can carry; it may persist across turns.
+
+The ledger's `real` label refers to counters priced at catalog rates, not a
+reported invoice amount. Aggregate counters cannot identify per-call pricing
+tiers after internal compaction or a tier crossing. Standard cache tokens are
+synthetic for host pricing; use `raw*` for measured request counters.
 
 ### 4. Interpret the cache diagnosis
 
@@ -236,8 +265,7 @@ rawReadRatio = rawCacheRead / rawInput
 rawWriteRatio = rawCacheWrite / rawInput
 ```
 
-Some Cursor Runs report `rawCacheWrite=0` and count new input as uncached. This
-is an upstream value, not evidence that the provider dropped writes.
+Captured Cursor Runs commonly report `rawCacheWrite=0`. This is an upstream
 value, not evidence that the provider dropped writes: the provider decodes
 `TurnEnded` field 4 (`turn_ended raw wire fields: … f4:wt0=`), and some models
 report it (gpt-5.6-luna sent `f4=8201` on a cold call). Where writes are 0,

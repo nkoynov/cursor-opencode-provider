@@ -11,6 +11,7 @@ import {
   snapshotMirroredTodosBySession,
 } from "../src/language-model.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
+import { billingLedger } from "../src/billing.js"
 import { sessionFixture } from "./session-fixture.js"
 
 function writeVarint(out: number[], value: number): void {
@@ -1321,7 +1322,11 @@ describe("display-only ToolCall pump bridge", () => {
     })
     expect(finish.providerMetadata).toEqual({
       copilot: { totalNanoAiu: 0 },
-      cursor: { usageVersion: 3, occupancyOnly: true },
+      cursor: {
+        usageVersion: 3,
+        occupancyOnly: true,
+        billing: { stepUsd: 0, estimate: true, sessionRealUsd: 0, sessionBilledUsd: 0 },
+      },
     })
     expect(sessionManager.pendingFor(session.sessionId, 34)?.resultField).toBe("subagent_result")
     sessionManager.resolve(session.sessionId, 34)
@@ -1333,6 +1338,8 @@ describe("display-only ToolCall pump bridge", () => {
     const session = fakeSession([rawExecPayload(34, 28, rawSubagentArgs())], writes)
     session.tokenDetails = { usedTokens: 153_744, maxTokens: 256_000 }
     session.tokenDetailsFresh = true
+    // The context the previous step sent is read from cache on this one.
+    session.billing.prefixTokens = 123_651
     session.cacheDiagnostics = {
       conversationId: "display-bridge-conversation",
       priorTokenDetails: { usedTokens: 123_651, maxTokens: 256_000 },
@@ -1369,6 +1376,7 @@ describe("display-only ToolCall pump bridge", () => {
       cursor: {
         usageVersion: 3,
         occupancyOnly: true,
+        billing: { stepUsd: 0, estimate: true, sessionRealUsd: 0, sessionBilledUsd: 0 },
         context: {
           contextUsageVersion: 2,
           source: "checkpoint-current-run",
@@ -1381,6 +1389,96 @@ describe("display-only ToolCall pump bridge", () => {
       },
     })
     sessionManager.resolve(session.sessionId, 34)
+  })
+
+
+  it("bills a priced tool-call step like one model call and tells both hosts the same amount", async () => {
+    const parts: any[] = []
+    const session = fakeSession([rawExecPayload(34, 28, rawSubagentArgs())], [])
+    session.tokenDetails = { usedTokens: 29_467, maxTokens: 256_000 }
+    session.tokenDetailsFresh = true
+    session.billing = { key: "ses_priced_step", cost: { input: 2, output: 6, cache_read: 0.5 }, prefixTokens: 22_944 }
+    const controller = {
+      enqueue(part: unknown) { parts.push(part) },
+      error(error: Error) { throw error },
+    } as unknown as ReadableStreamDefaultController<any>
+    try {
+      await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
+      const finish = parts.find((part) => part.type === "finish" && part.finishReason?.unified === "tool-calls")
+      expect(finish.usage.inputTokens).toEqual({ total: 29_466, noCache: 6_522, cacheRead: 22_944, cacheWrite: 0 })
+      const usd = (6_522 * 2 + 22_944 * 0.5 + 6) / 1e6
+      expect(finish.providerMetadata.copilot.totalNanoAiu / 1e11).toBeCloseTo(usd, 9)
+      expect(finish.providerMetadata.cursor.billing).toEqual({
+        stepUsd: usd, estimate: true, sessionRealUsd: 0, sessionBilledUsd: usd, sessionEstimatedUsd: usd,
+      })
+      // The next step reads this step's context from cache.
+      expect(session.billing.prefixTokens).toBe(29_467)
+    } finally {
+      sessionManager.resolve(session.sessionId, 34)
+      billingLedger.clear()
+    }
+  })
+  it("replaces a completing Run's delivered tool estimates with its actual counters", async () => {
+    const parts: any[] = []
+    const session = fakeSession([
+      rawExecPayload(34, 28, rawSubagentArgs()),
+      encodeMessage("AgentServerMessage", {
+        interaction_update: { turn_ended: { input_tokens: 60_000, cache_read: 50_000, output_tokens: 500 } },
+      }),
+    ], [])
+    session.tokenDetails = { usedTokens: 40_000, maxTokens: 256_000 }
+    session.billing = { key: "ses_completed_step", cost: { input: 2, output: 6, cache_read: 0.5 }, prefixTokens: 30_000 }
+    const controller = {
+      enqueue(part: unknown) { parts.push(part) },
+      close() {},
+      error(error: Error) { throw error },
+    } as unknown as ReadableStreamDefaultController<any>
+    try {
+      await pump(session, controller, { textId: "t", reasoningId: "r" })
+      sessionManager.resolve(session.sessionId, 34)
+      await pump(session, controller, { textId: "t", reasoningId: "r" })
+      const finishes = parts.filter((part) => part.type === "finish")
+      expect(finishes).toHaveLength(2)
+      const billed = finishes.reduce((sum, part) => sum + part.providerMetadata.copilot.totalNanoAiu / 1e11, 0)
+      expect(Math.abs(billed - 0.048)).toBeLessThan(2e-6)
+      expect(billingLedger.estimated(session.billing.key)).toBe(0)
+      expect(Math.abs(billingLedger.outstanding(session.billing.key))).toBeLessThan(2e-6)
+    } finally {
+      billingLedger.clear()
+    }
+  })
+
+  it("keeps abandoned tool-step estimates out of a later Run's settlement", async () => {
+    const key = "ses_abandoned_step"
+    const cost = { input: 2, output: 6, cache_read: 0.5 }
+    const first = fakeSession([rawExecPayload(34, 28, rawSubagentArgs())], [])
+    first.runId = "abandoned-run"
+    first.tokenDetails = { usedTokens: 40_000, maxTokens: 256_000 }
+    first.billing = { key, cost, prefixTokens: 0 }
+    const firstParts: any[] = []
+    const controller = (parts: any[]) => ({
+      enqueue(part: unknown) { parts.push(part) },
+      close() {},
+      error(error: Error) { throw error },
+    }) as unknown as ReadableStreamDefaultController<any>
+    try {
+      await pump(first, controller(firstParts), { textId: "t", reasoningId: "r" })
+      expect(firstParts.find((part) => part.type === "finish").providerMetadata.cursor.billing.stepUsd).toBeGreaterThan(0.08)
+      sessionManager.close(first, "superseded-by-new-run")
+      const next = fakeSession([encodeMessage("AgentServerMessage", {
+        interaction_update: { turn_ended: { input_tokens: 60_000, cache_read: 50_000, output_tokens: 500 } },
+      })], [])
+      next.runId = "completed-run"
+      next.tokenDetails = { usedTokens: 40_000, maxTokens: 256_000 }
+      next.billing = { key, cost, prefixTokens: 40_000 }
+      const nextParts: any[] = []
+      await pump(next, controller(nextParts), { textId: "t", reasoningId: "r" })
+      const finish = nextParts.find((part) => part.type === "finish")
+      expect(Math.abs(finish.providerMetadata.cursor.billing.stepUsd - 0.048)).toBeLessThan(2e-6)
+      expect(Math.abs(billingLedger.outstanding(key))).toBeLessThan(2e-6)
+    } finally {
+      billingLedger.clear()
+    }
   })
 
   it("routes Cursor guide through an enabled custom scout without changing local explore", async () => {
@@ -1770,7 +1868,7 @@ describe("display-only ToolCall pump bridge", () => {
     expect(session.closed).toBe(true)
   })
 
-  it("splits checkpoint occupancy like turn_ended and preserves the raw counters", async () => {
+  it("emits checkpoint occupancy and preserves raw turn_ended counters", async () => {
     const parts: any[] = []
     const session = fakeSession(
       [
@@ -1801,10 +1899,14 @@ describe("display-only ToolCall pump bridge", () => {
 
     const finish = parts.find((part) => part.type === "finish")
     expect(finish).toBeDefined()
-    // The Run's only finish: the parts match its turn_ended counts and still add up to occupancy.
-    expect(finish!.usage.inputTokens).toEqual({ total: 100, noCache: 85, cacheRead: 12, cacheWrite: 3 })
-    expect(finish!.usage.outputTokens).toEqual({ total: 40, text: 40, reasoning: 0 })
-    expect(finish!.usage.inputTokens.total + finish!.usage.outputTokens.total).toBe(140)
+    expect(finish!.usage.inputTokens.total).toBe(139)
+    expect(
+      finish!.usage.inputTokens.noCache
+        + finish!.usage.inputTokens.cacheRead
+        + finish!.usage.inputTokens.cacheWrite,
+    ).toBe(139)
+    expect(finish!.usage.inputTokens.cacheWrite).toBe(0)
+    expect(finish!.usage.outputTokens).toEqual({ total: 1, text: 1, reasoning: 0 })
     expect(finish!.providerMetadata).toMatchObject({
       copilot: { totalNanoAiu: 0 },
       cursor: {
@@ -1866,16 +1968,17 @@ describe("progress-only continuation pump", () => {
     expect(session.closed).toBe(true)
   })
 
-  it("settles the finish against both Cursor turns of a reopened Run", async () => {
+  it("bills both Cursor turns of a reopened Run on its last step", async () => {
     const turnEnded = (input: number, output: number) => encodeMessage("AgentServerMessage", {
-      interaction_update: { turn_ended: { input_tokens: input, output_tokens: output } },
+      interaction_update: { turn_ended: { input_tokens: input, cache_read: input, output_tokens: output } },
     })
     const parts: any[] = []
-    const session = fakeSession([textDeltaPayload("Checking the workspace"), turnEnded(300, 40)], [])
+    const session = fakeSession([textDeltaPayload("Checking the workspace"), turnEnded(300, 20)], [])
     session.resumeCheckpoint = Uint8Array.of(1, 2, 3)
     session.tokenDetails = { usedTokens: 1_000, maxTokens: 256_000 }
+    session.billing = { key: "ses_reopened", cost: { input: 2, output: 6, cache_read: 0.5 }, prefixTokens: 0 }
     session.reopenWithUserMessage = async () => {
-      session.frames = iteratorFrom([textDeltaPayload("Done."), turnEnded(500, 60)])
+      session.frames = iteratorFrom([textDeltaPayload("Done."), turnEnded(400, 30)])
     }
     const controller = {
       enqueue(part: unknown) {
@@ -1884,11 +1987,18 @@ describe("progress-only continuation pump", () => {
       error() {},
     } as unknown as ReadableStreamDefaultController<any>
 
-    await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
+    try {
+      await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 
-    const finish = parts.find((part) => part.type === "finish")
-    expect(finish.usage.outputTokens.total).toBe(100)
-    expect(finish.usage.inputTokens).toEqual({ total: 900, noCache: 800, cacheRead: 100, cacheWrite: 0 })
+      const finishes = parts.filter((part) => part.type === "finish")
+      expect(finishes).toHaveLength(1)
+      expect(finishes[0].usage.inputTokens.total + finishes[0].usage.outputTokens.total).toBe(1_000)
+      // (300 × 0.5 + 20 × 6) + (400 × 0.5 + 30 × 6) per million.
+      expect(Math.abs(finishes[0].providerMetadata.cursor.billing.stepUsd - 650e-6)).toBeLessThan(1e-6)
+      expect(Math.abs(billingLedger.outstanding("ses_reopened"))).toBeLessThan(1e-6)
+    } finally {
+      billingLedger.clear()
+    }
   })
 
   it("does not reopen a complete answer that starts with a progress verb", async () => {
