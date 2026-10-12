@@ -307,6 +307,27 @@ describe("foreign-history rebase", () => {
     expect((thrown as APICallError).message).toMatch(/prompt is too long/i)
   })
 
+  it("rejects a compaction request as too large, not as a context overflow", () => {
+    let thrown: unknown
+    try {
+      assertForeignHistoryRebaseFits({
+        modelInfo: { id: "m", maxContext: 1_000, variants: [] },
+        cursorModelId: "m",
+        maxMode: false,
+        history: [{ role: "user", content: "x".repeat(4_000) }],
+        systemPrompt: undefined,
+        userText: "Summarize",
+        isCompaction: true,
+      })
+    } catch (error) {
+      thrown = error
+    }
+    expect(APICallError.isInstance(thrown)).toBe(true)
+    expect((thrown as APICallError).statusCode).toBe(413)
+    expect((thrown as APICallError).message).toMatch(/^request too large: /)
+    expect((thrown as APICallError).message).not.toMatch(/prompt is too long|context length|too many tokens/i)
+  })
+
   it("counts the system prompt once, not again as a history entry", () => {
     expect(() => assertForeignHistoryRebaseFits({
       modelInfo: { id: "m", maxContext: 2_000, variants: [] },

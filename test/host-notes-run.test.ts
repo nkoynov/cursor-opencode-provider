@@ -9,8 +9,9 @@ import http2 from "node:http2"
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
-import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider"
+import { APICallError, type LanguageModelV3CallOptions, type LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
+import { CURSOR_COMPACTION_OPTION } from "../src/shared.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
@@ -185,6 +186,79 @@ describe("seeded Runs through a full provider Run", () => {
       const rules = request.action.user_message_action.request_context.rules as Array<{ content: string }>
       expect(rules).toHaveLength(1)
       expect(rules[0]!.content).toStartWith("Host system prompt: build with bazel.")
+    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+  }, 30_000)
+})
+
+describe("compaction Runs through a full provider Run", () => {
+  const SUMMARY_PROMPT = "Summarize only what the user and the assistant said. Use the template headings."
+  const NUDGE = "The previous response did not fill in the required summary template."
+
+  async function compact(model: ReturnType<ReturnType<typeof createCursor>["languageModel"]>, prompt: Prompt, sessionKey: string) {
+    const { stream } = await model.doStream({
+      prompt,
+      tools: [],
+      providerOptions: { cursor: { [CURSOR_COMPACTION_OPTION]: true } },
+      headers: { "x-opencode-session-id": sessionKey },
+    } as LanguageModelV3CallOptions)
+    const parts: LanguageModelV3StreamPart[] = []
+    const reader = stream.getReader()
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      parts.push(value)
+    }
+    return parts
+  }
+
+  const history = (output: string): Prompt => [
+    { role: "system", content: "Host system prompt." },
+    { role: "user", content: [{ type: "text", text: "Read probe.txt." }] },
+    { role: "assistant", content: [{ type: "tool-call", toolCallId: "call_read", toolName: "read", input: { filePath: "probe.txt" } }] },
+    { role: "tool", content: [{ type: "tool-result", toolCallId: "call_read", toolName: "read", output: { type: "text", value: output } }] },
+    { role: "assistant", content: [{ type: "text", text: "Read it." }] },
+  ] as Prompt
+
+  it("rejects a compaction request over the window as too large before opening a Run, the nudge included", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-compaction-size-"))
+    cacheHttp2SessionForTests(ORIGIN, client)
+    try {
+      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      onRun = (run, message) => {
+        if (message.run_request) endTurn(run, "Done.")
+      }
+      const prompted: Prompt = [...history("x".repeat(400_000)), { role: "user", content: [{ type: "text", text: SUMMARY_PROMPT }] }]
+      for (const prompt of [prompted, [...prompted, { role: "user", content: [{ type: "text", text: NUDGE }] }] as Prompt]) {
+        const error = await compact(model, prompt, "ses_compaction_too_large").then(() => undefined, (thrown: unknown) => thrown)
+        expect(APICallError.isInstance(error)).toBe(true)
+        expect((error as APICallError).statusCode).toBe(413)
+        expect((error as APICallError).message).toStartWith("request too large: this compaction request needs ~")
+        expect((error as APICallError).message).not.toMatch(/prompt is too long/i)
+      }
+      expect(runs).toHaveLength(0)
+    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+  }, 30_000)
+
+  it("sends a compaction request that fits, with the history and the summary prompt last", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-compaction-fits-"))
+    cacheHttp2SessionForTests(ORIGIN, client)
+    try {
+      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      onRun = (run, message) => {
+        if (message.run_request) endTurn(run, "## Objective\nRead probe.txt.")
+      }
+      const transcript = `[user] Read probe.txt.\n[assistant] read probe.txt\n[tool] ${"x".repeat(1_250)}`
+      const parts = await compact(model, [
+        { role: "system", content: "Host system prompt." },
+        { role: "user", content: [{ type: "text", text: transcript }] },
+        { role: "user", content: [{ type: "text", text: SUMMARY_PROMPT }] },
+      ], "ses_compaction_fits")
+      expect(textOf(parts)).toBe("## Objective\nRead probe.txt.")
+      expect(runs).toHaveLength(1)
+      const text = runs[0]!.received.find((message) => message.run_request)!.run_request
+        .action.user_message_action.user_message.text as string
+      expect(text).toContain(transcript)
+      expect(text).toEndWith(SUMMARY_PROMPT)
     } finally { fs.rmSync(root, { recursive: true, force: true }) }
   }, 30_000)
 })
