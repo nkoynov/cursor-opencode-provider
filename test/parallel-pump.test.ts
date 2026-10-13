@@ -4,7 +4,7 @@ import path from "node:path"
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { deliverContinuationResults, pump, pumpWithRecovery, resetTurnStateForTests } from "../src/language-model.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
-import { toolsToDescriptors } from "../src/protocol/tools.js"
+import { OPENCODE_2_TOOL_DIALECT, toolsToDescriptors } from "../src/protocol/tools.js"
 import { sessionManager, type Frame } from "../src/session.js"
 import { sessionFixture } from "./session-fixture.js"
 
@@ -189,6 +189,46 @@ describe("parallel tool-call pump", () => {
       const readReply = writes.map(frame => decodeMessage<any>("AgentClientMessage", frame).exec_client_message)
         .find(message => message?.read_result)
       expect(readReply.read_result.success.content).toBe("export const value = 1\n")
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ["gpt", "new", "patch", (target: string) => ({ patchText: `*** Begin Patch\n*** Add File: ${target}\n+created\n*** End Patch` })],
+    ["gpt", "existing", "patch", (target: string) => ({ patchText: `*** Begin Patch\n*** Update File: ${target}\n@@\n-before\n+created\n*** End Patch` })],
+    ["opus", "new", "write", (target: string) => ({ path: target, content: "created\n" })],
+    ["opus", "existing", "edit", (target: string) => ({ path: target, oldString: "before\n", newString: "created\n" })],
+  ] as const)("sends an OpenCode 2 %s edit_tool_call on a %s file to `%s`", async (model, file, toolName, input) => {
+    const existing = file === "existing"
+    const root = fs.mkdtempSync("/tmp/cursor-oc2-patch-")
+    const target = path.join(root, "target.txt")
+    if (existing) fs.writeFileSync(target, "before\n")
+    const { session, writes } = fixture([
+      frame({ interaction_update: { tool_call_started: {
+        call_id: "edit", tool_call: { edit_tool_call: { args: { path: target } } },
+      } } }),
+      frame({ exec_server_message: { id: 1, read_args: { path: target, tool_call_id: "edit" } } }),
+      frame({ exec_server_message: { id: 2, write_args: { path: target, file_text: "created\n", tool_call_id: "edit" } } }),
+      ended(),
+    ])
+    const tools = [{ name: "shell", description: "Shell" }, { name: "read", description: "Read" },
+      ...(model === "gpt" ? [{ name: "patch", description: "Patch" }]
+        : [{ name: "edit", description: "Edit" }, { name: "write", description: "Write" }]),
+    ]
+    session.toolCatalog = tools
+    session.toolDescriptors = toolsToDescriptors(tools, "opencode")
+    session.hostToolDialect = OPENCODE_2_TOOL_DIALECT
+    session.requestContext.env = { workspace_paths: [root] }
+    try {
+      const { parts, controller } = collect()
+      await pump(session, controller, ids)
+      const calls = toolCalls(parts)
+      expect(calls.map(p => p.toolName)).toEqual([toolName])
+      expect(JSON.parse((calls[0] as { input: string }).input)).toEqual(input(target))
+      const replies = writes.map(frame => decodeMessage<any>("AgentClientMessage", frame).exec_client_message)
+      expect(replies.some(message => message?.write_result?.error)).toBe(false)
+      expect(replies.find(message => message?.read_result)?.read_result.success.content).toBe(existing ? "before\n" : "")
     } finally {
       fs.rmSync(root, { recursive: true, force: true })
     }

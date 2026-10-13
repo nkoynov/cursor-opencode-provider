@@ -14,9 +14,10 @@ import {
   type CursorExecVariant,
 } from "./exec-variants.js"
 import {
-  APPLY_PATCH_TOOL,
   buildAddFilePatch,
   buildUpdateFilePatch,
+  hostPatchTool,
+  isHostPatchTool,
   planSubstringEdit,
 } from "./apply-patch.js"
 import {
@@ -1119,7 +1120,7 @@ export function remapCorrelatedEditWriteForCatalog(
 ): boolean {
   if (parsed.resultField !== "write_result" || parsed.toolName !== "write") return false
   const advertised = new Set(advertisedToolNames)
-  if (!advertised.has("edit") && !advertised.has(APPLY_PATCH_TOOL)) return false
+  if (!advertised.has("edit") && !hostPatchTool(advertised)) return false
 
   const filePath = opencodePathArg(parsed.args)
   const content = stringValue(parsed.args.content)
@@ -1158,19 +1159,19 @@ export function remapCorrelatedEditWriteForCatalog(
 }
 
 /**
- * Express a native Cursor write/edit as `apply_patch` when the host swapped the
+ * Express a native Cursor write/edit as a patch call when the host swapped the
  * edit-tool family out from under us.
  *
- * OpenCode 1.x removes `edit` and `write` from the catalog for GPT models and
- * advertises `apply_patch` in their place — see the module comment in
- * `./apply-patch.ts` for the upstream reasoning and citations. Cursor keeps
- * using its native write/edit exec channel regardless, so without this the
- * request is refused as an unavailable tool and the model loses the ability to
- * change files at all.
+ * Both OpenCode majors remove `edit` and `write` from the catalog for GPT
+ * models and advertise a patch tool in their place (`apply_patch` on 1.x,
+ * `patch` on 2.0) — see the module comment in `./apply-patch.ts` for the
+ * upstream reasoning and citations. Cursor keeps using its native write/edit
+ * exec channel regardless, so without this the request is refused as an
+ * unavailable tool.
  *
  * Keyed purely off the advertised set: this is inert whenever the host offers
  * `write`/`edit` normally, and equally inert when it offers neither those nor
- * `apply_patch` (the caller's unavailable-tool rejection still applies).
+ * a patch tool (the caller's unavailable-tool rejection still applies).
  */
 export function remapEditToolsForCatalog(
   parsed: ParsedExecRequest,
@@ -1178,22 +1179,23 @@ export function remapEditToolsForCatalog(
   workspaceRoot?: string,
 ): void {
   if (parsed.toolName !== "write" && parsed.toolName !== "edit") return
-  // `apply_patch` envelopes are text. A binary write has no patch form at all,
+  // Patch envelopes are text. A binary write has no patch form at all,
   // so it must stay a write and reach the byte-preserving path — converting it
   // here would drop the bytes and report a patch-translation failure instead of
   // the image Cursor asked to save.
   if (binaryWritePayload(parsed)) return
   const advertised = new Set(advertisedToolNames)
-  if (advertised.has(parsed.toolName) || !advertised.has(APPLY_PATCH_TOOL)) return
+  const patchTool = hostPatchTool(advertised)
+  if (advertised.has(parsed.toolName) || !patchTool) return
 
   const requested = parsed.toolName
   const filePath = opencodePathArg(parsed.args)
   const refuse = (reason: string) => {
-    parsed.toolName = APPLY_PATCH_TOOL
+    parsed.toolName = patchTool
     parsed.args = {}
     parsed.localError =
-      `Cursor ${requested} request cannot be expressed as an apply_patch call: ${reason}. ` +
-      "The host advertises `apply_patch` instead of `edit`/`write` for this model."
+      `Cursor ${requested} request cannot be expressed as a ${patchTool} call: ${reason}. ` +
+      `The host advertises \`${patchTool}\` instead of \`edit\`/\`write\` for this model.`
   }
 
   if (!filePath) {
@@ -1218,7 +1220,7 @@ export function remapEditToolsForCatalog(
       refuse("the replacement is missing its old or new text")
       return
     }
-    // apply_patch matches whole lines, so a substring edit has to be widened to
+    // A patch matches whole lines, so a substring edit has to be widened to
     // the lines it touches — which requires the file the model is editing.
     const absolute = path.resolve(workspaceRoot ?? process.cwd(), filePath)
     let source: string
@@ -1249,9 +1251,9 @@ export function remapEditToolsForCatalog(
     patchText = buildUpdateFilePatch(filePath, plan.chunks)
   }
 
-  parsed.toolName = APPLY_PATCH_TOOL
+  parsed.toolName = patchTool
   parsed.args = { patchText }
-  // apply_patch's output does not carry opencode `write`'s <path> tag, so keep
+  // Patch output does not carry opencode `write`'s <path> tag, so keep
   // the requested path for the typed Cursor result.
   parsed.resultMetadata = { ...parsed.resultMetadata, path: filePath }
 }
@@ -1319,7 +1321,7 @@ export function rejectPartialReadMutation(parsed: ParsedExecRequest): void {
   let content: unknown
   if (parsed.toolName === "write") {
     content = parsed.args.content
-  } else if (parsed.toolName === APPLY_PATCH_TOOL) {
+  } else if (isHostPatchTool(parsed.toolName)) {
     const patchText = parsed.args.patchText
     if (typeof patchText !== "string" || !patchText.includes("*** Add File:")) return
     content = patchText
@@ -3264,7 +3266,7 @@ export function buildTypedExecResult(
       }
     }
     case "write_result": {
-      // Prefer the path recorded from WriteArgs / a remapped apply_patch write.
+      // Prefer the path recorded from WriteArgs / a remapped patch write.
       // Host write output is not a `<path>` envelope, and Cursor's GetMcpTools
       // spill copies WriteSuccess.path into the model-visible filePath.
       const remappedPath = str(resultMetadata?.path)

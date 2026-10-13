@@ -414,6 +414,17 @@ describe("buildOpenCodeInteractionGuidance", () => {
     expect(guidance).toContain("How to reach host tools and bridged Cursor interactions this turn:")
   })
 
+  it("routes Cursor StrReplace and Write to OpenCode 2's `patch` on a GPT catalog", () => {
+    const guidance = buildOpenCodeInteractionGuidance([
+      { name: "patch" },
+      { name: "read" },
+      { name: "shell" },
+    ], false, "/workspace/project")!
+    expect(guidance).toContain("`patch` (StrReplace, Write)")
+    expect(guidance).toContain("use Cursor StrReplace and Write; the provider converts them to OpenCode `patch` automatically")
+    expect(guidance).toContain("make a targeted edit/patch from complete context")
+  })
+
   it("names a configured MCP server's namespace and bare tool names", () => {
     const guidance = buildOpenCodeInteractionGuidance([
       { name: "read" },

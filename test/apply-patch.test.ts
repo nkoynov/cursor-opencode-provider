@@ -5,14 +5,17 @@ import path from "node:path"
 import {
   buildAddFilePatch,
   buildUpdateFilePatch,
+  hostPatchTool,
   planSubstringEdit,
 } from "../src/protocol/apply-patch.js"
 import {
+  OPENCODE_2_TOOL_DIALECT,
   parseExecServerMessage,
   remapCorrelatedEditWriteForCatalog,
   remapEditToolsForCatalog,
   buildTypedExecResult,
 } from "../src/protocol/tools.js"
+import { predictEarlyToolName } from "../src/early-tool-rows.js"
 import {
   parseDisplayToolCall,
   resolveBridgedOpenCodeToolCall,
@@ -255,6 +258,111 @@ describe("correlated legacy edit writes", () => {
     expect(remapCorrelatedEditWriteForCatalog(parsed, ["write"], "new.txt", workspace)).toBe(false)
     expect(remapCorrelatedEditWriteForCatalog(parsed, ["edit", "write"], "other.txt", workspace)).toBe(false)
     expect(parsed.toolName).toBe("write")
+  })
+})
+
+describe("OpenCode 2 `patch` catalog", () => {
+  // OpenCode 2's PatchTool hook: GPT models get `patch` and lose `edit`/`write`; everyone else the reverse.
+  const gptCatalog = ["read", "shell", "glob", "grep", "patch"]
+  const opusCatalog = ["read", "shell", "glob", "grep", "edit", "write"]
+  const writeRequest = (filePath: string, content: string) =>
+    parseExecServerMessage({ id: 21, write_args: { path: filePath, file_text: content } }, OPENCODE_2_TOOL_DIALECT)!
+
+  it("resolves the host's patch tool name for each major", () => {
+    expect(hostPatchTool(new Set(gptCatalog))).toBe("patch")
+    expect(hostPatchTool(new Set(["read", "bash", "apply_patch"]))).toBe("apply_patch")
+    expect(hostPatchTool(new Set(opusCatalog))).toBeUndefined()
+  })
+
+  it("sends a GPT model's new file straight to `patch` as an Add File hunk", () => {
+    const target = path.join(workspace, "fresh.txt")
+    const parsed = writeRequest(target, "alpha\nbeta\n")
+    expect(parsed.args).toMatchObject({ path: target })
+
+    expect(remapCorrelatedEditWriteForCatalog(parsed, gptCatalog, target, workspace)).toBe(false)
+    remapEditToolsForCatalog(parsed, gptCatalog, workspace)
+    expect(parsed.localError).toBeUndefined()
+    expect(parsed.toolName).toBe("patch")
+    expect(parsed.resultField).toBe("write_result")
+    expect(parsed.args).toEqual({
+      patchText: ["*** Begin Patch", `*** Add File: ${target}`, "+alpha", "+beta", "*** End Patch"].join("\n"),
+    })
+    expect(parsed.resultMetadata).toMatchObject({ path: target })
+  })
+
+  it("sends a GPT model's edit of an existing file to `patch` as an Update File hunk", () => {
+    const target = path.join(workspace, "existing.ts")
+    fs.writeFileSync(target, "const a = 1\nconst b = 2\nconst c = 3\n")
+    const parsed = writeRequest(target, "const a = 1\nconst b = 20\nconst c = 3\n")
+
+    expect(remapCorrelatedEditWriteForCatalog(parsed, gptCatalog, target, workspace)).toBe(true)
+    expect(parsed.args).toMatchObject({ path: target })
+    remapEditToolsForCatalog(parsed, gptCatalog, workspace)
+    expect(parsed.localError).toBeUndefined()
+    expect(parsed.toolName).toBe("patch")
+    expect(parsed.args).toEqual({
+      patchText: [
+        "*** Begin Patch",
+        `*** Update File: ${target}`,
+        "@@",
+        "-const b = 2",
+        "-const c = 3",
+        "+const b = 20",
+        "+const c = 3",
+        "*** End Patch",
+      ].join("\n"),
+    })
+  })
+
+  it("sends a GPT model's Pi edit to `patch`", () => {
+    const target = path.join(workspace, "pi.ts")
+    fs.writeFileSync(target, "one\ntwo\n")
+    const parsed = parseExecServerMessage({
+      id: 22,
+      pi_edit_args: { path: target, edits: [{ old_text: "two", new_text: "three" }] },
+    }, OPENCODE_2_TOOL_DIALECT)!
+    remapEditToolsForCatalog(parsed, gptCatalog, workspace)
+    expect(parsed.toolName).toBe("patch")
+    expect(parsed.args).toEqual({
+      patchText: ["*** Begin Patch", `*** Update File: ${target}`, "@@", "-two", "+three", "*** End Patch"].join("\n"),
+    })
+  })
+
+  it("names `patch` when a GPT request cannot be expressed as one", () => {
+    const parsed = parseExecServerMessage({
+      id: 23,
+      pi_edit_args: { path: path.join(workspace, "missing.ts"), edits: [{ old_text: "a", new_text: "b" }] },
+    }, OPENCODE_2_TOOL_DIALECT)!
+    remapEditToolsForCatalog(parsed, gptCatalog, workspace)
+    expect(parsed.toolName).toBe("patch")
+    expect(parsed.localError).toContain("cannot be expressed as a patch call")
+    expect(parsed.localError).toContain("advertises `patch` instead of `edit`/`write`")
+  })
+
+  it("leaves Opus writes and edits on `write`/`edit`", () => {
+    const fresh = writeRequest(path.join(workspace, "new.txt"), "x\n")
+    expect(remapCorrelatedEditWriteForCatalog(fresh, opusCatalog, path.join(workspace, "new.txt"), workspace)).toBe(false)
+    remapEditToolsForCatalog(fresh, opusCatalog, workspace)
+    expect(fresh).toMatchObject({ toolName: "write", args: { path: path.join(workspace, "new.txt"), content: "x\n" } })
+
+    const target = path.join(workspace, "old.txt")
+    fs.writeFileSync(target, "keep\nold\n")
+    const edit = writeRequest(target, "keep\nnew\n")
+    expect(remapCorrelatedEditWriteForCatalog(edit, opusCatalog, target, workspace)).toBe(true)
+    remapEditToolsForCatalog(edit, opusCatalog, workspace)
+    expect(edit).toMatchObject({ toolName: "edit", args: { path: target, oldString: "old\n", newString: "new\n" } })
+  })
+
+  it("predicts the `patch` row for a GPT edit_tool_call and keeps Opus on write/edit", () => {
+    const existing = path.join(workspace, "row.txt")
+    fs.writeFileSync(existing, "body\n")
+    const call = (target: string) => ({ variant: "edit_tool_call", args: { path: target } })
+    const gpt = { advertised: new Set(gptCatalog), workspaceRoot: workspace }
+    const opus = { advertised: new Set(opusCatalog), workspaceRoot: workspace }
+    expect(predictEarlyToolName(call(path.join(workspace, "absent.txt")), gpt)).toBe("patch")
+    expect(predictEarlyToolName(call(existing), gpt)).toBe("patch")
+    expect(predictEarlyToolName(call(path.join(workspace, "absent.txt")), opus)).toBe("write")
+    expect(predictEarlyToolName(call(existing), opus)).toBe("edit")
   })
 })
 
