@@ -256,7 +256,8 @@ export async function fetchAgentUrl(
 
 export type BidiStream = {
   write(msg: Uint8Array): boolean | void
-  waitForDrain?(timeoutMs: number): Promise<void>
+  /** Fails once the stream has taken nothing more for `stallTimeoutMs`; no deadline for the whole write. */
+  waitForDrain?(stallTimeoutMs: number): Promise<void>
   end(): void
   frames(): AsyncIterable<{ flags: number; payload: Uint8Array }>
   destroy(): void
@@ -357,6 +358,8 @@ const CONNECT_TIMEOUT_MS = 15_000
 const DEFAULT_SESSION_PING_TIMEOUT_MS = 5_000
 const DEFAULT_READ_IDLE_MS = 120_000
 const WRITE_DRAIN_TIMEOUT_CODE = "CURSOR_WRITE_DRAIN_TIMEOUT"
+// Small enough that a 13 KB/s uplink still moves a slice per five-second stall window.
+const WRITE_SLICE_BYTES = 64 * 1024
 export const HTTP2_SESSION_MAX_AGE_MS = 15 * 60_000
 // Cursor CLI pings an agent connection before use only after 10 s without a response or ping reply.
 export const HTTP2_SESSION_LIVE_WINDOW_MS = 10_000
@@ -806,6 +809,20 @@ export async function bidiRunStream(
   let locallyClosed = false
   let remotelyClosed = false
   let backpressured = false
+  // A frame over one slice goes out a slice at a time, the next once the stream has taken the last: neither
+  // Node nor Bun lowers `writableLength` or calls back while one large write drains, so only this shows the
+  // stream's own progress (the socket's byte count includes sibling Runs on the same connection).
+  const outbound: Uint8Array[] = []
+  let pacer: object | undefined
+  let pacedBytesSent = 0
+  const pacerIdleListeners = new Set<() => void>()
+  // Node's stream.close() holds back `close` while a write is pending, so a local close settles drains itself.
+  const localCloseListeners = new Set<() => void>()
+  const notifyLocalClose = () => {
+    const listeners = [...localCloseListeners]
+    localCloseListeners.clear()
+    for (const listener of listeners) listener()
+  }
   let responseStatus = 0
   let responseHeaders: Record<string, unknown> = {}
   let responseTrailers: Record<string, unknown> = {}
@@ -829,6 +846,51 @@ export async function bidiRunStream(
   let inboundReaderStarted = false
   const abortSignal = options.signal
   let abortHandler: (() => void) | undefined
+
+  const stopPacer = () => {
+    outbound.length = 0
+    pacer = undefined
+  }
+  const sendNextSlice = (token: object) => {
+    const slice = outbound.shift()
+    if (!slice) {
+      pacer = undefined
+      backpressured = false
+      const listeners = [...pacerIdleListeners]
+      pacerIdleListeners.clear()
+      for (const listener of listeners) listener()
+      return
+    }
+    const target = stream
+    target.write(slice, (error?: Error | null) => {
+      if (error || pacer !== token) return
+      pacedBytesSent += slice.length
+      try {
+        sendNextSlice(token)
+      } catch (cause) {
+        stopPacer()
+        streamFailure ??= toTransportError(cause, "Cursor Run stream write failed")
+        streamFailure.replaySafe = false
+        writable = false
+        try { target.destroy(streamFailure) } catch { /* already closing */ }
+      }
+    })
+  }
+  const send = (frame: Uint8Array): boolean => {
+    if (!pacer && frame.length <= WRITE_SLICE_BYTES) {
+      backpressured = !stream.write(frame)
+      return !backpressured
+    }
+    for (let offset = 0; offset < frame.length; offset += WRITE_SLICE_BYTES) {
+      outbound.push(frame.subarray(offset, offset + WRITE_SLICE_BYTES))
+    }
+    backpressured = true
+    if (!pacer) {
+      pacer = {}
+      sendNextSlice(pacer)
+    }
+    return false
+  }
 
   const observedFailure = (): CursorProviderError | undefined => {
     if (streamFailure) return streamFailure
@@ -923,6 +985,7 @@ export async function bidiRunStream(
     unanswered = undefined
     resending = frames
     streamGeneration++
+    stopPacer()
     if (inboundReaderStarted) stream.removeListener("data", onInboundChunk)
     trace(
       `h2 Run stream failed before Cursor answered on a session reused without ping (${reason}) — ` +
@@ -954,7 +1017,7 @@ export async function bidiRunStream(
       next.on("data", onInboundChunk)
       armReadIdleWatchdog()
     }
-    for (const frame of frames) backpressured = !next.write(frame)
+    for (const frame of frames) send(frame)
     notifyResend(true)
   }
   const settleObservedTerminal = () => {
@@ -1085,6 +1148,7 @@ export async function bidiRunStream(
     target.on("close", () => {
       if (replaced()) return
       noteConnectionState()
+      stopPacer()
       writable = false
       remotelyClosed = !locallyClosed
       if (remotelyClosed) {
@@ -1113,7 +1177,9 @@ export async function bidiRunStream(
         finishInbound()
         stopInboundReader()
         settleTerminal({ kind: "local-close" })
+        stopPacer()
         stream.close()
+        notifyLocalClose()
       }
     }
     abortSignal.addEventListener("abort", abortHandler, { once: true })
@@ -1139,11 +1205,11 @@ export async function bidiRunStream(
       }
       const frame = encodeFrame(0x00, msg)
       try {
-        const accepted = stream.write(frame)
+        const accepted = send(frame)
         unanswered?.push(frame)
-        backpressured = !accepted
         return accepted
       } catch (cause) {
+        stopPacer()
         rawStreamError = cause
         streamFailure = toTransportError(cause, "Cursor Run stream write failed")
         streamFailure.replaySafe = false
@@ -1152,24 +1218,28 @@ export async function bidiRunStream(
         throw streamFailure
       }
     },
-    waitForDrain(timeout) {
+    waitForDrain(stallTimeout) {
       if (!backpressured) return Promise.resolve()
-      const drainTimeoutMs = timeoutMs("Cursor write drain timeout", timeout, timeout)
+      const stallTimeoutMs = timeoutMs("Cursor write drain stall timeout", stallTimeout, stallTimeout)
       return new Promise<void>((resolve, reject) => {
         let settled = false
         let target = stream
         let failLater: (() => void) | undefined
         let timer: ReturnType<typeof setTimeout> | undefined
         const detach = () => {
-          target.removeListener("drain", onDrain)
+          target.removeListener("drain", onStreamDrain)
           target.removeListener("error", onError)
           target.removeListener("close", onClose)
+          pacerIdleListeners.delete(onDrain)
+          localCloseListeners.delete(failOnClose)
           resendListeners.delete(onResend)
         }
         const attach = () => {
-          target.once("drain", onDrain)
+          target.on("drain", onStreamDrain)
           target.once("error", onError)
           target.once("close", onClose)
+          pacerIdleListeners.add(onDrain)
+          localCloseListeners.add(failOnClose)
           if (unanswered || resending) resendListeners.add(onResend)
         }
         const finish = (error?: CursorProviderError) => {
@@ -1183,6 +1253,10 @@ export async function bidiRunStream(
         const onDrain = () => {
           backpressured = false
           finish()
+        }
+        // The stream also drains after every slice the pacer hands it.
+        const onStreamDrain = () => {
+          if (!pacer) onDrain()
         }
         const failOnError = (cause: Error) => {
           streamFailure ??= toTransportError(cause, "Cursor Run stream drain failed")
@@ -1218,15 +1292,18 @@ export async function bidiRunStream(
           armTimer()
           attach()
         }
+        // A stall window, not a deadline: it starts over whenever the stream has taken another slice.
         const armTimer = () => {
+          const sentAtArm = pacedBytesSent
           timer = setTimeout(() => {
+            if (pacedBytesSent > sentAtArm) return armTimer()
             streamFailure ??= new CursorTransportError(
-              `Cursor Run stream backpressure did not drain after ${drainTimeoutMs}ms`,
+              `Cursor Run stream backpressure made no progress for ${stallTimeoutMs}ms`,
               { transient: false, replaySafe: false, code: WRITE_DRAIN_TIMEOUT_CODE },
             )
             finish(streamFailure)
             try { stream.destroy(streamFailure) } catch { /* already closing */ }
-          }, drainTimeoutMs)
+          }, stallTimeoutMs)
           timer.unref?.()
         }
         if (!resending) armTimer()
@@ -1236,6 +1313,9 @@ export async function bidiRunStream(
     end() {
       locallyClosed = true
       writable = false
+      const unsent = outbound.splice(0)
+      if (!stream.closed && !stream.destroyed) for (const slice of unsent) stream.write(slice)
+      pacer = undefined
       inboundFrames.length = 0
       pendingChunks.length = 0
       finishInbound()
@@ -1282,7 +1362,9 @@ export async function bidiRunStream(
         finishInbound()
         stopInboundReader()
         settleTerminal({ kind: "local-close" })
+        stopPacer()
         stream.close()
+        notifyLocalClose()
       }
     },
     isClosed() {

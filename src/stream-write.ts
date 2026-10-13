@@ -67,9 +67,10 @@ async function writeStreamMessageNow(
   if (!stream.waitForDrain) {
     throw new StreamWriteDrainError(`Cursor ${operation} write was backpressured`)
   }
+  const startedAt = Date.now()
   try {
     await stream.waitForDrain(5_000)
-    trace(`stream write drained: operation=${operation} bytes=${message.length}`)
+    trace(`stream write drained: operation=${operation} bytes=${message.length} ms=${Date.now() - startedAt}`)
   } catch (cause) {
     throw new StreamWriteDrainError(
       `Cursor ${operation} backpressure drain failed`,

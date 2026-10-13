@@ -44,11 +44,17 @@ function fakeCursorRuns(): { runs: any[]; restore: () => void } {
       closed: false,
       destroyed: false,
       request() {
+        let written = Buffer.alloc(0)
         const stream: any = Object.assign(new EventEmitter(), {
           closed: false,
           destroyed: false,
           rstCode: 0,
-          write(frame: Uint8Array) {
+          write(chunk: Uint8Array, callback?: () => void) {
+            if (callback) setImmediate(callback)
+            written = Buffer.concat([written, chunk])
+            if (written.length < 5 || written.length < 5 + written.readUInt32BE(1)) return true
+            const frame = written.subarray(0, 5 + written.readUInt32BE(1))
+            written = written.subarray(frame.length)
             const message = decodeMessage<any>("AgentClientMessage", frame.subarray(5))
             if (message.run_request) {
               runs.push(message.run_request)
