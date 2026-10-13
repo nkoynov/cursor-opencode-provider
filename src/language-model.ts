@@ -53,9 +53,11 @@ import {
   resolveCustomWebToolAlias,
   remapNativeSubagentForCatalog,
   preferCorrelatedTaskDescription,
+  appendTaskAttachments,
   remapCorrelatedEditWriteForCatalog,
   remapEditToolsForCatalog,
   buildCompleteEditReadMessages,
+  buildTaskAttachmentReadMessages,
   buildTerminalFileReadMessages,
   rejectPartialReadMutation,
   binaryWritePayload,
@@ -84,6 +86,7 @@ import {
   extractProtobufSubmessage,
   listProtobufFieldNumbers,
   parseDisplayToolCall,
+  taskToolCallAttachments,
   resolveBridgedOpenCodeToolCall,
   isNativeDisplayToolCall,
   snapshotMirroredTodos,
@@ -4062,6 +4065,21 @@ export async function pump(
   }
 
   /**
+   * Cursor reads a Task's attachments before its subagent request. A host read
+   * would end the step and close the Task's early row as a failed subagent.
+   */
+  const answerTaskAttachmentRead = async (parsed: ParsedExecRequest): Promise<boolean> => {
+    const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
+    const requestedPath = opencodePathArg(parsed.args) ?? ""
+    const ok = await writeExecFrames(
+      buildTaskAttachmentReadMessages(parsed.id, path.resolve(workspaceRoot, requestedPath), requestedPath),
+      `task attachment read id=${parsed.id}`,
+    )
+    if (ok) trace(`exec: task attachment read answered id=${parsed.id} path=${JSON.stringify(requestedPath)}`)
+    return ok
+  }
+
+  /**
    * Cursor's streamed edit handshake needs the complete target before it sends
    * the replacement through write_args. OpenCode's ordinary read tool caps at
    * 50 KB, so forwarding this private prerequisite read teaches Cursor's editor
@@ -5099,6 +5117,7 @@ export async function pump(
         if (earlyRow) earlyRow.settle ??= "Cursor finished this call without asking OpenCode to run it."
       }
       if (callId) session.editToolCalls?.delete(callId)
+      const refusedAttachmentTask = !!callId && session.taskAttachmentCalls?.delete(callId) === true
       if (callId) session.resultsAfterCheckpoint?.awaiting.delete(callId)
       if (callId) noteCursorWaitEnded(session, callId)
       noteToolCallFinished(order, callId)
@@ -5121,11 +5140,13 @@ export async function pump(
           // overwrite the host's list with a plan that does not exist.
           const deferredPlan = display?.variant === "create_plan_tool_call"
             && session.deferredCreatePlanCalls?.delete(callId) === true
-          const bridged = display && !deferredPlan
+          const bridged = display && !deferredPlan && !refusedAttachmentTask
             ? resolveBridgedOpenCodeToolCall(display, advertised, session.hostToolDialect)
             : undefined
           if (deferredPlan) {
             trace(`display tool_call_completed: deferred create_plan not mirrored callId=${callId}`)
+          } else if (refusedAttachmentTask) {
+            trace(`display tool_call_completed: Task refused after its attachment reads, not bridged callId=${callId}`)
           } else if (!display) {
             const callIdLog = callId.replace(/\r?\n/g, "\\n")
             // AgentServerMessage.interaction_update(1).tool_call_completed(3).tool_call(2)
@@ -5314,8 +5335,13 @@ export async function pump(
           terminalsFolder: terminalsFolderFromRequestContext(session.requestContext),
           workspaceRoot: workspaceRootFromRequestContext(session.requestContext),
         })
-        // An edit's private prerequisite read is not the call's own request; its write is.
+        const taskAttachmentRead = !!displayCallId
+          && parsed?.resultField === "read_result"
+          && parsed.toolName === "read"
+          && parseDisplayToolCall(displayCallId, session.displayToolCalls.get(displayCallId))?.variant === "task_tool_call"
+        // An edit's private prerequisite read is not the call's own request; its write is. Nor is a Task's attachment read.
         const ownRequestCallId = displayCallId
+          && !taskAttachmentRead
           && !(parsed?.resultField === "read_result" && session.editToolCalls?.has(displayCallId))
           ? displayCallId
           : undefined
@@ -5357,6 +5383,12 @@ export async function pump(
               const description =
                 typeof display.args.description === "string" ? display.args.description : undefined
               preferCorrelatedTaskDescription(parsed, description)
+              appendTaskAttachments(
+                parsed,
+                taskToolCallAttachments(stored),
+                workspaceRootFromRequestContext(session.requestContext),
+              )
+              session.taskAttachmentCalls?.delete(displayCallId)
               if (description?.trim()) {
                 trace(
                   `exec: preferred TaskToolCall description callId=${displayCallId} ` +
@@ -5418,6 +5450,11 @@ export async function pump(
               trace(`exec: dropped ${toollessText.length} chars of tool-less narration before refused id=${parsed.id}`)
               toollessText = ""
             }
+            continue
+          }
+          if (taskAttachmentRead) {
+            if (!await answerTaskAttachmentRead(parsed)) return
+            ;(session.taskAttachmentCalls ??= new Set()).add(displayCallId!)
             continue
           }
           if (parsed.toolName === "read") noteBackgroundShellRead(parsed)

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { encodeMessage } from "../src/protocol/messages.js"
+import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { OPENCODE_1_TOOL_DIALECT, OPENCODE_2_TOOL_DIALECT, toolsToDescriptors } from "../src/protocol/tools.js"
 import {
   deliverContinuationResults,
@@ -260,6 +260,70 @@ describe("early tool rows", () => {
     await pumping
     expect(hostCalls(parts)).toMatchObject([{ toolCallId: rowStarts(parts)[0].id, toolName: "subagent" }])
     expect(JSON.parse(hostCalls(parts)[0].input)).toMatchObject({ agent: "general" })
+  })
+
+  it("keeps a subagent row through Cursor's attachment read and hands the subagent the paths", async () => {
+    const script = scriptedFrames()
+    const session = fakeSession(script.frames)
+    const written: Uint8Array[] = []
+    session.stream.write = ((message: Uint8Array) => { written.push(message); return true }) as any
+    fs.writeFileSync(path.join(rootOf(session), "shot.png"), "png bytes")
+    const args = { description: "Describe the shot", prompt: "Describe the attached image.", attachments: ["shot.png"] }
+    script.push(
+      partial("t", { task_tool_call: {} }),
+      started("t", { task_tool_call: { args } }),
+      frame({ exec_server_message: { id: 1, read_args: { path: "shot.png", tool_call_id: "t" } } }),
+      frame({
+        exec_server_message: {
+          id: 2,
+          subagent_args: { tool_call_id: "t", prompt: args.prompt, subagent_type: "generalPurpose" },
+        },
+      }),
+    )
+    const parts = await pumpOnce(session)
+
+    expect(closedRows(parts)).toEqual([])
+    const [call] = hostCalls(parts)
+    expect(call).toMatchObject({ toolCallId: rowStarts(parts)[0].id, toolName: "subagent" })
+    expect(JSON.parse(call.input)).toEqual({
+      agent: "general",
+      description: "Describe the shot",
+      prompt: `Describe the attached image.\n\nAttached files (open them with your file tools):\n- ${path.join(rootOf(session), "shot.png")}`,
+    })
+    expect([...session.pending.keys()]).toEqual([2])
+    const read = written
+      .map((message) => decodeMessage("AgentClientMessage", message) as any)
+      .find((message) => message.exec_client_message?.id === 1)
+    const success = read.exec_client_message.read_result.success
+    expect(success.path).toBe("shot.png")
+    expect(success.data.length).toBeGreaterThan(0)
+    expect(Buffer.from(success.data).toString()).not.toContain("png bytes")
+  })
+
+  it("does not run a Task Cursor refuses after its attachment reads", async () => {
+    const script = scriptedFrames()
+    const session = fakeSession(script.frames, ["read", "task"])
+    const written: Uint8Array[] = []
+    session.stream.write = ((message: Uint8Array) => { written.push(message); return true }) as any
+    const args = {
+      description: "Describe the shot",
+      prompt: "Describe the attached image.",
+      subagent_type: { explore: {} },
+      attachments: ["gone.png"],
+    }
+    script.push(
+      started("t", { task_tool_call: { args } }),
+      frame({ exec_server_message: { id: 1, read_args: { path: "gone.png", tool_call_id: "t" } } }),
+      completed("t", { task_tool_call: { args } }),
+      turnEnded(),
+    )
+    const parts = await pumpOnce(session)
+    expect(hostCalls(parts)).toEqual([])
+    expect(session.taskAttachmentCalls?.size ?? 0).toBe(0)
+    const read = written
+      .map((message) => decodeMessage("AgentClientMessage", message) as any)
+      .find((message) => message.exec_client_message?.id === 1)
+    expect(read.exec_client_message.read_result).toEqual({ file_not_found: { path: "gone.png" } })
   })
 
   it("closes the row with Cursor's refusal when the call cannot run", async () => {
