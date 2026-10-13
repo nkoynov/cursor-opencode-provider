@@ -171,6 +171,7 @@ export function createMessageTypes(): protobuf.Root {
     { id: 4, name: "model", type: "string" },
     { id: 5, name: "resume", type: "string" },
     { id: 6, name: "agent_id", type: "string" },
+    { id: 7, name: "attachments", type: "string", repeated: true },
   ])
   addType(root, "TaskToolCall", [{ id: 1, name: "args", type: "TaskToolArgs" }])
 
