@@ -18,9 +18,13 @@ import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { sessionManager } from "../src/session.js"
 import { resetTurnStateForTests, restorePersistedHostNotes } from "../src/language-model.js"
 import { encodePersistedHostNotes } from "../src/protocol/host-notes.js"
-import { resetConversationBindingsForTests } from "../src/protocol/conversation-bind.js"
-import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
+import { resetConversationBindingsForTests, sessionIdToUuid } from "../src/protocol/conversation-bind.js"
+import { getCheckpoint, resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
+import { resetConversationBlobsForTests } from "../src/protocol/blob-store.js"
+import { resetFrozenRequestContextsForTests } from "../src/context/frozen.js"
+import { resetTurnProvenanceForTests } from "../src/protocol/turn-provenance.js"
+import { notifyHostInterrupt } from "../src/host-interrupt.js"
 
 type Prompt = LanguageModelV3CallOptions["prompt"]
 type ClientMessage = Record<string, any>
@@ -188,6 +192,158 @@ describe("seeded Runs through a full provider Run", () => {
       expect(rules[0]!.content).toStartWith("Host system prompt: build with bazel.")
     } finally { fs.rmSync(root, { recursive: true, force: true }) }
   }, 30_000)
+})
+
+describe("history images through a full provider Run", () => {
+  const IMAGE_A = "AQID"
+  const IMAGE_B = "BAUG"
+  const checkpoint = (n: number) => Uint8Array.from([0x98, 0x06, n])
+  const model = (root: string) => createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root })
+    .languageModel("claude-sonnet-5-5")
+  const user = (text: string, image?: string): Prompt[number] => ({
+    role: "user",
+    content: [{ type: "text", text }, ...(image ? [{ type: "file" as const, mediaType: "image/png", data: image }] : [])],
+  })
+  const assistant = (text: string): Prompt[number] => ({ role: "assistant", content: [{ type: "text", text }] })
+  const request = (index: number) => runs[index]!.received.find((message) => message.run_request)!.run_request
+  const sentImages = (index: number) =>
+    ((request(index).action.user_message_action.user_message.selected_context?.selected_images ?? []) as Array<{ data: Uint8Array }>)
+      .map((image) => Buffer.from(image.data).toString("base64"))
+  const sentCheckpoint = (index: number) => {
+    const state = request(index).conversation_state as Uint8Array | undefined
+    return state?.length ? Uint8Array.from(state) : undefined
+  }
+
+  function endTurnOn(run: FakeRun, bytes: Uint8Array | undefined): void {
+    run.send({ interaction_update: { text_delta: { text: "Done." } } })
+    if (bytes) run.send({ conversation_checkpoint_update: bytes })
+    run.send({ interaction_update: { turn_ended: { input_tokens: 10, output_tokens: 2 } } })
+  }
+
+  function restartProcess(): void {
+    sessionManager.dispose()
+    resetTurnStateForTests()
+    resetTurnProvenanceForTests()
+    resetConversationPersistenceForTests()
+    resetConversationBindingsForTests()
+    resetCheckpointsForTests()
+    resetConversationBlobsForTests()
+    resetFrozenRequestContextsForTests()
+  }
+
+  // Each registration adds listeners to the shared client.
+  beforeAll(() => cacheHttp2SessionForTests(ORIGIN, client))
+
+  async function withRoot(run: (root: string) => Promise<void>): Promise<void> {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-history-images-"))
+    try { await run(root) } finally { fs.rmSync(root, { recursive: true, force: true }) }
+  }
+
+  it("attaches an explicit image once, and not again after a restart", () => withRoot(async (root) => {
+    const sessionKey = "ses_images_restart"
+    onRun = (run, message) => { if (message.run_request) endTurnOn(run, checkpoint(runs.indexOf(run) + 1)) }
+    const turn1: Prompt = [user("Here is the screenshot.", IMAGE_A)]
+    await collect(model(root), turn1, sessionKey)
+    const turn2: Prompt = [...turn1, assistant("Done."), user("Second question.")]
+    await collect(model(root), turn2, sessionKey)
+    restartProcess()
+    await collect(model(root), [...turn2, assistant("Done."), user("Third question.")], sessionKey)
+
+    expect(sentImages(0)).toEqual([IMAGE_A])
+    expect(sentImages(1)).toEqual([])
+    expect(sentCheckpoint(2)).toEqual(checkpoint(2))
+    expect(sentImages(2)).toEqual([])
+  }), 30_000)
+
+  it("sends again an image whose turn ended without a checkpoint of its own, after a restart too", () => withRoot(async (root) => {
+    const sessionKey = "ses_images_no_checkpoint"
+    onRun = (run, message) => {
+      if (message.run_request) endTurnOn(run, runs.indexOf(run) === 1 ? undefined : checkpoint(runs.indexOf(run) + 1))
+    }
+    const turn1: Prompt = [user("First screenshot.", IMAGE_A)]
+    await collect(model(root), turn1, sessionKey)
+    const turn2: Prompt = [...turn1, assistant("Done."), user("Second screenshot.", IMAGE_B)]
+    await collect(model(root), turn2, sessionKey)
+    restartProcess()
+    await collect(model(root), [...turn2, assistant("Done."), user("Which one is newer?")], sessionKey)
+
+    expect(sentImages(1)).toEqual([IMAGE_B])
+    expect(sentCheckpoint(2)).toEqual(checkpoint(1))
+    expect(sentImages(2)).toEqual([IMAGE_B])
+  }), 30_000)
+
+  it("sends again the image of a turn the user stopped, even when Cursor ends it on a checkpoint", () => withRoot(async (root) => {
+    const sessionKey = "ses_images_stopped"
+    onRun = (run, message) => {
+      const index = runs.indexOf(run)
+      if (message.run_request && index === 1) {
+        run.send({ interaction_update: { text_delta: { text: "Looking" } } })
+        run.send({ conversation_checkpoint_update: checkpoint(20) })
+      } else if (message.conversation_action?.cancel_action) {
+        endTurnOn(run, checkpoint(21))
+      } else if (message.run_request) {
+        endTurnOn(run, checkpoint(index + 1))
+      }
+    }
+    const turn1: Prompt = [user("First screenshot.", IMAGE_A)]
+    await collect(model(root), turn1, sessionKey)
+    const turn2: Prompt = [...turn1, assistant("Done."), user("Second screenshot.", IMAGE_B)]
+    const stopped = collect(model(root), turn2, sessionKey).then(() => undefined, (error: unknown) => error)
+    const conversationId = sessionIdToUuid(sessionKey)
+    for (let i = 0; i < 200 && getCheckpoint(conversationId)?.[2] !== 20; i++) await Bun.sleep(10)
+    notifyHostInterrupt(sessionKey, "user", Date.now())
+    await stopped
+    for (let i = 0; i < 200 && getCheckpoint(conversationId)?.[2] !== 21; i++) await Bun.sleep(10)
+    await collect(model(root), [...turn2, assistant("Looking"), user("Try again.")], sessionKey)
+
+    expect(sentImages(1)).toEqual([IMAGE_B])
+    expect(sentCheckpoint(2)).toEqual(checkpoint(21))
+    expect(sentImages(2)).toEqual([IMAGE_B])
+  }), 30_000)
+
+  it("sends again the image of a turn whose Run failed after a checkpoint", () => withRoot(async (root) => {
+    const sessionKey = "ses_images_failed"
+    onRun = (run, message) => {
+      const index = runs.indexOf(run)
+      if (message.run_request && index === 1) {
+        run.send({ conversation_checkpoint_update: checkpoint(30) })
+        run.end()
+      } else if (message.run_request) {
+        endTurnOn(run, checkpoint(index + 1))
+      }
+    }
+    const turn1: Prompt = [user("First screenshot.", IMAGE_A)]
+    await collect(model(root), turn1, sessionKey)
+    const turn2: Prompt = [...turn1, assistant("Done."), user("Second screenshot.", IMAGE_B)]
+    await collect(model(root), turn2, sessionKey)
+    await collect(model(root), [...turn2, assistant("Done."), user("Which one is newer?")], sessionKey)
+
+    expect(sentImages(1)).toEqual([IMAGE_B])
+    // Run recovery resumes the turn on the checkpoint the failed Run received.
+    expect(sentCheckpoint(2)).toEqual(checkpoint(30))
+    expect(sentCheckpoint(3)).toEqual(checkpoint(3))
+    expect(sentImages(3)).toEqual([IMAGE_B])
+  }), 30_000)
+
+  it("sends every image again after a compaction", () => withRoot(async (root) => {
+    const sessionKey = "ses_images_compaction"
+    onRun = (run, message) => { if (message.run_request) endTurnOn(run, checkpoint(runs.indexOf(run) + 1)) }
+    const turn1: Prompt = [user("Here is the screenshot.", IMAGE_A)]
+    await collect(model(root), turn1, sessionKey)
+    const { stream } = await model(root).doStream({
+      prompt: [...turn1, assistant("Done."), user("Summarize the conversation.")],
+      tools: [],
+      providerOptions: { cursor: { [CURSOR_COMPACTION_OPTION]: true } },
+      headers: { "x-opencode-session-id": sessionKey },
+    } as LanguageModelV3CallOptions)
+    for (const reader = stream.getReader(); !(await reader.read()).done;);
+    await collect(model(root), [...turn1, assistant("Done."), user("Summary: a screenshot."), user("Next question.")], sessionKey)
+
+    expect(sentCheckpoint(1)).toBeUndefined()
+    expect(sentImages(1)).toEqual([IMAGE_A])
+    expect(sentCheckpoint(2)).toBeUndefined()
+    expect(sentImages(2)).toEqual([IMAGE_A])
+  }), 30_000)
 })
 
 describe("compaction Runs through a full provider Run", () => {

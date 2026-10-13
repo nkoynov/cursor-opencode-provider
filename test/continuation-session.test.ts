@@ -3,13 +3,14 @@ import fs from "node:fs"
 import path from "node:path"
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import { sessionManager, type CursorSession } from "../src/session.js"
-import { findContinuationSession, deliverContinuationResults, extractTrailingToolResults, hasApprovedUncorrelatedPlanStageResult, rememberMirroredTodos, refreshHeldSessionToolCatalog, resetTurnStateForTests, snapshotMirroredTodosBySession, snapshotSentHistoryImageHashesForTests, decodeTrailingToolImages } from "../src/language-model.js"
+import { findContinuationSession, deliverContinuationResults, extractTrailingToolResults, hasApprovedUncorrelatedPlanStageResult, rememberMirroredTodos, refreshHeldSessionToolCatalog, resetTurnStateForTests, snapshotMirroredTodosBySession, decodeTrailingToolImages } from "../src/language-model.js"
 import { getOrBuildRequestContext } from "../src/context/frozen.js"
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
 import { CREATE_PLAN_RESULT_FIELD } from "../src/protocol/create-plan.js"
 import { decodeMessage } from "../src/protocol/messages.js"
 import { buildMcpStateResult } from "../src/protocol/tools.js"
 import { getActiveCursorMode, setActiveCursorMode } from "../src/protocol/switch-mode.js"
+import { runHistoryImages } from "../src/protocol/sent-history-images.js"
 import {
   captureCursorShellResult,
   registerCursorShellCall,
@@ -478,6 +479,7 @@ describe("deliverContinuationResults", () => {
     const writes: Uint8Array[] = []
     const live = fakeSession("image-read")
     live.openCodeSessionId = "host-image-read"
+    live.historyImages = runHistoryImages()
     live.stream.write = (frame: Uint8Array) => { writes.push(frame) }
     sessionManager.registerPending(12, live, "read_result", "read", false, { path: "/work/badge.png" })
     const data = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
@@ -495,7 +497,7 @@ describe("deliverContinuationResults", () => {
     const result = decodeMessage<any>("AgentClientMessage", writes[0]).exec_client_message
     expect(Uint8Array.from(result.read_result.success.data)).toEqual(data)
     expect(result.read_result.success.content).toBeUndefined()
-    expect(snapshotSentHistoryImageHashesForTests("host-image-read")).toEqual(["hash"])
+    expect(live.historyImages.sent).toEqual(["hash"])
   })
 
   it("injects a host update after an image read and leaves the bytes unchanged", async () => {
@@ -530,6 +532,7 @@ describe("deliverContinuationResults", () => {
   it("does not record history-image hashes when the image write never lands", async () => {
     const live = fakeSession("image-read-fail")
     live.openCodeSessionId = "host-image-read-fail"
+    live.historyImages = runHistoryImages()
     live.stream.write = () => {
       throw new Error("stream closed")
     }
@@ -545,7 +548,7 @@ describe("deliverContinuationResults", () => {
       images: [{ data, filename: "badge.png", mimeType: "image/png" }],
       imageHashes: ["hash-fail"],
     }])).toBeUndefined()
-    expect(snapshotSentHistoryImageHashesForTests("host-image-read-fail")).toEqual([])
+    expect(live.historyImages.sent).toEqual([])
   })
 
   it("delivers MCP tool images on the held Run instead of waiting for the next user turn", async () => {

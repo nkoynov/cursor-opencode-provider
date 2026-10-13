@@ -15,6 +15,7 @@ import type { ContextEpoch } from "./context/epoch.js"
 import type { ToolCallOrder } from "./tool-call-order.js"
 import type { EarlyToolRowState } from "./early-tool-rows.js"
 import type { HostNoteBatch } from "./protocol/host-notes.js"
+import type { RunHistoryImages } from "./protocol/sent-history-images.js"
 import type { OpenCodeModelCost } from "./pricing.js"
 import type { RunCostEstimate } from "./billing.js"
 
@@ -219,6 +220,8 @@ export type CursorSession = {
    * again replays nothing the host acted on (Cursor CLI resumes the same way).
    */
   carriedCheckpoint?: Uint8Array
+  /** History images this Run's checkpoints hold or may hold; absent for a Run outside an OpenCode session. */
+  historyImages?: RunHistoryImages
   /** Cursor-side waits (AwaitShell) in flight: call id → how long the Run may stay silent. */
   cursorWaits?: Map<string, number>
   /** Tool calls Cursor announced (`partial_tool_call`) whose input its model is still writing: call id → when. */
