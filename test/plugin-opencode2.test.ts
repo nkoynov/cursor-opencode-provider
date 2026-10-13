@@ -5,6 +5,7 @@ import { join, resolve } from "node:path"
 import plugin from "../src/plugin-opencode2.js"
 import { CursorPlugin } from "../src/plugin.js"
 import { sessionActivity } from "../src/activity.js"
+import { onHostInterrupt } from "../src/host-interrupt.js"
 import { applyCursorProviderInventory, CURSOR_AISDK_PACKAGE, modelConfigEntryToInfo } from "../src/opencode2/catalog.js"
 import {
   accessTokenFromCredential,
@@ -1216,6 +1217,34 @@ describe("opencode2 setup", () => {
       expect(sessionActivity.lastActivityAt("parent")).toBe(start + 3_600_000)
     } finally {
       setSystemTime()
+      await cleanup()
+      sessionActivity.clear()
+    }
+  })
+
+  test("reports a stopped execution to the model, and a shutdown again from cleanup", async () => {
+    const heard: Array<[string | undefined, string, number | "now"]> = []
+    const before = Date.now()
+    const stop = onHostInterrupt((sessionID, reason, at) => {
+      heard.push([sessionID, reason, sessionID ? at : at >= before ? "now" : at])
+    })
+    const { ctx } = fakeContext([
+      { type: "session.execution.succeeded", data: { sessionID: "ses_done" } },
+      { type: "session.execution.failed", data: { sessionID: "ses_failed", error: { type: "unknown", message: "x" } } },
+      { type: "session.execution.interrupted", created: 1_790_000_000_000, data: { sessionID: "ses_restart", reason: "shutdown" } },
+      { type: "session.execution.interrupted", created: 1_790_000_000_001, data: { sessionID: "ses_stop", reason: "user" } },
+    ])
+    const cleanup = await setupPlugin(ctx)
+    try {
+      for (let i = 0; i < 100 && heard.length < 2; i++) await new Promise((resolve) => setTimeout(resolve, 5))
+      expect(heard).toEqual([
+        ["ses_restart", "shutdown", 1_790_000_000_000],
+        ["ses_stop", "user", 1_790_000_000_001],
+      ])
+      await cleanup()
+      expect(heard[heard.length - 1]).toEqual([undefined, "shutdown", "now"])
+    } finally {
+      stop()
       await cleanup()
       sessionActivity.clear()
     }

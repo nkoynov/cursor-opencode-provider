@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- On OpenCode 2, Stop stops the Cursor Run instead of leaving it generating, or waiting for a tool result, until your next message ([#58](https://github.com/oakimov/cursor-opencode-provider/pull/58) by [@nkoynov](https://github.com/nkoynov))
+- A Run whose stream is cancelled mid-generation, as OpenCode 1.x does on Stop, is cancelled at Cursor so the next message resumes from where it stopped, and a tool result Cursor has withdrawn is no longer sent back ([#58](https://github.com/oakimov/cursor-opencode-provider/pull/58) by [@nkoynov](https://github.com/nkoynov))
+- A turn stopped mid-step keeps its Cursor conversation and prompt cache at the next message, also after a restart ([#58](https://github.com/oakimov/cursor-opencode-provider/pull/58) by [@nkoynov](https://github.com/nkoynov), [#74](https://github.com/oakimov/cursor-opencode-provider/issues/74))
+
 ## [0.8.2] - 2026-10-15
 
 ### Added

@@ -80,7 +80,11 @@ export async function hydrateTurnProvenance(cacheDir: string, sessionKey: string
   if (provenance?.conversationId === persisted.conversationId) restoreTurnProvenance(sessionKey, provenance)
 }
 
-/** Persist the complete resumable state only after Cursor confirms TurnEnded. */
+/**
+ * Persist the resumable state at Cursor's TurnEnded, or before it
+ * (`runInProgress`) so a Run the host interrupts, or a restart, resumes from
+ * the latest checkpoint and still recognizes the step in progress.
+ */
 export async function persistConversationState(
   cacheDir: string,
   input: {
@@ -92,6 +96,7 @@ export async function persistConversationState(
     hostAgent?: string
     systemPromptHash?: string
     hostNote?: string
+    runInProgress?: boolean
   },
 ): Promise<void> {
   // A newer Run may have reset/superseded this conversation while its final
@@ -104,7 +109,9 @@ export async function persistConversationState(
     return
   }
   const checkpoint = getCheckpoint(input.conversationId)
-  const blobCompaction = compactConversationBlobs(input.conversationId, checkpoint)
+  const blobCompaction = compactConversationBlobs(input.conversationId, checkpoint, {
+    keepInMemory: input.runInProgress,
+  })
   const blobs = blobCompaction.blobs
   const requestContext = getFrozenRequestContext(input.conversationId) ?? input.requestContext
   const provenance = getTurnProvenance(input.sessionKey)
@@ -124,7 +131,7 @@ export async function persistConversationState(
       : {}),
   })
   trace(
-    `conversation persistence: saved sessionKey=${input.sessionKey} ` +
+    `conversation persistence: saved${input.runInProgress ? " in-progress" : ""} sessionKey=${input.sessionKey} ` +
       `conversationId=${input.conversationId} checkpoint=${checkpoint?.length ?? 0}B ` +
       `blobs=${blobCompaction.beforeCount}->${blobCompaction.afterCount} ` +
       `blobBytes=${blobCompaction.beforeBytes}->${blobCompaction.afterBytes}` +

@@ -162,3 +162,10 @@ export function buildHeartbeat(): Uint8Array {
     client_heartbeat: {},
   })
 }
+
+/** Stops the live Run, as Cursor CLI does on a user Stop before it closes the stream. */
+export function buildCancelAction(reason: string): Uint8Array {
+  return encodeMessage("AgentClientMessage", {
+    conversation_action: { cancel_action: { reason } },
+  })
+}

@@ -6,11 +6,14 @@ import { APICallError, type LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import {
   beginEmittedStep,
   detectForeignHistory,
+  finishEmittedStep,
   getTurnProvenance,
   MAX_PROVENANCE_SESSIONS,
   parseTurnProvenance,
   recordEmittedPart,
   resetTurnProvenanceForTests,
+  restoreTurnProvenance,
+  resumeEmittedStep,
   serializeTurnProvenance,
   trackTurnProvenance,
 } from "../src/protocol/turn-provenance.js"
@@ -142,8 +145,10 @@ describe("detectForeignHistory", () => {
     trackTurnProvenance(SESSION, CONVERSATION)
     beginEmittedStep(SESSION, CONVERSATION)
     recordEmittedPart(SESSION, CONVERSATION, { type: "text-delta", delta: "Earlier answer" })
+    finishEmittedStep(SESSION, CONVERSATION)
     beginEmittedStep(SESSION, CONVERSATION)
     recordEmittedPart(SESSION, CONVERSATION, { type: "reasoning-delta", delta: "Only thinking" })
+    finishEmittedStep(SESSION, CONVERSATION)
     expect(getTurnProvenance(SESSION)).toMatchObject({ text: "", textWithReasoning: "Onlythinking" })
     expect(detect(promptEndingWith(assistantText("Only thinking")))).toBeUndefined()
     expect(detect(promptEndingWith(assistantText("Earlier answer")))).toBe("foreign-assistant")
@@ -153,8 +158,10 @@ describe("detectForeignHistory", () => {
     trackTurnProvenance(SESSION, CONVERSATION)
     beginEmittedStep(SESSION, CONVERSATION)
     recordEmittedPart(SESSION, CONVERSATION, { type: "text-delta", delta: "Done." })
+    finishEmittedStep(SESSION, CONVERSATION)
     beginEmittedStep(SESSION, CONVERSATION)
     recordEmittedPart(SESSION, CONVERSATION, { type: "text-delta", delta: "Refactored the parser." })
+    finishEmittedStep(SESSION, CONVERSATION)
     // A foreign model answering "Done." must not match the older Cursor step.
     expect(detect(promptEndingWith(assistantText("Done.")))).toBe("foreign-assistant")
     expect(detect(promptEndingWith(assistantText("Refactored the parser.")))).toBeUndefined()
@@ -220,6 +227,68 @@ describe("detectForeignHistory", () => {
     expect(parseTurnProvenance(serializeTurnProvenance(value))).toEqual(value)
     expect(parseTurnProvenance("{not json")).toBeUndefined()
     expect(parseTurnProvenance("{}")).toBeUndefined()
+  })
+
+  it("matches a stopped step by what the host read of it, or the step before when the host dropped it", () => {
+    trackTurnProvenance(SESSION, CONVERSATION)
+    beginEmittedStep(SESSION, CONVERSATION)
+    recordEmittedPart(SESSION, CONVERSATION, { type: "tool-call", toolCallId: "call_ours" })
+    finishEmittedStep(SESSION, CONVERSATION)
+    beginEmittedStep(SESSION, CONVERSATION)
+    recordEmittedPart(SESSION, CONVERSATION, { type: "reasoning-delta", delta: "Checking the output" })
+    recordEmittedPart(SESSION, CONVERSATION, { type: "text-delta", delta: "The build passed and" })
+
+    expect(detect(promptEndingWith(assistantText("The build passed and")))).toBeUndefined()
+    expect(detect(promptEndingWith(assistantText("The build passed")))).toBeUndefined()
+    // OpenCode 2 replays an errored message's reasoning as text.
+    expect(detect(promptEndingWith(assistantText("Checking the output The build")))).toBeUndefined()
+    expect(detect(promptEndingWith(assistantToolCall("call_ours")))).toBeUndefined()
+    expect(detect(promptEndingWith(assistantText("Something else")))).toBe("foreign-assistant")
+    expect(detect(promptEndingWith(assistantToolCall("call_theirs")))).toBe("foreign-assistant")
+    expect(detect(promptEndingWith(assistantToolCall("call_theirs", "The build passed")))).toBe("foreign-assistant")
+
+    // Once the step finishes, only the whole step matches again.
+    finishEmittedStep(SESSION, CONVERSATION)
+    expect(detect(promptEndingWith(assistantText("The build passed")))).toBe("foreign-assistant")
+    expect(detect(promptEndingWith(assistantToolCall("call_ours")))).toBe("foreign-assistant")
+  })
+
+  it("treats a step continued after its turn ended as unfinished until it finishes again", () => {
+    trackTurnProvenance(SESSION, CONVERSATION)
+    beginEmittedStep(SESSION, CONVERSATION)
+    recordEmittedPart(SESSION, CONVERSATION, { type: "text-delta", delta: "Checking the workspace" })
+    finishEmittedStep(SESSION, CONVERSATION)
+    resumeEmittedStep(SESSION, CONVERSATION)
+    recordEmittedPart(SESSION, CONVERSATION, { type: "text-delta", delta: " Found the bug in parser.ts" })
+
+    expect(detect(promptEndingWith(assistantText("Checking the workspace Found the bug")))).toBeUndefined()
+    finishEmittedStep(SESSION, CONVERSATION)
+    expect(detect(promptEndingWith(assistantText("Checking the workspace Found the bug")))).toBe("foreign-assistant")
+  })
+
+  it("keeps a stopped step and the step before it through its persisted JSON form", () => {
+    trackTurnProvenance(SESSION, CONVERSATION)
+    beginEmittedStep(SESSION, CONVERSATION)
+    recordEmittedPart(SESSION, CONVERSATION, { type: "tool-call", toolCallId: "call_ours" })
+    finishEmittedStep(SESSION, CONVERSATION)
+    expect(serializeTurnProvenance(getTurnProvenance(SESSION)!)).not.toContain("unfinished")
+    beginEmittedStep(SESSION, CONVERSATION)
+    recordEmittedPart(SESSION, CONVERSATION, { type: "text-delta", delta: "Partial" })
+    const value = getTurnProvenance(SESSION)!
+    expect(value).toEqual({
+      conversationId: CONVERSATION,
+      toolCallIds: [],
+      text: "Partial",
+      textWithReasoning: "Partial",
+      unfinished: true,
+      previous: { toolCallIds: ["call_ours"], text: "", textWithReasoning: "" },
+    })
+    expect(parseTurnProvenance(serializeTurnProvenance(value))).toEqual(value)
+
+    resetTurnProvenanceForTests()
+    restoreTurnProvenance(SESSION, parseTurnProvenance(serializeTurnProvenance(value))!)
+    expect(detect(promptEndingWith(assistantToolCall("call_ours")))).toBeUndefined()
+    expect(detect(promptEndingWith(assistantText("Part")))).toBeUndefined()
   })
 })
 

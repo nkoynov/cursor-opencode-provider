@@ -88,7 +88,7 @@ const fileOperations = new Map<string, Promise<void>>()
 /** `.${snapshot}.${pid}.${uuid}.tmp`, as written by writeConversationFile. */
 const WRITER_TEMP_FILE = /^\..+\.pb\.gz\.\d+\.[^.]+\.tmp$/
 type PersistenceTestPhase =
-  | "maintenance-start" | "before-quarantine" | "after-quarantine" | "full-decode" | "directory-opened"
+  | "maintenance-start" | "before-quarantine" | "after-quarantine" | "full-decode" | "directory-opened" | "before-write"
 let testHook: ((phase: PersistenceTestPhase, filePath: string) => Promise<void> | void) | undefined
 
 function errorCode(error: unknown): unknown {
@@ -991,6 +991,7 @@ export async function persistConversation(
   startupDiscardedStatuses.get(path.resolve(cacheDir))?.delete(path.basename(
     conversationCacheFilePath(cacheDir, value.sessionKey),
   ))
+  await testHook?.("before-write", conversationCacheFilePath(cacheDir, value.sessionKey))
   await queueWrite(store, snapshot)
   scheduleMaintenance(path.resolve(cacheDir), now)
 }

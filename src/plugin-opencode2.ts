@@ -8,6 +8,7 @@ import { opencode2PlanDir, opencodeGlobalCacheDir, setNativePlansDir } from "./c
 import { discoverModels, isCacheFresh, readCache, type ModelInfo } from "./models.js"
 import { resolveAgentUrl } from "./agent-url.js"
 import { applyHostPromptEvent, sessionActivity } from "./activity.js"
+import { notifyHostInterrupt } from "./host-interrupt.js"
 import {
   fetchOpenCodeWebSearchText,
   parseExaWebSearchResults,
@@ -631,6 +632,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
       unsubscribe?.()
       releasePermissionCalls()
       refusals.clear()
+      await saveOpenTurnsForShutdown()
       disposeHostAgentModeSwitch?.()
       disposeNativePlansDir()
       trace(`opencode2 plugin: cleanup directory=${workspaceRoot}`)
@@ -639,6 +641,22 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
       }
     }
   },
+}
+
+const SHUTDOWN_SAVE_TIMEOUT_MS = 2_000
+
+/** Save every open turn for the next server start, without holding shutdown up for long. */
+async function saveOpenTurnsForShutdown(): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timedOut = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, SHUTDOWN_SAVE_TIMEOUT_MS)
+    timer.unref?.()
+  })
+  try {
+    await Promise.race([notifyHostInterrupt(undefined, "shutdown"), timedOut])
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 function subscribeSessionActivity(
@@ -729,6 +747,13 @@ function applySessionActivity(event: any, onCredentialSwitch?: () => void): void
       if (type.startsWith("session.") && type !== "session.deleted") {
         const id = payload?.sessionID ?? info?.sessionID ?? info?.id
         if (id) sessionActivity.recordActivity(id)
+        if (id && type === "session.execution.interrupted") {
+          void notifyHostInterrupt(
+            id,
+            typeof payload?.reason === "string" ? payload.reason : "user",
+            typeof event.created === "number" ? event.created : Date.now(),
+          )
+        }
       }
       break
     }
