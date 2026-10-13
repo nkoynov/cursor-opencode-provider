@@ -152,6 +152,8 @@ const toolStarted = (callId = "toolu_w") => frame({
   },
 })
 const thinking = (delta: string) => frame({ interaction_update: { thinking_delta: { text: delta } } })
+// `InteractionUpdate.token_delta` #8 { count #1 = 5 }, a member the provider does not decode.
+const tokenDelta = (): Frame => ({ flags: 0, payload: Uint8Array.from([0x0a, 0x04, 0x42, 0x02, 0x08, 0x05]) })
 
 describe("a tool input Cursor holds until the model has written it", () => {
   it("keeps the Run through heartbeats past the idle window", async () => {
@@ -166,7 +168,6 @@ describe("a tool input Cursor holds until the model has written it", () => {
     const parts: any[] = []
     await pump(session, controller(parts), ids)
     expect(parts.filter((part) => part.type === "finish")).toHaveLength(1)
-    expect(session.composingToolCalls?.size ?? 0).toBe(0)
   })
 
   it("keeps holding for a parallel call announced before the previous call's exec", async () => {
@@ -181,7 +182,6 @@ describe("a tool input Cursor holds until the model has written it", () => {
       { frame: turnEnded() },
     ])
     await pump(session, controller(), ids)
-    expect(session.composingToolCalls?.size ?? 0).toBe(0)
   })
 
   it("keeps holding across thinking Cursor delivers before the call starts", async () => {
@@ -205,26 +205,73 @@ describe("a tool input Cursor holds until the model has written it", () => {
     await expect(pump(session, controller(), ids)).rejects.toMatchObject({ code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
   })
 
-  it("returns to the idle window once the call has started", async () => {
-    const session = fakeSession("input-arrived", [
-      { frame: partialToolCall() },
+  it("keeps a Run that sends only heartbeats after its text until the call arrives", async () => {
+    const session = fakeSession("input-unannounced", [
+      { frame: text("I'll write the file.") },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: partialToolCall(), afterMs: 40 },
       { frame: toolStarted() },
-      { frame: heartbeat(), afterMs: 40 },
-      { frame: heartbeat(), afterMs: 40 },
-      { frame: turnEnded(), afterMs: 40 },
+      { frame: turnEnded() },
     ])
-    await expect(pump(session, controller(), ids)).rejects.toMatchObject({ code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
+    const parts: any[] = []
+    await pump(session, controller(parts), ids)
+    expect(parts.filter((part) => part.type === "finish")).toHaveLength(1)
   })
 
-  it("returns to the idle window when the step ends without the call", async () => {
-    const session = fakeSession("input-step-done", [
-      { frame: partialToolCall() },
+  it("keeps a Run that streams only token counts while the input is written", async () => {
+    const session = fakeSession("input-token-counts", [
+      { frame: thinking("patch it") },
+      { frame: tokenDelta(), afterMs: 40 },
+      { frame: tokenDelta(), afterMs: 40 },
+      { frame: tokenDelta(), afterMs: 40 },
+      { frame: partialToolCall(), afterMs: 40 },
+      { frame: toolStarted() },
+      { frame: turnEnded() },
+    ])
+    const parts: any[] = []
+    await pump(session, controller(parts), ids)
+    expect(parts.filter((part) => part.type === "finish")).toHaveLength(1)
+  })
+
+  it("keeps the Run through heartbeats after a step ends, while the next call is written", async () => {
+    const session = fakeSession("input-next-step", [
       { frame: frame({ interaction_update: { step_completed: { step_id: 1, step_duration_ms: 10 } } }) },
       { frame: heartbeat(), afterMs: 40 },
       { frame: heartbeat(), afterMs: 40 },
-      { frame: turnEnded(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: toolStarted(), afterMs: 40 },
+      { frame: turnEnded() },
     ])
-    await expect(pump(session, controller(), ids)).rejects.toMatchObject({ code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
+    await pump(session, controller(), ids)
+  })
+
+  it("still times out a silent stream after the model's text", async () => {
+    const session = fakeSession("text-then-silent", [
+      { frame: text("I'll write the file.") },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: toolStarted(), afterMs: IDLE_MS + 80 },
+    ])
+    await expect(pump(session, controller(), ids)).rejects.toMatchObject({
+      code: "CURSOR_SEMANTIC_IDLE_TIMEOUT",
+      replaySafe: false,
+    })
+  })
+
+  it("holds a Run with no output on heartbeats and keeps its silent stall retry-safe", async () => {
+    const session = fakeSession("heartbeats-then-silent", [
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: toolStarted(), afterMs: IDLE_MS + 80 },
+    ])
+    const started = Date.now()
+    await expect(pump(session, controller(), ids)).rejects.toMatchObject({
+      code: "CURSOR_SEMANTIC_IDLE_TIMEOUT",
+      replaySafe: true,
+    })
+    expect(Date.now() - started).toBeGreaterThanOrEqual(120 + IDLE_MS - 5)
   })
 
   it("starts the idle window afresh when the step ends a long hold without the call", async () => {
@@ -240,15 +287,26 @@ describe("a tool input Cursor holds until the model has written it", () => {
     expect(parts.filter((part) => part.type === "finish")).toHaveLength(1)
   })
 
-  it("gives the input at most MAX_TOOL_INPUT_MS from the announcement", () => {
+  it("gives heartbeats alone at most MAX_TOOL_INPUT_MS after the last other frame", () => {
     const now = Date.now()
+    const lastOther = now - MAX_TOOL_INPUT_MS + 10
     const session = fakeSession("input-cap", [], {
-      semanticDeadlineAt: now - 1,
-      composingToolCalls: new Map([["toolu_w", now - MAX_TOOL_INPUT_MS + 10]]),
+      semanticDeadlineAt: lastOther + IDLE_MS,
+      lastNonHeartbeatAt: lastOther,
       lastFrameAt: now,
     })
     expect(semanticDeadlineAt(session)).toBe(now + 10)
-    session.composingToolCalls!.set("toolu_w", now - 1_000)
+    session.lastNonHeartbeatAt = now - 1_000
+    expect(semanticDeadlineAt(session)).toBe(now + IDLE_MS)
+  })
+
+  it("measures the heartbeat stretch from the Run's last progress when that is later", () => {
+    const now = Date.now()
+    const session = fakeSession("input-cap-progress", [], {
+      semanticDeadlineAt: now - 1_000 + IDLE_MS,
+      lastNonHeartbeatAt: now - MAX_TOOL_INPUT_MS - 60_000,
+      lastFrameAt: now,
+    })
     expect(semanticDeadlineAt(session)).toBe(now + IDLE_MS)
   })
 })
