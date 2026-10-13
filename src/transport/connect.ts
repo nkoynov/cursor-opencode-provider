@@ -360,6 +360,9 @@ const DEFAULT_READ_IDLE_MS = 120_000
 const WRITE_DRAIN_TIMEOUT_CODE = "CURSOR_WRITE_DRAIN_TIMEOUT"
 // Small enough that a 13 KB/s uplink still moves a slice per five-second stall window.
 const WRITE_SLICE_BYTES = 64 * 1024
+// Node and Bun fail every new stream with ENHANCE_YOUR_CALM once a session's unsent bytes pass
+// maxSessionMemory (10 MB by default), and all Runs share one session; slicing bounds each Run's share.
+const RUN_SESSION_OPTIONS = { maxSessionMemory: 256 } satisfies http2.ClientSessionOptions
 export const HTTP2_SESSION_MAX_AGE_MS = 15 * 60_000
 // Cursor CLI pings an agent connection before use only after 10 s without a response or ping reply.
 export const HTTP2_SESSION_LIVE_WINDOW_MS = 10_000
@@ -655,13 +658,17 @@ function connectSession(origin: string): Promise<http2.ClientHttp2Session> {
           }
           tunnelSocket = tlsSocket
           session = http2.connect(origin, {
+            ...RUN_SESSION_OPTIONS,
             createConnection: () => tlsSocket,
           })
         } else if (_testConnection) {
           const createTestConnection = _testConnection
-          session = http2.connect(origin, { createConnection: () => createTestConnection(origin) })
+          session = http2.connect(origin, {
+            ...RUN_SESSION_OPTIONS,
+            createConnection: () => createTestConnection(origin),
+          })
         } else {
-          session = http2.connect(origin)
+          session = http2.connect(origin, RUN_SESSION_OPTIONS)
         }
         if (settled) {
           try { session.destroy() } catch { /* ignore */ }
