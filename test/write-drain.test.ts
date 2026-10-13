@@ -156,6 +156,23 @@ describe("Run write drain", () => {
     expect(run.isClosed()).toBe(true)
   }, 15_000)
 
+  it("fails one stall window after the last slice the stream took, not at the next window boundary", async () => {
+    fake = await startSlowCursor(2_000_000)
+    const run = await bidiRunStream("token", { baseURL: ORIGIN })
+
+    expect(run.write(new Uint8Array(64_000_000).fill(5))).toBe(false)
+    const drain = failureOf(run.waitForDrain!(1_000))
+    await new Promise((resolve) => setTimeout(resolve, 1_500))
+    fake.stall()
+    const stalledAt = Date.now()
+    const error = await drain
+    const sinceStall = Date.now() - stalledAt
+
+    expect((error as CursorProviderError).code).toBe("CURSOR_WRITE_DRAIN_TIMEOUT")
+    expect(sinceStall).toBeGreaterThan(900)
+    expect(sinceStall).toBeLessThan(1_300)
+  }, 15_000)
+
   it("fails a stalled stream while a sibling Run keeps the shared connection busy", async () => {
     fake = await startSlowCursor(2_000_000, [1])
     const sibling = await bidiRunStream("token", { baseURL: ORIGIN })

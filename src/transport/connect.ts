@@ -814,7 +814,7 @@ export async function bidiRunStream(
   // stream's own progress (the socket's byte count includes sibling Runs on the same connection).
   const outbound: Uint8Array[] = []
   let pacer: object | undefined
-  let pacedBytesSent = 0
+  let lastSliceTakenAt = 0
   const pacerIdleListeners = new Set<() => void>()
   // Node's stream.close() holds back `close` while a write is pending, so a local close settles drains itself.
   const localCloseListeners = new Set<() => void>()
@@ -864,7 +864,7 @@ export async function bidiRunStream(
     const target = stream
     target.write(slice, (error?: Error | null) => {
       if (error || pacer !== token) return
-      pacedBytesSent += slice.length
+      lastSliceTakenAt = Date.now()
       try {
         sendNextSlice(token)
       } catch (cause) {
@@ -1292,18 +1292,18 @@ export async function bidiRunStream(
           armTimer()
           attach()
         }
-        // A stall window, not a deadline: it starts over whenever the stream has taken another slice.
-        const armTimer = () => {
-          const sentAtArm = pacedBytesSent
+        // A stall window, not a deadline: it runs from the last slice the stream took.
+        const armTimer = (delayMs = stallTimeoutMs, armedAt = Date.now()) => {
           timer = setTimeout(() => {
-            if (pacedBytesSent > sentAtArm) return armTimer()
+            const quietMs = Date.now() - Math.max(armedAt, lastSliceTakenAt)
+            if (quietMs < stallTimeoutMs) return armTimer(stallTimeoutMs - quietMs, armedAt)
             streamFailure ??= new CursorTransportError(
               `Cursor Run stream backpressure made no progress for ${stallTimeoutMs}ms`,
               { transient: false, replaySafe: false, code: WRITE_DRAIN_TIMEOUT_CODE },
             )
             finish(streamFailure)
             try { stream.destroy(streamFailure) } catch { /* already closing */ }
-          }, stallTimeoutMs)
+          }, delayMs)
           timer.unref?.()
         }
         if (!resending) armTimer()
