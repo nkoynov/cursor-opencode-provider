@@ -199,7 +199,9 @@ describe("parallel tool-call pump", () => {
     ["gpt", "existing", "patch", (target: string) => ({ patchText: `*** Begin Patch\n*** Update File: ${target}\n@@\n-before\n+created\n*** End Patch` })],
     ["opus", "new", "write", (target: string) => ({ path: target, content: "created\n" })],
     ["opus", "existing", "edit", (target: string) => ({ path: target, oldString: "before\n", newString: "created\n" })],
-  ] as const)("sends an OpenCode 2 %s edit_tool_call on a %s file to `%s`", async (model, file, toolName, input) => {
+    ["opus-then-gpt", "new", "patch", (target: string) => ({ patchText: `*** Begin Patch\n*** Add File: ${target}\n+created\n*** End Patch` })],
+    ["opus-then-gpt", "existing", "patch", (target: string) => ({ patchText: `*** Begin Patch\n*** Update File: ${target}\n@@\n-before\n+created\n*** End Patch` })],
+  ] as const)("sends an OpenCode 2 %s edit_tool_call (%s file) to `%s`", async (model, file, toolName, input) => {
     const existing = file === "existing"
     const root = fs.mkdtempSync("/tmp/cursor-oc2-patch-")
     const target = path.join(root, "target.txt")
@@ -212,12 +214,16 @@ describe("parallel tool-call pump", () => {
       frame({ exec_server_message: { id: 2, write_args: { path: target, file_text: "created\n", tool_call_id: "edit" } } }),
       ended(),
     ])
-    const tools = [{ name: "shell", description: "Shell" }, { name: "read", description: "Read" },
-      ...(model === "gpt" ? [{ name: "patch", description: "Patch" }]
-        : [{ name: "edit", description: "Edit" }, { name: "write", description: "Write" }]),
-    ]
+    const base = [{ name: "shell", description: "Shell" }, { name: "read", description: "Read" }]
+    const patchTool = { name: "patch", description: "Patch" }
+    const editTools = [{ name: "edit", description: "Edit" }, { name: "write", description: "Write" }]
+    // After a model switch the epoch catalog keeps every tool seen; only this turn's host list drops edit/write.
+    const tools = model === "gpt" ? [...base, patchTool]
+      : model === "opus" ? [...base, ...editTools]
+      : [...base, ...editTools, patchTool]
     session.toolCatalog = tools
     session.toolDescriptors = toolsToDescriptors(tools, "opencode")
+    session.permittedToolNames = new Set((model === "opus" ? [...base, ...editTools] : [...base, patchTool]).map(t => t.name))
     session.hostToolDialect = OPENCODE_2_TOOL_DIALECT
     session.requestContext.env = { workspace_paths: [root] }
     try {

@@ -3795,6 +3795,11 @@ export async function pump(
   const advertisedToolNameSet = new Set(
     advertisedToolNames.map((name) => resolveCustomWebToolAlias(name, session.toolAliases)),
   )
+  // The epoch catalog still lists `edit`/`write` after a switch to a GPT model; this turn's host list picks the file tool.
+  const fileToolNames = (): ReadonlySet<string> =>
+    session.permittedToolNames && session.permittedToolNames.size > 0
+      ? session.permittedToolNames
+      : advertisedToolNameSet
   let textStarted = false
   let reasoningStarted = false
   let assistantText = ""
@@ -3990,7 +3995,7 @@ export async function pump(
     if (!order.calls.every((entry) => entry.callId === callId || earlyRows.handled.has(entry.callId))) return
     if (call.variant === "edit_tool_call" && typeof call.args.path !== "string") return
     const toolName = predictEarlyToolName(call, {
-      advertised: advertisedToolNameSet,
+      advertised: fileToolNames(),
       permitted: session.permittedToolNames,
       workspaceRoot: workspaceRootFromRequestContext(session.requestContext),
     })
@@ -5370,7 +5375,7 @@ export async function pump(
           if (editCall) {
             const remapped = remapCorrelatedEditWriteForCatalog(
               parsed,
-              advertisedToolNameSet,
+              fileToolNames(),
               editCall.path,
               workspaceRootFromRequestContext(session.requestContext),
             )
@@ -5389,7 +5394,7 @@ export async function pump(
           // exec requests. Translate before the unavailable-tool check below.
           remapEditToolsForCatalog(
             parsed,
-            advertisedToolNameSet,
+            fileToolNames(),
             workspaceRootFromRequestContext(session.requestContext),
           )
         }
