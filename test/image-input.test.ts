@@ -90,6 +90,21 @@ describe("tool-result images", () => {
     expect((await extractCursorPromptImages([explicit], explicit, { supportsImages: true, seenHistoryHashes })).userImageCount).toBe(1)
   })
 
+  it("reports an explicit attachment's hash, so the next turn can skip it as history", async () => {
+    const attached = { role: "user", content: [{ type: "text", text: "look" }, { type: "file", mediaType: "image/png", data: "AQID" }] }
+    const sent = await extractCursorPromptImages([attached], attached, { supportsImages: true })
+    expect(sent.userImageCount).toBe(1)
+    expect(sent.hashes).toHaveLength(1)
+
+    const nextUser = { role: "user", content: [{ type: "text", text: "and now?" }] }
+    const next = await extractCursorPromptImages([attached, nextUser], nextUser, {
+      supportsImages: true,
+      seenHistoryHashes: new Set(sent.hashes),
+    })
+    expect(next.images).toEqual([])
+    expect(next.duplicateCount).toBe(1)
+  })
+
   it("deduplicates multiple detached caption parts in a recovery Run", async () => {
     const file = { type: "file", mediaType: "image/png", data: "AQID" }
     const caption = { role: "user", content: [{ type: "text", text: "Attached media from tool result:" }, file, file] }

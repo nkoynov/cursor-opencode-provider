@@ -1,0 +1,153 @@
+import { createHash } from "node:crypto"
+
+// Content hashes of the history images a session's Cursor conversation holds, so
+// growing history does not re-upload old screenshots. Each set belongs to one
+// checkpoint: a Run skips an image only when it sends exactly that checkpoint.
+
+/** Mirrors MAX_TURN_STATE_SESSIONS. */
+const MAX_SESSIONS = 256
+const MAX_IMAGES_PER_SESSION = 256
+/** A model-switch stop rolls back to a checkpoint from earlier in its turn. */
+const MAX_CHECKPOINTS_PER_SESSION = 32
+
+/** `hashes` is shared between entries and never mutated. */
+type HeldImages = { conversationId: string; checkpoint: string; hashes: readonly string[] }
+
+/** Newest first. */
+const heldBySession = new Map<string, HeldImages[]>()
+
+/**
+ * One Run's view: `held` by the checkpoint it last stood on, `checkpointed` sent
+ * before Cursor's latest checkpoint, `sent` since. Only a turn that ends on a
+ * checkpoint of its own moves `checkpointed` into `held`.
+ */
+export type RunHistoryImages = { held: readonly string[]; checkpointed: string[]; sent: string[] }
+
+export function checkpointFingerprint(checkpoint: Uint8Array): string {
+  return createHash("sha256").update(checkpoint).digest("hex")
+}
+
+function newest(hashes: Iterable<string>): string[] {
+  const unique = [...new Set([...hashes].reverse())].reverse()
+  return unique.slice(Math.max(0, unique.length - MAX_IMAGES_PER_SESSION))
+}
+
+function touch(sessionKey: string, entries: HeldImages[]): void {
+  heldBySession.delete(sessionKey)
+  if (entries.length === 0) return
+  heldBySession.set(sessionKey, entries.slice(0, MAX_CHECKPOINTS_PER_SESSION))
+  while (heldBySession.size > MAX_SESSIONS) {
+    const oldest = heldBySession.keys().next().value as string | undefined
+    if (!oldest) break
+    heldBySession.delete(oldest)
+  }
+}
+
+function find(sessionKey: string, conversationId: string, checkpoint: Uint8Array): HeldImages | undefined {
+  const entries = heldBySession.get(sessionKey)
+  if (!entries) return undefined
+  const fingerprint = checkpointFingerprint(checkpoint)
+  return entries.find((entry) => entry.conversationId === conversationId && entry.checkpoint === fingerprint)
+}
+
+/** The images `checkpoint` is known to hold. */
+export function heldHistoryImageHashes(
+  sessionKey: string,
+  conversationId: string,
+  checkpoint: Uint8Array,
+): ReadonlySet<string> | undefined {
+  const entry = find(sessionKey, conversationId, checkpoint)
+  if (!entry) return undefined
+  touch(sessionKey, heldBySession.get(sessionKey)!)
+  return new Set(entry.hashes)
+}
+
+function recordHeldHistoryImages(
+  sessionKey: string,
+  conversationId: string,
+  checkpoint: Uint8Array,
+  hashes: readonly string[],
+): void {
+  if (hashes.length === 0) return
+  const entry = { conversationId, checkpoint: checkpointFingerprint(checkpoint), hashes }
+  const others = (heldBySession.get(sessionKey) ?? [])
+    .filter((other) => other.conversationId !== conversationId || other.checkpoint !== entry.checkpoint)
+  touch(sessionKey, [entry, ...others])
+}
+
+export function runHistoryImages(held?: ReadonlySet<string>): RunHistoryImages {
+  return { held: [...(held ?? [])], checkpointed: [], sent: [] }
+}
+
+export function noteHistoryImagesSent(run: RunHistoryImages, hashes: readonly string[]): void {
+  run.sent.push(...hashes)
+}
+
+/** Cursor's checkpoints extend the one the Run started on, so each holds at least what that one held. */
+export function noteHistoryImageCheckpoint(
+  run: RunHistoryImages,
+  sessionKey: string,
+  conversationId: string,
+  checkpoint: Uint8Array,
+): void {
+  run.checkpointed.push(...run.sent)
+  run.sent = []
+  recordHeldHistoryImages(sessionKey, conversationId, checkpoint, run.held)
+}
+
+/**
+ * The turn ended. On a checkpoint of its own, that checkpoint holds what the Run
+ * sent before it; without one, nothing the Run sent counts as held.
+ */
+export function confirmHistoryImagesAtTurnEnd(
+  run: RunHistoryImages,
+  sessionKey: string,
+  conversationId: string,
+  checkpoint: Uint8Array | undefined,
+): void {
+  if (checkpoint?.length) {
+    run.held = newest([...run.held, ...run.checkpointed])
+    recordHeldHistoryImages(sessionKey, conversationId, checkpoint, run.held)
+  }
+  run.checkpointed = []
+  run.sent = []
+}
+
+/** For the restart snapshot: the set the checkpoint being saved holds. */
+export function heldHistoryImagesSnapshot(
+  sessionKey: string,
+  conversationId: string,
+  checkpoint: Uint8Array | undefined,
+): { checkpoint: string; hashes: string[] } | undefined {
+  const entry = checkpoint?.length ? find(sessionKey, conversationId, checkpoint) : undefined
+  return entry ? { checkpoint: entry.checkpoint, hashes: [...entry.hashes] } : undefined
+}
+
+export function restoreHeldHistoryImages(
+  sessionKey: string,
+  conversationId: string,
+  saved: { checkpoint?: string; hashes?: readonly string[] },
+): void {
+  touch(sessionKey, saved.checkpoint && saved.hashes?.length
+    ? [{ conversationId, checkpoint: saved.checkpoint, hashes: newest(saved.hashes) }]
+    : [])
+}
+
+/** The session moved to a new conversation id that continues from the same checkpoint bytes. */
+export function rebindHeldHistoryImages(sessionKey: string, fromId: string, toId: string): void {
+  const entries = heldBySession.get(sessionKey)
+  if (!entries) return
+  heldBySession.set(sessionKey, entries.map((entry) => entry.conversationId === fromId ? { ...entry, conversationId: toId } : entry))
+}
+
+export function forgetHeldHistoryImages(sessionKey: string): void {
+  heldBySession.delete(sessionKey)
+}
+
+export function snapshotHeldHistoryImagesForTests(sessionKey: string): HeldImages[] {
+  return (heldBySession.get(sessionKey) ?? []).map((entry) => ({ ...entry, hashes: [...entry.hashes] }))
+}
+
+export function resetHeldHistoryImagesForTests(): void {
+  heldBySession.clear()
+}

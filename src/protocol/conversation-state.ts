@@ -26,6 +26,11 @@ import {
   serializeTurnProvenance,
 } from "./turn-provenance.js"
 import {
+  heldHistoryImagesSnapshot,
+  rebindHeldHistoryImages,
+  restoreHeldHistoryImages,
+} from "./sent-history-images.js"
+import {
   deletePersistedConversation,
   getPersistedAnsweredSteers,
   getPersistedTurnProvenance,
@@ -63,10 +68,14 @@ export async function hydrateConversationState(
   setFrozenRequestContext(persisted.conversationId, persisted.requestContext)
   const provenance = persisted.turnProvenance ? parseTurnProvenance(persisted.turnProvenance) : undefined
   if (provenance?.conversationId === persisted.conversationId) restoreTurnProvenance(sessionKey, provenance)
+  restoreHeldHistoryImages(sessionKey, persisted.conversationId, {
+    checkpoint: persisted.sentImagesCheckpoint,
+    hashes: persisted.sentImageHashes,
+  })
   trace(
     `conversation persistence: restored sessionKey=${sessionKey} ` +
       `conversationId=${persisted.conversationId} checkpoint=${persisted.checkpoint?.length ?? 0}B ` +
-      `blobs=${persisted.blobs.length}`,
+      `blobs=${persisted.blobs.length} heldImages=${persisted.sentImageHashes?.length ?? 0}`,
   )
   return {
     conversationId: persisted.conversationId,
@@ -130,6 +139,7 @@ export async function persistConversationState(
   const blobs = blobCompaction?.blobs ?? snapshotConversationBlobs(input.conversationId)
   const requestContext = getFrozenRequestContext(input.conversationId) ?? input.requestContext
   const provenance = getTurnProvenance(input.sessionKey)
+  const heldImages = heldHistoryImagesSnapshot(input.sessionKey, input.conversationId, checkpoint)
   await persistConversation(cacheDir, {
     sessionKey: input.sessionKey,
     conversationId: input.conversationId,
@@ -143,6 +153,7 @@ export async function persistConversationState(
     hostNote: input.hostNote,
     ...(input.answeredSteers?.length ? { answeredSteers: [...input.answeredSteers] } : {}),
     ...(input.modelFallbackStop ? { modelFallbackStop: input.modelFallbackStop } : {}),
+    ...(heldImages ? { sentImageHashes: heldImages.hashes, sentImagesCheckpoint: heldImages.checkpoint } : {}),
     ...(provenance?.conversationId === input.conversationId
       ? { turnProvenance: serializeTurnProvenance(provenance) }
       : {}),
@@ -187,6 +198,7 @@ export function rekeyConversation(
   restoreConversationBinding(sessionKey, toId)
   // What this provider emitted last stays the reference for telling another model's answer apart.
   rebindTurnProvenance(sessionKey, fromId, toId)
+  rebindHeldHistoryImages(sessionKey, fromId, toId)
   return toId
 }
 
