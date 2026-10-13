@@ -19,7 +19,7 @@
 import fs from "node:fs"
 import path from "node:path"
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider"
-import { APPLY_PATCH_TOOL } from "./protocol/apply-patch.js"
+import { hostPatchTool } from "./protocol/apply-patch.js"
 
 const EARLY_ROW_VARIANTS = new Set(["edit_tool_call", "task_tool_call"])
 /** Cursor's own pre-write read threshold, as `remapCorrelatedEditWriteForCatalog` uses it. */
@@ -103,7 +103,7 @@ export type EarlyToolNameContext = {
  * certain now. An edit mirrors the pump: Cursor's private read is answered by
  * the provider only inside the workspace, then the whole-file write becomes
  * `edit` for a non-empty existing file and stays `write` for a new or empty
- * one, or `apply_patch` on a host that offers it instead.
+ * one, or the patch tool (`apply_patch` / `patch`) on a host that offers it instead.
  */
 export function predictEarlyToolName(call: ComposingToolCall, context: EarlyToolNameContext): string | undefined {
   const { advertised } = context
@@ -112,10 +112,11 @@ export function predictEarlyToolName(call: ComposingToolCall, context: EarlyTool
     name = advertised.has("task") ? "task" : advertised.has("subagent") ? "subagent" : undefined
   } else if (call.variant === "edit_tool_call") {
     const target = typeof call.args.path === "string" ? call.args.path : ""
-    if (!target || !(advertised.has("write") || advertised.has(APPLY_PATCH_TOOL))) return undefined
+    const patchTool = hostPatchTool(advertised)
+    if (!target || !(advertised.has("write") || patchTool)) return undefined
     const base = editTargetToolName(target, context)
     if (!base) return undefined
-    name = advertised.has(base) ? base : advertised.has(APPLY_PATCH_TOOL) ? APPLY_PATCH_TOOL : undefined
+    name = advertised.has(base) ? base : patchTool
   }
   if (!name) return undefined
   const permitted = context.permitted
@@ -135,7 +136,7 @@ function editTargetToolName(target: string, context: EarlyToolNameContext): "wri
     if (relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) return undefined
     const stat = fs.statSync(absolute)
     if (!stat.isFile() || stat.size > MAX_EDIT_SOURCE_BYTES) return undefined
-    const editable = context.advertised.has("edit") || context.advertised.has(APPLY_PATCH_TOOL)
+    const editable = context.advertised.has("edit") || hostPatchTool(context.advertised) !== undefined
     return stat.size > 0 && editable ? "edit" : "write"
   } catch {
     return undefined

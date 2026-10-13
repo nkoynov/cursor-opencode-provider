@@ -144,6 +144,8 @@ describe("resolveHostToolRoutes", () => {
 
     expect(resolveHostToolRoutes(named("apply_patch", "read")).native.get("apply_patch")).toBe("StrReplace, Write")
     expect(resolveHostToolRoutes(named("apply_patch", "edit")).native.get("apply_patch")).toBe("Write")
+    expect(resolveHostToolRoutes(named("patch", "read", "shell")).native.get("patch")).toBe("StrReplace, Write")
+    expect(resolveHostToolRoutes(named("patch", "read", "edit", "write")).native.has("patch")).toBe(false)
     const interactions = resolveHostToolRoutes(named("plan_enter", "plan_exit", "cursor_plan_stage", "cursor_image_save"))
     expect(Object.fromEntries(interactions.native)).toEqual({
       plan_enter: "SwitchMode",
