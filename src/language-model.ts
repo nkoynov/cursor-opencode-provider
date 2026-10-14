@@ -25,6 +25,7 @@ import {
 } from "./transport/connect.js"
 import { waitForStreamWrites, writeStreamMessage as writeWithBackpressure } from "./stream-write.js"
 import { isDebugEnabled, trace, traceRequestContextPaths } from "./debug.js"
+import { toolResultFailure, type ToolRefusal } from "./opencode2/tool-results.js"
 import { isExchangeableApiKey } from "./auth.js"
 import { resolveBearerToken } from "./auth-renewal.js"
 import { buildRunRequest, buildHeartbeat } from "./protocol/request.js"
@@ -72,6 +73,8 @@ import {
   type ParsedExecRequest,
 } from "./protocol/tools.js"
 import { buildGitDiffExecMessages } from "./protocol/git-diff.js"
+import { runtimeExecMessages, runtimeRootFromContext } from "./runtime-files.js"
+import { createManagedTerminal } from "./terminal-runner.js"
 import { cursorExecVariantByRequestField, describeCursorExecVariant } from "./protocol/exec-variants.js"
 import { appendCheckpointUserGrounding, appendWorkspaceRootGrounding } from "./protocol/workspace-grounding.js"
 import {
@@ -229,8 +232,12 @@ import {
 } from "./image-input.js"
 import { getDocumentedCursorModelContext, resolveCursorModelSupportsImages } from "./model-metadata.js"
 import {
+  CURSOR_TIMEOUT_BACKGROUND,
   consumeCursorShellResult,
   registerCursorShellCall,
+  resolveCursorShellPath,
+  shellPolicyFromMetadata,
+  type CursorShellPolicy,
 } from "./shell-timeout.js"
 import {
   type HostNoteBatch,
@@ -869,18 +876,26 @@ async function doStreamImpl(
         // drain turn_ended) before opening the new Run so the checkpoint prefix
         // is preserved. registerSession will not close a prior Run that still
         // has real pending execs; a failed prepare leaves that Run held.
+        let unfinishedPrior = false
         try {
-          await preparePriorSessionForFreshTurn(sessionKey, {
+          const prepared = await preparePriorSessionForFreshTurn(sessionKey, {
             toolResults: historicalResults,
             hostAgent: hostAgentFromCallOptions(callOptions),
           })
+          unfinishedPrior = prepared !== "drained" && prepared !== "none"
+          if (unfinishedPrior) trace(`fresh turn: prior preparation=${prepared} — rebasing from host history`)
         } catch (error) {
+          unfinishedPrior = true
           trace(
-            `fresh turn: prepare-prior failed — opening the new Run and leaving ` +
+            `fresh turn: prepare-prior failed — rebasing the new Run and leaving ` +
               `any still-pending prior held — ${(error as Error).message}`,
           )
         }
-        session = await openSession()
+        // Without TurnEnded, the checkpoint may predate completed side effects.
+        // Include their host results instead of resuming that model step.
+        session = await openSession(unfinishedPrior
+          ? { recovery: { kind: "rebase", reason: "unfinished-prior-run" } }
+          : undefined)
       }
     }
   }
@@ -1109,7 +1124,7 @@ export async function pumpWithRecovery(input: {
 }
 
 export type CursorRunRecovery =
-  | { kind: "rebase"; reason?: "checkpoint-unusable" }
+  | { kind: "rebase"; reason?: "checkpoint-unusable" | "unfinished-prior-run" }
   | { kind: "resume"; conversationId: string; checkpoint: Uint8Array }
 
 const heartbeatWritePendingBySession = new WeakMap<CursorSession, boolean>()
@@ -1238,9 +1253,10 @@ async function startSession(
   const allowTools = toolState.allowTools
   const discoveredSubagentCatalog = extractHostSubagentCatalog(cursorTools)
   let recovery = startOptions?.recovery
+  const unfinishedPriorRun = recovery?.kind === "rebase" && recovery.reason === "unfinished-prior-run"
   let resumeRecovery = recovery?.kind === "resume" ? recovery : undefined
   let resuming = !!resumeRecovery
-  const lifecycle = !allowTools && !isCompaction && !recovery
+  const lifecycle = !allowTools && !isCompaction && (!recovery || unfinishedPriorRun)
   // Isolated helpers must not share the parent's openCodeSessionId or sticky
   // conversation: registerSession would otherwise supersede the held parent Run.
   const ephemeralRun = lifecycle || isolateHelper
@@ -1307,7 +1323,8 @@ async function startSession(
     : { count: 0, bytes: 0, complete: true }
   const forcedResetReason: string | undefined = foreignHistory
     ? `foreign-history:${foreignHistory}`
-    : checkpointUnusable ? "checkpoint-unusable" : undefined
+    : checkpointUnusable ? "checkpoint-unusable"
+    : unfinishedPriorRun ? "unfinished-prior-run" : undefined
   // CLI soft-reuses incomplete / oversized graphs (100 MiB is export-only).
   // Never remint — warn and keep the sticky conversation + checkpoint.
   if (conversationState) {
@@ -1340,7 +1357,7 @@ async function startSession(
   }
 
   const lastUser = [...prompt].reverse().find((message) => message.role === "user")
-  let userText = recovery?.kind === "rebase" && !checkpointUnusable
+  let userText = recovery?.kind === "rebase" && !checkpointUnusable && !unfinishedPriorRun
     ? "Continue the interrupted turn from the conversation history above. Do not repeat completed work."
     : (extractUserText(lastUser) || ".")
   // After an approved SwitchMode, inject the Cursor CLI-shaped mode reminder
@@ -1377,9 +1394,9 @@ async function startSession(
         server: resolveToolServerIdentity("plan_exit", "opencode", knownMcpServers).server,
       })
   const history = extractPromptHistory(prompt, {
-    preserveTrailingUser: recovery?.kind === "rebase" && !checkpointUnusable,
+    preserveTrailingUser: recovery?.kind === "rebase" && !checkpointUnusable && !unfinishedPriorRun,
     // A foreign-history rebase replays the other model's tool results too.
-    toolResults: isCompaction || foreignHistory || checkpointUnusable ? "all" : (recovery?.kind === "rebase" ? "trailing" : "omit"),
+    toolResults: isCompaction || foreignHistory || checkpointUnusable || unfinishedPriorRun ? "all" : (recovery?.kind === "rebase" ? "trailing" : "omit"),
   })
   const userTurnHostNotes = prepareUserTurnHostNotes({
     sessionKey,
@@ -1521,7 +1538,7 @@ async function startSession(
     maxMode: hintMaxMode,
   })
 
-  if (foreignHistory || checkpointUnusable) {
+  if (foreignHistory || checkpointUnusable || unfinishedPriorRun) {
     assertForeignHistoryRebaseFits({
       modelInfo,
       cursorModelId,
@@ -1887,11 +1904,28 @@ export const FRESH_TURN_DRAIN_TIMEOUT_MS = 8_000
 export const FRESH_TURN_PENDING_CANCEL_REASON =
   "Host started a new user turn before this tool result was delivered"
 
+/** Persist an acknowledged terminal checkpoint without inventing usage counters. */
+async function persistTerminalCheckpoint(session: CursorSession): Promise<void> {
+  if (!session.openCodeSessionId) return
+  await persistConversationState(session.cacheDir ?? opencodeGlobalCacheDir(), {
+    sessionKey: session.openCodeSessionId,
+    conversationId: session.conversationId,
+    requestContext: session.requestContext,
+    toolCatalog: session.toolCatalog ?? [],
+    postCompactionRebase: session.postCompactionRebase,
+    hostAgent: session.hostAgent,
+    systemPromptHash: session.stableSystemPromptHash,
+    hostNote: encodePersistedHostNotes(undeliveredHostNotes(session.openCodeSessionId)),
+  }).catch((error) => {
+    trace(`conversation persistence: terminal save failed sessionKey=${session.openCodeSessionId}: ${String(error)}`)
+  })
+}
+
 /**
- * Before opening a new user-turn Run, finish the prior held-open Run cleanly:
- * settle display-only bridged pendings, cancel any real execs still waiting on
- * the host, then drain for `turn_ended`. That preserves the same
- * conversation_id / checkpoint prefix instead of aborting mid-tool.
+ * Before opening a new user-turn Run, settle the held Run's pending results
+ * and drain its terminal checkpoint. The unseen follow-up to results settled
+ * here can finish through Cursor's cancellation contract; an unacknowledged
+ * turn must rebase.
  */
 export async function preparePriorSessionForFreshTurn(
   openCodeSessionId: string | undefined,
@@ -1965,11 +1999,22 @@ export async function preparePriorSessionForFreshTurn(
     return "busy"
   }
 
-  const outcome = await drainSessionUntilTurnEnded(prior, {
+  let outcome = await drainSessionUntilTurnEnded(prior, {
     timeoutMs: opts?.timeoutMs ?? FRESH_TURN_DRAIN_TIMEOUT_MS,
   })
+  if (outcome === "busy" && (historicalPending.length > 0 || cancelled > 0)) {
+    // The host ended that turn (rejection, interruption, or an abandoned
+    // call) before its next model call; OpenCode 1.x and a restarted host do
+    // not say which. Cursor started a follow-up nobody will read. Cancel it
+    // through Cursor's protocol action; retain continuity only with its
+    // terminal acknowledgment and checkpoint.
+    outcome = await drainSessionUntilTurnEnded(prior, {
+      timeoutMs: opts?.timeoutMs ?? FRESH_TURN_DRAIN_TIMEOUT_MS,
+      cancelReason: "host_new_user_turn",
+    })
+  }
   trace(`fresh turn: prior session ${prior.sessionId} drain outcome=${outcome}`)
-  if (outcome === "turn-ended") return "drained"
+  if (outcome === "turn-ended" || outcome === "cancelled") return "drained"
   if (cancelled > 0 || settledBridged > 0) return "settled-only"
   return outcome === "timeout" || outcome === "interrupted" ? "settled-only" : "busy"
 }
@@ -2036,8 +2081,8 @@ async function waitUntilNotPumping(
  */
 export async function drainSessionUntilTurnEnded(
   session: CursorSession,
-  opts?: { timeoutMs?: number },
-): Promise<"turn-ended" | "busy" | "timeout" | "interrupted" | "skipped"> {
+  opts?: { timeoutMs?: number; cancelReason?: string },
+): Promise<"turn-ended" | "cancelled" | "busy" | "timeout" | "interrupted" | "skipped"> {
   if (session.closed) return "skipped"
   if (session.pending.size > 0 || sessionManager.isActivelyPumping(session)) return "busy"
 
@@ -2045,9 +2090,16 @@ export async function drainSessionUntilTurnEnded(
   const owner = Symbol(`fresh-turn-drain:${session.sessionId}`)
   sessionManager.beginPump(session, owner)
   const deadlineAt = Date.now() + timeoutMs
-  let outcome: "turn-ended" | "busy" | "timeout" | "interrupted" = "timeout"
+  let outcome: "turn-ended" | "cancelled" | "busy" | "timeout" | "interrupted" = "timeout"
+  let cancellationCheckpoint = false
 
   try {
+    if (opts?.cancelReason) {
+      session.heartbeatCancel?.()
+      await writeWithBackpressure(session.stream, encodeMessage("AgentClientMessage", {
+        conversation_action: { cancel_action: { reason: opts.cancelReason } },
+      }), "fresh-turn cancellation")
+    }
     while (Date.now() < deadlineAt) {
       if (session.closed) {
         outcome = "interrupted"
@@ -2076,6 +2128,19 @@ export async function drainSessionUntilTurnEnded(
 
       const frame = next.value as Frame
       if (frame.flags & 0x02) {
+        if (opts?.cancelReason) {
+          try {
+            const failure = connectFrameError(new TextDecoder().decode(decodeFramePayload(frame)))
+            trace(`fresh turn drain: cancellation terminal code=${failure.code ?? "unknown"} checkpoint=${cancellationCheckpoint}`)
+            if (failure.origin === "server" && failure.code === "canceled" && cancellationCheckpoint) {
+              keepUndeliveredHostNotes(session)
+              await persistTerminalCheckpoint(session)
+              sessionManager.close(session)
+              outcome = "cancelled"
+              break
+            }
+          } catch { /* an invalid terminal acknowledgment cannot preserve continuity */ }
+        }
         outcome = "interrupted"
         break
       }
@@ -2103,6 +2168,7 @@ export async function drainSessionUntilTurnEnded(
       if (checkpointRaw != null) {
         const bytes = normalizeCheckpointBytes(checkpointRaw)
         if (bytes && bytes.length > 0) {
+          cancellationCheckpoint = true
           if (session.cacheDiagnostics) session.cacheDiagnostics.checkpointUpdates++
           setCheckpoint(session.conversationId, bytes)
           session.resumeCheckpoint = Uint8Array.from(bytes)
@@ -2118,6 +2184,10 @@ export async function drainSessionUntilTurnEnded(
       if (iu?.context_injection_state) applyContextInjectionState(session, iu.context_injection_state)
 
       if (iu?.turn_ended) {
+        if (opts?.cancelReason && !cancellationCheckpoint) {
+          outcome = "interrupted"
+          break
+        }
         trace(`fresh turn drain: turn_ended raw wire fields: ${debugWalkTurnEnded(payload)}`)
         keepUndeliveredHostNotes(session)
         if (session.openCodeSessionId) {
@@ -2199,6 +2269,7 @@ export async function drainSessionUntilTurnEnded(
       // once instead of paying for (and waiting on) an invisible answer; only
       // the control tail of a turn that is already ending is worth draining.
       if (iu?.text_delta || iu?.thinking_delta || iu?.partial_tool_call) {
+        if (opts?.cancelReason) continue
         trace(`fresh turn drain: model output resumed sessionId=${session.sessionId}`)
         outcome = "busy"
         break
@@ -2218,12 +2289,14 @@ export async function drainSessionUntilTurnEnded(
         continue
       }
       if (iu?.tool_call_started) {
+        if (opts?.cancelReason) continue
         // A new tool needs host mediation — stop draining.
         outcome = "busy"
         break
       }
 
       if (esm || interactionQuery || requiredChannel === "exec" || requiredChannel === "interaction") {
+        if (opts?.cancelReason) continue
         outcome = "busy"
         break
       }
@@ -2416,7 +2489,8 @@ async function deliverContinuationResultsNow(
   // Host notes that trailed this step: injected once, after its results.
   const stepNotes = collectHostNoteBodies(trailingToolResults.flatMap((r) => r.notes ?? []))
   let deliveredResults = 0
-  for (const r of pendingResults) {
+  for (const original of pendingResults) {
+    const r = original.error === "" ? { ...original, error: "OpenCode tool execution failed" } : original
     const claim = sessionManager.claim(session.sessionId, r.execId)
     if ("kind" in claim) {
       if (claim.kind === "deliverable") {
@@ -2569,7 +2643,9 @@ async function deliverContinuationResultsNow(
             execId: r.execId,
             resultField: pending.resultField,
             output: shellResult?.output ?? r.output,
-            error: r.error,
+            error: r.error ?? shellResult?.error,
+            refusal: r.refusal,
+            interrupted: r.interrupted,
             toolName: pending.toolName ?? r.toolName,
             resultMetadata: pending.resultMetadata,
             shellOutcome: shellResult?.outcome,
@@ -2976,6 +3052,50 @@ async function nextFrameWithSemanticDeadline(
 }
 
 /**
+ * Hand a background or soft-background shell to a supervised terminal record.
+ * Where that is unavailable (native Windows, runtime storage this conversation
+ * never advertised or cannot create), the request keeps the unmanaged
+ * background wrappers it already carries.
+ */
+function manageBackgroundShell(
+  parsed: ParsedExecRequest,
+  policy: CursorShellPolicy,
+  context: Record<string, unknown> | undefined,
+): void {
+  const workspaceRoot = workspaceRootFromRequestContext(context)
+  // The host runs the command in the directory its wrapper records, so
+  // OpenCode 2's shell hook can correlate the two by command and directory.
+  // Resolve against the workspace here: the hook sees the host's directory,
+  // and a relative path resolved later would use the daemon's own cwd.
+  policy.workingDirectory = path.resolve(workspaceRoot, policy.workingDirectory || ".")
+  parsed.args.workdir = policy.workingDirectory
+  parsed.resultMetadata = { ...parsed.resultMetadata, working_directory: policy.workingDirectory }
+  const root = runtimeRootFromContext(context)
+  const env = context?.env as Record<string, unknown> | undefined
+  if (process.platform === "win32" || !root || env?.terminals_folder !== path.join(root, "terminals")) return
+  let managed: ReturnType<typeof createManagedTerminal>
+  try {
+    policy.shellPath = resolveCursorShellPath(undefined, workspaceRoot)
+    managed = createManagedTerminal(policy, root)
+  } catch (error) {
+    trace(`background shell: supervised terminal unavailable, keeping the unmanaged wrapper: ${(error as Error).message}`)
+    return
+  }
+  // A spawn's host command is the launcher, which embeds the command verbatim
+  // for approval. A soft-background command keeps its own text: shell hooks
+  // substitute the launcher, and a host without them runs it in the foreground.
+  // The launcher reports within its own startup deadline, so the host's
+  // default timeout stays in place for a host that runs the command as is.
+  if (policy.backgroundSpawn) parsed.args.command = managed.command
+  parsed.resultMetadata = {
+    ...parsed.resultMetadata,
+    managed_command: managed.command,
+    managed_job_directory: managed.directory,
+    managed_shell_path: policy.shellPath,
+  }
+}
+
+/**
  * Read the held-open stream, emitting stream parts, until the turn boundary:
  *  - tool call(s) for one Cursor generation → emit each tool-call as it
  *    arrives; finish "tool-calls" once Cursor's listed count (field 27) is
@@ -3368,7 +3488,11 @@ export async function pump(
    * errors fall through to OpenCode so a genuine permission decision stands.
    */
   const rejectMissingReadTarget = async (parsed: ParsedExecRequest): Promise<boolean> => {
-    if (parsed.toolName !== "read") return false
+    // This validation belongs to Cursor's native LocalReadExecutor contract.
+    // MCP reads belong to the advertised OpenCode executor: both OpenCode
+    // generations support directories and permission-gate missing paths.
+    // Sending a typed ReadResult to an MCP call leaves it without mcp_result.
+    if (parsed.toolName !== "read" || parsed.resultField !== "read_result") return false
     const requested = opencodePathArg(parsed.args) ?? ""
     if (!requested) return false
     // A scheme-addressed target is the advertised host executor's to resolve,
@@ -3611,24 +3735,6 @@ export async function pump(
     )
   }
 
-  const persistTerminalCheckpoint = async () => {
-    if (!session.openCodeSessionId) return
-    await persistConversationState(session.cacheDir ?? opencodeGlobalCacheDir(), {
-      sessionKey: session.openCodeSessionId,
-      conversationId: session.conversationId,
-      requestContext: session.requestContext,
-      toolCatalog: session.toolCatalog ?? [],
-      postCompactionRebase: session.postCompactionRebase,
-      hostAgent: session.hostAgent,
-      systemPromptHash: session.stableSystemPromptHash,
-      hostNote: encodePersistedHostNotes(
-        undeliveredHostNotes(session.openCodeSessionId),
-      ),
-    }).catch((error) => {
-      trace(`conversation persistence: terminal save failed sessionKey=${session.openCodeSessionId}: ${String(error)}`)
-    })
-  }
-
   while (true) {
     // Consumer cancelled / closed the ReadableStream. Stop reading Cursor
     // frames so a continuation doStream can resume the same iterator —
@@ -3711,7 +3817,7 @@ export async function pump(
         && session.pending.size === 0 && isHostPlanEntryPending(session.openCodeSessionId)) {
         // Cancellation is an explicit terminal acknowledgment, not TurnEnded.
         // Preserve its final checkpoint without inventing aggregate billing.
-        await persistTerminalCheckpoint()
+        await persistTerminalCheckpoint(session)
         trace("host-agent-mode: Run cancellation acknowledged for plan handoff")
         emitFinish(undefined, { unified: "stop", raw: undefined })
         sessionManager.close(session)
@@ -3873,7 +3979,7 @@ export async function pump(
       keepUndeliveredHostNotes(session)
       const turnEnded = iu.turn_ended as Record<string, unknown>
       recordTurnEndedCost(session, turnEnded)
-      await persistTerminalCheckpoint()
+      await persistTerminalCheckpoint(session)
       const checkpoint = session.resumeCheckpoint ?? getCheckpoint(session.conversationId)
       if (
         typeof session.reopenWithUserMessage === "function"
@@ -4178,8 +4284,41 @@ export async function pump(
       } else {
         replaySafety.markBarrier("non-control-exec")
         const displayCallId = extractExecDisplayCallId(esm)
+        const runtimeMessages = await runtimeExecMessages(esm, session.requestContext, session.allowTools)
+        if (runtimeMessages) {
+          for (const message of runtimeMessages) {
+            await writeWithBackpressure(session.stream, message, `runtime metadata reply id=${esmId}`)
+          }
+          if (displayCallId) session.displayToolCalls.delete(displayCallId)
+          disposeParallelCall(displayCallId)
+          if (closeIfParallelStepComplete()) return
+          continue
+        }
         const parsed = parseExecServerMessage(esm, session.hostToolDialect)
         if (parsed) {
+          // The model can reach the same internal file through an advertised
+          // canonical read over MCP. It still must not ask the host to approve
+          // access to provider-owned cache metadata.
+          if (parsed.toolName === "read" && parsed.resultField === "mcp_result") {
+            const internalRead = await runtimeExecMessages({
+              id: parsed.id,
+              read_args: { ...parsed.args, path: opencodePathArg(parsed.args) },
+            }, session.requestContext, session.allowTools)
+            if (internalRead) {
+              const reply = decodeMessage<Record<string, any>>("AgentClientMessage", internalRead[0]!)
+              const read = reply.exec_client_message.read_result as Record<string, any>
+              const error = read.error?.error ?? (read.file_not_found ? "Runtime metadata file was not found" : undefined)
+              const frames = buildExecClientMessages({
+                execId: parsed.id, resultField: "mcp_result", toolName: "read",
+                output: read.success?.content ?? "", error,
+              })
+              for (const message of frames) await writeWithBackpressure(session.stream, message, `runtime MCP read reply id=${esmId}`)
+              if (displayCallId) session.displayToolCalls.delete(displayCallId)
+              disposeParallelCall(displayCallId)
+              if (closeIfParallelStepComplete()) return
+              continue
+            }
+          }
           const executableToolName = resolveCustomWebToolAlias(parsed.toolName, session.toolAliases)
           if (executableToolName !== parsed.toolName) {
             trace(`web tool alias resolved: ${parsed.toolName} -> ${executableToolName}`)
@@ -4418,6 +4557,10 @@ export async function pump(
             if (closeIfParallelStepComplete()) return
             continue
           }
+          const shellPolicy = shellPolicyFromMetadata(parsed.resultMetadata)
+          if (shellPolicy && (shellPolicy.backgroundSpawn || shellPolicy.timeoutBehavior === CURSOR_TIMEOUT_BACKGROUND)) {
+            manageBackgroundShell(parsed, shellPolicy, session.requestContext)
+          }
           if (displayCallId) {
             session.displayToolCalls.delete(displayCallId)
             trace(`exec: claimed display callId=${displayCallId}`)
@@ -4427,6 +4570,7 @@ export async function pump(
             parsed.resultField === "shell_stream"
             || parsed.resultField === "shell_result"
             || parsed.resultField === "background_shell_spawn_result"
+            || shellPolicy !== undefined
           ) {
             registerCursorShellCall(tc.toolCallId, parsed.resultMetadata)
           }
@@ -4838,6 +4982,8 @@ type ToolResultContent = {
   toolName: string
   output: string
   error?: string
+  refusal?: ToolRefusal
+  interrupted?: boolean
   /** Host media parts of this result (own content, or the trailing media message). */
   media?: unknown[]
   /** `media` decoded for the exec result, with content hashes in the same order. */
@@ -4866,15 +5012,20 @@ function extractToolResultContent(prompt: LanguageModelV3CallOptions["prompt"]):
       const p = part as unknown as Record<string, unknown>
       if (p.type !== "tool-result") continue
       const toolCallId = (p.toolCallId as string) ?? ""
-      const { text, isError } = toolResultOutputToText(p.output)
-      const media = toolResultOutputMedia(p.output)
+      const failure = toolResultFailure(p.providerOptions, toolCallId)
+      const normalized = toolResultOutputToText(p.output)
+      const text = failure?.text ?? normalized.text
+      const isError = failure !== undefined || normalized.isError
+      const media = isError ? [] : toolResultOutputMedia(p.output)
       const toolName = (p.toolName as string) ?? "mcp"
       const instruction = toolName === "read" && !isError ? extractOpenCodeReadInstruction(text) : undefined
       out.push({
         toolCallId,
         toolName,
         output: text,
-        error: isError ? text : undefined,
+        error: isError ? text || "OpenCode tool execution failed" : undefined,
+        ...(failure?.refusal ? { refusal: failure.refusal } : {}),
+        ...(failure?.type === "aborted" ? { interrupted: true } : {}),
         ...(media.length > 0 ? { media } : {}),
         ...(instruction ? { notes: [instruction] } : {}),
       })
@@ -4898,6 +5049,10 @@ const TOOL_MEDIA_CAPTION = "Attached media from tool result:"
 // of `Instructions from: <absolute path>\n<content>` blocks (the same text
 // OpenCode 1 puts in a read's <system-reminder>). No marker reaches the provider.
 const OPENCODE_INSTRUCTIONS = /^Instructions from: (?:\/|[A-Za-z]:[\\/])/
+// OpenCode 2 ShellResult.notification, packages/core/src/shell/result.ts.
+// Its raw command may contain quotes or newlines. Keep the complete notice as
+// context; do not derive execution status by parsing its command or output.
+const OPENCODE_SHELL_NOTIFICATION = /^<shell id="[^"\r\n]+" state="(?:completed|cancelled|error)" command="[\s\S]*">\r?\n[\s\S]*\r?\n<\/shell>$/
 
 type HostTailNote = { text?: string; media?: unknown[] }
 
@@ -4916,7 +5071,11 @@ function hostTailNote(message: LanguageModelV3CallOptions["prompt"][number]): Ho
   for (const part of message.content) {
     if (part.type !== "text") return undefined
     const text = part.text.trim()
-    if (wrappedHostNote(text, SYSTEM_UPDATE_OPEN, SYSTEM_UPDATE_CLOSE) || OPENCODE_INSTRUCTIONS.test(text)) {
+    if (
+      wrappedHostNote(text, SYSTEM_UPDATE_OPEN, SYSTEM_UPDATE_CLOSE)
+      || OPENCODE_INSTRUCTIONS.test(text)
+      || OPENCODE_SHELL_NOTIFICATION.test(text)
+    ) {
       texts.push(text)
       append = true
       continue
@@ -5006,11 +5165,13 @@ const MEDIA_READ_OUTPUTS = new Set(["Image read successfully", "PDF read success
 function attributeTrailingMedia(results: ToolResultContent[], media: unknown[]): void {
   if (results.length === 0) return
   if (results.length === 1) {
+    if (results[0]!.error !== undefined) return
     if (results[0]!.toolName === "read" && !MEDIA_READ_OUTPUTS.has(results[0]!.output)) return
     results[0]!.media = [...(results[0]!.media ?? []), ...media]
     return
   }
   const bounds = results.map(result => {
+    if (result.error !== undefined) return { min: 0, max: 0 }
     if (result.toolName === "read") {
       const count = MEDIA_READ_OUTPUTS.has(result.output) ? 1 : 0
       return { min: count, max: count }
@@ -5126,7 +5287,7 @@ export function hasApprovedUncorrelatedPlanStageResult(
       if (part.type !== "tool-result" || part.toolName !== CURSOR_PLAN_STAGE_TOOL) continue
       if (parseExecIdFromToolCallId(part.toolCallId)) continue
       const result = toolResultOutputToText(part.output)
-      return !result.isError
+      return !result.isError && !toolResultFailure(part.providerOptions, part.toolCallId)
     }
   }
   return false
@@ -5139,10 +5300,10 @@ function toolResultOutputToText(output: unknown): { text: string; isError: boole
   // LanguageModelV3 tool-result output: { type: "text"|"json"|"error-text"|..., value }
   const isError = o.type === "execution-denied" || (typeof o.type === "string" && o.type.startsWith("error"))
   if (o.type === "execution-denied") {
-    return { text: String(o.reason ?? "Tool execution denied"), isError: true }
+    return { text: String(o.reason || "Tool execution denied"), isError: true }
   }
   if (o.type === "text" || o.type === "error-text") {
-    return { text: String(o.value ?? ""), isError }
+    return { text: String(o.value ?? "") || (isError ? "OpenCode tool execution failed" : ""), isError }
   }
   if (o.type === "json" || o.type === "error-json") {
     return { text: JSON.stringify(o.value ?? null), isError }
@@ -5507,7 +5668,8 @@ export function extractPromptHistory(
         if (p.type !== "tool-result") continue
         const toolName = typeof p.toolName === "string" && p.toolName ? p.toolName : "tool"
         const toolCallId = typeof p.toolCallId === "string" ? p.toolCallId : ""
-        const result = toolResultOutputToText(p.output)
+        const failure = toolResultFailure(p.providerOptions, toolCallId)
+        const result = failure ? { text: failure.text, isError: true } : toolResultOutputToText(p.output)
         results.push(formatSeedToolObservation({
           toolName,
           toolCallId,

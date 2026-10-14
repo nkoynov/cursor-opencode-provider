@@ -4,8 +4,24 @@ import { SessionActivityTracker } from "../src/activity.js"
 import { CursorProtocolError } from "../src/errors.js"
 import type { BidiStream, BidiTerminalEvent } from "../src/transport/connect.js"
 import { sessionFixture } from "./session-fixture.js"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
+import { createManagedTerminal } from "../src/terminal-runner.js"
 
 let _seq = 0
+it("releases an unstarted shell reservation when cancellation closes its Run without a tool result", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-session-terminal-"))
+  try {
+    const terminal = createManagedTerminal({ command: "touch denied", workingDirectory: root, timeoutMs: 0, timeoutBehavior: 0, backgroundSpawn: true }, root)
+    const mgr = new SessionManager()
+    const session = fakeSession()
+    mgr.registerPending(1, session, "background_shell_spawn_result", "shell", false, { managed_job_directory: terminal.directory })
+    mgr.close(session, "process-disposed")
+    expect(fs.existsSync(terminal.directory)).toBe(false)
+    expect(fs.existsSync(terminal.file)).toBe(false)
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+})
 function fakeSession(): CursorSession {
   return sessionFixture({
     sessionId: `sess_test_${++_seq}`,

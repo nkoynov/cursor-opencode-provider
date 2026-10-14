@@ -23,11 +23,7 @@ const status = (context: Record<string, unknown>) =>
 afterEach(() => {
   setSystemTime()
   resetWorkspaceFactsForTests()
-  for (const root of roots.splice(0)) {
-    const index = path.join(root, ".git", "index")
-    if (fs.existsSync(index)) fs.chmodSync(index, 0o644)
-    fs.rmSync(root, { recursive: true, force: true })
-  }
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true })
 })
 
 describe("workspace facts", () => {
@@ -47,7 +43,7 @@ describe("workspace facts", () => {
   it("reports git status incomplete when git status fails", async () => {
     const root = await repo()
     await execFileAsync("git", ["add", "a.txt"], { cwd: root })
-    fs.chmodSync(path.join(root, ".git", "index"), 0o000)
+    fs.writeFileSync(path.join(root, ".git", "index"), "corrupt index")
     const context = await buildRequestContext({ workspaceRoot: root, mergedConfig: {} })
     expect(context.git_status_info_complete).toBe(false)
     expect(status(context)).toBe("")

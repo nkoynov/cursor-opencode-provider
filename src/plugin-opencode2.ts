@@ -13,8 +13,10 @@ import {
   parseExaWebSearchResults,
 } from "./web-tools.js"
 import {
+  armCursorShellCreate,
   captureCursorShellResult,
-  cursorShellEnvForCommand,
+  captureCursorShellFailure,
+  prepareCursorShellCreate,
   prepareCursorShellArgs,
   releaseCursorShellEnv,
   sanitizeRegisteredCursorShellOutput,
@@ -46,6 +48,7 @@ import {
   setActiveCursorMode,
 } from "./protocol/switch-mode.js"
 import { CursorPlugin } from "./plugin.js"
+import { nativeToolRefusal, preserveNativeToolResults, type ToolRefusal } from "./opencode2/tool-results.js"
 import type { CreateCursorOptions } from "./index.js"
 import type {
   Cleanup,
@@ -144,6 +147,50 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
     let disposeHostAgentModeSwitch: (() => void) | undefined
     trace(`opencode2 plugin: setup directory=${workspaceRoot}`)
     const hasShellEnvHook = typeof ctx.shell?.hook === "function"
+    const refusals = new Map<string, ToolRefusal>()
+    const permissionCalls = new Map<string, { sessionID: string; callID: string }>()
+    const rememberRefusal = (id: string, refusal: ToolRefusal) => {
+      refusals.delete(id)
+      refusals.set(id, refusal)
+      while (refusals.size > 512) refusals.delete(refusals.keys().next().value!)
+    }
+    const releasePermissionCalls = () => {
+      for (const call of permissionCalls.values()) releaseCursorShellEnv(call.callID)
+      permissionCalls.clear()
+    }
+    const toolLifecycle = (event: any) => {
+      const payload = eventPayload(event)
+      if (event?.type === "permission.asked" && payload?.source?.type === "tool"
+        && typeof payload.source.id === "string" && payload.source.id.startsWith("cursor_")
+        && typeof payload.id === "string" && typeof payload.sessionID === "string") {
+        permissionCalls.set(payload.id, { sessionID: payload.sessionID, callID: payload.source.id })
+      } else if (event?.type === "permission.replied") {
+        const call = permissionCalls.get(payload?.requestID)
+        if (!call || call.sessionID !== payload?.sessionID) return
+        permissionCalls.delete(payload.requestID)
+        if (payload.reply === "reject") {
+          rememberRefusal(call.callID, "rejected")
+          releaseCursorShellEnv(call.callID)
+          // Native rejection also rejects the session's other pending requests.
+          for (const [id, pending] of permissionCalls) if (pending.sessionID === call.sessionID) {
+            rememberRefusal(pending.callID, "rejected")
+            releaseCursorShellEnv(pending.callID)
+            permissionCalls.delete(id)
+          }
+        }
+      } else if ((event?.type === "session.tool.failed" || event?.type === "session.tool.success")
+        && typeof payload?.id === "string") {
+        if (event.type === "session.tool.failed") releaseCursorShellEnv(payload.id)
+        for (const [id, call] of permissionCalls) if (call.callID === payload.id && call.sessionID === payload.sessionID) {
+          permissionCalls.delete(id)
+        }
+      } else if (event?.type === "session.deleted") {
+        for (const [id, call] of permissionCalls) if (call.sessionID === payload?.sessionID) {
+          releaseCursorShellEnv(call.callID)
+          permissionCalls.delete(id)
+        }
+      }
+    }
 
     if (typeof ctx.session.switchAgent === "function") {
       const switchAgent = ctx.session.switchAgent
@@ -334,22 +381,31 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
 
     // ── Shell timeout wrapper ────────────────────────────────
     await track(
-      ctx.tool.hook("execute.before", (event) => {
-        if (!isShellTool(event.tool)) return
+      ctx.tool.hook("execute.before", async (event) => {
+        if (!isShellTool(event.tool) || typeof event.input !== "object" || event.input === null) return
         const executionID = toolExecutionID(event)
-        prepareCursorShellArgs(executionID, event.input as Record<string, unknown>, {
-          // OpenCode 2.0 `shell.create.before` can inject env for bash/zsh.
+        const input = event.input as Record<string, unknown>
+        prepareCursorShellArgs(executionID, input, {
+          deferToShellHook: hasShellEnvHook,
           preferWrapperCommand: !hasShellEnvHook,
         })
+        if (hasShellEnvHook) await armCursorShellCreate(executionID, event)
       }),
     )
 
     await track(
       ctx.tool.hook("execute.after", (event) => {
-        if (!isShellTool(event.tool)) return
         const executionID = toolExecutionID(event)
+        if (event.status === "error") {
+          const refusal = nativeToolRefusal(event.error)
+          if (refusal) rememberRefusal(executionID, refusal)
+        } else refusals.delete(executionID)
+        if (!isShellTool(event.tool)) return
         try {
-          if (event.status !== "completed") return
+          if (event.status !== "completed") {
+            if (event.status === "error") captureCursorShellFailure(executionID, event.error)
+            return
+          }
           const result = event.result as Record<string, any>
           // V1: `output` is the model-facing string. V2: `output` is structured
           // per-tool output (shell: `{ output: string, ... }`) and the
@@ -401,9 +457,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
     if (ctx.shell) {
       await track(
         ctx.shell.hook("create.before", (event) => {
-          const env = cursorShellEnvForCommand(event.command, event.cwd)
-          if (!env) return
-          event.env = { ...event.env, ...env }
+          prepareCursorShellCreate(event)
         }),
       )
     }
@@ -420,6 +474,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
 
     await track(
       ctx.session.hook("context", async (event) => {
+        event.messages = preserveNativeToolResults(event.messages, refusals)
         markCompactionAndOptions(event, event.agent === "compaction")
         event.options ??= {}
         event.options[CURSOR_HOST_AGENT_OPTION] = event.agent
@@ -487,6 +542,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
 
     await track(
       ctx.session.hook("compaction", async (event) => {
+        event.messages = preserveNativeToolResults(event.messages, refusals)
         markCompactionAndOptions(event, true)
         await rememberSessionDirectory(event.sessionID)
       }),
@@ -494,6 +550,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
 
     await track(
       ctx.session.hook("generate", async (event) => {
+        event.messages = preserveNativeToolResults(event.messages, refusals)
         markCompactionAndOptions(event, false)
         await rememberSessionDirectory(event.sessionID)
       }),
@@ -501,6 +558,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
 
     await track(
       ctx.session.hook("title", async (event) => {
+        event.messages = preserveNativeToolResults(event.messages, refusals)
         markCompactionAndOptions(event, false)
         await rememberSessionDirectory(event.sessionID)
       }),
@@ -566,11 +624,13 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
       credentialGeneration++
     }
 
-    const unsubscribe = subscribeSessionActivity(ctx, ensureModels, onCredentialSwitch)
+    const unsubscribe = subscribeSessionActivity(ctx, ensureModels, onCredentialSwitch, toolLifecycle, releasePermissionCalls)
 
     return async () => {
       clearInterval(retry)
       unsubscribe?.()
+      releasePermissionCalls()
+      refusals.clear()
       disposeHostAgentModeSwitch?.()
       disposeNativePlansDir()
       trace(`opencode2 plugin: cleanup directory=${workspaceRoot}`)
@@ -585,20 +645,25 @@ function subscribeSessionActivity(
   ctx: PluginContext,
   onEvent?: () => void,
   onCredentialSwitch?: () => void,
+  onToolEvent?: (event: unknown) => void,
+  onStreamClosed?: () => void,
 ): (() => void) | undefined {
   try {
-    const stream = ctx.event.subscribe()
+    const controller = new AbortController()
+    const stream = ctx.event.subscribe({ signal: controller.signal })
     if (!stream || typeof stream[Symbol.asyncIterator] !== "function") return undefined
     let stopped = false
-    void (async () => {
+    void (async () => { try {
       for await (const event of stream as AsyncIterable<any>) {
         if (stopped) break
         applySessionActivity(event, onCredentialSwitch)
+        onToolEvent?.(event)
         onEvent?.()
       }
-    })().catch(() => {})
+    } finally { onStreamClosed?.() } })().catch(() => {})
     return () => {
       stopped = true
+      controller.abort()
     }
   } catch {
     return undefined

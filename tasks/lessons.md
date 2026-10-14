@@ -1,762 +1,717 @@
 # Lessons
 
-- A deferred mode handoff cannot depend on a model obeying a stop instruction after Cursor's native mode has changed. Explicitly cancel the old Run, stop its heartbeat, retain the final checkpoint, and accept only the requested server cancellation as terminal before switching agents. Next-turn-only switches must still record the plan in the current Run. Native discovery errors remain diagnostics, never host execution.
-- A global invocation reminder is insufficient when discovery shows only an inner argument schema. Carry the exact outer identity in every dynamic definition without changing the tool's schema or guessing identities for rejected calls. Inspect saved Cursor calls: a server-side rejection has no client execution to repair.
-
-- Complete every advertised canonical shell field before required-key validation. Native shell requests have no description field; preserve a supplied description and derive one from a real command only when the schema requires it. Leave schemas without that field unchanged. File schemas and host-generated reminders must be normalized by OCP before reaching this provider; weakening the validator conceals those boundary defects.
-
-- Gate guidance about native interactions by the same canonical catalog as execution. Advertising AskQuestion as bridged without `question` invites a predictable refusal; silence about a missing `task`/`subagent` executor also invites unnecessary attempts. State the unavailable route explicitly while preserving supported planning interactions.
-
-- Tool-less calls still expose Cursor's native tools remotely. Give these calls an explicit text-only instruction that treats the supplied task as input, and make a refusal request the answer rather than repeat the embedded task. Before emitting an executable call, check normalized arguments against explicit required keys in the live catalog; a correlated error can request correction without creating an invalid host call. Verify that the catalog and normalized arguments use the same canonical contract through a real consumer session before claiming success; a local rejection test alone misses translation-boundary regressions.
-
-- A diagnostic must apply the same bounds as the value it checks.
-  `occupancyValidationCounters` used the prior checkpoint size as the cached
-  prefix unclamped; the usage builder clamps it to the input. When Cursor's
-  context shrank (26,823 → 26,766) the validator reported `status=mismatch`
-  (`rawCachedRatio=100.2%`) for correct usage.
-
-- A strict wire classifier must follow the extracted proto, not only the
-  fields it was written against. `KvServerMessage` carries
-  `span_context` (#4); `validKvWire` counted it as a second variant, so every
-  live Run hit `replay barrier: reason=unknown-or-malformed-frame` on its
-  first KV frame and lost automatic retry. The exec analyzer already skipped
-  its own `span_context` (#19). When a barrier fires on every Run, read the
-  frame against `agent.proto` before trusting the label.
-- Same class, next run: `InteractionUpdate` members `thinking_completed` #5
-  and `token_delta` #8 were not in the classifier's set, and
-  `ThinkingDeltaUpdate.thinking_style` #2 failed the one-field check. After
-  the KV fix they became the first barrier after every continuation write.
-  Admit only documented members that carry no output or state; keep the rest
-  as barriers.
-- The extracted proto can lag the live server: after that fix, 7-byte
-  `interaction_update` frames right after each tool-result write still
-  failed, and no declared member matched. Guessing field numbers wasted a
-  round. Debug runs now trace `replay frame unknown: layout=…` (field numbers
-  and wire types only) once per layout; read that before changing the set.
-- The layout trace resolved it in one run: `InteractionUpdate`
-  `message_started_at_ms` #25 beside the oneof, `tool_requests_listed` #27,
-  `tool_call_delta` #15, and top-level `AgentServerMessage.ttft_breakdown` #8.
-  The installed Cursor CLI bundle (`index.js`, `"InteractionUpdate|…"`
-  descriptors) has the current schema; the extracted agent.proto does not.
-
-- TurnEnded on a held Run is cumulative across every tool step, but the host
-  finish only spans the last generation slice. Emitting `output_tokens` /
-  `reasoning_tokens` there made Kilo tok/s (`(output+reasoning)/elapsed`) hit
-  six figures (8069 tokens / 62ms). Stop finishes now use the same occupancy
-  snapshot as tool boundaries (`output=1`); exact request counters stay under
-  `providerMetadata.cursor.*Raw`.
-- Cursor Auto (`default`) has no static `maxContext` on the model list. The
-  catalog fallback must match live checkpoints (256k base), not a generic 200k,
-  or the host context meter disagrees with Cursor.
-- Display `create_plan_tool_call` mirrors into `todowrite` after the plan file
-  exists. Mark that synthetic plan row `completed`, not `pending`, or hosts
-  keep a forever-open checklist item.
-
-- An in-session helper that calls the model on the parent session while that
-  Run is still waiting for the helper must not be treated as a fresh user
-  turn. Cancelling the pending helper and reusing the parent conversation
-  remints it (`interrupted-run`) and the model resumes lost. Isolate that
-  call when its catalog is a small subset of the busy parent's catalog:
-  skip `preparePriorSessionForFreshTurn`, bind an ephemeral conversation, and
-  leave `openCodeSessionId` unset so `registerSession` cannot supersede the
-  held parent (self-verify L3: `task` trailing result after a 67-of-70 helper).
-- After plan approval, the agent-mode reminder has to say the plan-mode
-  edit ban is over and that file changes go through `write` / `edit`. The
-  older reminder says it supersedes other instructions, and the execution
-  turn otherwise appends with the shell.
-
-- Debug log re-init must append when `CURSOR_PROVIDER_DEBUG_FILE` already has
-  content. Truncating on every module load wipes mid-run `EMITTED` lines and
-  makes self-verify falsely fail ask/todo/task even though the host transcript
-  still has the calls (`reinit=append` marker). Operators truncate once before
-  a clean run. Separately, when the file reaches 10 MiB, `trace` size-caps it
-  (`debug: size-cap truncate`) so unbounded self-verify logs cannot fill disk.
-- Account-specific endpoint discovery should fail closed when the authoritative API lookup fails; silently substituting a legacy global endpoint can mask the real issue and route regional accounts to a host known to reject them.
-- Telemetry fields on API discovery calls should default to disabled and require an explicit provider config opt-in.
-- Keep API base URLs and agent Run host overrides as separate options; sharing one `baseURL` name makes it too easy to send the HTTP/2 Run stream to the API host.
-- When a host framework merges provider, model, agent, and variant options into one namespace, generated wire parameters need a dedicated typed payload; never infer them from every key in the merged object.
-- If a selectable variant changes static host metadata such as the context window, materialize it as a distinct host model entry; when the host uses config `id` for inheritance, keep the synthetic id and carry the upstream wire id in a dedicated option instead.
-- Cache schema invalidation must be resolved before configuration materializes cached data; refreshing the file later does not update an already-built in-memory provider catalog.
-- Every server-initiated request channel on a bidirectional RPC must either receive its correlated response or fail the turn explicitly; treating an unfamiliar interaction query as an ignorable event leaves both peers alive but permanently waiting.
-- Detect framework lifecycle turns (such as OpenCode compaction) through explicit plugin metadata, not by assuming an empty tool list or `toolChoice:none` uniquely identifies them.
-- Compaction seeds must preserve actual tool-result payloads; replacing them with tool-name summaries fabricates completion evidence and can make later turns claim tools ran without executing them.
-- When a protocol checkpoint captures turn capabilities, a summary turn may disable tool execution but must still advertise the established catalog so post-compaction turns remain tool-capable.
-- An opaque checkpoint also captures the lifecycle agent's system/root state; never reuse a compaction agent checkpoint as the resumed normal agent merely because the tool catalog is present. Rebase the normal agent from the host's compacted prompt and normal system instructions.
-- Proto3 default scalar values are omitted from the wire. A missing encoded `uint32` correlation field can validly mean zero; raw safety inspectors must apply protobuf defaults before declaring a live frame malformed.
-- Provider-specific tool guidance must be derived from the exact per-turn advertised catalog and omitted from lifecycle prompts; naming unavailable host tools turns a useful fallback into another unexecutable request.
-- A protobuf encode/decode round trip against one locally declared schema cannot prove wire compatibility; protocol regressions need independent canonical field fixtures, especially where a reused field number changes wire type. Never register a compatibility alias under the name of a different canonical message, because later reuse can silently select the wrong shape.
-- Tool translation requires compatible state and input semantics, not merely similar names. Decline a bridge when it would turn a read/lifecycle action into a replacement write, lose merge state, substitute a search term for a URL, fabricate a structured policy/selection from a coarse boolean or unrelated catalog, or reuse an item identity as a group identity.
-- When one held-open stream is resumed across host calls, dispatch each inbound frame to completion before reading the next. Concurrent fan-out can consume past the handoff boundary and make continuation frames impossible to recover.
-- Never infer a client response field from a server request field number. Protocol families can deliberately offset request/result oneofs; maintain an explicit mapping and close each exec stream after the typed result.
-- A completed tool-display event is evidence that an operation already finished, not authority to execute it again. Only mirror self-contained final UI state; data, interaction answers, side effects, and failures require a request/reply channel.
-- Process-global session metadata needs a shared finite lifetime just like checkpoints and blobs. Bound tool catalogs, lifecycle markers, and conversation bindings, and evict their associated opaque state together.
-- Advertising a virtual MCP server also commits the provider to its control plane. Answer state/readiness probes from the exact advertised descriptor set before waiting for the eventual tool execution request, but validate each response against its canonical nested schema: MCP state uses full tool definitions even though request-context catalogs use narrower filesystem descriptors.
-- Cursor-native GetMcpTools / GetDynamicTools is executed by the agent after `mcp_state`, not by an OpenCode catalog tool. Oversized catalogs spill through `write_args` into `agent-tools/<uuid>.txt` and the model reads `filePath` from `WriteSuccess.path`. Echo `WriteArgs.path` on that success field; host write prose has no `<path>` tag, so parsing it invents nothing and leaves the spill path empty.
-- An HTTP success status or clean iterator EOF is not an application-level turn boundary for a bidirectional agent protocol. Require the protocol's terminal event, capture connection trailers/GOAWAY, and rebase from host-owned history when a held-open Run disappears.
-- A native Task display frame does not execute the subagent. Cursor's correlated exec field #28 must be decoded as `SubagentArgs`, emitted once through OpenCode's `task` tool, and answered with the paired typed `SubagentResult` so the held-open Run can resume.
-- Native tool bridges must normalize framework-specific built-in identifiers at the semantic boundary. Cursor's `generalPurpose` maps to OpenCode `general`, while native read-oriented `bugbot` reviews map to `explore`; forwarding those wire names verbatim executes the bridge but fails host validation before spawning anything.
-- A native background-process request cannot be represented by merely renaming it to a foreground shell tool. Detach it with every inherited stream redirected, preserve request metadata until the typed spawn result is sent, and reject interactive lifecycle features the host cannot actually service.
-- Host-tool timeout prose is transport metadata, not model-visible stdout. Preserve the upstream timeout policy through tool execution, remove the host envelope in the result hook before persistence, and encode the protocol's typed timeout/background outcome on continuation.
-- Keep a complete request/result inventory even when only a subset is executable. A raw field id should resolve to its canonical request name, paired result name/id, and local support class; that makes known unsupported capability distinguishable from protocol drift without fabricating a response.
-- Cursor's native capability set can exceed the current OpenCode agent's advertised tools. Treat the per-turn host catalog as an execution allowlist for every decoded exec request, not only MCP calls; return an unavailable request through its correlated typed result instead of letting the host synthesize an `invalid` tool call.
-- Structured workspace context alone may not prevent invented path prefixes after a conversation rebase. Derive any prompt-level path anchor from the same normalized root used by the structured context, and keep lifecycle prompts such as compaction unchanged.
-- User-facing behavior documentation should stay concise and point maintainers to the source and focused tests; internal prompt transport and checkpoint mechanics belong in code unless users need them to operate the feature.
-- The package root is an OpenCode plugin entrypoint, not a general public runtime barrel. Keep root runtime exports plugin-safe and publish auxiliary APIs from subpath exports so the classic loader cannot invoke classes or helpers as plugin functions.
-- Cursor's streamed edit is a client handshake, not one atomic exec: an existing file follows `edit_tool_call` → `read_args` → `write_args`. For a correlated missing target, answer the prerequisite read as an empty file so creation can continue through the normal write tool instead of teaching the model to fall back to shell.
-- A protocol operation's final exec variant can describe client mechanics rather than model intent. Preserve the display call id across a streamed edit, satisfy its private read with complete workspace content rather than a host-capped preview, and translate only the correlated whole-file write back into the host's targeted edit capability; an uncorrelated write must remain a write and external reads must retain host permissions.
-- Never flatten host tool results into assistant-authored seed-history prose. Normal conversation rebases should omit stale results; lifecycle flows that need the evidence must mark it as a host observation so the model is not trained to counterfeit a result instead of issuing a tool call.
-- A bounded tool result's payload length is not the resource's total length. Preserve the requested range and full-resource metadata before stripping a host-specific envelope; otherwise a correct slice becomes an internally impossible protocol response that teaches the model to distrust the tool.
-- Security hardening may manage permissions only on provider-owned paths. An explicit file override authorizes that file location, not chmod of its parent directory; provider-owned temporary directories must also be validated as real, current-user-owned directories before use.
-- A network deadline must cover response-body consumption, not only receipt of headers. Clear abort timers in `finally` after the body has been consumed, or a server can acknowledge a request and then hang initialization indefinitely.
-- Metadata recovery for capped output must use bounded memory. If an upstream footer omits a full-resource count, scan in fixed chunks rather than buffering the complete resource just to derive metadata.
-- A server checkpoint is a recovery boundary, not merely evidence that replay is unsafe. On a transient Run failure, resume the same conversation from the newest checkpoint with the protocol's resume action; only fall back to history replay when no stateful progress occurred.
-- Install-tree compatibility wrappers must consume the host identity recorded when they are installed. Isolated provider workers can hide the parent binary and environment, so ignore config-directory guesses for behavioral policy and use the validated install-tree host only as a fallback after stronger live signals.
-- When a host tool name collides with a model's native UI-bound capability, prompt wording alone is not a reliable routing boundary. Advertise a collision-safe alias, retain a per-session reverse mapping to the exact original tool, and fail closed when capability discovery is ambiguous.
-- A safe alias does not disable the corresponding native capability. When the protocol exposes optional capability flags, advertise unavailable UI-bound capabilities explicitly as false on every context path; rejecting a later approval query leaks avoidable failure narration into the model turn.
-- Co-installed application directories are evidence of installation, not process identity. Route host-owned state only from explicit options/environment, live binary/package identity, or the provider's own install path; otherwise use the upstream OpenCode default.
-- An interaction approval channel is not a tool bridge when its response cannot carry execution output. For headless compatibility, expose an executable host tool and translate the model request through the correlated exec channel instead of auto-approving a server-side substitute.
-- Framework tool ids can be reserved beyond the built-in registry. If filtering happens after plugin tools are merged, a plugin collision is filtered too; register fallbacks under their final collision-safe public id and test the host-visible catalog, not only the raw plugin hook.
-- Cursor-native Task subtype names, host agent names, and MiMo work-item tools are separate namespaces. Preserve the raw Cursor subtype until it can be resolved against the current permission-filtered Task/Actor catalog; prefer exact spawnable custom names, use structured enums over broader prose lists, and route MiMo execution through `actor` rather than its `task` tracker.
-- A host's "v2 plugin API" and its next-major plugin API can be different, source-incompatible APIs sharing a version-adjacent name. Verify hook signatures, credential value types (Effect vs Promise), and provider schema against the published package for the exact dist-tag users install; when advancing a beta pin, diff declarations and preserve runtime compatibility for simple field renames where practical.
-- Documentation is a starting hypothesis, not ground truth, for an unreleased API. Read the shipped `.d.ts` before designing against docs prose: the published surface here contradicted the docs on hook arity, the `aisdk:` package discriminator, and which domains exist.
-- A type-conformance test proves nothing unless the build actually typechecks the file. Confirm a guard fails when deliberately broken; `include: ["src"]` silently excluded the entire test tree, so the first version passed vacuously.
-- Prefer usage-level type assertions over whole-interface assignability when guarding against a schema-derived API. Branded strings and mutable-vs-readonly drafts make structural identity unachievable, while one assertion per real call site still fails loudly on a breaking change.
-- When emulating a removed host hook, confirm the replacement hook actually exposes a writable channel for the value. A mutation to a field the host does not read is indistinguishable from working code at compile time and silently drops the behavior.
-- A structured metadata flag is not a message to the model. `truncated: true` was already being sent and models still asserted "highly confident" that partial content was the whole file; only a marker inside the content text changed the answer. Verify a signal reaches the model behaviorally, not just on the wire.
-- A stale code comment can misdirect an entire fix. "Most reads arrive via mcp_result" sent the first version of this change to a path live traffic never used; one end-to-end run showed every read going through `read_result`. Confirm which branch real traffic takes before optimizing it.
-- Design an A/B fixture so the signal under test is the *only* way to reach the right answer. A self-describing fixture (lines carrying their own index) let the model infer truncation without the notice, hiding a null result until the fixture was made blind.
-- A regex that reads control metadata out of a payload will eventually match the payload itself. Anchor footer/marker parsing to its structural position in the envelope, not to a substring search over the whole document — a file that merely quotes the marker otherwise impersonates it.
-- Stripping a host envelope must preserve what the envelope *said*, not just the payload. A capped read whose "output capped" footer is removed is indistinguishable from a complete one, so the model rewrites the file from a partial view and destroys the remainder. Re-state the limit through a channel the model cannot echo back into content — a separate result item or a structured truncation field — rather than restoring the raw footer.
-- A matching constant on both sides of an integration is not evidence of which side applied it. Two independent 50 KiB budgets looked like one server-side cap; the truncation was in the opposite direction from the symptom, on the read that fed the write. Trace the data path before attributing a boundary.
-- An allowlist named for transport metadata will quietly swallow content fields. Before adding a wire field to a decoder, check whether an existing filter already discards it; a schema addition alone changes nothing if the key is dropped downstream.
-- A host may substitute one capability for another rather than merely withholding it. When a tool is missing, check whether an equivalent was advertised in its place and translate; key that translation off the advertised set alone, never off a model id or host version, so it stays inert wherever the substitution does not apply.
-- Before adding a fallback to a dispatch path, confirm the path is reachable for the inputs in question. A display-mirror bridge that gates on a small variant allowlist will never see the streamed-edit variant it appears to handle, so a fallback there is unreachable code that a passing typecheck cannot distinguish from working code.
-- A shared implementation module silently couples every entrypoint to its heaviest import. When one host's package root exports a value another host's does not, keep that value import in a leaf module owned by the host that needs it; a smoke test run inside the repo cannot detect the breakage because the dev dependency always resolves locally. Audit the built dependency graph instead.
-- Security scanners classify data flow by shape, not intent. When a high-entropy token is hashed only for an ephemeral memoization key, keep the raw secret out of process-global state and narrowly suppress the password-hash rule with the lifecycle rationale rather than weakening the design to silence the alert.
-- Regexes that combine repeated prefixes, lazy wildcards, or anchored alternatives can become polynomial even when normal inputs are short. Parse structural delimiters such as data-URL metadata in explicit linear passes and keep stress fixtures that exercise repeated-prefix and missing-terminator cases.
-- Inspect the exact fetched artifact before extending a generated-data pipeline. Cursor's pricing page and aggregate docs expose related model data through separate markdown endpoints, even when the rendered documentation makes them look like one model table.
-- A model capability flag is safe to publish only when the provider preserves the matching prompt parts on the wire. Keep live negative values authoritative over docs fallbacks, because account-specific model catalogs can contradict the public table in both directions.
-- When a live continuation channel is text-only but a fresh request accepts images, keep continuation frames unchanged and harvest media from prompt history only when opening the next Run. Bound history growth with content-hash deduplication, while allowing recovery rebases to resend because they create a new upstream conversation.
-- A host's native capability can be advertised implicitly, with no descriptor and no flag to disable — the client either owns an executor for a request field or it doesn't. Treat any such field as reachable regardless of what this provider chooses to advertise, and give it a total, typed answer on the protocol floor; a request-context flag that merely describes supplied data is not evidence the underlying capability can be turned off.
-- A tool-name collision with a host-native capability is not limited to one feature area. When this provider's own advertisement inverts the host's model (every tool exposed, including ones the host already owns natively), the same alias-and-reverse-map remedy applies to each new collision as it's found, not just the one it was first built for.
-- A per-turn trace value computed before the encoder is not evidence of what went on the wire. `historyChars` counts a system entry that `buildSeedConversationState` then drops whenever `systemPrompt` is set, so the log reads like a duplicated 69 KB prompt that is never actually sent twice. Read the encode path before reporting a payload defect inferred from arithmetic over trace fields.
-- A host can withhold tools from the model without withholding them from itself. oh-my-pi's `tools.xdev` mounts every non-essential tool — all MCP servers included — behind `xd://` device URLs and ships only ~11 entries in `Context.tools`; the devices remain fully executable and are catalogued in the system prompt, so nothing in the provider or bridge is broken and neither can advertise what the host never puts in the tool list. When a model reports that tools are missing, separate "absent from the callable schema" from "absent from the host", and look for a host presentation setting before changing wire code.
-- A model's account of its own system prompt is not evidence about the system prompt. Asked directly, the model denied any `xd://` or GitHub content while that same prompt carried 63 device lines and it could execute those devices on request. Verify prompt contents by dumping what the provider actually sends, and verify capability by invoking it.
-- A 50 KB read cap can still cause data loss when a model turns the partial result into a whole-file edit; an explicit model-visible warning must be paired with guidance to page before replacing complete contents, and large `TurnEnded` counters need a request-local sanity check even without a visible tool boundary.
-- A model-visible partial-read warning is still advisory, but a literal-content guard must match the destructive operation: reject whole-file writes and overwriting Add File patches that echo it, while allowing targeted edits and complete correlated edit transactions so source code can legitimately quote the warning.
-- A host-authorized external read can safely establish permission for a provider-internal edit prerequisite, but authorization and data completeness are separate facts: wait for the host's successful result, then read the exact correlated file completely before allowing a whole-file edit transaction to continue.
-- A cache snapshot is not frozen merely because it is retained in a map. Recursively freeze the stored base, deduplicate concurrent first builds, and compare encoded overlays, or callers and races can silently change the supposedly byte-stable prompt prefix.
-- Persisting an opaque conversation checkpoint alone is not restart recovery: its session binding, content-addressed blobs, stable request-context base, lifecycle tool fallback, and pending compaction rebase must be replaced atomically at the protocol's successful turn boundary.
-- Binary-heavy durable state should not pay JSON's base64 expansion merely for inspectability. Measure the real payload: direct protobuf bytes plus whole-record gzip retained schema evolution while reducing this conversation snapshot far more than compacting JSON or protobuf alone.
-- A content-addressed restart store cannot safely keep only its root checkpoint, but it also must not append every historical blob forever. Traverse the latest root with the producer's own reachability rules, garbage-collect only after the successful boundary, and fall back to retaining everything when the graph is incomplete or undecodable.
-- Protocol fields can become live across client releases. `RequestContextArgs.use_cached` was unused in the earlier CLI, but the 2026.08.11 exec daemon uses it for a baked disk context and overlays current plugin rules/skills/subagents plus MCP tools/options; verify the exact shipped build before treating a field as inert.
-- Prompt-cache stability must not freeze capability truth. Keep expensive workspace context stable, but refresh tools/MCP, skills, agents, and plugin metadata each turn; byte-compare the materialized result so unchanged capabilities remain exactly cacheable.
-- A conversation-id reset is not necessarily a workspace-context reset. Compaction must discard the old checkpoint/history identity, but transferring the frozen base and prior byte-comparison seed lets unchanged system capabilities retain an identical cache prefix while live overlays still refresh.
-- Atomic replacement prevents a torn cache file, not cross-process lost updates when every process rewrites one aggregate from its own stale in-memory map. Partition durable state by its single-writer ownership key (the stable OpenCode session id), retain the rotating Cursor conversation id inside that record, and make stale cleanup revalidate any file moved aside so it cannot erase a concurrent fresh replacement.
-- Usage fields named as totals may already contain their cache/reasoning subsets, while repeated downstream step boundaries can still multiply one upstream request. Verify semantics against both the shipped client and multiple live turns: here decreasing continuation counters proved `TurnEnded` is request-local. Never infer cumulative semantics from one monotonically increasing sample.
-- OpenCode TUI/GUI **replace** the last assistant message's tokens (TUI requires `tokens.output > 0`); they do not sum occupancy. Session cost **adds** every step-finish. Emitting occupancy *deltas* would make the footer show only the increment. Emitting billed occupancy on every tool step would explode spend once Composer/Grok have prices. The correct mid-turn signal is the last-known checkpoint snapshot (`output=1` so TUI accepts it) plus OpenCode's only getUsage override, `providerMetadata.copilot.totalNanoAiu: 0`. Bill the occupancy once at `TurnEnded`.
-- When a host uses one AI SDK usage total for both display and compaction, use Cursor checkpoint `tokenDetails.usedTokens`, not aggregate `TurnEnded` input. Keep the current output component, proportionally normalize the input cache partition so every displayed component sums to Cursor's total, and retain exact request counters in provider metadata. With no fresh token details, keep the prior checkpoint explicitly stale; with no known checkpoint, leave occupancy unavailable/zero. Cursor CLI does not promote request usage into context occupancy, and neither should the provider.
-- An aggregate cache ratio cannot identify why reuse is low. Log the prior checkpoint occupancy, current category deltas, byte-stable context fingerprints, and agent-step/tool activity alongside raw read/write/uncached counters; explicitly mark per-model-call cache accounting unavailable when the protocol does not provide it.
-- A heartbeat backpressure error can be only the first awaited write to expose a backlog created elsewhere. Serialize response-required writes, await each KV drain before reading another request, and label failures with the operation that actually filled the stream. Treat an opaque checkpoint envelope, its reachable blob graph, and a fresh-history seed as separate quantities; only the latter two can inform safe rebase and context diagnostics.
-- TypeScript editor diagnostics can use the root `tsconfig.json` even when the
-  repository's test typecheck intentionally excludes runtime tests. Keep
-  `@types/bun` installed and include `bun` in `compilerOptions.types` so Bun's
-  `bun:test` imports resolve in OpenCode's LSP without widening the build's
-  source/test inclusion.
-- A provider-side argument mapper must preserve alternate host tool shapes
-  before normalizing the default shape. OMP's hashline `edit` sends `{input}`;
-  rebuilding every edit from OpenCode's `{filePath,oldString,newString}` fields
-  silently changed that valid call to `{}`, so OMP reported a misleading missing
-  `input` field. Keep the hashline payload intact and strip only its metadata.
-- Host-owned paths must be calculated through the path bridge, not hardcoded to
-  OpenCode's default. Writing CreatePlan files to `.opencode/plans/` verbatim
-  breaks MiMo/Kilo/OMP hosts that use a different project-config dir; route through
-  `opencodeProjectConfigDirs` / `hostPlansDir` and keep the body in the host's
-  universal plain-markdown shape so non-Cursor models are not confused by Cursor
-  YAML frontmatter or `~/.cursor/plans`.
-- Do not refuse a Cursor InteractionQuery that OpenCode can satisfy with an
-  advertised host tool. SwitchMode (#4) maps onto `plan_enter` / `plan_exit` the
-  same way AskQuestion maps onto `question`: hold the query open, emit the host
-  tool, and reply `approved{}` / `rejected{reason}` (CLI string on user decline)
-  on continuation. Map `plan`/`spec` → `plan_enter` and every other non-empty
-  target → `plan_exit` (no exclusions); after approval, inject a CLI-shaped
-  `<system_reminder>` for that mode on later Runs. Never invent a `task`/
-  subagent spawn for SwitchMode itself — reminders may instruct the model to
-  use `task` afterward.
-- OpenCode 1.18 `/plugin/v2` has no `tool` domain — `cursor_image_save` and
-  `custom_websearch` live only on the classic Hooks plugin. Dual-load classic +
-  v2 is required for GenerateImage on 1.18; a v2-only load silently disables it.
-  OpenCode 2.0 `/plugin/opencode2` must register `cursor_image_save` itself via
-  `ctx.tool.transform` using host-neutral `executeCursorImageSave` (never import
-  `image-save-tool.ts`, which pulls classic `@opencode-ai/plugin` `tool()`).
-- SwitchMode has two Cursor channels that must stay distinct: InteractionQuery
-  #4 is the sync consent gate (`approved{}`/`rejected{reason}`, no async
-  variant); display `switch_mode_tool_call` (#25) is the transcript record with
-  `SwitchModeResult` (success hardcodes `from_mode_id=""`). Bridging the query
-  without inventing a display result is correct — display stays non-replayed.
-  OpenCode advertisement is the live gate for *bridging to a host tool*, but
-  absence of that tool is not a reason to refuse the switch (see the 2026-08-16
-  entry below).
-- A provider-recorded mode can become stale when the host completes a native UI
-  lifecycle without another SwitchMode query. For the omp bridge, mark the mode
-  as bridge-entered when the real `plan_enter` continuation succeeds; native
-  approval/exit restores `plan_enter`, which is then a reliable signal to emit
-  one Agent handoff and clear the Cursor plan reminder. Do not infer native-plan
-  liveness from registration alone: the bridge tool is callable outside plan
-  mode too, so CreatePlan staging must require that successful entry marker.
-
-## 2026-08-16 — An approval the model has to volunteer is not a gate
-
-- **A gate that depends on the model choosing to ask is not a gate.** Plan mode
-  was entered and the plan file was written, and then the turn simply ended: the
-  model never raised SwitchMode back to `agent`, so the approval prompt that
-  lives on that path never fired. Nothing was broken by the spec's own terms —
-  the spec was wrong. Attach the prompt to the step that actually happens
-  (recording the plan), not to a later step the model may skip.
-- **Two hosts satisfying "the same" flow can fail in opposite directions.** The
-  pi-bridge path asked but reported *both* answers as success, so requesting a
-  refinement made Cursor start implementing the plan the user had just declined;
-  the native path never asked at all. Fix both by naming one contract — success
-  = approved for execution, error = written but not accepted — and making every
-  channel report through it, rather than patching each side's symptom.
-- **Split "persist" from "execute" when deciding what needs consent.** Writing a
-  plan is cheap, reversible, and outside the repository, so it needs no
-  approval; starting the work it describes does. That split is what lets the
-  write stay unconditional while the gate stays mandatory.
-- **An approval prompt is only a gate if the user can see what they are
-  approving.** The first version asked "start implementing?" and named a file
-  path; the plan itself had never been displayed, because Cursor routes the body
-  through the interaction query rather than the text stream. Ask where the
-  content already is, or put the content where the user reads — and check which
-  surface can actually hold it: OpenCode's question dock renders outside the
-  scrollbox with `flexShrink={0}`, so a full plan there pushes the conversation
-  off screen, while the assistant message scrolls and persists.
-- **An answer parsed by anchor text must be parsed with the exact anchor.** The
-  host echoes the prompt verbatim and the answer is sliced relative to it, so a
-  prompt built from a different label silently reads as unanswered. Carry the
-  literal question that was asked through to the parse, and test the mismatch —
-  the failure mode is a prompt that can never be approved.
-
-## 2026-08-16 — A missing host tool is not automatically a refusal
-
-- **Read what the host tool *does* before treating its absence as a dead end.**
-  SwitchMode rejected twice in `/tmp/opencode-plan-test.log` because neither
-  `plan_enter` nor `plan_exit` was advertised. The bridge was behaving to spec,
-  but the spec was wrong: OpenCode's plan tools are not mode flags. Each asks
-  the user through the Question service and, on "Yes", injects a synthetic user
-  message carrying `agent:"plan"|"build"`, which `createUserMessage` turns into
-  a `setAgentModel` primary-agent switch (`tool/plan.ts`, `session/prompt.ts`).
-  Of those three effects a provider cannot reach only the last one — so the
-  bridge can reproduce the observable contract instead of refusing.
-- **Entering a provider-owned mode needs no host tool at all.** The injected
-  `<system_reminder>` *is* the contract, exactly as Cursor CLI's own plan mode
-  is prompt-enforced. Gate on a host tool only where the host genuinely owns the
-  outcome — here, the execution approval, which degrades to `question`.
-- **Do not conclude "not implemented" from a filtered grep.** The first pass
-  searched `plan_enter` while excluding the very files that define plan mode,
-  concluded upstream had no such tool, and missed `plan-enter.txt`, commit
-  `fa559b038` disabling `PlanEnterTool`, and the whole synthetic-message
-  mechanism. Widen the search and read the git history before declaring absence.
-- **Absence is the common case, not the edge case.** OCP only relabels tools the
-  host already advertises — it never invents them — and neither the MiMo nor the
-  Kilo profile declares a plan role. Emulation is the live path on those hosts,
-  so it must be as considered as the native path, not a fallback afterthought.
-
-## 2026-08-16 — CreatePlan Yes must kick off OpenCode, not only ack Cursor
-
-- **Cursor `success` is not a host turn.** After the emulated CreatePlan
-  approval, writing `{success, plan_uri}` and flipping the session to `agent`
-  only closes the held Run (`finish: stop`). Native `plan_exit` also injects a
-  synthetic user message with `agent: "build"` and "Execute the plan" so a new
-  OpenCode loop starts. Mirror that second half via `session.promptAsync` from
-  the classic plugin (`src/plan-execution-kickoff.ts`); keep failures out of the
-  Cursor wire path — approval already succeeded.
-- **Register the kickoff where the host client lives.** The language model
-  cannot import the OpenCode SDK client; the classic plugin installs the
-  handler once, and unit tests stub it. No handler means approval still works
-  but the host stays idle — that is the observed production bug.
-
-## 2026-08-16 — Lifecycle SwitchMode must soft-ack, not reject
-
-- **A hard `rejected{reason}` on a tools=0 title turn enters the transcript.**
-  The real agentic Run then sees "mode switch rejected" and narrates that
-  switches are blocked, even though the next SwitchMode succeeds. Soft-ack
-  with `approved{}` and omit `switchMode` so session mode is not mutated —
-  same pattern CreatePlan already uses for lifecycle turns.
-- **Advertisement ≠ permission still holds.** Re-advertise the full catalog on
-  lifecycle turns, refuse execution, and never flip plan mode from them.
-- **Soft-ack is not a tool-list change.** Rebuild `dist/` before live OpenCode
-  tests; a stale build still hard-rejects while source soft-acks.
-
-## 2026-08-16 — Cold-start zero-tool Runs must wait for the sibling catalog
-
-- **Never freeze `tools=0` into RequestContext when a real catalog is about to
-  arrive.** Title/lifecycle Opens often race ahead of the agent Run. Advertising
-  empty then the full set changes RequestContext bytes and colds the prompt
-  cache (`continuity=cold`, divergent hashes). A timeout is not a fix — the live
-  race exceeded 1.6 seconds. A session-keyed lifecycle Run must wait for a sibling
-  `rememberToolCatalog`; cancellation is the only escape, never `tools=[]`.
-- **Do not invent or filter enabled tools.** Advertisement stays the host's full
-  set (or the last remembered one); permission (`allowTools`) stays false on
-  zero-tool turns. Soft-ack alone does not fix the cache break.
-
-## 2026-08-19 — Host retry loops key off error *text*, not our flags
-
-- **OpenCode SessionRetry matches substrings in the provider error message**
-  (notably `unavailable` and `exhausted`), not `transient` / `replaySafe`.
-  After this provider finishes its own Run budget — or suppresses replay as
-  unsafe — the host-facing message must not still contain those triggers, or
-  OpenCode will keep retrying ("Provider is overloaded") until the process is
-  restarted. Keep the real gRPC code on structured fields; sanitize only the
-  terminal message text.
-
-## 2026-08-17 — Bridged Cursor interactions are not missing MCP tools
-
-- **The OpenCode tool catalog is not the complete Cursor capability set.**
-  CreatePlan is an inbound Cursor `InteractionQuery`, so it is expected to be
-  absent from the OpenCode/MCP catalog while still appearing in Cursor's native
-  function definitions. Guidance must name this distinction explicitly and tell
-  the model to raise CreatePlan normally, not narrate that it is unavailable.
-- **Use actual tool APIs, never render tool-call JSON as assistant text.** A
-  textual tool request does not execute and confuses the user; after a failed
-  tool attempt, retry with the provided tool mechanism rather than another
-  protocol representation.
-
-## 2026-08-17 — Compatibility dependency is one-way
-
-- **A provider-neutral bridge is not enough if the provider imports the bridge
-  package.** The provider may consume a structural host capability installed on
-  `globalThis`, but host detection, package imports, fork environment variables,
-  and rotated tool vocabulary belong entirely to the compatibility layer.
-- **Move behavior only after parity is pinned at its destination.** Before
-  removing fork handling from the provider, prove catalog, call, resume-id,
-  result, path, and schema translation in OCP. This keeps architectural cleanup
-  from silently deleting working compatibility.
-
-## 2026-09-18 — OpenCode 2 dropped host todowrite; Task is `subagent`
-
-- **A missing host builtin is not a dialect bug.** OpenCode 2 has no
-  `todowrite`/`todoread` in `packages/core/src/tool/plugin/`; planning there is
-  a Plan **agent**, not a todo tool. Plugin-owned canonical todo names are an
-  opt-in fallback only: register them through `ctx.tool.transform` when
-  `CURSOR_OPENCODE2_TODOS=1`/`true` and `editor.get`/`list` does not already own
-  them. With the flag off, register none. Do not invent `plan_enter`/`plan_exit`
-  just to fill the catalog: SwitchMode already degrades, and a `plan_exit` tool
-  that cannot ask the user would skip the execution gate.
-- **Store plugin-owned todos in-memory per session, not in restart state.**
-  Same lifetime as `mirroredTodosBySession`. Clear on `session.deleted`. Do not
-  persist into the prompt or checkpoint.
-- **OpenCode 2's executor is `subagent`, not `task`.** `parseExec` still emits
-  `task`; `remapNativeSubagentForCatalog` must pick `task` when advertised else
-  rewrite to `subagent` with `agent` / `sessionID` / `background`. Parse
-  "Available subagents:" inline lists as well as the 1.x Task catalog marker.
-- **OpenCode `execute` is Code Mode, not a shell.** The host tool is named
-  `execute` and takes `{ code }` (JS). Calling it with `{ command }` fails
-  (`code: Missing key`) and looks like "Code Mode rather than shell". OS
-  commands go to `shell`/`bash`. Do not invent "file too large" when a search
-  tool returns empty — `test/tools.test.ts` is ~80 KB; verify with Read or
-  `rg` via `shell`.
-
-## 2026-09-18 — OpenCode 2 plugin tools must be direct catalog tools
-
-- **`codemode !== false` hides a plugin tool from the AI SDK catalog.** OpenCode
-  2 splits the snapshot: `codemode === false` is advertised to the model;
-  everything else is Code Mode-only (`packages/core/src/tool.ts` direct vs
-  `codeModeTools`). Plugin-owned `todowrite`/`todoread` need that flag so
-  Cursor TodoWrite mirroring can run.
-- **Returning `output` without an `output` schema is a host die, not a tool
-  error.** `packages/core/src/tool/runtime.ts` dies with `Tool result declared
-  output without an output schema`. Live `execute` → `tools.todoread({})`
-  hit that. Declare the schema (JSON Schema is a valid `ValueSchema`) or omit
-  `output` from the result.
-- **Do not register a second permission-sensitive web-search fallback through the 2.0 public
-  `ToolContext`.** It exposes session/agent/message/call identity and progress,
-  but no permission-request method. The provider aliases the host's native
-  permission-gated `websearch` → `custom_websearch` and supplies an Exa backend
-  through `ctx.websearch.transform`; a second direct fallback would bypass
-  `ask`. `cursor_image_save` is handle-only (opaque id, containment) and is
-  registered on 2.0 with catalog `permission: "edit"` so generated images can
-  be committed; do not turn it into a general file writer.
-
-## 2026-09-15 — Cursor native todos mirror into host todowrite/todoread
-
-- **Cursor TodoWrite/TodoRead are display completions, not exec requests.** When
-  the host advertises `todowrite` / `todoread`, mirror finalized display state
-  into those tools. Prefer terse host-todo guidance; spelling out Cursor-vs-
-  OpenCode catalog collisions teaches the model to inventory tools instead of
-  calling the host ones.
-- **OpenCode `todowrite` is replace-all.** Cursor `merge: true` patches that omit
-  `success.todos` must expand against the last observed full list (match by id,
-  then by content across id spaces) or the bridge must decline — never send a
-  partial list that would wipe host state.
-- **`session.mirroredTodos` dies with the Run** (`turn_ended` closes the
-  session). Keep a per-OpenCode-session copy (`mirroredTodosBySession`), seed it
-  in `startSession`, and refresh it from bridged writes, direct host
-  `todowrite`, and recognizable `todoread` JSON. Same pattern and cap as
-  `toolCatalogBySession`.
-- **Process restart clearing the snapshot is intentional, not a bug.** The map
-  is in-memory only — never prompt, RequestContext, or persisted restart state —
-  so Cursor's prompt-cache prefix stays intact. After a provider/process
-  restart, the first `merge: true` without a completed list declines until a
-  write/read refreshes the map. Do not "fix" this by persisting todos into
-  restart state or the prompt.
-- **Host `todoread` takes `{}`.** Drop Cursor `status_filter` / `id_filter`; they
-  are not part of the canonical host schema. Non-JSON read output must leave the
-  prior snapshot alone.
-- **Scope stays in the Cursor provider.** Devin has no native TodoWrite rival;
-  OCP/pi-bridge already remaps host names. Do not port this collision machinery
-  elsewhere without a real dual-catalog bug.
-- **Do not seed the snapshot from Cursor `read_todos` success unless observed.**
-  Host JSON `todoread` already refreshes the map; Cursor-side seed only helps
-  when the host returns non-JSON and the next merge omits `success.todos`. That
-  path can disagree with host truth — see
-  `tasks/plans/optional-seed-todo-snapshot-from-cursor-read.md` (implement only
-  if that failure is diagnosed live).
-
-## 2026-09-21 — Epoch catalog hold and recovered seed
-
-- **Same-size catalogs must not replace frozen descriptors.** Refreshing
-  schemas or descriptions when the name set is unchanged retokenizes the tools
-  prefix. Grow by appending new names only; shrink and equal sets keep the
-  epoch advertisement.
-- **Do not re-sort the epoch catalog on grow.** UTF-16 order is for the first
-  advertisement and for sorting newcomers among themselves. Re-sorting the
-  merged list inserts a name that sorts before `z` and retokenizes the tools
-  prefix. The encoder must emit advertised order, not sort again.
-- **Overlay lists follow the same hold.** Skills, subagents, and plugins are
-  rediscovered every Run but equal ids keep frozen bytes (including skill
-  content); new ids append. Shrink does not drop an advertised overlay entry.
-- **A recovered epoch has no original baseline bytes.** Do not freeze live
-  host text as `seedSystemPrompt` after checkpoint-less recovery — Cursor
-  already holds the prefix. Chronological updates stay on the user-turn tail.
-
-## 2026-09-26 — OpenCode 2 MCP catalog placement
-
-- **Do not write MCP server `codemode` to put tools on the direct catalog.**
-  That field also decides whether OpenCode appends `?codemode=false` so a
-  remote server returns individual tools (`packages/core/src/mcp/client.ts`).
-  Catalog placement is `options.codemode` on the tool (`packages/core/src/tool.ts`).
-  Set that to `false` via `ctx.tool.transform` for namespaces whose server did not explicitly set `codemode: true`.
-  Prompt text that tells Cursor to call every MCP tool inside `execute` fights
-  a direct catalog. OpenCode's `<mcp_instructions>` still emit that sentence
-  from server config (`packages/core/src/mcp/instructions.ts`), so provider
-  guidance has to prefer the direct name when the tool is on the direct list.
-- **A prompt sent before MCP servers finish connecting is a non-issue.**
-  OpenCode connects servers asynchronously and does not block startup on a
-  slow server (`packages/core/src/mcp/index.ts`). The first turn can advertise
-  no MCP tools; the next turn in the same session replays the tool transform
-  after discovery and includes them. Do not delay startup or the first Run to
-  wait for MCP.
-
-## 2026-09-30 — Skill Mid-Conversation only on catalog change (OpenCode parity)
-
-- Per-turn `Relevant skill id(s) this turn` nudges re-loaded `ocp-dev` (and
-  firecrawl-*) whenever user text overlapped skill descriptions (`cursor` +
-  `provider`, self-verify paths, …). OpenCode 1 (`SystemPrompt.skills` /
-  `SkillGuidance`) and OpenCode 2 (`SkillInstructions`) never do that: the
-  catalog is baseline guidance; Mid-Conversation text fires only when the
-  available-skills list changes; OC2 also says a present `<skill_content>`
-  need not be invoked again.
-- Fix: drop userText matching. Admit the skill id set on first turn silently;
-  `takeSkillCatalogChangeReminder` emits an OpenCode-shaped supersede only
-  when the held catalog grows/shrinks. Frozen routing instruction carries the
-  load-when-matches + do-not-reinvoke lines.
-
-## 2026-09-29 — Issue #29: Cursor dynamic catalog for skill / MCP
-
-- **Cursor cannot promote OpenCode `skill` / MCP to native top-level tools.**
-  They stay on GetDynamicTools / CallDynamicTool (exec `mcp_args`). Agent-level
-  prompt text alone is not enough; provider interaction guidance + Mid-
-  Conversation reminders on **catalog change** carry more weight (issue #29
-  direction 3). Do not chase directions 1–2 (top-level promotion) or invent a
-  top-level catalog. Do not per-turn nudge matched skill ids — OpenCode never
-  does that (baseline `<available_skills>` + change-only updates).
-- **OC2 direct-catalog placement is necessary but not sufficient.**
-  `exposeDirectMcpTools` gets MCP into the AI SDK catalog so RequestContext can
-  advertise them; Cursor models still call via the dynamic catalog. Classic
-  1.x already puts MCP in that catalog.
-- **Never infer MCP servers from underscore prefixes.** `apply_patch` is not
-  server `apply`. Name only servers from merged `opencode.json` that own an
-  advertised tool, using the same `resolveToolServerIdentity` as descriptors.
-- **Wire `AgentSkill` drops `id`.** Epoch-hold keeps ids in overlay memory;
-  catalog-change reminders must read `getHeldOverlaySkills`, not RequestContext
-  `agent_skills` alone, or frontmatter-renamed skills break.
-- **Skill schema key differs by host major.** OpenCode 1.x requires `{name}`
-  and rejects `id`; OpenCode 2.0 requires `{id}` and rejects `name`
-  (`additionalProperties: false` strips the wrong key to `{}`). Put
-  `skillArgKey` on `HostToolDialect`, detect from the advertised skill schema
-  when possible, and remap CallDynamicTool args to that key only. Change-
-  reminder text must name the live key — hard-coding `id` fails 1.18.
-- **Gate the change reminder on this turn’s permission, not the epoch
-  advertisement.** `allowTools && incomingTools` includes `skill`; a
-  host-empty lifecycle turn advertises `[]` and must not ask for a call the
-  host would refuse.
-
-## 2026-10-01 — Credential renewal: verify against the right Cursor client
-
-- **Cursor CLI is not the reference for every flow.** It never renews a
-  browser login (it only re-exchanges an API key), so "do what the CLI does"
-  left OAuth with nothing to copy. The IDE bundle
-  (`/Applications/Cursor.app/.../workbench.desktop.main.js`) does renew, through
-  `/oauth/token`. When one client lacks a flow, check the other before
-  concluding Cursor has none, and confirm with one live request.
-- **The endpoint we called did not exist.** `/auth/token` answered 404 for both
-  credential kinds; the API-key symptom in #35 hid that OAuth was equally
-  broken. Test the refresh path itself, not just the caller's fallback.
-- **A failed refresh can be HTTP 200.** `/oauth/token` reports a dead session as
-  `{access_token:"", shouldLogout:true}`. Status-code handling alone would have
-  stored an empty token, as the IDE itself would.
-- **Never let one credential kind stand in for another.** A browser login and an
-  API key are different credentials with different renewal; a fallback between
-  them hides which one is broken (user correction on PR #36's review).
-- **Provider options are not private.** OpenCode serves them unredacted from
-  `/provider`; only functions are dropped by its JSON serialization. Hand the
-  provider a token function, never a raw key.
-- **Do no more with credentials than OpenCode's own providers do.** Its OAuth
-  plugins (codex, xai, copilot in 1.x; openai/opencode integrations in 2.0)
-  renew only when a request needs a token, store the real expiry, and hand the
-  SDK a function rather than a token. A background timer and a fake
-  "renewal-due" `expires` went beyond that and were removed (user decision);
-  only *when* a token is due follows Cursor's own client (IDE 1272 h window).
-
-## 2026-08-25 — Pricing gate before every release
-
-- **CI regenerating pricing is a backstop, not permission to skip the local
-  gate.** Bumping/`v*` tagging before `bun run generate:pricing && bun run
-  check:pricing` succeeded locally produced a failed `v0.6.4` publish on an
-  unmapped `Legacy Enterprise Auto` docs row and forced a retag. Run the gate
-  in the same turn as the bump, commit mapping/`pricing-data.ts` first, and
-  treat “I’ll fix it after the tag” as forbidden.
-
-## 2026-10-01 — Trace the whole feature path before calling a gap
-
-- **Before flagging a capability as lost, follow it past the function under
-  review.** Reviewing PR #34 I reported tool-read images as "never reaching
-  Cursor" because `hostTailNote` drops the media caption and continuations
-  are text-only. That missed the existing design: held-Run continuations skip
-  media on purpose (`toolResultOutputToText`) and `cursorHistoryImageParts`
-  harvests tool-result and earlier-user images on the next fresh Run. Grep the
-  feature (images, media) across `src/` and read the code comments that state
-  intent before reporting a regression.
-
-## 2026-10-03 — Review restart recovery against effective context
-
-- Test an instruction change during downtime and a return to the original
-  instructions after an intervening update. Matching the frozen first-turn
-  prefix does not prove matching the checkpoint's latest effective context
-  (`test/context-epoch.test.ts:158`).
-
-## 2026-10-04 — Describe provider behavior in OpenCode terms only
-
-- A fix motivated by a clone host must still be stated, implemented, and tested
-  as OpenCode behavior. "OpenCode 1.x-shaped host without `plan_enter`" and
-  "(Kilo, MiMo)" in the changelog, another host's agent names (`code`,
-  `checkpoint-writer`) in tests, and their approval wording in comments all
-  broke the boundary. Check the OpenCode source first: current 1.x has no
-  `plan_enter` at all, so the case was simply "OpenCode 1.x".
-- A structural bridge member may only override a native OpenCode rule, never
-  replace it. `planFile` without a native fallback left stock OpenCode with no
-  plan file; the provider now follows `Session.plan` itself
-  (`src/context/paths.ts` `hostPlanFilePath`).
-- "Host location" means each OpenCode version's own default, not the
-  operator's config or env: 1.x `Session.plan` (worktree `.opencode/plans`
-  in a git project), 2.0 the Plan directory `~/.opencode/plan`. Verify 2.0
-  through its documented `plugin/opencode2` entry in a dedicated
-  `OPENCODE_CONFIG_DIR`, never through a global config that loads the
-  classic entry.
-- Pin host binaries by absolute path in live runs. A tmux login shell put the
-  nvm OpenCode 1.x ahead of the installed 2.0, so "2.0" runs were 1.x runs.
-
-## 2026-10-04 — Prefer the host's review; ask only where it has none
-
-- Route plan approval to the host's own review first (a plan-stage tool, or
-  `plan_exit` under its `plan` agent). Only where the host has none does
-  CreatePlan ask through `question`, with upstream `PlanExitTool`'s wording.
-- 2026-10-05: the docs, the plan-mode reminder and the SwitchMode refusal had
-  drifted to "the provider never asks; the user switches agents" while the
-  code still asked. One policy, stated identically in code, reminders, README,
-  `docs/opencode-2.md`, `docs/cli-parity.md` and `AGENTS.md`.
-
-## 2026-10-04 — Reconcile state at the delivery boundary
-
-- A smaller catalog is insufficient evidence of a helper when the request
-  carries a result for the held parent's pending call. Check that correlation
-  before choosing isolation; a result followed by an agent reminder is still
-  owed to the parent Run (`test/fresh-turn-drain.test.ts`).
-- Serialize native-agent callbacks per session, including replacement requests.
-  An awaited callback must delete only its own queue entry, and a failed older
-  callback must not clear a newer request's Run ownership
-  (`test/switch-mode.test.ts`).
-- Encode approval replies without mutating execution state. Apply the mode
-  transition and queue the native switch only after delivery succeeds
-  (`test/create-plan.test.ts`).
-- Revalidate the pending exec owner after every awaited result write, including
-  drain failures. A closed or replaced owner must retain its terminal state,
-  pending entry, and approval state (`test/session.test.ts`). Serialize the
-  entire continuation transaction so overlapping calls cannot split claims and
-  independently inject the same step notes (`test/host-notes.test.ts`).
-
-- Keep acceptance documents reusable: incorporate review findings as test
-  criteria in the checklist, and keep dated review results, approvals, and
-  validation counts in separate run reports.
-
-## 2026-10-05 — Read the whole frame tail before giving up a Run
-
-- A display `tool_call_completed` is Cursor closing a call it already has an
-  answer for; it never waits on the client. The fresh-turn drain stopped there
-  and superseded the Run ~150 ms before its checkpoint and `turn_ended`, so the
-  next Run resumed from the pre-plan checkpoint (live self-verify logs of
-  hosts that answer a plan review together with a new user message).
-  Stop draining only on frames Cursor waits on (new tool, exec, interaction).
-- A tool-less (title/summary) Run still narrates and tries tools; the refused
-  calls are invisible to the host, so the narration ends up in the title. Hold
-  tool-less text and drop the part that preceded a refused call.
-- Cursor can span one "step" over several tool calls and interactions, so
-  `step_completed` is not a text boundary; tool and interaction frames are.
-
-## 2026-10-06 — Token categories can lag occupancy
-
-- A checkpoint can carry updated occupancy with an older, internally consistent category breakdown. Keep the raw wire evidence, omit stale categories from current display/comparisons, and distinguish that from an incorrect usage partition or category sum.
-
-## 2026-10-05 — A plugin cleanup removes only what its own setup installed
-
-- OpenCode 2.0 sets a plugin up once per location instance and again on a
-  plugin reload, then disposes older setups while newer ones run. A cleanup
-  that reset process-wide state (`setHostAgentModeSwitch(undefined)`,
-  `setNativePlansDir(undefined)`) removed the live setup's switch: SwitchMode
-  fell back to provider-owned mode, plans went to `<data>/plans`, and an
-  approved plan never started. Setters return a disposer for their own
-  registration; an entrypoint with nothing to install must not clear another's.
-- Diagnose from the host's own log first: `~/.local/share/opencode/log`
-  showed four "loading plugin" entries for two directories.
-
-## 2026-10-06 — Validate invocation identity and operation, not only required keys
-
-- Dynamic invocation identity (`namespace`, `toolName`) lives outside tool arguments and must accompany every call, including parallel members. Server-side wrapper errors can arrive only in a display completion: decode the MCP error title/detail without replaying that completion as host execution.
-- A file tool with optional fields can accept an unrelated `command` and return a successful default listing. Reject misplaced shell commands against the advertised canonical schema while preserving opaque tools, valid default listings, and explicitly command-capable schemas. Host success alone does not establish that the requested operation ran.
-
-## 2026-10-07 — Adversarial skill and argument review
-
-- Compare catalog rendering field by field with the host source. Names and descriptions can be raw while file locations are HTML-escaped; decoding every field or decoding twice corrupts literal entity text.
-- A replace-all tool must reject malformed input before side effects. Reusing a permissive storage normalizer at the validation boundary can silently turn a missing list into a successful deletion.
-- A checkpoint-backed conversation and a positive context size establish continuity, not cache reuse. Report a zero cache counter without guessing why it is zero.
-
-## 2026-10-08 — Retry cleanup after releasing pump ownership
-
-- Cleanup during an active pump must defer to its owner, but a canceled consumer can stop that pump without receiving a remote terminal event. Retry ordinary cleanup after the same owner releases it; keep pending tool turns and never release or close a newer owner's pump (`test/run-interruption.test.ts`).
-
-## 2026-10-08 — Preserve evidence before correlating media
-
-- Result correlation is a delivery filter, not an ownership filter. Keep host-owned results until attribution is complete, prove attachment slice boundaries, and use the actual typed result contract for denials and context updates. Review record: `docs/pr-42-46-review.md`.
-
-## 2026-10-08 — A timed-out read still owns the iterator operation
-
-- Racing an iterator read against a timer does not cancel that read. Keep its promise on the session until consumed, including late EOF/errors; every continuation and drain must use the same reader (`src/session.ts:922`, `test/parallel-pump.test.ts:322`).
-- Once a streamed host tool has been emitted, terminal recovery must finish the tool step before rebasing from its result. A checkpoint does not make replay of already-started host side effects safe (`src/language-model.ts:2863`, `test/parallel-pump.test.ts:351`).
-
-## 2026-10-09 — Deferred instructions retain their original order and carrier
-
-- A fresh history seed does not prove that a deferred instruction is present.
-  Compare the actual seed before suppressing it, and retain initial user-action
-  notes across recovery until a replacement seed carries them
-  (`test/host-notes-run.test.ts`). Match the note's text inside the seed, not
-  whole seed entries: the seed merges adjacent user-role entries and carries
-  tool observations (with lifted read instructions) as user text, so equality
-  re-sends notes the seed already holds (`test/host-notes.test.ts`).
-- Acknowledgement arrival order is not instruction order. Preserve the original
-  batch order through rejection, unacknowledged release, recovery, and
-  persistence. When a user action is sent, remove only its captured batches;
-  later arrivals must survive without replaying the earlier instructions
-  (`test/host-notes.test.ts`).
-
-## 2026-10-09 — Checkpoint categories show what reached the prompt
-
-- Cursor's checkpoint `categories` are the evidence for what the model was
-  given. A drop that persists across a conversation (here `rules`, `skills`,
-  `mcp`, `subagents` to 0 after a rebuild) is a prompt-assembly failure, not
-  accounting noise: compare the first checkpoint of every rebuilt conversation
-  with its predecessor, then A/B the client field that differs before
-  explaining it away (`test/host-notes-run.test.ts`, seeded Runs).
-- Before re-designing a recovery path around a protocol action, check its live
-  semantics. `resume_action` looked like a cheaper rebuild but re-runs the
-  model step from the last checkpoint and re-requests the tool under a new id;
-  answering it would have needed guesswork or double execution.
-
-## 2026-10-09 — Test independent dependency graphs
-
-- Reloading an entry module with a query string does not reload its dependencies. Reproductions involving class identity must load a separate dependency graph and assert different constructors; success-path deduplication alone does not validate a shared promise's rejection path (`test/process-shared.test.ts`).
-
-## 2026-10-09 — Check each host's cost formula, not one host's override
-
-- OpenCode 1.x honours `providerMetadata.copilot.totalNanoAiu`; OpenCode 2 has
-  no override and prices every step's tokens. A $0 override therefore hid the
-  cost on one host and billed every occupancy snapshot as a full prompt on the
-  other. Verify billing against both hosts' recorded session cost, not against
-  the provider's own metadata (`test/billing.test.ts` replicates both formulas).
-
-## 2026-10-09 — Settlement must follow delivery and preserve accounting bounds
-
-- Book a finish only after its consumer accepts it; otherwise the next turn
-  must still settle the amount. Separate module graphs share plain session
-  ledger data, while isolated test ledgers remain independent.
-- Price the bounded input/cache partition and do not let output occupancy alone
-  trigger a higher input tier. Aggregate TurnEnded counters cannot prove
-  per-call tier choices; document that estimate and the minimum/maximum and
-  rounding limits instead of promising an exact invoice match
-  (`test/billing.test.ts`).
-
-## 2026-10-10 — Missing terminal counters are unknown cost
-
-- Keep tool-step estimates owned by their Run. A cancellation or supersession
-  before TurnEnded cannot turn those charges into credit against another Run;
-  replace only the completing Run's estimates, including zero-cost completions.
-  Keep unresolved charges explicitly estimated (`test/billing.test.ts`,
-  `test/display-bridge-pump.test.ts`).
-- A reloaded plugin header does not prove the host replaced its cached SDK.
-  Check the running finish records after a full daemon restart before claiming
-  a rebuilt accounting implementation passed live validation.
-
-## 2026-10-11 — Diagnostics must check their own total
-
-- The footer's synthetic output token is part of checkpoint occupancy, not
-  additional occupancy. Diagnostic input must reserve that token, cap cached
-  input to the remaining partition, and reject a diagnostic total that differs
-  from the sent snapshot (`test/usage-from-turn-ended.test.ts`).
-
-## 2026-10-11 — Reproduce the host's hook order
-
-- Test provider hooks with a pre-populated SDK when the host's generic loader
-  runs first. Preserving that fallback can bypass per-request credential
-  renewal even though tests starting with an empty SDK pass. Keep the current
-  integration resolver after captured host options, and preserve other
-  providers' SDKs (`test/plugin-opencode2.test.ts`).
-
-## 2026-10-12 — Streaming cache metadata needs explicit byte and handle ownership
-
-- A full-buffer protobuf reader is not necessarily a streaming parser:
-  `protobufjs.Reader.uint64()` accepted a fragmented value before its terminating
-  byte. Prefix inspection must distinguish incomplete varints/strings from
-  complete metadata (`test/conversation-maintenance.test.ts`).
-- Disposing a file stream can close an externally supplied descriptor despite
-  `autoClose: false` on a runtime. Feed the inflater with bounded positional
-  reads instead, settle read-ahead before returning the handle, and verify that
-  the same handle still reads the complete snapshot on Node and Bun
-  (`src/protocol/conversation-cache-header.ts`, `test/conversation-startup.mjs`).
-- `rename(src, dst)` ENOENT names either side. When another collector can
-  `rmdir` the shared destination directory, ENOENT does not prove the source
-  is gone; `lstat` the source before reporting it missing, and tolerate ENOENT
-  between `mkdir` and `chmod` of that directory
-  (`discardCacheCandidate`, `ensureCacheDirectory`).
-- A process-lifetime exemption from cleanup (pinning every loaded session)
-  silently disables periodic expiry on long-running servers. The per-file
-  operation queue already serializes in-process loads, writes and collection,
-  so a loaded session's snapshot can expire by its persisted age like any other.
-- A per-session store that caches the decoded snapshot duplicates the live
-  checkpoint/blob maps for every session the process ever touched. Keep only
-  the head (conversation id, timestamp, turn provenance) resident, hand the
-  loaded snapshot to its first reader, and re-read the durable copy after the
-  session's queued write (`takeConversation`).
-- Bun's `opendir` reads the directory lazily: a directory removed after
-  `opendir` throws `ENOENT scandir` from the `for await`, where Node yields no
-  entries. Iterate directories other collectors may remove through
-  `removableDirectoryEntries`, which treats ENOENT from either step as empty.
+Mistakes made in this repository and the principle each one taught. The
+current rules live in `AGENTS.md`; this file records why they exist, so the
+same mistake is not made twice. Entries are grouped by topic. Each one states
+the principle first, then the incident behind it and the test or symbol that
+now guards it.
+
+When adding a lesson, put it in the matching section, merge it with an
+existing entry that covers the same principle, and correct or remove any entry
+it supersedes. Cite tests and symbols rather than line numbers, which drift.
+
+## Investigating and verifying
+
+- **Trace the whole feature before calling something a gap.** A review of
+  PR #34 reported tool-read images as never reaching Cursor because one helper
+  dropped the media caption; the feature delivered them through another path.
+  Search the feature across `src/` and read the comments that state intent
+  before reporting a regression.
+- **Do not conclude that something is absent from a filtered search.** A search
+  for `plan_enter` that excluded the files defining plan mode concluded that
+  OpenCode had no such tool, and missed its prompt file, the commit that
+  disabled it, and the synthetic-message mechanism behind it. Widen the search
+  and read the git history before declaring absence.
+- **Confirm which branch live traffic takes before optimizing it.** A stale
+  comment ("most reads arrive via `mcp_result`") sent the first partial-read fix
+  to a path that real sessions never used; one end-to-end run showed every read
+  going through `read_result`.
+- **Treat documentation of an unreleased API as a hypothesis.** The shipped
+  `.d.ts` for OpenCode 2 contradicted its docs on hook arity, the `aisdk:`
+  package discriminator and which domains exist. Read the published types for
+  the exact version users install.
+- **Verify that a signal changes model behavior, not only that it is on the
+  wire.** `truncated: true` was already sent and models still treated partial
+  content as the whole file; only a marker inside the content changed the
+  answer. Design an A/B fixture so the signal under test is the only way to the
+  right answer: a fixture whose lines carried their own index let the model
+  infer truncation without the notice.
+- **A model's account of its own prompt is not evidence about the prompt.** A
+  model denied having content that its system prompt carried and that it could
+  use on request. Dump what the provider sends to check prompt contents, and
+  invoke a capability to check that it exists.
+- **A value computed before the encoder is not evidence of what was sent.** A
+  trace counter included a history entry that the encoder later drops, so the
+  log looked like a prompt sent twice. Read the encode path before reporting a
+  payload defect derived from trace arithmetic.
+- **A matching constant on both sides does not show which side applied it.**
+  Two independent 50 KiB budgets looked like one server-side cap, and the real
+  truncation was on the read that fed the write. Trace the data path before
+  attributing a boundary.
+- **Separate "absent from the model's tool list" from "absent from the host".**
+  A host can keep tools executable while presenting only a few of them as
+  callable schema; nothing in the provider was broken. Look for a host
+  presentation setting before changing wire code.
+- **Trace a stuck process before designing its fix.** A reviewer blamed a lost
+  TERM for a stuck shell supervisor, and so did the first reading; a `set -x`
+  trace under parallel load showed it blocked in `wait` for a child that had
+  already exited (see "Shell supervisor and terminal records").
+- **Validate bounds while the producer is still running.** Checking only the
+  completed file missed transient disk growth. Stress a fast producer and
+  sample its live size (`test/terminal-runner.test.ts`).
+- **Diagnose from the host's own log first.** OpenCode's log showed four
+  "loading plugin" entries for two directories, which explained a disposed
+  setup removing a live one.
+- **Pin host binaries by absolute path in live runs.** A login shell put an
+  OpenCode 1.x install ahead of 2.0, so the "2.0" runs were 1.x runs. Verify
+  OpenCode 2.0 through its `plugin/opencode2` entry in a dedicated
+  `OPENCODE_CONFIG_DIR`, never through a global config that loads the classic
+  entry.
+- **Rebuild `dist/` and restart the host before a live check.** A stale build
+  still behaved the old way while the source was fixed, and a reloaded plugin
+  header did not prove the host had replaced its cached SDK; only a full daemon
+  restart did.
+
+## Reviews, process and releases
+
+- **A reviewer's suggested patch is a hypothesis about one branch.** The
+  timeout-handoff suggestion bounded its wait by the supervisor's grace alone,
+  skipped the cancellation drain, and left the other launcher with the same
+  race. State the invariant first, apply it everywhere it holds, and derive
+  bounds from what the other process actually does.
+- **A rebase can bring in new review rules.** Rebasing PR #51 onto a `main`
+  that had just added `.greptile/config.json` re-reviewed the whole PR under
+  its protocol-evidence rule, and wire fields that had passed earlier reviews
+  became a blocker. Check the PR against any rule change on the new base
+  before pushing.
+- **A later "do not commit" does not cancel an earlier request.** A request to
+  raise coverage still stood after the user asked not to commit; finish it in
+  the same change unless the user drops it.
+- **Run the pricing gate before every version bump.** Tagging `v0.6.4` before
+  `generate:pricing` passed locally failed the publish on an unmapped docs row
+  and forced a retag. CI regenerating pricing is a backstop, not permission to
+  skip the local gate (`AGENTS.md`, release gate).
+- **A changelog bullet must describe a change from the last release.** Bullets
+  that fixed only intermediate states of an unreleased feature, or that
+  described internals, were flagged in review. Compare against the released tag
+  before writing a "Fixed" entry.
+- **State one policy identically everywhere.** The docs, the plan-mode
+  reminder and the SwitchMode refusal drifted to "the provider never asks"
+  while the code still asked. When a policy changes, update code, reminders,
+  `README.md`, `docs/` and `AGENTS.md` together.
+- **Keep acceptance documents reusable.** Turn review findings into checklist
+  criteria, and keep dated results and validation counts in separate run
+  reports.
+- **Keep user-facing documentation short.** Point maintainers to the source
+  and tests; prompt transport and checkpoint mechanics belong in code unless
+  users need them to operate the feature.
+
+## Provider boundary and host contracts
+
+- **The compatibility dependency is one-way.** A host-neutral bridge is not
+  enough if the provider imports the bridge package; host detection, fork
+  environment variables and alternate tool vocabulary belong entirely to the
+  compatibility layer. Before removing compatibility handling from the
+  provider, prove the same catalog, call, result, path and schema behavior at
+  its new home (`AGENTS.md`, provider boundary).
+- **Describe, implement and test every fix as OpenCode behavior.** Clone-host
+  names in the changelog, another host's agent names in tests and its approval
+  wording in comments all broke the boundary. Checking the OpenCode source
+  showed the case was simply "OpenCode 1.x", which has no `plan_enter`.
+- **A structural bridge member may override a native rule, never replace it.**
+  A bridge `planFile` without a native fallback left stock OpenCode with no plan
+  file; the provider now follows `Session.plan` itself (`hostPlanFilePath` in
+  `src/context/paths.ts`).
+- **"Host location" means each OpenCode version's own default.** That is
+  `Session.plan` on 1.x and the Plan directory on 2.0, not the operator's config
+  or environment. Install directories on disk are evidence of installation,
+  not of which host is running; route host-owned state only from explicit
+  options or the provider's own install path.
+- **A host may substitute one capability for another.** OpenCode 1.x replaces
+  `edit`/`write` with `apply_patch` for some models. Translate keyed off the
+  advertised set alone, never off a model id or host version, so the
+  translation stays inert wherever the substitution does not apply
+  (`remapEditToolsForCatalog`).
+- **Host retry loops key off error text, not provider flags.** OpenCode's
+  `SessionRetry` matches substrings such as `unavailable` and `exhausted`. After
+  the provider spends its own retry budget, the message it hands the host must
+  not contain those words, or OpenCode retries until restarted. Keep the real
+  error code on structured fields.
+- **Check each host's cost formula, not one host's override.** OpenCode 1.x
+  honours `providerMetadata.copilot.totalNanoAiu`; OpenCode 2 prices every
+  step's tokens. A $0 override hid the cost on one host and billed every
+  occupancy snapshot as a full prompt on the other (`test/billing.test.ts`
+  replicates both formulas).
+
+## OpenCode plugin surfaces
+
+- **OpenCode 1.18 "v2" and OpenCode 2.0 are different plugin APIs.** They share
+  a version-adjacent name but differ in hook signatures, credential value types
+  and provider schema. Keep separate entrypoints, and diff the published
+  declarations when advancing a pin.
+- **OpenCode 1.18 `/plugin/v2` has no `tool` domain.** `cursor_image_save` and
+  `custom_websearch` exist only on the classic plugin, so a v2-only load
+  silently disables image generation. The OpenCode 2.0 entry registers
+  `cursor_image_save` through `ctx.tool.transform` with the host-neutral
+  `executeCursorImageSave`, never `src/image-save-tool.ts`, which imports the
+  classic `tool()`.
+- **A shared module couples every entrypoint to its heaviest import.** A value
+  import that one host's package root exports and another's does not breaks
+  the second host, and an in-repo smoke test cannot see it because the dev
+  dependency always resolves. Keep such imports in a leaf module owned by the
+  host that needs them, and audit the built dependency graph.
+- **The package root is a plugin entrypoint, not a general barrel.** The
+  classic loader calls every exported function as a plugin; publish auxiliary
+  APIs from subpath exports.
+- **Confirm that an emulated hook writes to a channel the host reads.** A
+  mutation to a field the host ignores compiles and silently drops the
+  behavior.
+- **A classic experimental messages hook must keep the array's identity.** The
+  host passes `{ messages: msgs }` and later converts `msgs`, ignoring the
+  returned object. Replace entries with request-only clones
+  (`test/plugin.test.ts`).
+- **Reproduce the host's hook order.** Test provider hooks with a
+  pre-populated SDK, because OpenCode 2's generic loader can run first; keeping
+  that fallback bypassed per-request credential resolution while tests that
+  started from an empty SDK passed (`test/plugin-opencode2.test.ts`).
+- **A plugin cleanup removes only what its own setup installed.** OpenCode 2.0
+  sets a plugin up per location and again on reload, then disposes older
+  setups. A cleanup that reset process-wide state removed the live setup's agent
+  switch and plan directory, and approved plans never started. Setters return
+  a disposer for their own registration (`setHostAgentModeSwitch`,
+  `setNativePlansDir`).
+- **OpenCode 2 has no `todowrite`/`todoread`, and its executor is
+  `subagent`.** Plugin-owned todos are an opt-in fallback
+  (`CURSOR_OPENCODE2_TODOS`), kept in memory per session. Cursor Task is
+  remapped to `subagent` when `task` is absent (`remapNativeSubagentForCatalog`).
+  OpenCode 2 `execute` is Code Mode JavaScript taking `{ code }`; OS commands go
+  to `shell`/`bash`.
+- **An OpenCode 2 plugin tool must opt out of Code Mode to reach the model.**
+  Only `codemode === false` tools are in the AI SDK catalog. A tool that returns
+  `output` must declare an `output` schema, or the host dies instead of
+  reporting a tool error.
+- **The OpenCode 2 `ToolContext` cannot ask for permission.** Do not register a
+  second web-search path through it; supply a backend for the host's
+  permission-gated `websearch` instead. `cursor_image_save` stays handle-only (an opaque id plus
+  containment) and must never become a general file writer.
+- **Do not write MCP server `codemode` to move tools into the direct
+  catalog.** That field also changes what a remote server returns. Placement is
+  the tool's `options.codemode`, set through `ctx.tool.transform`
+  (`exposeDirectMcpTools`). OpenCode connects MCP servers asynchronously, so a
+  first turn without MCP tools is expected and needs no delay.
+- **The `skill` argument key differs by OpenCode major.** OpenCode 1.x
+  requires `{name}` and 2.0 requires `{id}`, and each strips the other to `{}`.
+  Detect the key from the advertised schema (`skillArgKey`).
+
+## Cursor wire protocol
+
+- **Follow the live schema, not the extracted proto.** A strict frame
+  classifier counted `KvServerMessage.span_context` as a second variant, then
+  rejected `InteractionUpdate` members it did not list, so every Run lost
+  automatic retry. The extracted `agent.proto` lagged the server; the installed
+  Cursor CLI bundle had the current descriptors. Debug runs trace unknown
+  frame layouts (`replay frame unknown: layout=…`); read that before changing
+  the set, and admit only members that carry no output or state.
+- **Apply protobuf defaults before declaring a frame malformed.** proto3 omits
+  default scalars, so a missing `uint32` can mean zero. For omission
+  assertions, decode with `decodeMessageSparse`; `decodeMessage` invents
+  defaults, so an absent string reads as empty.
+- **A round trip through one local schema does not prove wire
+  compatibility.** Use independent canonical field fixtures, especially where a
+  reused field number changes wire type, and never register an alias under
+  another message's name.
+- **Never infer a response field number from the request's.** Request and
+  result oneofs can be offset; keep an explicit mapping, and keep a complete
+  request/result inventory so known-unsupported capabilities are
+  distinguishable from protocol drift.
+- **Every server-initiated request needs a correlated answer.** Treating an
+  unfamiliar interaction query as an ignorable event left both peers waiting
+  forever. A capability Cursor exercises implicitly, with no descriptor and no
+  flag to disable it, still needs a total, typed answer.
+- **HTTP success or a clean EOF is not a turn boundary.** Require the
+  protocol's terminal event, capture trailers and GOAWAY, and rebuild from host
+  history when a held Run disappears.
+- **Fields can become live across client releases.**
+  `RequestContextArgs.use_cached` was unused in an earlier CLI and live in a
+  later one. Verify against the exact shipped build before treating a field as
+  inert.
+- **Dispatch each inbound frame to completion before reading the next.**
+  Concurrent fan-out on a held stream consumed past the handoff boundary and
+  lost continuation frames.
+- **A timed-out read still owns the iterator.** Racing a read against a timer
+  does not cancel the read. Keep its promise until consumed, including a late
+  EOF or error, and use the same reader everywhere
+  (`retains late %s after a frame-read timeout`, `test/parallel-pump.test.ts`).
+- **Read the whole frame tail before giving up a Run.** A display
+  `tool_call_completed` never waits on the client; a drain that stopped there
+  superseded the Run about 150 ms before its checkpoint. Stop only on frames
+  Cursor waits on: a new tool, exec or interaction. `step_completed` is not a
+  text boundary either, because one step can span several tool calls.
+- **Check a protocol action's live semantics before building on it.**
+  `resume_action` re-runs the model step from the last checkpoint and
+  re-requests the tool under a new id, so it cannot deliver a late tool result.
+- **Serialize response-required writes and await each drain.** A heartbeat
+  backpressure error was only the first awaited write to expose a backlog of KV
+  replies queued elsewhere. Label failures with the operation that filled the
+  stream.
+- **A full-buffer reader is not a streaming parser.** `protobufjs`
+  `Reader.uint64()` accepted a fragmented varint before its last byte; prefix
+  inspection must tell incomplete values from complete ones
+  (`test/conversation-maintenance.test.ts`).
+
+## Runs, sessions and recovery
+
+- **An in-session helper on a busy parent is not a fresh user turn.**
+  Cancelling the parent's pending call and reusing its conversation reminted
+  it, and the model resumed lost. Isolate such a helper on an ephemeral
+  conversation. A smaller catalog alone is not evidence of a helper when the
+  request carries a result for the parent's pending call
+  (`preparePriorSessionForFreshTurn`, `test/fresh-turn-drain.test.ts`).
+- **Background completion notices are context, not a new turn.** They can
+  arrive as trailing user messages beside pending tool results; keep the
+  results on the held Run and inject the notices after them
+  (`test/host-notes-run.test.ts`).
+- **A busy or incomplete fresh-turn drain does not establish a safe
+  checkpoint.** Rebuild from the host's results while keeping the new user
+  request, and never deduplicate commands by their text.
+- **A rejected host call can leave Cursor generating an unseen follow-up.**
+  Keep the conversation warm through the cancel action only after a terminal
+  acknowledgement and a new checkpoint, and gate that cancel on settled
+  results rather than a refusal flag, which OpenCode 1.x, interruptions and a
+  restarted OpenCode 2 decline do not carry. Verified live: Cursor answered
+  the cancel within 100 ms and the next Run stayed on the same conversation.
+- **Once a host tool has been emitted, finish its step before rebuilding.** A
+  checkpoint does not make replaying already-started side effects safe
+  (`does not recover after emitting tools before %s`,
+  `test/parallel-pump.test.ts`).
+- **On a transient failure, resume from the newest checkpoint.** Fall back to
+  history replay only when no stateful progress was made
+  (`pumpWithRecovery`).
+- **Revalidate the pending exec's owner after every awaited write.** A closed
+  or replaced owner keeps its terminal state, pending entry and approval state.
+  Serialize the whole continuation so overlapping calls cannot split claims or
+  inject the same notes twice (`test/session.test.ts`,
+  `test/host-notes.test.ts`).
+- **Retry cleanup after the pump's owner releases it.** A cancelled consumer
+  can stop the pump without a remote terminal event; never release or close a
+  newer owner's pump (`test/run-interruption.test.ts`).
+- **Process-global session metadata needs a finite lifetime.** Bound tool
+  catalogs, lifecycle markers and conversation bindings, and evict them
+  together with their checkpoints and blobs.
+
+## Tool bridges and argument contracts
+
+- **A translation needs compatible semantics, not similar names.** Decline a
+  bridge that would turn a read into a replacement write, lose merge state,
+  substitute a search term for a URL, or invent a structured choice from a
+  boolean.
+- **A completed display event is not authority to execute.** Mirror only
+  self-contained final UI state; data, answers, side effects and failures need
+  a request/reply channel.
+- **Cursor's Task display does not run the subagent.** Exec #28 is
+  `SubagentArgs`; emit it once through the host executor and answer with
+  `SubagentResult`. Normalize Cursor's built-in agent names (`generalPurpose`
+  to `general`, `bugbot` to `explore`), or host validation fails before
+  anything spawns.
+- **The per-turn host catalog is the allowlist for every exec.** Cursor's
+  native capabilities exceed what the agent advertises; answer an unavailable
+  request through its typed result instead of letting the host synthesize an
+  `invalid` call.
+- **A name collision with a native Cursor capability needs an alias.** Prompt
+  wording does not route reliably. Advertise a collision-safe alias, map it
+  back per session, set the matching capability flag to false on every context
+  path, and apply the same remedy to each new collision.
+- **An approval channel that cannot carry output is not a tool bridge.**
+  Expose an executable host tool instead of auto-approving a server-side
+  substitute.
+- **Register a fallback tool under its final public id.** Hosts can reserve ids
+  beyond their built-ins and filter after plugin tools merge; test the
+  host-visible catalog.
+- **Complete every required field before validation.** Native shell requests
+  have no description; keep a supplied one and derive one from the command
+  only when the schema requires it. Translation of another host's schemas
+  belongs in the compatibility layer, and weakening the validator would hide
+  those defects.
+- **Gate guidance on the same catalog as execution.** Advertising AskQuestion
+  as bridged without `question` invited a refusal, and silence about a missing
+  `task` executor invited attempts.
+- **Tool-less calls still see Cursor's native tools.** Give them an explicit
+  text-only instruction. They still narrate and try tools, and the refused
+  calls are invisible to the host, so hold their text and drop the part before
+  a refused call, or the narration ends up in the session title. Check
+  normalized arguments against the catalog's required keys before emitting a
+  call; a correlated error can request a correction.
+- **Carry a dynamic tool's full identity in its definition.** A reminder was
+  not enough when discovery showed only the inner argument schema. Invocation
+  identity (`namespace`, `toolName`) must accompany every call, including
+  parallel ones, and server-side wrapper errors can arrive only in a display
+  completion.
+- **Host success does not prove the requested operation ran.** A file tool with
+  optional fields accepted an unrelated `command` and returned a default
+  listing; reject misplaced shell commands against the canonical schema.
+- **A replace-all tool must reject malformed input before side effects.** A
+  permissive storage normalizer at the validation boundary turned a missing
+  list into a deletion. OpenCode `todowrite` replaces the whole list, so a
+  Cursor `merge: true` patch must expand against the last observed list or be
+  declined; that per-session snapshot is in memory only, and clearing it on
+  restart is intentional.
+- **Skill and MCP calls stay on Cursor's dynamic catalog.** Cursor models call
+  them through GetDynamicTools/CallDynamicTool; do not try to promote them to
+  top-level tools. Never infer an MCP server from an underscore prefix
+  (`apply_patch` is not server `apply`); use `resolveToolServerIdentity`.
+- **Advertising a virtual MCP server commits the provider to its control
+  plane.** Answer state probes from the advertised descriptors, validated
+  against the nested schema. Oversized catalogs spill through `write_args`;
+  echo `WriteArgs.path` on the success so the model can read the spill.
+- **Cursor's streamed edit is a handshake.** An existing file goes through
+  `edit_tool_call`, `read_args`, then `write_args`. Answer a correlated
+  missing target's read as an empty file, satisfy the private read with
+  complete content, and translate only the correlated whole-file write back to
+  a targeted host edit.
+- **Check that a fallback in a dispatch path is reachable.** A display bridge
+  gated on a small variant allowlist never saw the variant its fallback
+  handled.
+- **An allowlist named for transport metadata will swallow content.** Check
+  existing filters before adding a decoded field; `file_bytes` was dropped as
+  if it were metadata.
+- **Background requests and timeouts have typed outcomes.** A background
+  request cannot be renamed to a foreground shell call, and host timeout prose
+  is metadata to strip before persistence, not stdout.
+
+## Plan mode, SwitchMode and CreatePlan
+
+- **An approval the model has to volunteer is not a gate.** The model wrote the
+  plan and ended the turn without raising SwitchMode, so the prompt on that
+  path never fired. Attach the prompt to the step that always happens.
+- **Name one approval contract and route every channel through it.** One path
+  asked but reported both answers as success, so a refinement request started
+  implementation; another never asked. Success means approved for execution,
+  error means written but not accepted. Writing a plan needs no consent;
+  executing it does.
+- **The user must see what they approve.** Cursor routes the plan body through
+  the interaction query, so nothing had displayed it. Put the plan in the
+  assistant message, not the question: OpenCode's question dock renders
+  outside the scrollbox and a full plan pushes the conversation off screen.
+- **Parse an answer with the exact anchor that was asked.** The answer is
+  sliced relative to the echoed prompt, so a prompt built from a different
+  label could never be approved.
+- **A missing host plan tool is not a refusal.** OpenCode's plan tools ask the
+  user and then switch the primary agent; entering a provider-owned mode needs
+  no host tool, and only the execution approval needs one, falling back to
+  `question`. Absence is the common case on many hosts, so the emulated path
+  must be as careful as the native one.
+- **An approval must start the host's next turn.** Acking Cursor and flipping
+  the session mode only closed the held Run. The provider now selects the host
+  `build` agent and continues (`queueHostAgentModeSwitch`,
+  `src/host-agent-mode.ts`).
+- **A deferred mode handoff must not depend on the model stopping.** Cancel the
+  old Run explicitly, keep its final checkpoint, and accept only the requested
+  cancellation as terminal before switching agents.
+- **Lifecycle turns soft-ack interactions.** A hard rejection on a title turn
+  entered the transcript and the real turn narrated that mode switches were
+  blocked. Reply `approved{}` without changing the mode, and gate bridged
+  interactions on this turn's permission, not on advertisement.
+- **Prefer the host's own review.** Use a plan-stage tool or `plan_exit` under
+  the `plan` agent first; only without one does CreatePlan ask through
+  `question`, using upstream `PlanExitTool`'s wording.
+- **Apply mode transitions only after delivery succeeds.** Encode approval
+  replies without mutating state, and serialize native agent switches per
+  session so an older callback cannot clear a newer request
+  (`test/create-plan.test.ts`, `test/switch-mode.test.ts`).
+- **After approval, tell the model the edit ban is over.** The older
+  plan-mode reminder claimed to supersede other instructions, and the
+  execution turn fell back to editing through the shell.
+- **SwitchMode has two separate Cursor channels.** InteractionQuery #4 is the
+  synchronous consent gate; display `switch_mode_tool_call` (#25) is a
+  transcript record that is never replayed.
+- **Mark the mirrored CreatePlan todo `completed`.** It is mirrored after the
+  plan file exists; `pending` left a checklist item open forever.
+
+## Context, prompt cache and instructions
+
+- **Freeze cached context for real.** A snapshot kept in a map is not frozen:
+  freeze it recursively, deduplicate concurrent first builds, and compare
+  encoded bytes, or races change the prompt prefix.
+- **Cache stability must not freeze capability truth.** Keep workspace context
+  stable but rediscover tools, MCP, subagents and plugins every Run, and reuse
+  the previous bytes only when the encoding is identical. A compaction resets
+  the conversation id, not the workspace base.
+- **Hold the catalog for the whole epoch.** Equal name sets keep frozen
+  descriptors, and new names append at the tail; re-sorting the merged list or
+  refreshing schemas retokenized the tools prefix. A recovered epoch has no
+  original baseline bytes, so live host text must not be frozen as one.
+- **A host-empty tool list is a lifecycle turn: advertise `[]` and do not
+  wait.** An earlier design made zero-tool Runs wait for a sibling catalog to
+  protect the cache; that stalled standalone no-tool calls and serialized title
+  generation, and was replaced. OpenCode 2 compaction still sends a nonempty
+  catalog and keeps the epoch advertisement, with execution refused
+  (`src/language-model.ts`, tool-catalog resolution).
+- **Detect lifecycle turns from explicit metadata.** An empty tool list or
+  `toolChoice: none` alone does not identify compaction.
+- **Compaction must keep real tool results and its own identity.** Replacing
+  results with tool-name summaries made later turns claim tools had run. Never
+  resume the compaction agent's checkpoint as the normal agent; rebuild from
+  the host's compacted prompt.
+- **Checkpoint categories show what reached the prompt.** A persistent drop of
+  `rules`, `skills` or `subagents` to zero after a rebuild was a prompt
+  assembly failure, not accounting noise: client entries in
+  `root_prompt_messages_json` stopped Cursor from rendering them. Compare each
+  rebuilt conversation's first checkpoint with its predecessor.
+- **Skill catalog changes reach Cursor through the host.** Per-turn "relevant
+  skill" nudges re-loaded skills whenever user text overlapped a description;
+  OpenCode never does that. The host's `<system-update>` is the catalog-change
+  channel, and `agent_skills` carries paths and descriptions only.
+- **Provider guidance must follow the exact per-turn catalog.** Naming
+  unavailable tools turned a fallback into another unexecutable request; leave
+  guidance out of lifecycle prompts.
+- **Deferred instructions keep their order and carrier.** A fresh seed does
+  not prove a deferred note is present; match the note's text inside the seed.
+  Acknowledgement order is not instruction order, and sending a user action
+  removes only the batches it captured (`test/host-notes.test.ts`).
+- **Test restart recovery against the latest effective context.** Matching the
+  frozen first-turn prefix does not prove the checkpoint's current
+  instructions (`test/context-epoch.test.ts`).
+- **Never flatten tool results into assistant prose.** It teaches the model to
+  write fake results instead of calling the tool; mark needed evidence as a host
+  observation.
+- **Derive a path anchor from the same root as the structured context.**
+  Structured workspace context alone did not stop invented path prefixes after
+  a rebuild.
+- **Result correlation filters delivery, not ownership.** Keep host-owned
+  results until attribution of attached media is complete, and attribute only
+  slices that are uniquely determined.
+
+## Reads, writes and truncation
+
+- **Stripping an envelope must keep what it said.** A capped read without its
+  footer looks complete, and the model rewrote the file from a partial view.
+  Re-state the limit in the content as `[Partial read: …]` and through
+  structured fields.
+- **Parse control markers by position, not by substring.** A file that quotes a
+  marker otherwise impersonates it.
+- **Guard the destructive operation, not every echo.** Reject whole-file writes
+  and overwriting patches that echo the partial-read marker; allow targeted
+  edits, because source can legitimately quote the warning.
+- **Permission and completeness are separate facts.** A host-authorized
+  external read can establish permission for an edit's private read; read the
+  exact file completely only after that host read succeeds.
+- **A bounded result's length is not the resource's length.** Preserve the
+  requested range and full-resource metadata, and recover missing counts in
+  fixed-size chunks rather than buffering the whole file.
+
+## Usage, cost and diagnostics
+
+- **Hosts replace message tokens but add up cost.** OpenCode replaces an
+  assistant message's tokens (the TUI footer needs `output > 0`) and adds every
+  step-finish to session cost. Emit the last-known occupancy snapshot at every
+  boundary and bill through `src/billing.ts`; occupancy deltas would show only
+  the increment.
+- **`TurnEnded` spans the whole held Run; a finish spans one slice.** Emitting
+  its output tokens made host tokens-per-second reach six figures. Exact
+  counters belong under `providerMetadata.cursor.*Raw`.
+- **Use checkpoint `usedTokens` for occupancy.** Aggregate `TurnEnded` input is
+  not context occupancy. Keep an older breakdown marked stale rather than
+  presenting it as current; categories can lag occupancy.
+- **Verify counter semantics across several live turns.** Totals can already
+  contain their cache subsets, and one increasing sample made request-local
+  counters look cumulative.
+- **Book a charge only after its consumer accepts the finish.** Tool-step
+  estimates belong to their Run; a cancelled Run's estimates must not become a
+  credit against another Run. Aggregate counters cannot prove per-call tiers,
+  so document the estimate's limits instead of promising an exact invoice
+  match (`test/billing.test.ts`).
+- **A diagnostic must apply the same bounds as the value it checks, and check
+  its own total.** An unclamped prior prefix reported a mismatch for correct
+  usage, and counting the footer token as extra input made the totals
+  disagree (`test/usage-from-turn-ended.test.ts`).
+- **An aggregate cache ratio cannot say why reuse is low.** Log the prior
+  occupancy, category deltas and context fingerprints, report a zero counter
+  without guessing its cause, and mark per-call accounting unavailable.
+- **Match fallbacks to live data.** Cursor Auto (`default`) has no static
+  context size; live checkpoints report 256k, not a generic 200k.
+- **Append to an existing debug log.** Truncating on every module load wiped
+  earlier lines and made verification fail falsely; the log caps itself at
+  10 MiB instead.
+
+## Persistence and cache files
+
+- **A checkpoint alone is not restart recovery.** Its session binding, blobs,
+  stable context base, lifecycle tool fallback and pending compaction rebase
+  must be saved together at a successful turn end. Keep only blobs reachable
+  from the latest checkpoint, and keep everything when the graph cannot be
+  proven complete.
+- **Measure before choosing a storage format.** Protobuf bytes plus whole-file
+  gzip shrank snapshots far more than compact JSON, which pays base64 for every
+  blob.
+- **Partition durable state by its single writer.** Atomic replacement stops
+  torn files, not lost updates when several processes rewrite one aggregate
+  file. One file per OpenCode session, with cleanup that revalidates anything
+  it moves aside.
+- **Do not exempt loaded sessions from expiry.** Pinning them disabled
+  expiry on long-running servers; the per-file operation queue already
+  serializes loads, writes and cleanup.
+- **Do not keep a decoded copy of every loaded snapshot.** It duplicated the
+  live state of every session the process touched; keep only the head and
+  re-read from disk (`takeConversation`).
+- **Runtime file APIs differ in edge cases.** Disposing a Bun file stream
+  closed a supplied descriptor despite `autoClose: false`; Bun's `opendir`
+  throws `ENOENT` mid-iteration where Node yields nothing
+  (`removableDirectoryEntries`); a `rename` `ENOENT` can name either side
+  (`discardCacheCandidate`). Test file maintenance on Node and Bun.
+
+## Shell supervisor and terminal records
+
+- **Read the native execution paths of both OpenCode versions first.** Shell
+  selection, permission, spawn, exit and cancellation differ, and OpenCode 2
+  runs its shell create hook before the permission scanner. Source anchors are
+  in `docs/opencode-2.md`.
+- **Pass through a capability the host already has.** OpenCode 2's shell
+  `background` option keeps completion notices that a provider substitute
+  dropped. Recognize only the provider's own files, and resolve relative
+  working directories against the workspace before registering a policy.
+- **Keep failures in the host's execution status.** OpenCode 2 lowers every
+  tool error to text, so preserve native status before conversion, for every
+  tool and in restarted history (`test/opencode2-tool-results.test.ts`).
+  Classic rejection and interruption differ again; test both on both versions
+  (`test/classic-tool-results.test.ts`).
+- **A decline or interruption can bypass `execute.after`.** Cleanup also
+  follows native permission and terminal events, must be idempotent, and must
+  keep ready or running jobs.
+- **Pair anonymous creates with their owner by what makes them ambiguous.**
+  OpenCode 2 `create.before` has no call id. A process-wide gate let one
+  rewritten command stall every session's shells. Lanes keyed by command text
+  limit waiting to identical commands, and matching against the holder's live
+  `execute.before` input attributes a command a later hook rewrote
+  (`test/shell-timeout.test.ts`).
+- **Time deadlines with clocks, not poll counts.** 500 × `sleep 0.02` took
+  15.8 s on macOS. Both OpenCode versions kill the command's whole process
+  group on timeout, abort or failure, so the supervisor must not be a plain
+  child of the launcher; it naps until a child sends `USR1`.
+- **Outcome markers inside stdout are data.** Choose the launcher's outcome
+  across all marker kinds before interpreting it.
+- **Run generated scripts under every supported `/bin/sh`.** dash rejects
+  `kill -TERM -- -PGID` and prints "Terminated" to its own stderr when `wait`
+  reaps a signalled job. macOS `sh` is bash, so force the dash path with a
+  `sh` link first on `PATH`.
+- **bash discards a disowned job's status.** Keep the payload a job and
+  silence notices by redirecting the shell's own stderr.
+- **bash's `wait` can lose a child it reaped.** A trapped signal arriving
+  during `wait` jumps out after `waitpid` reaps the child but before it is
+  recorded (bash 5.2 and 5.3 `waitchld`), and a later `wait` for that child
+  blocks while any other child lives. Wait only for children `kill -0` still
+  sees, carry exit status in files, and read a vanished leader's status only
+  when no other child is left.
+- **A signal can be swallowed by a just-forked child.** Before it execs or
+  resets traps, the child still has the parent's trap; bash clears pending
+  traps in a new subshell and dash clears its traps. Stop plain sleeps with
+  KILL, and give helper subshells a marker file, written before the signal, to
+  stop on (`stops deadline sleeps at once even when TERM cannot reach them`).
+- **Record a one-way transition instead of re-deriving it.** bash can list a
+  job it just killed as running, so a second stop waited out a full grace.
+  Forking instrumentation hid that race; an in-memory trace exposed it.
+- **Latch a signal that arrives between fork and `$!`.** Force that gap in the
+  real generated script instead of relying on a stress loop.
+- **A missing completion marker does not prove work never started.** Cleanup
+  and startup both take one atomic claim (`mkdir`), and a failed startup hands
+  the claim back (`releaseUnstartedTerminal`).
+- **Tie a detached helper to its owner with a FIFO.** The kernel closes the
+  owner's write end on any exit, including SIGKILL, so the reader sees EOF.
+  Disarm the watcher on success so explicitly detached daemons survive. A
+  helper that must not hold the FIFO needs another owner-death path: the
+  updater, which polls the supervisor anyway, stops the hard-timeout watchdog
+  and, after a bounded drain, the collector, whose output a descendant in its
+  own process group can hold open indefinitely.
+- **Keep a group's leader alive through draining, and signal only a process
+  you can show is still yours.** PIDs are reused, and shell ids identify
+  records, not processes. This holds upward too: a helper signalling its
+  supervisor checks `is_ours` first, because a day-long deadline can outlive
+  an abruptly killed supervisor.
+- **Copy pipe output as it is read.** BSD `head -c` and macOS `dd` with
+  `count` above 1 buffer. Prove streaming with text that is not also in the
+  command, because the record header repeats it.
+- **A collector's exit during teardown is not an I/O failure.** Keep the native
+  cancellation outcome and the writer's explicit error record; the collector
+  marks a complete drain itself.
+- **Do not assume a terminal record's header fits a fixed prefix.** The
+  command and title precede `status` and have no length limit. A prefix scan
+  missed the completion footer when the header alone exceeded the head
+  budget, and a 64 KiB read left a record with a dead supervisor reporting
+  `running`. Read the real file tail for the footer, and read until the header
+  ends when patching it (`test/runtime-files.test.ts`).
+- **A background spawn reports its handle once the command runs.** A fast
+  command that already finished is still a successful spawn.
+
+## Auth, endpoints and security
+
+- **Check the Cursor client that actually has the flow.** Cursor CLI never
+  renews a browser login; the IDE does, through `/oauth/token`. The endpoint
+  previously called, `/auth/token`, did not exist. A failed refresh can be
+  HTTP 200 with `shouldLogout`, so read the body.
+- **Never let one credential stand in for another.** A browser login and an
+  API key renew differently, and a fallback between them hid which one was
+  broken.
+- **Do no more with credentials than OpenCode's own providers do.** Renew on
+  demand, store the real expiry, and hand the SDK a token function: provider
+  options are served unredacted from `/provider`.
+- **Fail closed when account-specific discovery fails.** A silent fallback to a
+  legacy global host routed regional accounts to a host that rejects them.
+  Telemetry on discovery calls is off unless explicitly enabled, and the API
+  base URL and the Run host are separate options.
+- **Harden only provider-owned paths.** An explicit file override authorizes
+  that file, not a chmod of its parent; validate provider temp directories as
+  real, current-user-owned directories.
+- **A network deadline must cover reading the body.** Clear the timer after
+  the body is consumed, or a server can hang initialization after the headers.
+- **Security scanners judge by shape.** When a token is hashed only for an
+  in-memory key, keep the raw secret out of global state and suppress the rule
+  narrowly with the reason.
+- **Parse structural delimiters in linear passes.** Regexes with repeated
+  prefixes and lazy wildcards became polynomial; keep stress fixtures for those
+  inputs.
+
+## Models and pricing
+
+- **Give generated wire parameters their own typed payload.** OpenCode merges
+  provider, model, agent and variant options into one namespace.
+- **A variant that changes host metadata is a separate model entry.** Carry the
+  upstream wire id in a dedicated option when the host uses `id` for
+  inheritance.
+- **Invalidate a cache schema before configuration reads it.** Refreshing the
+  file later does not update a catalog already built in memory.
+- **Inspect the fetched artifact before extending a generator.** Cursor's
+  pricing and model data come from separate markdown endpoints that render as
+  one table.
+- **Publish a capability flag only when the wire keeps the matching parts.**
+  Live negative values outrank documentation, because account catalogs can
+  contradict the public table.
+
+## Testing and tooling
+
+- **A type-conformance test proves nothing unless the build checks it.**
+  `include: ["src"]` excluded the test tree and the first guard passed
+  vacuously; break a guard on purpose to confirm it fails. Assert real usages
+  rather than whole-interface assignability.
+- **Load a physical second module graph to test shared state.** A
+  query-string import neither reloads dependencies nor creates another module
+  under Bun; assert different exported identities (`test/process-shared.test.ts`).
+- **Check every fixture that narrows `PATH` after changing a launcher.** The
+  no-bash fixture lacked `mkdir`, and only Linux CI ran it. Run Linux-only paths
+  in `docker run --init oven/bun` before pushing; without `--init`, killed
+  descendants stay zombies and look alive.
+- **Capture per-test state before awaiting in a shared `afterEach`.** A hook
+  timeout otherwise deletes the next test's files. Clear installed host-agent
+  switches after each fixture, because Bun's file order differs across
+  filesystems (`test/switch-mode.test.ts`).
+- **Choose fixtures that fail the same way for every user.** A permission-mode
+  fixture does not fail under root; a malformed Git index does
+  (`test/workspace-facts.test.ts`).
+- **A malformed response is not a passing injected-failure test.** Count
+  launches across the transcript and require the intended owner before scoring
+  output bounds. Live-test prompts must separate interactive answers from host
+  actions that deliberately stop the turn (`docs/execution-self-verify.md`).
+- **Strip coverage records for temporary module copies.** Codecov maps them
+  onto the real file and counts their lines as misses
+  (`scripts/strip-copied-coverage.ts`).
+- **Keep Bun types in the editor's TypeScript config.** Include `bun` in
+  `compilerOptions.types` so OpenCode's LSP resolves `bun:test` without
+  widening the build.

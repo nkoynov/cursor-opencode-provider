@@ -739,6 +739,7 @@ describe("takeHostPlanAgentNote", () => {
 
 describe("OpenCode 1.x prompt-based host-agent switch", () => {
   beforeEach(() => resetHostAgentModeSwitchForTests())
+  afterEach(() => resetHostAgentModeSwitchForTests())
 
   function recorder(primary: ReadonlySet<string> = new Set(["build", "plan"])) {
     const prompts: Array<{ sessionID: string; agent: string; text: string }> = []

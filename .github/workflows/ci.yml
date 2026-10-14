@@ -35,7 +35,9 @@ jobs:
         run: bun run typecheck
 
       - name: Test
-        run: bun test --coverage --coverage-reporter=lcov
+        run: |
+          bun test --coverage --coverage-reporter=lcov
+          bun scripts/strip-copied-coverage.ts
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5

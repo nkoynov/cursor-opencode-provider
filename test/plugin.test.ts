@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, setSystemTime } from "bun:test"
 import { mkdir, writeFile, rm } from "node:fs/promises"
+import { existsSync, mkdtempSync, rmSync } from "node:fs"
+import { createManagedTerminal } from "../src/terminal-runner.js"
 import os from "node:os"
 import path from "node:path"
 import { CursorPlugin } from "../src/plugin.js"
@@ -490,6 +492,32 @@ describe("CursorPlugin compaction marker", () => {
 })
 
 describe("CursorPlugin shell result hooks", () => {
+  it("normalizes interrupted model input in the original array without changing stored parts", async () => {
+    const plugin = await CursorPlugin({ directory: process.cwd() } as never)
+    const original = { info: { role: "assistant" }, parts: [{ type: "tool", tool: "bash", callID: "cursor_projection_1", state: { status: "completed", input: {}, output: "partial\n\n<shell_metadata>\nUser aborted the command\n</shell_metadata>", metadata: { exit: null }, time: { start: 0, end: 1 } } }] }
+    const messages = [original]
+    const output = { messages }
+    await plugin["experimental.chat.messages.transform"]?.({} as never, output as never)
+    expect(output.messages).toBe(messages)
+    expect(messages[0]!.parts[0]!.state.status).toBe("error")
+    expect(original.parts[0]!.state.status).toBe("completed")
+  })
+
+  it("releases an unstarted reservation on persisted error state without an after hook or continuation", async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "cursor-classic-rejected-"))
+    try {
+      const plugin = await CursorPlugin({ directory: root } as never)
+      const terminal = createManagedTerminal({ command: "true", workingDirectory: root, timeoutMs: 0, timeoutBehavior: 0, backgroundSpawn: true }, root)
+      const callID = "cursor_classic_rejected_1"
+      registerCursorShellCall(callID, { background_shell_spawn: true, command: "true", working_directory: root, managed_command: terminal.command, managed_job_directory: terminal.directory })
+      const part = { id: "part", messageID: "message", sessionID: "session", type: "tool", tool: "bash", callID, state: { status: "error", input: { command: "true" }, error: "Rejected", time: { start: 0, end: 1 } } }
+      await plugin.event?.({ event: { type: "message.part.updated", properties: { part } } } as never)
+      expect(existsSync(terminal.file)).toBe(false)
+      expect(existsSync(terminal.directory)).toBe(false)
+      expect(existsSync(path.join(root, "terminals", ".jobs", `${terminal.shellId}.json`))).toBe(false)
+    } finally { resetCursorShellCalls(); rmSync(root, { recursive: true, force: true }) }
+  })
+
   it("removes OpenCode timeout metadata before rendering and records a typed timeout", async () => {
     const plugin = await CursorPlugin({ directory: process.cwd() } as never)
     const callID = "cursor_hook_1"
@@ -519,6 +547,31 @@ describe("CursorPlugin shell result hooks", () => {
       kind: "timeout",
       timeoutMs: 30_000,
     })
+  })
+
+  it("replays a timed-out shell as a timeout once its saved outcome is gone", async () => {
+    const plugin = await CursorPlugin({ directory: process.cwd() } as never)
+    const callID = "cursor_hook_timeout_replay"
+    registerCursorShellCall(callID, { shell_stream: true, command: "bun test", working_directory: process.cwd(), timeout_ms: 30_000, timeout_behavior: 1 })
+    const output = {
+      title: "bun test",
+      output: "partial\n\n<shell_metadata>\nshell tool terminated command after exceeding timeout 30000 ms. Retry.\n</shell_metadata>",
+      metadata: { exit: null } as Record<string, unknown>,
+    }
+    await plugin["tool.execute.after"]?.({ tool: "bash", sessionID: "ses_1", callID, args: {} } as never, output as never)
+    expect(output.metadata.cursorShellTimeoutMs).toBe(30_000)
+    const stored = { info: { role: "assistant" }, parts: [{ type: "tool", tool: "bash", callID, state: { status: "completed", input: {}, output: output.output, metadata: output.metadata, time: { start: 0, end: 1 } } }] }
+    const projected = async () => {
+      const messages = [stored]
+      await plugin["experimental.chat.messages.transform"]?.({} as never, { messages } as never)
+      return (messages[0] as typeof stored).parts[0]!.state.output
+    }
+    const timedOut = { output: "partial\nTimed out after 30000ms.\n", outcome: { kind: "timeout" as const, timeoutMs: 30_000 } }
+    // Live: the saved outcome wins and the restored block is not sent as output.
+    expect(consumeCursorShellResult(callID, await projected())).toEqual(timedOut)
+    // Replay after that outcome was consumed, as after a restart.
+    expect(consumeCursorShellResult(callID, await projected())).toEqual(timedOut)
+    expect(stored.parts[0]!.state.output).toBe("partial\nTimed out after 30000ms.\n")
   })
 
   it("keeps soft-background Bash command original and injects wrap via shell.env", async () => {

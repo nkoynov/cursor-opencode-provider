@@ -1,7 +1,20 @@
+import { statSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { trace } from "../debug.js"
 import { ensureOpencodeProjectDir } from "./paths.js"
+import { maintainRuntimeFiles, runtimeLayout } from "../runtime-files.js"
+
+function agentTranscriptsFolder(workspaceRoot: string): string | undefined {
+  const configured = process.env.CURSOR_AGENT_TRANSCRIPTS_FOLDER
+  if (!configured?.trim()) return undefined
+  const folder = path.resolve(workspaceRoot, configured)
+  try {
+    return statSync(folder).isDirectory() ? folder : undefined
+  } catch {
+    return undefined
+  }
+}
 
 export function buildEnv(workspaceRoot: string): Record<string, unknown> {
   const cwd = path.resolve(workspaceRoot)
@@ -21,6 +34,15 @@ export function buildEnv(workspaceRoot: string): Record<string, unknown> {
   // Cursor's project_folder is a metadata root (agent-tools, terminals, …),
   // not the git workspace. Keep dumps under OpenCode cache.
   const projectFolder = ensureOpencodeProjectDir(cwd)
+  let terminalsFolder: string | undefined
+  try {
+    const layout = runtimeLayout(projectFolder, true)
+    terminalsFolder = layout.terminals
+    maintainRuntimeFiles(layout)
+  } catch (error) {
+    trace(`runtime folders unavailable: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  const transcriptsFolder = agentTranscriptsFolder(cwd)
   // process_working_directory must match the workspace, not the host process
   // cwd. OpenCode 2.0's daemon is long-lived and often started from $HOME, so
   // process.cwd() would advertise the home folder to Cursor and the model would
@@ -33,8 +55,8 @@ export function buildEnv(workspaceRoot: string): Record<string, unknown> {
     sandbox_supported: false,
     time_zone: timeZone,
     project_folder: projectFolder,
-    terminals_folder: path.join(projectFolder, "terminals"),
-    agent_transcripts_folder: path.join(projectFolder, "agent-transcripts"),
+    ...(terminalsFolder ? { terminals_folder: terminalsFolder } : {}),
+    ...(transcriptsFolder ? { agent_transcripts_folder: transcriptsFolder } : {}),
     process_working_directory: cwd,
     is_working_dir_home_dir: cwd === path.resolve(home),
   }
@@ -42,7 +64,7 @@ export function buildEnv(workspaceRoot: string): Record<string, unknown> {
     `buildEnv: workspace_paths=${JSON.stringify(env.workspace_paths)} ` +
       `project_folder=${env.project_folder} ` +
       `terminals_folder=${env.terminals_folder} ` +
-      `agent_transcripts_folder=${env.agent_transcripts_folder} ` +
+      `agent_transcripts_folder=${env.agent_transcripts_folder ?? "(none)"} ` +
       `process_working_directory=${env.process_working_directory}`,
   )
   return env

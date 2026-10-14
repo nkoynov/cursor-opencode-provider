@@ -1225,6 +1225,7 @@ export function parseExecServerMessage(
         background_shell_spawn: true,
         command: command ?? "",
         working_directory: workingDirectory,
+        ...(str(raw.description) ? { description: str(raw.description) } : {}),
       },
       localError:
         raw.enable_write_shell_stdin_tool === true
@@ -1332,6 +1333,8 @@ export function parseExecServerMessage(
         ? writeRequestResultMetadata(rawArgs, mapped.args)
       : execVariant === "grep_args"
         ? grepRequestResultMetadata(rawArgs)
+        : execVariant === "delete_args" || execVariant === "ls_args"
+          ? { path: str(rawArgs.path) ?? "" }
         : undefined
   if (
     resultMetadata
@@ -1378,6 +1381,7 @@ function shellStreamResultMetadata(raw: Record<string, unknown>): Record<string,
   return {
     shell_stream: true,
     command: str(raw.command) ?? "",
+    ...(str(raw.description) ? { description: str(raw.description) } : {}),
     working_directory: str(raw.working_directory) ?? "",
     timeout_ms: effectiveTimeout,
     timeout_behavior: timeoutBehavior,
@@ -1494,6 +1498,9 @@ export function mapCursorArgsToOpencode(
       if (workdir) args.workdir = workdir
       const timeout = num(cleaned.timeout)
       if (timeout !== undefined) args.timeout = timeout
+      // The model only sends this when the host's advertised shell schema has
+      // it (OpenCode 2); the host then owns the background job and its notice.
+      if (cleaned.background === true) args.background = true
       return { toolName: dialect.shellTool, args }
     }
     case "grep": {
@@ -1830,6 +1837,8 @@ export type ToolResultInput = {
   resultField: string
   output: string
   error?: string
+  refusal?: "permission_denied" | "rejected"
+  interrupted?: boolean
   executionTimeMs?: number
   /**
    * Resolved opencode tool name (read/write/grep/…). Gates read-envelope
@@ -1880,10 +1889,14 @@ function mcpImageItems(images: readonly CursorImageInput[]): Array<Record<string
  * shell execs hang on heartbeats forever).
  */
 export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
+  if (input.error === "") return buildExecClientMessages({ ...input, error: "OpenCode tool execution failed" })
   const resultField = input.resultField || "mcp_result"
   const frames: Uint8Array[] = []
 
-  if (resultField === "shell_stream") {
+  const refused = refusedExecResult(input)
+  if (resultField === "shell_stream" && refused) {
+    frames.push(encodeShellStream(input.execId, input.executionTimeMs, refused))
+  } else if (resultField === "shell_stream") {
     const stdout = groundShellPathText(
       input.output,
       shellPathRoot(input.resultMetadata, input.workspaceRoot),
@@ -1892,7 +1905,8 @@ export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
     frames.push(encodeShellStream(input.execId, undefined, { start: {} }))
     if (input.error) {
       frames.push(encodeShellStream(input.execId, undefined, { stderr: { data: input.error } }))
-      frames.push(encodeShellStream(input.execId, input.executionTimeMs, { exit: { code: 1, aborted: false } }))
+      frames.push(encodeShellStream(input.execId, input.executionTimeMs, { exit: input.interrupted || input.shellOutcome?.kind === "aborted"
+        ? { code: 0, aborted: true, abort_reason: 1 } : { code: 1, aborted: false } }))
     } else {
       if (stdout) {
         frames.push(encodeShellStream(input.execId, undefined, { stdout: { data: stdout } }))
@@ -1913,6 +1927,10 @@ export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
           // Native CLI represents timeout structurally. ShellAbortReason.TIMEOUT=2.
           exit: { code: 0, aborted: true, abort_reason: 2 },
         }))
+      } else if (input.shellOutcome?.kind === "aborted") {
+        frames.push(encodeShellStream(input.execId, input.executionTimeMs, {
+          exit: { code: 0, aborted: true, abort_reason: 1 },
+        }))
       } else {
         const exitCode = input.shellOutcome?.kind === "exit"
           ? Math.max(0, Math.min(0xffff_ffff, input.shellOutcome.code))
@@ -1927,7 +1945,7 @@ export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
       id: input.execId,
       local_execution_time_ms: input.executionTimeMs ?? 0,
     }
-    clientMsg[resultField] = buildTypedExecResult(
+    clientMsg[resultField] = refused ?? buildTypedExecResult(
       resultField,
       input.output,
       input.error,
@@ -1937,6 +1955,10 @@ export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
       input.workspaceRoot,
       execResultImages(resultField, input.images),
     )
+    if ((input.interrupted || input.shellOutcome?.kind === "aborted") && resultField === "shell_result") {
+      const failure = (clientMsg[resultField] as { failure?: { aborted: boolean; exit_code: number } }).failure
+      if (failure) { failure.aborted = true; failure.exit_code = 0 }
+    }
     frames.push(
       encodeMessage("AgentClientMessage", {
         exec_client_message: clientMsg,
@@ -2001,6 +2023,36 @@ export function buildExecStreamClose(execId: number): Uint8Array {
       stream_close: { id: execId },
     },
   })
+}
+
+/** Refusal oneofs verified against the extracted agent.v1 protocol. */
+function refusedExecResult(input: ToolResultInput): Record<string, unknown> | undefined {
+  if (!input.refusal || !input.error) return undefined
+  const denied = input.refusal === "permission_denied"
+  const reason = input.error
+  const requested = str(input.resultMetadata?.path) ?? ""
+  const filePath = requested && input.workspaceRoot && !isUriReadTarget(requested)
+    ? resolveReadTargetPath(requested, input.workspaceRoot) : requested
+  const command = str(input.resultMetadata?.command) ?? ""
+  const working_directory = str(input.resultMetadata?.working_directory) ?? ""
+  switch (input.resultField) {
+    case "shell_stream": case "shell_result": case "background_shell_spawn_result":
+      return denied ? { permission_denied: { command, working_directory, error: reason } }
+        : { rejected: { command, working_directory, reason } }
+    case "write_result":
+      return denied ? { permission_denied: { path: filePath, directory: filePath ? path.dirname(filePath) : "", operation: "write", error: reason, is_readonly: false } }
+        : { rejected: { path: filePath, reason } }
+    case "read_result":
+      return denied ? { permission_denied: { path: filePath } } : { rejected: { path: filePath, reason } }
+    case "ls_result": return { rejected: { path: filePath, reason } }
+    case "delete_result":
+      return denied ? { permission_denied: { path: filePath, client_visible_error: reason, is_readonly: false } }
+        : { rejected: { path: filePath, reason } }
+    case "mcp_result":
+      return denied ? { permission_denied: { error: reason, is_readonly: false } }
+        : { rejected: { reason, is_readonly: false } }
+    default: return undefined
+  }
 }
 
 export function buildUnsupportedExecDeny(input: {
@@ -2939,6 +2991,7 @@ export function buildTypedExecResult(
   workspaceRoot?: string,
   images: readonly CursorImageInput[] = [],
 ): Record<string, unknown> {
+  if (error === "") error = "OpenCode tool execution failed"
   // Prefer the session workspace; never advertise the host process cwd (daemon
   // often starts in $HOME) as the path Cursor shows the model for glob/ls.
   const trimmedRoot = typeof workspaceRoot === "string" ? workspaceRoot.trim() : ""
@@ -3093,15 +3146,15 @@ export function buildTypedExecResult(
       const command = str(resultMetadata?.command) ?? ""
       const workingDirectory = str(resultMetadata?.working_directory) ?? ""
       const stdout = groundShellPathText(output, shellPathRoot(resultMetadata, resultRoot))
-      if (error) {
+      if (error || shellOutcome?.kind === "aborted") {
         return {
           failure: {
             command,
             working_directory: workingDirectory,
-            exit_code: 1,
+            exit_code: shellOutcome?.kind === "aborted" ? 0 : 1,
             stdout: stdout || "",
-            stderr: error,
-            aborted: false,
+            stderr: error || "Shell execution interrupted",
+            aborted: shellOutcome?.kind === "aborted",
           },
         }
       }
@@ -3158,12 +3211,12 @@ export function buildTypedExecResult(
       return { success: { output: listing?.text ?? groundSearchOutput(output, resultRoot) } }
     }
     case "delete_result":
-      if (error) return { error: { path: "", error } }
-      return { success: { path: "", deleted_file: "" } }
+      if (error) return { error: { path: resolveToolPath(str(resultMetadata?.path) ?? "", resultRoot), error } }
+      return { success: { path: resolveToolPath(str(resultMetadata?.path) ?? "", resultRoot), deleted_file: "" } }
     case "background_shell_spawn_result": {
       const command = str(resultMetadata?.command) ?? ""
       const workingDirectory = str(resultMetadata?.working_directory) ?? ""
-      if (error) return { error: { command, working_directory: workingDirectory, error } }
+      if (error || shellOutcome?.kind === "aborted") return { error: { command, working_directory: workingDirectory, error: error || "Shell execution interrupted" } }
       // Prefer the structured outcome captured by the plugin after-hook; markers
       // are already stripped from the stored/rendered OpenCode output by then.
       if (shellOutcome?.kind === "backgrounded") {
@@ -3177,8 +3230,10 @@ export function buildTypedExecResult(
         }
       }
       // Fallback when no plugin hook ran: parse the private spawn marker inline.
-      const match = new RegExp(`${BACKGROUND_SHELL_MARKER}(\\d+):([^\\r\\n]+)`).exec(output)
-      const pid = match ? Number(match[1]) : 0
+      // A managed spawn reports `shell-id:pid:file`; the unmanaged wrapper `pid:file`.
+      const match = new RegExp(`${BACKGROUND_SHELL_MARKER}(\\d+):(?:(\\d+):)?([^\\r\\n]+)`).exec(output)
+      const shellId = match ? Number(match[1]) : 0
+      const pid = match ? Number(match[2] || match[1]) : 0
       if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 0xffff_ffff) {
         return {
           error: {
@@ -3190,7 +3245,7 @@ export function buildTypedExecResult(
       }
       return {
         success: {
-          shell_id: pid,
+          shell_id: shellId,
           command,
           working_directory: workingDirectory,
           pid,
@@ -3198,7 +3253,7 @@ export function buildTypedExecResult(
       }
     }
     case "ls_result": {
-      if (error) return { error: { path: "", error } }
+      if (error) return { error: { path: resolveToolPath(str(resultMetadata?.path) ?? "", resultRoot), error } }
       const listing = parseOpenCode2DirectoryListing(output, resultRoot)
       const rootPath = listing?.directory || resultRoot || ""
       const entries = listing ? listing.entries : extractGroundedPaths(output, resultRoot)

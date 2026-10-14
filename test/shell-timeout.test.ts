@@ -1,24 +1,39 @@
 import { afterEach, describe, expect, it } from "bun:test"
-import { existsSync, readFileSync } from "node:fs"
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { pathToFileURL } from "node:url"
+import { tmpdir } from "node:os"
+import path from "node:path"
+import { createManagedTerminal } from "../src/terminal-runner.js"
+import { runtimeLayout } from "../src/runtime-files.js"
 import {
   CURSOR_TIMEOUT_BACKGROUND,
+  armCursorShellCreate,
   buildBackgroundShellCommand,
   buildSoftBackgroundCommand,
+  sanitizeCursorShellDisplayOutput,
   sanitizeRegisteredCursorShellOutput,
   captureCursorShellResult,
   consumeCursorShellResult,
   cursorShellEnvForCall,
-  cursorShellEnvForCommand,
+  disarmCursorShellCreate,
   prepareCursorShellArgs,
+  prepareCursorShellCreate,
   registerCursorShellCall,
   releaseCursorShellEnv,
   resetCursorShellCalls,
   resolveCursorShellKind,
+  resolveCursorShellPath,
   setCursorShellPath,
   shellPolicyFromMetadata,
 } from "../src/shell-timeout.js"
 
 afterEach(() => resetCursorShellCalls())
+
+async function independentShellCopy(root: string): Promise<typeof import("../src/shell-timeout.js")> {
+  cpSync(path.join(import.meta.dir, "../src"), path.join(root, "src"), { recursive: true })
+  symlinkSync(path.join(import.meta.dir, "../node_modules"), path.join(root, "node_modules"), "dir")
+  return import(pathToFileURL(path.join(root, "src/shell-timeout.ts")).href)
+}
 
 const metadata = (overrides: Record<string, unknown> = {}) => ({
   shell_stream: true,
@@ -91,6 +106,21 @@ describe("Cursor shell timeout translation", () => {
     const output = "__CURSOR_SHELL_EXIT__23\n"
     expect(captureCursorShellResult(id, output, { exit: 0 })).toBe(output)
     expect(consumeCursorShellResult(id, output).outcome).toEqual({ kind: "exit", code: 0 })
+  })
+
+  it("uses the final wrapper outcome when command output contains an earlier sentinel", () => {
+    const id = "cursor_marker_in_stdout"
+    registerCursorShellCall(id, metadata({ timeout_behavior: CURSOR_TIMEOUT_BACKGROUND }))
+    const clean = captureCursorShellResult(id, "__CURSOR_SHELL_BACKGROUND__1234:/tmp/example\nfailed\n__CURSOR_SHELL_EXIT__7\n")
+    expect(consumeCursorShellResult(id, clean).outcome).toEqual({ kind: "exit", code: 7 })
+    expect(clean).toContain("failed")
+  })
+
+  it("does not turn a failed spawn into success from an earlier stdout sentinel", () => {
+    const id = "cursor_spawn_marker_in_stdout"
+    registerCursorShellCall(id, { background_shell_spawn: true, command: "example" })
+    const clean = captureCursorShellResult(id, "__CURSOR_BACKGROUND_SHELL__1234:/tmp/example\n__CURSOR_SHELL_EXIT__1\n")
+    expect(consumeCursorShellResult(id, clean).outcome).toEqual({ kind: "exit", code: 1 })
   })
 
   it("keeps soft-background display command original and wraps via shell.env injectors", () => {
@@ -219,6 +249,34 @@ describe("Cursor shell timeout translation", () => {
     expect(buildSoftBackgroundCommand(policy)).toContain('[ "$cursor_shell_poll" -lt 0 ]')
   })
 
+  async function runSoftBackground(command: string, shell: string, overrides: Record<string, unknown> = {}) {
+    const policy = { command, workingDirectory: tmpdir(), timeoutMs: 2000, timeoutBehavior: CURSOR_TIMEOUT_BACKGROUND, shellPath: "/bin/sh", ...overrides }
+    const proc = Bun.spawn([shell, "-c", buildSoftBackgroundCommand(policy)], { stdout: "pipe", stderr: "pipe" })
+    const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited])
+    return { stdout, stderr }
+  }
+
+  it.each(["/bin/sh", "/bin/bash", "/bin/dash"].flatMap(shell => [
+    [shell, "printf done; exit 3", "done\n__CURSOR_SHELL_EXIT__3\n"],
+    [shell, "kill -TERM $$", "\n__CURSOR_SHELL_EXIT__143\n"],
+  ]))("reports the command's own status under %s for %s, without job notices", async (shell, command, expected) => {
+    if (!existsSync(shell)) return
+    expect(await runSoftBackground(command, shell)).toEqual({ stdout: expected, stderr: "" })
+  })
+
+  it.each([
+    ["stops promptly", "exec sleep 30"],
+    ["ignores TERM until the watchdog kills it", "trap '' TERM; exec sleep 30"],
+  ])("reports a hard timeout as a timeout when the command %s", async (_, command) => {
+    const root = mkdtempSync(path.join(tmpdir(), "cursor-soft-timeout-"))
+    try {
+      const pidFile = path.join(root, "pid")
+      const { stdout, stderr } = await runSoftBackground(`echo $$ >'${pidFile}'; printf before; ${command}`, "/bin/sh", { timeoutMs: 1000, hardTimeoutMs: 300 })
+      expect({ stdout, stderr }).toEqual({ stdout: "before\n__CURSOR_SHELL_TIMEOUT__300\n", stderr: "" })
+      expect(() => process.kill(Number(readFileSync(pidFile, "utf8")), 0)).toThrow()
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  }, 15_000)
+
   it("keeps background_shell_spawn display command original and wraps via shell.env", () => {
     setCursorShellPath("/bin/bash")
     const id = "cursor_session_bg_spawn"
@@ -237,7 +295,7 @@ describe("Cursor shell timeout translation", () => {
     const wrapperMatch = injector.match(/exec \/bin\/sh '([^']+)'/)
     expect(wrapperMatch?.[1]).toBeString()
     const wrapper = readFileSync(wrapperMatch![1]!, "utf8")
-    expect(wrapper).toContain("nohup sh -c 'zig translate-c /tmp/tiny.c -lc'")
+    expect(wrapper).toContain("nohup \"$cursor_payload_shell\" -c 'zig translate-c /tmp/tiny.c -lc'")
     expect(wrapper).toContain("__CURSOR_BACKGROUND_SHELL__")
     expect(wrapper).toContain("</dev/null &")
     expect(buildBackgroundShellCommand("echo hi")).toContain("__CURSOR_BACKGROUND_SHELL__")
@@ -318,7 +376,7 @@ describe("Cursor shell timeout translation", () => {
     releaseCursorShellEnv(id)
   })
 
-  it("exec-replaces OpenCode-style zsh -l -c via ZDOTDIR injector", () => {
+  it("exec-replaces the native OpenCode 1 shell tool's zsh -c command", () => {
     // Ubuntu CI images do not ship /bin/zsh by default; skip rather than ENOENT.
     if (!existsSync("/bin/zsh")) return
     setCursorShellPath("/bin/zsh")
@@ -333,16 +391,8 @@ describe("Cursor shell timeout translation", () => {
     const wrap = cursorShellEnvForCall(id)!
     const result = Bun.spawnSync([
       "/bin/zsh",
-      "-l",
       "-c",
-      `
-        [[ -f ~/.zshenv ]] && source ~/.zshenv >/dev/null 2>&1 || true
-        [[ -f "\${ZDOTDIR:-$HOME}/.zshrc" ]] && source "\${ZDOTDIR:-$HOME}/.zshrc" >/dev/null 2>&1 || true
-        cd -- "$1"
-        eval ${JSON.stringify(command)}
-      `,
-      "opencode",
-      process.cwd(),
+      command,
     ], {
       env: { ...process.env, ...wrap, CURSOR_OPENCODE_WRAP_ACTIVE: "1" },
       stdout: "pipe",
@@ -352,6 +402,19 @@ describe("Cursor shell timeout translation", () => {
     expect(raw).toContain("__CURSOR_SHELL_EXIT__")
     expect(captureCursorShellResult(id, raw)).toBe("INNER_OK\n")
     releaseCursorShellEnv(id)
+  })
+
+  it.each(["bash", "zsh"])("never substitutes a stale %s command after host approval changes it", name => {
+    const shell = Bun.which(name)
+    if (!shell) return
+    setCursorShellPath(shell)
+    const id = "cursor_approval_changed"
+    registerCursorShellCall(id, metadata({ command: "echo unapproved", timeout_behavior: CURSOR_TIMEOUT_BACKGROUND }))
+    prepareCursorShellArgs(id, { command: "echo unapproved" })
+    const env = cursorShellEnvForCall(id)!
+    const result = Bun.spawnSync([shell, "-c", "echo approved"], { env: { ...process.env, ...env }, stdout: "pipe", stderr: "pipe" })
+    expect(result.stdout.toString()).toBe("approved\n")
+    expect(result.exitCode).toBe(0)
   })
 
   it("uses a wrapper-file command for OpenCode sh and dash", () => {
@@ -412,42 +475,444 @@ describe("Cursor shell timeout translation", () => {
   })
 })
 
-describe("cursorShellEnvForCommand", () => {
-  it("returns the pending wrap whose policy command matches", () => {
+describe("prepareCursorShellCreate correlation", () => {
+  const createEvent = (command: string, cwd: string) => ({ command, cwd, timeout: 0, shell: "/bin/sh", env: {} as Record<string, string | undefined> })
+  const hookCall = (command: string): { input: unknown } => ({ input: { command } })
+
+  it("installs the adapter only for the pending wrap whose policy command matches", () => {
     const id = "cursor_cmd_key"
     registerCursorShellCall(id, {
       background_shell_spawn: true,
       command: "echo correlated",
       working_directory: "/tmp",
     })
-    const args = { command: "echo correlated" }
-    prepareCursorShellArgs(id, args)
-    const env = cursorShellEnvForCommand("echo correlated")
-    expect(env).toBeDefined()
-    expect(cursorShellEnvForCommand("echo other")).toBeUndefined()
+    prepareCursorShellArgs(id, { command: "echo correlated" }, { deferToShellHook: true })
+    const other = createEvent("echo other", "/tmp")
+    prepareCursorShellCreate(other)
+    expect(other.shell).toBe("/bin/sh")
+    const matched = createEvent("echo correlated", "/tmp")
+    prepareCursorShellCreate(matched)
+    expect(matched.shell).not.toBe("/bin/sh")
+    expect(path.basename(matched.shell)).toBe("sh")
     releaseCursorShellEnv(id)
   })
 
   it("uses the working directory to disambiguate identical commands", () => {
     const first = "cursor_cmd_first"
     const second = "cursor_cmd_second"
-    registerCursorShellCall(first, {
-      background_shell_spawn: true,
-      command: "echo same",
-      working_directory: "/first",
-    })
-    registerCursorShellCall(second, {
-      background_shell_spawn: true,
-      command: "echo same",
-      working_directory: "/second",
-    })
-    prepareCursorShellArgs(first, { command: "echo same" })
-    prepareCursorShellArgs(second, { command: "echo same" })
+    registerCursorShellCall(first, { background_shell_spawn: true, command: "echo same", working_directory: "/first" })
+    registerCursorShellCall(second, { background_shell_spawn: true, command: "echo same", working_directory: "/second" })
+    prepareCursorShellArgs(first, { command: "echo same" }, { deferToShellHook: true })
+    prepareCursorShellArgs(second, { command: "echo same" }, { deferToShellHook: true })
 
-    expect(cursorShellEnvForCommand("echo same", "/second")).toBeDefined()
+    const event = createEvent("echo same", "/second")
+    prepareCursorShellCreate(event)
+    expect(event.shell).not.toBe("/bin/sh")
     expect(cursorShellEnvForCall(second)).toBeUndefined()
     expect(cursorShellEnvForCall(first)).toBeDefined()
     releaseCursorShellEnv(first)
     releaseCursorShellEnv(second)
+  })
+
+  it("arms one create at a time so identical concurrent commands keep their own terminals", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cursor-shell-arm-"))
+    try {
+      runtimeLayout(root, true)
+      const first = "cursor_arm_first"
+      const second = "cursor_arm_second"
+      const terminalA = createManagedTerminal({
+        command: "echo same", workingDirectory: root, timeoutMs: 0, timeoutBehavior: 0, backgroundSpawn: true,
+      }, root)
+      const terminalB = createManagedTerminal({
+        command: "echo same", workingDirectory: root, timeoutMs: 0, timeoutBehavior: 0, backgroundSpawn: true,
+      }, root)
+      registerCursorShellCall(first, {
+        background_shell_spawn: true, command: "echo same", working_directory: root,
+        managed_command: terminalA.command, managed_job_directory: terminalA.directory,
+      })
+      registerCursorShellCall(second, {
+        background_shell_spawn: true, command: "echo same", working_directory: root,
+        managed_command: terminalB.command, managed_job_directory: terminalB.directory,
+      })
+
+      prepareCursorShellArgs(first, { command: "echo same" }, { deferToShellHook: true })
+      await armCursorShellCreate(first, hookCall("echo same"))
+
+      prepareCursorShellArgs(second, { command: "echo same" }, { deferToShellHook: true })
+      let secondArmed = false
+      const armSecond = armCursorShellCreate(second, hookCall("echo same")).then(() => { secondArmed = true })
+      await Bun.sleep(20)
+      expect(secondArmed).toBe(false)
+
+      const wrapperBody = (shell: string) => {
+        const match = /exec \/bin\/sh '([^']+)'/.exec(readFileSync(shell, "utf8"))
+        if (!match?.[1]) throw new Error(`adapter missing wrapper: ${shell}`)
+        return readFileSync(match[1], "utf8")
+      }
+      const firstCreate = createEvent("echo same", root)
+      prepareCursorShellCreate(firstCreate)
+      await armSecond
+      expect(secondArmed).toBe(true)
+      expect(wrapperBody(firstCreate.shell)).toContain(terminalA.directory)
+      expect(wrapperBody(firstCreate.shell)).not.toContain(terminalB.directory)
+
+      // Rejecting the first call must not delete the second call's reservation
+      // once creates are correctly owned; arm already transferred past the first.
+      releaseCursorShellEnv(first)
+      expect(existsSync(terminalB.directory)).toBe(true)
+
+      const secondCreate = createEvent("echo same", root)
+      prepareCursorShellCreate(secondCreate)
+      expect(wrapperBody(secondCreate.shell)).toContain(terminalB.directory)
+      expect(wrapperBody(secondCreate.shell)).not.toContain(terminalA.directory)
+      releaseCursorShellEnv(second)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it("releases an ordinary shell at creation without taking a wrapped call's adapter", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cursor-shell-ordinary-"))
+    try {
+      runtimeLayout(root, true)
+      const ordinary = "cursor_gate_foreground"
+      const managed = "cursor_gate_managed"
+      const terminal = createManagedTerminal({
+        command: "echo same", workingDirectory: root, timeoutMs: 0, timeoutBehavior: 0, backgroundSpawn: true,
+      }, root)
+      registerCursorShellCall(ordinary, {
+        shell_stream: true, command: "echo same", working_directory: root,
+        timeout_ms: 30_000, timeout_behavior: 0,
+      })
+      registerCursorShellCall(managed, {
+        background_shell_spawn: true, command: "echo same", working_directory: root,
+        managed_command: terminal.command, managed_job_directory: terminal.directory,
+      })
+
+      prepareCursorShellArgs(ordinary, { command: "echo same" }, { deferToShellHook: true })
+      await armCursorShellCreate(ordinary, hookCall("echo same"))
+      prepareCursorShellArgs(managed, { command: "echo same" }, { deferToShellHook: true })
+      let managedArmed = false
+      const armManaged = armCursorShellCreate(managed, hookCall("echo same")).then(() => { managedArmed = true })
+      await Bun.sleep(20)
+      expect(managedArmed).toBe(false)
+
+      const ordinaryCreate = { command: "echo same", cwd: root, timeout: 0, shell: "/bin/sh", env: {} as Record<string, string | undefined> }
+      prepareCursorShellCreate(ordinaryCreate)
+      expect(ordinaryCreate.shell).toBe("/bin/sh")
+      await armManaged
+      expect(managedArmed).toBe(true)
+      expect(existsSync(terminal.directory)).toBe(true)
+
+      const managedCreate = { command: "echo same", cwd: root, timeout: 0, shell: "/bin/sh", env: {} as Record<string, string | undefined> }
+      prepareCursorShellCreate(managedCreate)
+      const wrapper = /exec \/bin\/sh '([^']+)'/.exec(readFileSync(managedCreate.shell, "utf8"))
+      expect(wrapper?.[1] && readFileSync(wrapper[1], "utf8")).toContain(terminal.directory)
+
+      // The ordinary command is still running; releasing it must not delete the
+      // terminal the managed call just claimed.
+      releaseCursorShellEnv(ordinary)
+      expect(existsSync(terminal.directory)).toBe(true)
+      releaseCursorShellEnv(managed)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it("does not borrow a pending wrapper from another project after a cwd mismatch", () => {
+    registerCursorShellCall("cursor_project", { background_shell_spawn: true, command: "echo same", working_directory: "/first" })
+    prepareCursorShellArgs("cursor_project", { command: "echo same" }, { deferToShellHook: true })
+    const event = createEvent("echo same", "/second")
+    prepareCursorShellCreate(event)
+    expect(event.shell).toBe("/bin/sh")
+    expect(cursorShellEnvForCall("cursor_project")).toBeDefined()
+    releaseCursorShellEnv("cursor_project")
+  })
+
+  it("correlates a pending wrapper when the host reports the directory through a symlink", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "cursor-shell-cwd-"))
+    try {
+      const link = path.join(base, "link")
+      symlinkSync(base, link, "dir")
+      registerCursorShellCall("cursor_linked", { background_shell_spawn: true, command: "echo linked", working_directory: link })
+      prepareCursorShellArgs("cursor_linked", { command: "echo linked" }, { deferToShellHook: true })
+      const event = createEvent("echo linked", realpathSync(base))
+      prepareCursorShellCreate(event)
+      expect(event.shell).not.toBe("/bin/sh")
+      releaseCursorShellEnv("cursor_linked")
+    } finally {
+      rmSync(base, { recursive: true, force: true })
+    }
+  })
+
+  it("releases reservations across separate plugin and SDK module copies", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cursor-shell-copies-"))
+    try {
+      const other = await independentShellCopy(root)
+      expect(other.releaseCursorShellEnv).not.toBe(releaseCursorShellEnv)
+      const terminal = createManagedTerminal({ command: "true", workingDirectory: root, timeoutMs: 0, timeoutBehavior: 0, backgroundSpawn: true }, root)
+      registerCursorShellCall("cursor_copies_1", { background_shell_spawn: true, command: "true", working_directory: root, managed_command: terminal.command, managed_job_directory: terminal.directory })
+      other.releaseCursorShellEnv("cursor_copies_1")
+      expect(existsSync(terminal.directory)).toBe(false)
+      expect(existsSync(terminal.file)).toBe(false)
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+
+  it("shares global and per-directory configured shells with a separate module copy", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cursor-shell-config-copy-"))
+    const shell = process.execPath
+    try {
+      const other = await independentShellCopy(root)
+      expect(other.setCursorShellPath).not.toBe(setCursorShellPath)
+      setCursorShellPath(shell)
+      expect(other.resolveCursorShellPath()).toBe(shell)
+      setCursorShellPath(undefined)
+      setCursorShellPath(shell, root)
+      expect(other.resolveCursorShellPath(undefined, root)).toBe(shell)
+      other.setCursorShellPath(undefined, root)
+      expect(resolveCursorShellPath(undefined, root)).not.toBe(shell)
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+
+  it("releases a reserved terminal when its call is evicted before the host runs it", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cursor-shell-evict-"))
+    try {
+      runtimeLayout(root, true)
+      const terminal = createManagedTerminal({ command: "true", workingDirectory: root, timeoutMs: 0, timeoutBehavior: 0, backgroundSpawn: true }, root)
+      registerCursorShellCall("cursor_evicted", {
+        background_shell_spawn: true, command: "true", working_directory: root,
+        managed_command: terminal.command, managed_job_directory: terminal.directory,
+      })
+      for (let index = 0; index < 512; index++) {
+        registerCursorShellCall(`cursor_newer_${index}`, { background_shell_spawn: true, command: "true", working_directory: root })
+      }
+      expect(existsSync(terminal.file)).toBe(false)
+      expect(existsSync(terminal.directory)).toBe(false)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it("resolves a shell by PATH name and falls back when that name is absent", () => {
+    const found = resolveCursorShellPath("sh")
+    expect(found.endsWith("/sh") || found.endsWith("/zsh") || found === "/bin/sh").toBe(true)
+    const missing = resolveCursorShellPath("/no/such/cursor-shell")
+    expect(missing === "/bin/zsh" || missing.endsWith("/bash") || missing === "/bin/sh").toBe(true)
+    const root = mkdtempSync(path.join(tmpdir(), "cursor-shell-path-"))
+    const withBash = path.join(root, "with-bash")
+    const withoutBash = path.join(root, "without-bash")
+    mkdirSync(withBash)
+    mkdirSync(withoutBash)
+    writeFileSync(path.join(withBash, "bash"), "")
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")
+    const pathEnv = process.env.PATH
+    Object.defineProperty(process, "platform", { ...platform, value: "linux" })
+    try {
+      process.env.PATH = withBash
+      expect(resolveCursorShellPath("cursor-missing-shell")).toBe(path.join(withBash, "bash"))
+      process.env.PATH = withoutBash
+      expect(resolveCursorShellPath("cursor-missing-shell")).toBe("/bin/sh")
+    } finally {
+      Object.defineProperty(process, "platform", platform!)
+      if (pathEnv === undefined) delete process.env.PATH
+      else process.env.PATH = pathEnv
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it("drops a waiting create when the gate is reset", async () => {
+    await armCursorShellCreate("cursor_gate_holder", hookCall("echo gate"))
+    const waiting = armCursorShellCreate("cursor_gate_waiter", hookCall("echo gate"))
+    resetCursorShellCalls()
+    await waiting
+    expect(resolveCursorShellPath()).toBeTruthy()
+  })
+
+  it("releases a create when the pending call no longer has a wrapper", async () => {
+    const id = "cursor_wrap_gone"
+    registerCursorShellCall(id, { background_shell_spawn: true, command: "echo x", working_directory: "/tmp" })
+    prepareCursorShellArgs(id, { command: "echo x" }, { deferToShellHook: true })
+    registerCursorShellCall(id, { shell_stream: true, command: "echo x", working_directory: "/tmp", timeout_behavior: 0 })
+    await armCursorShellCreate(id, hookCall("echo x"))
+    const event = { command: "echo x", cwd: "/tmp", shell: "/bin/sh", env: {} as Record<string, string | undefined> }
+    prepareCursorShellCreate(event)
+    expect(event.shell).toBe("/bin/sh")
+  })
+
+  it("releases a call whose command a later hook rewrote at that call's own create", async () => {
+    const id = "cursor_gate_rewritten"
+    registerCursorShellCall(id, { background_shell_spawn: true, command: "echo original", working_directory: "/tmp" })
+    prepareCursorShellArgs(id, { command: "echo original" }, { deferToShellHook: true })
+    const call = hookCall("echo original")
+    await armCursorShellCreate(id, call)
+
+    let otherArmed = false
+    const armOther = armCursorShellCreate("cursor_gate_other", hookCall("echo other")).then(() => { otherArmed = true })
+    await Bun.sleep(0)
+    expect(otherArmed).toBe(true)
+    await armOther
+    disarmCursorShellCreate("cursor_gate_other")
+
+    let identicalArmed = false
+    const armIdentical = armCursorShellCreate("cursor_gate_identical", hookCall("echo original")).then(() => { identicalArmed = true })
+    await Bun.sleep(20)
+    expect(identicalArmed).toBe(false)
+
+    // A later execute.before hook replaces the input OpenCode creates from.
+    call.input = { command: "echo rewritten" }
+    const rewritten = createEvent("echo rewritten", "/tmp")
+    prepareCursorShellCreate(rewritten)
+    expect(rewritten.shell).toBe("/bin/sh")
+    await armIdentical
+    expect(identicalArmed).toBe(true)
+    disarmCursorShellCreate("cursor_gate_identical")
+
+    const later = createEvent("echo original", "/tmp")
+    prepareCursorShellCreate(later)
+    expect(later.shell).toBe("/bin/sh")
+    releaseCursorShellEnv(id)
+  })
+
+  it("wraps no call when hooks give two lane holders the same command", async () => {
+    const first = "cursor_gate_same_first"
+    const second = "cursor_gate_same_second"
+    registerCursorShellCall(first, { background_shell_spawn: true, command: "echo first", working_directory: "/tmp" })
+    registerCursorShellCall(second, { background_shell_spawn: true, command: "echo second", working_directory: "/tmp" })
+    prepareCursorShellArgs(first, { command: "echo first" }, { deferToShellHook: true })
+    prepareCursorShellArgs(second, { command: "echo second" }, { deferToShellHook: true })
+    const call = hookCall("echo first")
+    await armCursorShellCreate(first, call)
+    await armCursorShellCreate(second, hookCall("echo second"))
+    call.input = { command: "echo second" }
+
+    const create = createEvent("echo second", "/tmp")
+    prepareCursorShellCreate(create)
+    expect(create.shell).toBe("/bin/sh")
+    let waitingArmed = false
+    const armWaiting = armCursorShellCreate("cursor_gate_same_waiting", hookCall("echo second")).then(() => { waitingArmed = true })
+    await Bun.sleep(20)
+    expect(waitingArmed).toBe(false)
+
+    releaseCursorShellEnv(second)
+    await armWaiting
+    expect(waitingArmed).toBe(true)
+    disarmCursorShellCreate("cursor_gate_same_waiting")
+    releaseCursorShellEnv(first)
+  })
+
+  it("keeps an armed call's adapter from a create it does not own", async () => {
+    const holder = hookCall("echo same")
+    await armCursorShellCreate("cursor_gate_holder_moved", holder)
+    const waiting = "cursor_gate_waiter_kept"
+    registerCursorShellCall(waiting, { background_shell_spawn: true, command: "echo same", working_directory: "/tmp" })
+    prepareCursorShellArgs(waiting, { command: "echo same" }, { deferToShellHook: true })
+    let waitingArmed = false
+    const armWaiting = armCursorShellCreate(waiting, hookCall("echo same")).then(() => { waitingArmed = true })
+    holder.input = { command: "echo moved" }
+
+    const foreign = createEvent("echo same", "/tmp")
+    prepareCursorShellCreate(foreign)
+    expect(foreign.shell).toBe("/bin/sh")
+    await Bun.sleep(20)
+    expect(waitingArmed).toBe(false)
+
+    prepareCursorShellCreate(createEvent("echo moved", "/tmp"))
+    await armWaiting
+    expect(waitingArmed).toBe(true)
+    const own = createEvent("echo same", "/tmp")
+    prepareCursorShellCreate(own)
+    expect(own.shell).not.toBe("/bin/sh")
+    releaseCursorShellEnv(waiting)
+  })
+
+  it("does not hand an unwrapped owner's adapter to a later create", async () => {
+    const id = "cursor_gate_consumed"
+    registerCursorShellCall(id, { background_shell_spawn: true, command: "echo same", working_directory: "/tmp" })
+    prepareCursorShellArgs(id, { command: "echo same" }, { deferToShellHook: true })
+    await armCursorShellCreate(id, hookCall("echo same"))
+    const moved = createEvent("echo same", "/")
+    prepareCursorShellCreate(moved)
+    expect(moved.shell).toBe("/bin/sh")
+
+    const foreign = createEvent("echo same", "/tmp")
+    prepareCursorShellCreate(foreign)
+    expect(foreign.shell).toBe("/bin/sh")
+    releaseCursorShellEnv(id)
+  })
+
+  it("leaves a call whose input carries no command to single-match selection", async () => {
+    const id = "cursor_gate_no_command"
+    registerCursorShellCall(id, { background_shell_spawn: true, command: "echo x", working_directory: "/tmp" })
+    prepareCursorShellArgs(id, { command: "echo x" }, { deferToShellHook: true })
+    await armCursorShellCreate(id, { input: { command: 1 } })
+    await armCursorShellCreate(id, { input: undefined })
+    const create = createEvent("echo x", "/tmp")
+    prepareCursorShellCreate(create)
+    expect(create.shell).not.toBe("/bin/sh")
+    releaseCursorShellEnv(id)
+  })
+
+  it("releases a call whose working directory another hook changed without taking an identical call's adapter", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cursor-shell-moved-"))
+    try {
+      runtimeLayout(root, true)
+      const moved = "cursor_gate_moved"
+      const waiting = "cursor_gate_waiting"
+      const terminalA = createManagedTerminal({
+        command: "echo same", workingDirectory: root, timeoutMs: 0, timeoutBehavior: 0, backgroundSpawn: true,
+      }, root)
+      const terminalB = createManagedTerminal({
+        command: "echo same", workingDirectory: root, timeoutMs: 0, timeoutBehavior: 0, backgroundSpawn: true,
+      }, root)
+      registerCursorShellCall(moved, {
+        background_shell_spawn: true, command: "echo same", working_directory: root,
+        managed_command: terminalA.command, managed_job_directory: terminalA.directory,
+      })
+      registerCursorShellCall(waiting, {
+        background_shell_spawn: true, command: "echo same", working_directory: root,
+        managed_command: terminalB.command, managed_job_directory: terminalB.directory,
+      })
+      prepareCursorShellArgs(moved, { command: "echo same" }, { deferToShellHook: true })
+      await armCursorShellCreate(moved, hookCall("echo same"))
+      prepareCursorShellArgs(waiting, { command: "echo same" }, { deferToShellHook: true })
+      let waitingArmed = false
+      const armWaiting = armCursorShellCreate(waiting, hookCall("echo same")).then(() => { waitingArmed = true })
+      await Bun.sleep(20)
+      expect(waitingArmed).toBe(false)
+
+      const movedCreate = createEvent("echo same", tmpdir())
+      prepareCursorShellCreate(movedCreate)
+      expect(movedCreate.shell).toBe("/bin/sh")
+      await armWaiting
+      expect(waitingArmed).toBe(true)
+
+      const waitingCreate = createEvent("echo same", root)
+      prepareCursorShellCreate(waitingCreate)
+      const wrapper = /exec \/bin\/sh '([^']+)'/.exec(readFileSync(waitingCreate.shell, "utf8"))
+      const body = wrapper?.[1] ? readFileSync(wrapper[1], "utf8") : ""
+      expect(body).toContain(terminalB.directory)
+      expect(body).not.toContain(terminalA.directory)
+      releaseCursorShellEnv(moved)
+      expect(existsSync(terminalA.directory)).toBe(false)
+      expect(existsSync(terminalB.directory)).toBe(true)
+      releaseCursorShellEnv(waiting)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it("formats a finished background spawn that reports an exit instead of a handle", () => {
+    const shown = sanitizeCursorShellDisplayOutput("done\n__CURSOR_SHELL_EXIT__0\n", {
+      command: "echo x", workingDirectory: "/tmp", timeoutMs: 0, timeoutBehavior: 0, backgroundSpawn: true,
+    })
+    expect(shown).toContain("done")
+    expect(shown).not.toContain("__CURSOR_SHELL_EXIT__")
+  })
+
+  it("names the managed shell and its output file in the background notice", () => {
+    registerCursorShellCall("cursor_managed", { background_shell_spawn: true, command: "serve", working_directory: "/w" })
+    const clean = captureCursorShellResult("cursor_managed", "\n__CURSOR_BACKGROUND_SHELL__123456:4321:/cache/terminals/123456.txt\n")
+    expect(clean).toBe("Started in the background (shell 123456, pid 4321). Output: /cache/terminals/123456.txt\n")
+    expect(consumeCursorShellResult("cursor_managed", clean).outcome).toMatchObject({ kind: "backgrounded", shellId: 123456, pid: 4321, outputFile: "/cache/terminals/123456.txt" })
   })
 })

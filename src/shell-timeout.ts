@@ -1,6 +1,8 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { basename, delimiter, join } from "node:path"
+import { basename, delimiter, dirname as pathDirectory, join, resolve } from "node:path"
+import { releaseUnstartedTerminal } from "./terminal-runner.js"
+import { processShared } from "./process-shared.js"
 
 /** Cursor agent.v1 TimeoutBehavior enum values. */
 export const CURSOR_TIMEOUT_CANCEL = 1
@@ -9,6 +11,8 @@ export const CURSOR_TIMEOUT_BACKGROUND = 2
 const MAX_TRACKED_SHELL_CALLS = 512
 const OPENCODE_TIMEOUT_GRACE_MS = 15_000
 const POLL_INTERVAL_MS = 100
+/** Past the window, a hard-timed-out command gets the watchdog's 3 s TERM grace plus slack. */
+const TIMEOUT_SETTLE_MS = 4_000
 const BACKGROUND_MARKER = "__CURSOR_SHELL_BACKGROUND__"
 const EXIT_MARKER = "__CURSOR_SHELL_EXIT__"
 const TIMEOUT_MARKER = "__CURSOR_SHELL_TIMEOUT__"
@@ -23,10 +27,15 @@ export type CursorShellPolicy = {
   hardTimeoutMs?: number
   /** Immediate nohup detach for Cursor `background_shell_spawn_args`. */
   backgroundSpawn?: boolean
+  description?: string
+  managedCommand?: string
+  managedJobDirectory?: string
+  shellPath?: string
 }
 
 export type CursorShellOutcome =
   | { kind: "exit"; code: number }
+  | { kind: "aborted" }
   | { kind: "timeout"; timeoutMs: number }
   | {
       kind: "backgrounded"
@@ -36,24 +45,105 @@ export type CursorShellOutcome =
       workingDirectory: string
       msToWait: number
       reason: 1
+      /** Managed terminal record holding the command's output. */
+      outputFile?: string
     }
 
 type CursorShellEnvWrap = {
   env: Record<string, string>
   wrapperPath: string
-  cleanup: () => void
 }
 
-const policies = new Map<string, CursorShellPolicy>()
-const outcomes = new Map<string, CursorShellOutcome>()
+// Native plugin and SDK entrypoints can live in separate module graphs.
+const policies = processShared("shell-policies.v1", () => new Map<string, CursorShellPolicy>())
+const outcomes = processShared("shell-outcomes.v1", () => new Map<string, CursorShellOutcome>())
+const failures = processShared("shell-failures.v1", () => new Map<string, string>())
 /** callIDs that need shell.env injectors or a direct-command fallback. */
-const pendingEnvWraps = new Set<string>()
-const activeEnvWraps = new Map<string, CursorShellEnvWrap>()
-let configuredShell: string | undefined
+const pendingEnvWraps = processShared("shell-pending-env.v1", () => new Set<string>())
+const activeEnvWraps = processShared("shell-active-env.v1", () => new Map<string, CursorShellEnvWrap>())
+/**
+ * OpenCode 2 `create.before` has no tool-call id and matching is by command
+ * text. Shell calls with the same command take turns from `execute.before` to
+ * their create (or after-hook backstop), so a lane's holder owns the create
+ * carrying that command and identical concurrent commands cannot claim each
+ * other's managed terminals. Calls with other commands never wait.
+ */
+type CreateGateWaiter = { id: string; resolve: () => void; reject: (error: Error) => void }
+type CreateGateLane = { lockedBy: string; waiters: CreateGateWaiter[] }
+const createGate = processShared("shell-create-gate.v2", () => new Map<string, CreateGateLane>())
+/**
+ * The `execute.before` event of each armed call. OpenCode creates the shell
+ * from `event.input` after every hook ran, so its current command is the one
+ * the call's create carries, even when a later hook rewrote it.
+ */
+const armedCalls = processShared("shell-create-calls.v1", () => new Map<string, { readonly input: unknown }>())
+const shellConfiguration = processShared("shell-configuration.v1", () => ({
+  defaultShell: undefined as string | undefined,
+  directories: new Map<string, string | undefined>(),
+}))
+const configuredShells = shellConfiguration.directories
+
+/**
+ * Serialize OpenCode 2 shell creates onto their owning tool call. Call from
+ * `execute.before` after `prepareCursorShellArgs`, passing the hook event the
+ * host later executes. Every call arms, so an ordinary call cannot take a
+ * wrapped call's adapter; `prepareCursorShellCreate` releases the holder at
+ * its create. Only a create whose command a `create.before` hook rewrote
+ * cannot be attributed; that call keeps its own command's lane until
+ * `execute.after` or its failure.
+ */
+export async function armCursorShellCreate(toolCallId: string, call: { readonly input: unknown }): Promise<void> {
+  if (process.platform === "win32") return
+  const command = callCommand(call)
+  if (command === undefined) return
+  armedCalls.set(toolCallId, call)
+  const lane = createGate.get(command)
+  if (!lane) {
+    createGate.set(command, { lockedBy: toolCallId, waiters: [] })
+    return
+  }
+  try {
+    await new Promise<void>((resolve, reject) => {
+      lane.waiters.push({ id: toolCallId, resolve, reject })
+    })
+  } catch {
+    // resetCursorShellCalls cancelled this waiter.
+  }
+}
+
+/** Release a create-before arm when the call is claimed, fails, or finishes. */
+export function disarmCursorShellCreate(toolCallId: string): void {
+  armedCalls.delete(toolCallId)
+  for (const [command, lane] of createGate) {
+    lane.waiters = lane.waiters.filter((waiter) => waiter.id !== toolCallId)
+    if (lane.lockedBy !== toolCallId) continue
+    const next = lane.waiters.shift()
+    if (!next) {
+      createGate.delete(command)
+      continue
+    }
+    // Hand over before the waiter resumes, so releasing it in between still
+    // passes the lane on.
+    lane.lockedBy = next.id
+    next.resolve()
+  }
+}
+
+function callCommand(call: { readonly input: unknown } | undefined): string | undefined {
+  const input = call?.input
+  if (typeof input !== "object" || input === null) return undefined
+  const command = (input as Record<string, unknown>).command
+  return typeof command === "string" ? command : undefined
+}
 
 /** Track OpenCode's configured shell from the classic config hook. */
-export function setCursorShellPath(shell: string | undefined): void {
-  configuredShell = shell?.trim() || undefined
+export function setCursorShellPath(shell: string | undefined, directory?: string): void {
+  const selected = shell?.trim() || undefined
+  if (!directory) { shellConfiguration.defaultShell = selected; return }
+  const root = canonicalDirectory(directory)
+  configuredShells.delete(root)
+  configuredShells.set(root, selected)
+  while (configuredShells.size > 512) configuredShells.delete(configuredShells.keys().next().value!)
 }
 
 function executableOnPath(name: string): boolean {
@@ -63,12 +153,34 @@ function executableOnPath(name: string): boolean {
   return false
 }
 
+/** The executable selected by native OpenCode config, with its POSIX fallback. */
+export function resolveCursorShellPath(shell?: string, directory?: string): string {
+  const root = directory && canonicalDirectory(directory)
+  const configured = root && configuredShells.has(root) ? configuredShells.get(root) : shellConfiguration.defaultShell
+  shell ??= configured ?? process.env.SHELL
+  const name = shell ? basename(shell).toLowerCase() : ""
+  if (shell && name !== "fish" && name !== "nu") {
+    if (shell.includes("/")) {
+      try { if (statSync(shell).isFile()) return shell } catch { /* native fallback */ }
+    } else {
+      for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+        if (dir && existsSync(join(dir, shell))) return join(dir, shell)
+      }
+    }
+  }
+  if (process.platform === "darwin") return "/bin/zsh"
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+    if (dir && existsSync(join(dir, "bash"))) return join(dir, "bash")
+  }
+  return "/bin/sh"
+}
+
 /**
  * Mirror the relevant part of OpenCode Shell.acceptable(): fish/nu are denied,
  * then POSIX falls back to bash when installed and `/bin/sh` otherwise.
  */
 export function resolveCursorShellKind(
-  shell = configuredShell ?? process.env.SHELL,
+  shell = shellConfiguration.defaultShell ?? process.env.SHELL,
 ): "bash" | "zsh" | "sh" | "dash" | "other" {
   let name = shell ? basename(shell).toLowerCase().replace(/\.exe$/, "") : ""
   if (name === "fish" || name === "nu" || !name) {
@@ -100,6 +212,13 @@ export function shellPolicyFromMetadata(
   metadata: Record<string, unknown> | undefined,
 ): CursorShellPolicy | undefined {
   if (!metadata) return undefined
+  const managed = {
+    ...(typeof metadata.description === "string" ? { description: metadata.description } : {}),
+    ...(typeof metadata.managed_command === "string" ? { managedCommand: metadata.managed_command } : {}),
+    ...(typeof metadata.managed_job_directory === "string" ? { managedJobDirectory: metadata.managed_job_directory } : {}),
+    ...(typeof metadata.managed_shell_path === "string" ? { shellPath: metadata.managed_shell_path } : {}),
+  }
+  const hardTimeoutMs = finiteNonNegative(metadata.hard_timeout_ms)
   if (metadata.background_shell_spawn === true) {
     return {
       command: typeof metadata.command === "string" ? metadata.command : "",
@@ -108,12 +227,13 @@ export function shellPolicyFromMetadata(
       timeoutMs: 0,
       timeoutBehavior: 0,
       backgroundSpawn: true,
+      ...(hardTimeoutMs !== undefined && hardTimeoutMs > 0 ? { hardTimeoutMs } : {}),
+      ...managed,
     }
   }
   if (metadata.shell_stream !== true) return undefined
   const timeoutMs = finiteNonNegative(metadata.timeout_ms) ?? 30_000
   const timeoutBehavior = finiteNonNegative(metadata.timeout_behavior) ?? 0
-  const hardTimeoutMs = finiteNonNegative(metadata.hard_timeout_ms)
   return {
     command: typeof metadata.command === "string" ? metadata.command : "",
     workingDirectory:
@@ -121,6 +241,7 @@ export function shellPolicyFromMetadata(
     timeoutMs,
     timeoutBehavior,
     ...(hardTimeoutMs !== undefined && hardTimeoutMs > 0 ? { hardTimeoutMs } : {}),
+    ...managed,
   }
 }
 
@@ -131,7 +252,8 @@ export function registerCursorShellCall(
 ): void {
   const policy = shellPolicyFromMetadata(metadata)
   if (!policy || !toolCallId.startsWith("cursor_")) return
-  remember(policies, toolCallId, policy)
+  // A call evicted before the host ran it must not keep its reserved record.
+  remember(policies, toolCallId, policy, (evicted) => releaseUnstartedTerminal(evicted.managedJobDirectory))
 }
 
 function shellQuote(value: string): string {
@@ -156,8 +278,10 @@ export function buildSoftBackgroundCommand(policy: CursorShellPolicy): string {
     ? Math.max(1, Math.ceil(policy.hardTimeoutMs / POLL_INTERVAL_MS))
     : undefined
   const lines = [
+    `cursor_payload_shell=${shellQuote(policy.shellPath ?? resolveCursorShellPath())}`,
+    '[ -z "$CURSOR_SHELL_EXECUTABLE" ] || cursor_payload_shell="$CURSOR_SHELL_EXECUTABLE"',
     'cursor_shell_log="$(mktemp "${TMPDIR:-/tmp}/cursor-opencode-shell.XXXXXX")" || exit 1',
-    `nohup sh -c ${shellQuote(policy.command)} >"$cursor_shell_log" 2>&1 </dev/null &`,
+    `nohup "$cursor_payload_shell" -c ${shellQuote(policy.command)} >"$cursor_shell_log" 2>&1 </dev/null &`,
     "cursor_shell_pid=$!",
   ]
   if (hardPolls !== undefined) {
@@ -174,27 +298,41 @@ export function buildSoftBackgroundCommand(policy: CursorShellPolicy): string {
     // reap the watchdog; that text can otherwise land after our private marker
     // and leak into OpenCode's bash UI.
     "set +m 2>/dev/null || true",
+    // The payload stays a job so `wait` can return its status (bash discards
+    // a disowned job's). From here this shell's stderr carries only job
+    // notices; the payload and watchdog already write elsewhere.
+    "exec 2>/dev/null",
     'if [ -n "$cursor_shell_watchdog_pid" ]; then disown "$cursor_shell_watchdog_pid" 2>/dev/null || true; fi',
-    'disown "$cursor_shell_pid" 2>/dev/null || true',
+    'cursor_shell_timed_out() { [ -n "$cursor_shell_status" ] && [ "$(cat "$cursor_shell_status" 2>/dev/null)" = timeout ]; }',
     "cursor_shell_poll=0",
     `while [ "$cursor_shell_poll" -lt ${polls} ] && kill -0 "$cursor_shell_pid" 2>/dev/null; do`,
     `  sleep ${POLL_INTERVAL_MS / 1000}`,
     "  cursor_shell_poll=$((cursor_shell_poll + 1))",
     "done",
     'if kill -0 "$cursor_shell_pid" 2>/dev/null; then',
-    '  cat "$cursor_shell_log"',
-    `  printf '\n${BACKGROUND_MARKER}%s:%s\n' "$cursor_shell_pid" "$cursor_shell_log"`,
-    "  exit 0",
+    "  if ! cursor_shell_timed_out; then",
+    '    cat "$cursor_shell_log"',
+    `    printf '\n${BACKGROUND_MARKER}%s:%s\n' "$cursor_shell_pid" "$cursor_shell_log"`,
+    "    exit 0",
+    "  fi",
+    // A hard-timed-out command is being stopped, not running on: never hand
+    // it off. Give the watchdog's KILL a bounded time to land.
+    "  cursor_shell_poll=0",
+    `  while [ "$cursor_shell_poll" -lt ${Math.ceil(TIMEOUT_SETTLE_MS / POLL_INTERVAL_MS)} ] && kill -0 "$cursor_shell_pid" 2>/dev/null; do`,
+    `    sleep ${POLL_INTERVAL_MS / 1000}`,
+    "    cursor_shell_poll=$((cursor_shell_poll + 1))",
+    "  done",
     "fi",
-    'wait "$cursor_shell_pid" 2>/dev/null',
-    "cursor_shell_code=$?",
     'cat "$cursor_shell_log"',
-    'if [ -n "$cursor_shell_status" ] && [ "$(cat "$cursor_shell_status" 2>/dev/null)" = timeout ]; then',
-    // Reap the watchdog before printing the private marker so any residual
-    // shell diagnostics cannot trail the sentinel.
-    '  if [ -n "$cursor_shell_watchdog_pid" ]; then kill "$cursor_shell_watchdog_pid" 2>/dev/null || true; wait "$cursor_shell_watchdog_pid" 2>/dev/null || true; fi',
+    "if cursor_shell_timed_out; then",
+    // Stop the watchdog once the payload has exited, so its delayed KILL cannot
+    // reach a reused PID; while the payload lives, that KILL is still due.
+    '  if [ -n "$cursor_shell_watchdog_pid" ] && ! kill -0 "$cursor_shell_pid" 2>/dev/null; then kill "$cursor_shell_watchdog_pid" 2>/dev/null || true; wait "$cursor_shell_watchdog_pid" 2>/dev/null || true; fi',
     `  printf '\n${TIMEOUT_MARKER}%s\n' ${policy.hardTimeoutMs ?? policy.timeoutMs}`,
     "else",
+    // Only an exited payload reaches here, so this wait cannot block.
+    '  wait "$cursor_shell_pid" 2>/dev/null',
+    "  cursor_shell_code=$?",
     '  if [ -n "$cursor_shell_watchdog_pid" ]; then kill "$cursor_shell_watchdog_pid" 2>/dev/null || true; wait "$cursor_shell_watchdog_pid" 2>/dev/null || true; fi',
     `  printf '\n${EXIT_MARKER}%s\n' "$cursor_shell_code"`,
     "fi",
@@ -215,22 +353,25 @@ export function buildSoftBackgroundCommand(policy: CursorShellPolicy): string {
  * Residual: the detached child is not reaped by this provider after OpenCode
  * completes the tool call; cleanup is left to the user / OS.
  */
-export function buildBackgroundShellCommand(command: string): string {
+export function buildBackgroundShellCommand(command: string, shellPath?: string): string {
   return [
+    `cursor_payload_shell=${shellQuote(shellPath ?? resolveCursorShellPath())}`,
+    '[ -z "$CURSOR_SHELL_EXECUTABLE" ] || cursor_payload_shell="$CURSOR_SHELL_EXECUTABLE"',
     'bg_log="$(mktemp "${TMPDIR:-/tmp}/cursor-opencode-bg.XXXXXX")" || exit 1',
-    `nohup sh -c ${shellQuote(command)} >"$bg_log" 2>&1 </dev/null &`,
+    `nohup "$cursor_payload_shell" -c ${shellQuote(command)} >"$bg_log" 2>&1 </dev/null &`,
     "bg_pid=$!",
     `printf '${BACKGROUND_SHELL_MARKER}%s:%s\\n' "$bg_pid" "$bg_log"`,
   ].join("\n")
 }
 
 function wrapperBodyForPolicy(policy: CursorShellPolicy): string | undefined {
-  if (policy.backgroundSpawn) return buildBackgroundShellCommand(policy.command)
+  if (policy.managedCommand) return policy.managedCommand
+  if (policy.backgroundSpawn) return buildBackgroundShellCommand(policy.command, policy.shellPath)
   if (policy.timeoutBehavior === CURSOR_TIMEOUT_BACKGROUND) return buildSoftBackgroundCommand(policy)
   return undefined
 }
 
-function writeShellEnvInjector(wrapperBody: string): CursorShellEnvWrap {
+function writeShellEnvInjector(wrapperBody: string, command: string, shellPath?: string): CursorShellEnvWrap {
   const dir = mkdtempSync(join(tmpdir(), "cursor-opencode-wrap-"))
   const wrapperPath = join(dir, "wrapper.sh")
   const bashEnvPath = join(dir, "bashenv.sh")
@@ -239,6 +380,12 @@ function writeShellEnvInjector(wrapperBody: string): CursorShellEnvWrap {
   // Sourced by bash (BASH_ENV) or zsh (.zshenv via ZDOTDIR). `exec`
   // replaces the host shell before OpenCode's `-c <original>` body runs.
   const injector = [
+    // The classic shell.env hook follows permission approval. If a later
+    // plugin changed that command, never run the earlier policy snapshot.
+    `if [ "\${BASH_EXECUTION_STRING:-\${ZSH_EXECUTION_STRING:-}}" != ${shellQuote(command)} ]; then`,
+    "  unset BASH_ENV ZDOTDIR ENV CURSOR_OPENCODE_WRAP_ACTIVE",
+    "  return 0",
+    "fi",
     "unset BASH_ENV ZDOTDIR ENV CURSOR_OPENCODE_WRAP_ACTIVE",
     `exec /bin/sh ${shellQuote(wrapperPath)}`,
     "",
@@ -250,15 +397,13 @@ function writeShellEnvInjector(wrapperBody: string): CursorShellEnvWrap {
     env: {
       BASH_ENV: bashEnvPath,
       ZDOTDIR: dir,
-    },
-    cleanup: () => {
-      try {
-        rmSync(dir, { recursive: true, force: true })
-      } catch {
-        // best-effort temp cleanup
-      }
+      CURSOR_SHELL_EXECUTABLE: shellPath ?? resolveCursorShellPath(),
     },
   }
+}
+
+function cleanupShellEnvWrap(wrap: CursorShellEnvWrap): void {
+  try { rmSync(pathDirectory(wrap.wrapperPath), { recursive: true, force: true }) } catch { /* best effort */ }
 }
 
 function ensureShellEnvWrap(
@@ -269,8 +414,8 @@ function ensureShellEnvWrap(
   if (existing) return existing
   const wrapperBody = wrapperBodyForPolicy(policy)
   if (!wrapperBody) return undefined
-  const wrap = writeShellEnvInjector(wrapperBody)
-  remember(activeEnvWraps, toolCallId, wrap, (evicted) => evicted.cleanup())
+  const wrap = writeShellEnvInjector(wrapperBody, policy.command, policy.shellPath)
+  remember(activeEnvWraps, toolCallId, wrap, cleanupShellEnvWrap)
   return wrap
 }
 
@@ -278,20 +423,21 @@ function ensureShellEnvWrap(
  * Prepare OpenCode Bash args before execution when Cursor requested wrapping.
  *
  * bash/zsh source the shell.env injector, so the original command remains in
- * OpenCode's permission/UI state. sh/dash ignore those startup variables; for
- * them, use a short `exec wrapper.sh` command that contains no user payload.
+ * OpenCode's permission/UI state. sh/dash ignore those startup variables;
+ * managed jobs expose the complete launcher and payload for host approval.
  *
  * background_shell_spawn may already contain the inline non-plugin fallback.
  * The classic hook replaces it with the original command (bash/zsh) or the
- * shorter wrapper-file command (sh/dash), avoiding duplicate execution.
+ * inline managed launcher (sh/dash), avoiding duplicate execution.
  */
 export function prepareCursorShellArgs(
   toolCallId: string,
   args: Record<string, unknown>,
-  options: { preferWrapperCommand?: boolean } = {},
+  options: { preferWrapperCommand?: boolean; deferToShellHook?: boolean; shellPath?: string } = {},
 ): void {
   const policy = policies.get(toolCallId)
   if (!policy) return
+  policy.shellPath = options.shellPath ?? policy.shellPath
   if (!policy.backgroundSpawn && policy.timeoutBehavior !== CURSOR_TIMEOUT_BACKGROUND) return
 
   pendingEnvWraps.add(toolCallId)
@@ -301,10 +447,16 @@ export function prepareCursorShellArgs(
     args.timeout = Math.max(OPENCODE_TIMEOUT_GRACE_MS, policy.timeoutMs + OPENCODE_TIMEOUT_GRACE_MS)
   }
 
-  const shellKind = resolveCursorShellKind()
-  // OpenCode 2.0 has no `shell.env` hook, so bash/zsh cannot be wrapped by
-  // sourcing an injector. Callers there opt into the wrapper-file command —
-  // the same mechanism sh/dash already use — which needs no env injection.
+  if (options.deferToShellHook) {
+    // OpenCode 2 selects the actual shell later. Keep the approved command
+    // intact; its create hook installs an executable adapter, not a command.
+    args.command = policy.command
+    return
+  }
+
+  const shellKind = resolveCursorShellKind(policy.shellPath)
+  // A host without the create hook cannot install an executable adapter.
+  // Managed jobs then disclose their inline launcher for ordinary approval.
   const envInjectable =
     !options.preferWrapperCommand && (shellKind === "bash" || shellKind === "zsh")
   if (process.platform === "win32" || envInjectable) {
@@ -315,7 +467,7 @@ export function prepareCursorShellArgs(
   }
 
   const wrap = ensureShellEnvWrap(toolCallId, policy)
-  if (wrap) args.command = `exec /bin/sh ${shellQuote(wrap.wrapperPath)}`
+  if (wrap) args.command = policy.managedCommand ?? `exec /bin/sh ${shellQuote(wrap.wrapperPath)}`
 }
 
 /** Restore the model-facing command in OpenCode's completed tool title. */
@@ -325,11 +477,13 @@ export function cursorShellOriginalCommand(toolCallId: string): string | undefin
 
 /** Drop injector temp files for a finished/abandoned Cursor shell call. */
 export function releaseCursorShellEnv(toolCallId: string): void {
+  disarmCursorShellCreate(toolCallId)
   pendingEnvWraps.delete(toolCallId)
+  releaseUnstartedTerminal(policies.get(toolCallId)?.managedJobDirectory)
   const active = activeEnvWraps.get(toolCallId)
   if (!active) return
   activeEnvWraps.delete(toolCallId)
-  active.cleanup()
+  cleanupShellEnvWrap(active)
 }
 
 /**
@@ -346,29 +500,66 @@ export function cursorShellEnvForCall(toolCallId: string | undefined): Record<st
   return wrap.env
 }
 
+function canonicalDirectory(directory: string): string {
+  try {
+    return realpathSync(directory)
+  } catch {
+    return resolve(directory)
+  }
+}
+
 /**
- * OpenCode 2.0 `shell.create.before` has no tool-call id. Correlate the pending
- * wrap by command + working directory when possible, then fall back to the
- * original command for hosts that omit the directory.
+ * OpenCode 2.0.27 calls create.before before its permission scanner, then
+ * spawns the selected executable with [-c, command]. Preserve that command
+ * and the shell basename the scanner uses. The adapter runs only after host
+ * approval, and uses the host's selected executable for the actual payload.
+ * Sources: upstream packages/core/src/shell.ts:274-305 and
+ * packages/core/src/tool/plugin/shell.ts:125-145 at v2.0.27.
  */
-export function cursorShellEnvForCommand(
-  command: string | undefined,
-  workingDirectory?: string,
-): Record<string, string> | undefined {
-  if (typeof command !== "string" || !command) return undefined
-  if (workingDirectory) {
-    for (const [id, policy] of policies) {
-      if (!pendingEnvWraps.has(id)) continue
-      if (policy.command === command && policy.workingDirectory === workingDirectory) {
-        return cursorShellEnvForCall(id)
-      }
-    }
-  }
+export function prepareCursorShellCreate(event: {
+  command: string; cwd: string; shell: string; env: Record<string, string | undefined>
+}): void {
+  if (process.platform === "win32") return
+  // The lane holder whose call now carries this command owns the create.
+  // Release it even when its adapter no longer matches (a later hook changed
+  // the command or cwd): the create runs unwrapped and must not hold back
+  // identical commands. Holders that hooks gave one command cannot be told
+  // apart, so none of them is wrapped and each keeps its lane.
+  const owners = [...createGate.values()].map((lane) => lane.lockedBy)
+    .filter((id) => callCommand(armedCalls.get(id)) === event.command)
+  if (owners.length > 1) return
+  const owner = owners[0]
+  if (owner !== undefined) disarmCursorShellCreate(owner)
+  if (owner !== undefined && !pendingEnvWraps.has(owner)) return
   for (const [id, policy] of policies) {
-    if (!pendingEnvWraps.has(id)) continue
-    if (policy.command === command) return cursorShellEnvForCall(id)
+    if (!pendingEnvWraps.has(id) || policy.command !== event.command
+      || (policy.workingDirectory && canonicalDirectory(policy.workingDirectory) !== canonicalDirectory(event.cwd))) continue
+    // Only its owner's create may take an armed call's wrap. Without an arm
+    // (unit tests / non-plugin paths), keep single-match selection.
+    if (owner !== undefined ? id !== owner : armedCalls.has(id)) continue
+    const wrap = ensureShellEnvWrap(id, policy)
+    if (!wrap) break
+    const directory = join(resolve(wrap.wrapperPath, ".."), "shell")
+    mkdirSync(directory, { recursive: true, mode: 0o700 })
+    const executable = join(directory, basename(event.shell))
+    const script = [
+      "#!/bin/sh",
+      `if [ "$1" = -c ] && [ "$2" = ${shellQuote(event.command)} ]; then`,
+      `  export CURSOR_SHELL_EXECUTABLE=${shellQuote(event.shell)}`,
+      `  exec /bin/sh ${shellQuote(wrap.wrapperPath)}`,
+      "fi",
+      // A later host hook changed the command: execute exactly what the host
+      // approved instead of the provider's earlier command snapshot.
+      `exec ${shellQuote(event.shell)} "$@"`,
+      "",
+    ].join("\n")
+    writeFileSync(executable, script, { mode: 0o700 })
+    event.shell = executable
+    pendingEnvWraps.delete(id)
+    break
   }
-  return undefined
+  // The owner's create ran, wrapped or not; no later create may take its wrap.
+  if (owner !== undefined) pendingEnvWraps.delete(owner)
 }
 
 function withoutMarker(output: string, index: number): string {
@@ -386,9 +577,14 @@ function withoutMarker(output: string, index: number): string {
 function formatShellOutcomeDisplay(clean: string, outcome: CursorShellOutcome): string {
   let notice: string | undefined
   if (outcome.kind === "backgrounded") {
+    // A managed terminal has its own shell id and an output file to poll.
+    const identity = outcome.outputFile
+      ? `shell ${outcome.shellId}, pid ${outcome.pid}`
+      : `pid ${outcome.pid}`
+    const output = outcome.outputFile ? ` Output: ${outcome.outputFile}` : ""
     notice = outcome.msToWait > 0
-      ? `Still running in the background (pid ${outcome.pid}) after ${outcome.msToWait}ms.`
-      : `Started in the background (pid ${outcome.pid}).`
+      ? `Still running in the background (${identity}) after ${outcome.msToWait}ms.${output}`
+      : `Started in the background (${identity}).${output}`
   } else if (outcome.kind === "timeout") {
     notice = `Timed out after ${outcome.timeoutMs}ms.`
   }
@@ -425,48 +621,71 @@ function lastPrivateMarker(
   return last
 }
 
+/**
+ * Turn a stored timeout display back into OpenCode's own timeout block, so a
+ * replayed result parses as the timeout it was after its saved outcome is gone.
+ */
+export function restoreOpenCodeTimeout(display: string, timeoutMs: number): string {
+  const notice = `Timed out after ${timeoutMs}ms.\n`
+  const progress = display.endsWith(notice) ? display.slice(0, -notice.length).replace(/\n$/, "") : display
+  return `${progress || "(no output)"}\n\n<shell_metadata>\nshell tool terminated command after exceeding timeout ${timeoutMs} ms.\n</shell_metadata>`
+}
+
+/** The timeout recorded for a call whose result has not been consumed yet. */
+export function cursorShellTimeoutMs(toolCallId: string): number | undefined {
+  const outcome = outcomes.get(toolCallId)
+  return outcome?.kind === "timeout" ? outcome.timeoutMs : undefined
+}
+
 function parseOpenCodeTimeout(output: string): { output: string; timeoutMs: number } | undefined {
   const closeTag = "</shell_metadata>"
   const closeAt = output.lastIndexOf(closeTag)
   if (closeAt === -1 || output.slice(closeAt + closeTag.length).trim() !== "") return undefined
 
-  const header = /<shell_metadata>\r?\nshell tool terminated command after exceeding timeout (\d+) ms\./
-  const match = header.exec(output.slice(0, closeAt))
+  const openAt = output.lastIndexOf("<shell_metadata>", closeAt)
+  if (openAt < 0) return undefined
+  const header = /^<shell_metadata>\r?\nshell tool terminated command after exceeding timeout (\d+) ms\./
+  const match = header.exec(output.slice(openAt, closeAt))
   if (!match || match.index === undefined) return undefined
-  return { output: withoutMarker(output, match.index), timeoutMs: Number(match[1]) }
+  return { output: withoutMarker(output, openAt), timeoutMs: Number(match[1]) }
 }
 
 function parseSoftBackgroundOutcome(
   output: string,
   policy: CursorShellPolicy | undefined,
 ): { output: string; outcome: CursorShellOutcome } | undefined {
-  const background = lastPrivateMarker(output, BACKGROUND_MARKER, "(\\d+):([^\\r\\n]+)")
-  if (background) {
-    const pid = Number(background.values[0])
+  const background = lastPrivateMarker(output, BACKGROUND_MARKER, "(\\d+):(?:(\\d+):)?([^\\r\\n]+)")
+  const timeout = lastPrivateMarker(output, TIMEOUT_MARKER, "(\\d+)")
+  const exit = lastPrivateMarker(output, EXIT_MARKER, "(-?\\d+)")
+  // The launcher appends the authoritative outcome after the command's
+  // stdout. An earlier printed sentinel must not override that final marker.
+  const finalIndex = Math.max(background?.index ?? -1, timeout?.index ?? -1, exit?.index ?? -1)
+  if (background && background.index === finalIndex) {
+    const shellId = Number(background.values[0])
+    const pid = Number(background.values[1] || shellId)
     if (Number.isSafeInteger(pid) && pid > 0 && pid <= 0xffff_ffff) {
       return {
         output: withoutMarker(output, background.index),
         outcome: {
           kind: "backgrounded",
-          shellId: pid,
+          shellId,
           pid,
           command: policy?.command ?? "",
           workingDirectory: policy?.workingDirectory ?? "",
           msToWait: policy?.timeoutMs ?? 0,
           reason: 1,
+          ...(background.values[1] && background.values[2] ? { outputFile: background.values[2] } : {}),
         },
       }
     }
   }
-  const timeout = lastPrivateMarker(output, TIMEOUT_MARKER, "(\\d+)")
-  if (timeout) {
+  if (timeout && timeout.index === finalIndex) {
     return {
       output: withoutMarker(output, timeout.index),
       outcome: { kind: "timeout", timeoutMs: Number(timeout.values[0]) },
     }
   }
-  const exit = lastPrivateMarker(output, EXIT_MARKER, "(-?\\d+)")
-  if (exit) {
+  if (exit && exit.index === finalIndex) {
     return {
       output: withoutMarker(output, exit.index),
       outcome: { kind: "exit", code: Number(exit.values[0]) },
@@ -479,20 +698,24 @@ function parseBackgroundSpawnOutcome(
   output: string,
   policy: CursorShellPolicy | undefined,
 ): { output: string; outcome: CursorShellOutcome } | undefined {
-  const match = lastPrivateMarker(output, BACKGROUND_SHELL_MARKER, "(\\d+):([^\\r\\n]+)")
+  const match = lastPrivateMarker(output, BACKGROUND_SHELL_MARKER, "(\\d+):(?:(\\d+):)?([^\\r\\n]+)")
   if (!match) return undefined
-  const pid = Number(match.values[0])
+  const finished = lastPrivateMarker(output, "__CURSOR_SHELL_(?:BACKGROUND|TIMEOUT|EXIT)__", "[^\\r\\n]*")
+  if (finished && finished.index > match.index) return undefined
+  const shellId = Number(match.values[0])
+  const pid = Number(match.values[1] || shellId)
   if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 0xffff_ffff) return undefined
   return {
     output: withoutMarker(output, match.index),
     outcome: {
       kind: "backgrounded",
-      shellId: pid,
+      shellId,
       pid,
       command: policy?.command ?? "",
       workingDirectory: policy?.workingDirectory ?? "",
       msToWait: 0,
       reason: 1,
+      ...(match.values[1] && match.values[2] ? { outputFile: match.values[2] } : {}),
     },
   }
 }
@@ -513,6 +736,8 @@ export function sanitizeCursorShellDisplayOutput(
   if (policy?.backgroundSpawn) {
     const spawn = parseBackgroundSpawnOutcome(output, policy)
     if (spawn) return formatShellOutcomeDisplay(spawn.output, spawn.outcome)
+    const failed = parseSoftBackgroundOutcome(output, policy)
+    if (failed) return formatShellOutcomeDisplay(failed.output, failed.outcome)
   }
   if (policy?.timeoutBehavior === CURSOR_TIMEOUT_BACKGROUND) {
     const wrapper = parseSoftBackgroundOutcome(output, policy)
@@ -550,11 +775,25 @@ export function captureCursorShellResult(
   if (typeof output !== "string") return output
   if (typeof toolCallId !== "string" || !toolCallId.startsWith("cursor_")) return output
   const policy = policies.get(toolCallId)
+  // Classic OpenCode returns exit:null only for its timeout/abort race. That
+  // native outcome wins over any sentinel printed before the host killed it.
+  // https://github.com/anomalyco/opencode/blob/v1.18.31/packages/opencode/src/tool/shell.ts#L542-L589
+  if (metadata?.exit === null) {
+    const timeout = parseOpenCodeTimeout(output)
+    const outcome: CursorShellOutcome = timeout ? { kind: "timeout", timeoutMs: timeout.timeoutMs } : { kind: "aborted" }
+    remember(outcomes, toolCallId, outcome)
+    return timeout ? formatShellOutcomeDisplay(timeout.output, outcome) : output
+  }
   if (policy?.backgroundSpawn) {
     const spawn = parseBackgroundSpawnOutcome(output, policy)
     if (spawn) {
       remember(outcomes, toolCallId, spawn.outcome)
       return formatShellOutcomeDisplay(spawn.output, spawn.outcome)
+    }
+    const finished = parseSoftBackgroundOutcome(output, policy)
+    if (finished) {
+      remember(outcomes, toolCallId, finished.outcome)
+      return formatShellOutcomeDisplay(finished.output, finished.outcome)
     }
   }
   // Private wrapper sentinels are meaningful only for calls we transformed.
@@ -566,7 +805,8 @@ export function captureCursorShellResult(
     remember(outcomes, toolCallId, wrapper.outcome)
     return formatShellOutcomeDisplay(wrapper.output, wrapper.outcome)
   }
-  const timeout = parseOpenCodeTimeout(output)
+  // When the host supplied an exit code, successful stdout is not metadata.
+  const timeout = metadata?.exit === undefined ? parseOpenCodeTimeout(output) : undefined
   if (timeout) {
     const outcome = { kind: "timeout" as const, timeoutMs: timeout.timeoutMs }
     remember(outcomes, toolCallId, outcome)
@@ -577,29 +817,49 @@ export function captureCursorShellResult(
   return output
 }
 
+/** Record the host's authoritative error status, even if its SDK drops that flag. */
+export function captureCursorShellFailure(toolCallId: string, error: unknown): void {
+  if (!policies.has(toolCallId)) return
+  const message = (error instanceof Error ? error.message : String(error ?? "")) || "Shell execution failed"
+  remember(failures, toolCallId, message)
+}
+
 /** Consume the structured result, with an inline fallback when no plugin hook ran. */
 export function consumeCursorShellResult(
   toolCallId: string,
   output: string,
-): { output: string; outcome?: CursorShellOutcome } {
+): { output: string; outcome?: CursorShellOutcome; error?: string } {
   if (typeof toolCallId !== "string" || !toolCallId) {
     return { output }
   }
   let clean = output
-  if (!outcomes.has(toolCallId)) clean = captureCursorShellResult(toolCallId, output)
+  const saved = outcomes.get(toolCallId)
+  if (!saved) clean = captureCursorShellResult(toolCallId, output)
+  // A replayed timeout carries OpenCode's block; the saved outcome already says it.
+  const restored = saved?.kind === "timeout" ? parseOpenCodeTimeout(output) : undefined
+  if (saved && restored) clean = formatShellOutcomeDisplay(restored.output, saved)
   const outcome = outcomes.get(toolCallId)
+  const error = failures.get(toolCallId)
+  failures.delete(toolCallId)
   outcomes.delete(toolCallId)
-  policies.delete(toolCallId)
   releaseCursorShellEnv(toolCallId)
-  return { output: clean, outcome }
+  policies.delete(toolCallId)
+  return { output: clean, outcome, ...(error ? { error } : {}) }
 }
 
 /** Test/process cleanup. */
 export function resetCursorShellCalls(): void {
-  for (const wrap of activeEnvWraps.values()) wrap.cleanup()
+  const waiters = [...createGate.values()].flatMap((lane) => lane.waiters)
+  createGate.clear()
+  armedCalls.clear()
+  for (const waiter of waiters) waiter.reject(new Error("cursor shell create gate reset"))
+  for (const wrap of activeEnvWraps.values()) cleanupShellEnvWrap(wrap)
+  for (const policy of policies.values()) releaseUnstartedTerminal(policy.managedJobDirectory)
   activeEnvWraps.clear()
   pendingEnvWraps.clear()
   policies.clear()
   outcomes.clear()
-  configuredShell = undefined
+  failures.clear()
+  shellConfiguration.defaultShell = undefined
+  configuredShells.clear()
 }

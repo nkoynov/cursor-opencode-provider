@@ -6,6 +6,7 @@ import { encodeJsonAsValue, readAllFields } from "../src/protocol/struct.js"
 import { hostToolDialectFromTools, toolsToDescriptors, toolsToMcpDescriptors } from "../src/protocol/tools.js"
 import {
   pump,
+  deliverContinuationResults,
   rememberMirroredTodos,
   resetTurnStateForTests,
   snapshotMirroredTodosBySession,
@@ -160,6 +161,7 @@ function fakeSession(
       },
       end() {},
       destroy() {},
+      isClosed: () => false,
       frames: () => ({ [Symbol.asyncIterator]: () => frames }),
     } as any,
     frames,
@@ -696,6 +698,45 @@ describe("display-only ToolCall pump bridge", () => {
     expect(decodeMessage<any>("AgentClientMessage", writes[1]!)).toEqual({
       exec_client_control_message: { stream_close: { id: 21 } },
     })
+  })
+
+  it("leaves MCP missing-file and directory reads to the advertised host executor", async () => {
+    const root = fs.mkdtempSync("/tmp/cursor-mcp-read-")
+    try {
+      for (const target of [path.join(root, "missing.txt"), root]) {
+        const writes: Uint8Array[] = []
+        const parts: any[] = []
+        const struct = readAllFields(encodeJsonAsValue({ filePath: target }))
+          .find((field) => field.fn === 5)!.bytes!
+        const session = fakeSession([
+          encodeMessage("AgentServerMessage", { exec_server_message: {
+            id: 24, mcp_args: {
+              name: "opencode-read", args: readAllFields(struct).map((field) => field.bytes!),
+            },
+          } }),
+        ], writes, [{ name: "read", description: "Read files and directories" }])
+        await pump(session, {
+          desiredSize: 1, close() {},
+          enqueue(part: unknown) { parts.push(part) },
+          error(error: Error) { throw error },
+        } as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
+        expect(writes).toHaveLength(0)
+        const call = parts.find((part) => part.type === "tool-call")
+        expect(call?.toolName).toBe("read")
+        expect(JSON.parse(call.input)).toEqual({ filePath: target })
+        expect(sessionManager.pendingFor(session.sessionId, 24)?.resultField).toBe("mcp_result")
+        const missing = target !== root
+        const output = missing ? `File not found: ${target}` : `Read directory ${target}, 0 entries`
+        await deliverContinuationResults(session, [{
+          sessionId: session.sessionId, execId: 24, toolCallId: call.toolCallId,
+          toolName: "read", output, ...(missing ? { error: output } : {}),
+        }])
+        const reply = decodeMessage<any>("AgentClientMessage", writes[0]!).exec_client_message
+        expect(reply.read_result).toBeUndefined()
+        expect(JSON.stringify(reply.mcp_result)).toContain(output)
+        expect(missing ? reply.mcp_result.error : reply.mcp_result.success).toBeDefined()
+      }
+    } finally { fs.rmSync(root, { recursive: true, force: true }) }
   })
 
   it("forwards a scheme-addressed read target to the host instead of refusing it", async () => {
@@ -1615,7 +1656,7 @@ describe("display-only ToolCall pump bridge", () => {
     expect(toolCalls[0].toolName).toBe("bash")
     const input = JSON.parse(toolCalls[0].input)
     expect(input.workdir).toBe("/tmp")
-    expect(input.command).toContain("nohup sh -c 'zig translate-c /tmp/tiny.c -lc'")
+    expect(input.command).toContain("nohup \"$cursor_payload_shell\" -c 'zig translate-c /tmp/tiny.c -lc'")
     expect(input.command).toContain("__CURSOR_BACKGROUND_SHELL__")
     expect(session.displayToolCalls.has(callId)).toBe(false)
     expect(sessionManager.pendingFor(session.sessionId, 49)).toMatchObject({

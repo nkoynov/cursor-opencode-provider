@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test"
 import { mkdir, writeFile, rm } from "node:fs/promises"
+import { symlinkSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import os from "node:os"
 import { isProjectConfigDisabled, loadMergedConfig } from "../src/context/rules.js"
 import { buildRequestContext } from "../src/context/build.js"
-import { workspaceRootFromRequestContext } from "../src/context/env.js"
+import { buildEnv, workspaceRootFromRequestContext } from "../src/context/env.js"
 import { opencodeProjectDir } from "../src/context/paths.js"
 import { encodeMessage, decodeMessage } from "../src/protocol/messages.js"
 
@@ -13,8 +14,11 @@ describe("buildRequestContext", () => {
   let isolatedHome: string
   let prevHome: string | undefined
   let prevXdgConfig: string | undefined
+  let prevTranscriptsFolder: string | undefined
 
   beforeAll(async () => {
+    prevTranscriptsFolder = process.env.CURSOR_AGENT_TRANSCRIPTS_FOLDER
+    delete process.env.CURSOR_AGENT_TRANSCRIPTS_FOLDER
     prevHome = process.env.HOME
     prevXdgConfig = process.env.XDG_CONFIG_HOME
     delete process.env.XDG_CONFIG_HOME
@@ -36,6 +40,8 @@ describe("buildRequestContext", () => {
   })
 
   afterAll(async () => {
+    if (prevTranscriptsFolder === undefined) delete process.env.CURSOR_AGENT_TRANSCRIPTS_FOLDER
+    else process.env.CURSOR_AGENT_TRANSCRIPTS_FOLDER = prevTranscriptsFolder
     if (prevHome === undefined) delete process.env.HOME
     else process.env.HOME = prevHome
     if (prevXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME
@@ -152,7 +158,15 @@ describe("buildRequestContext", () => {
       expect(env.project_folder).toBe(expectedProject)
       expect(env.project_folder).not.toBe(path.resolve(root))
       expect(env.terminals_folder).toBe(path.join(expectedProject, "terminals"))
-      expect(env.agent_transcripts_folder).toBe(path.join(expectedProject, "agent-transcripts"))
+      const holder = path.join(path.dirname(expectedProject), "not-a-directory")
+      writeFileSync(holder, "")
+      const replaced = path.join(expectedProject, "terminals")
+      await rm(replaced, { recursive: true, force: true })
+      symlinkSync(holder, replaced)
+      const blocked = buildEnv(root)
+      expect(blocked.terminals_folder).toBeUndefined()
+      await rm(replaced, { force: true })
+      expect(env).not.toHaveProperty("agent_transcripts_folder")
       const fsOpts = ctx.mcp_file_system_options as Record<string, unknown>
       expect(fsOpts.workspace_project_dir).toBe(expectedProject)
       expect(workspaceRootFromRequestContext(ctx)).toBe(path.resolve(root))
