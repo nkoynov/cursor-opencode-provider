@@ -3828,6 +3828,26 @@ function scheduleHeldRunSave(session: CursorSession): void {
  * never advertised or cannot create), the request keeps the unmanaged
  * background wrappers it already carries.
  */
+/** A canonical MCP `read` of a runtime metadata file, answered as its `mcp_result`; undefined for any other path. */
+async function runtimeMcpReadMessages(
+  parsed: ParsedExecRequest,
+  context: Record<string, unknown> | undefined,
+  allowTools: boolean,
+): Promise<Uint8Array[] | undefined> {
+  const internalRead = await runtimeExecMessages({
+    id: parsed.id,
+    read_args: { ...parsed.args, path: opencodePathArg(parsed.args) },
+  }, context, allowTools)
+  if (!internalRead) return undefined
+  const reply = decodeMessage<Record<string, any>>("AgentClientMessage", internalRead[0]!)
+  const read = reply.exec_client_message.read_result as Record<string, any>
+  const error = read.error?.error ?? (read.file_not_found ? "Runtime metadata file was not found" : undefined)
+  return buildExecClientMessages({
+    execId: parsed.id, resultField: "mcp_result", toolName: "read",
+    output: read.success?.content ?? "", error,
+  })
+}
+
 function manageBackgroundShell(
   parsed: ParsedExecRequest,
   policy: CursorShellPolicy,
@@ -5415,8 +5435,13 @@ export async function pump(
         const parsed = parseExecServerMessage(esm, session.hostToolDialect)
         // Provider-owned spills and terminal records never wait for, or hold back, the step's host calls.
         // Before answering: an answer that starts on a finished terminal record shows its end.
-        if (parsed?.resultField === "read_result") noteBackgroundShellRead(parsed)
-        const runtimeMessages = await runtimeExecMessages(esm, session.requestContext, session.allowTools)
+        const mcpRead = parsed?.toolName === "read" && parsed.resultField === "mcp_result"
+        if (parsed?.resultField === "read_result" || mcpRead) noteBackgroundShellRead(parsed!)
+        // The model can reach the same internal file through an advertised canonical read over MCP.
+        // It still must not ask the host to approve access to provider-owned cache metadata.
+        const runtimeMessages = mcpRead
+          ? await runtimeMcpReadMessages(parsed!, session.requestContext, session.allowTools)
+          : await runtimeExecMessages(esm, session.requestContext, session.allowTools)
         if (runtimeMessages) {
           if (displayCallId) {
             toolStep.resolved.add(displayCallId)
@@ -5460,29 +5485,6 @@ export async function pump(
         }
         if (ownRequestCallId) noteEarlyRowExec(ownRequestCallId)
         if (parsed) {
-          // The model can reach the same internal file through an advertised
-          // canonical read over MCP. It still must not ask the host to approve
-          // access to provider-owned cache metadata.
-          if (parsed.toolName === "read" && parsed.resultField === "mcp_result") {
-            noteBackgroundShellRead(parsed)
-            const internalRead = await runtimeExecMessages({
-              id: parsed.id,
-              read_args: { ...parsed.args, path: opencodePathArg(parsed.args) },
-            }, session.requestContext, session.allowTools)
-            if (internalRead) {
-              const reply = decodeMessage<Record<string, any>>("AgentClientMessage", internalRead[0]!)
-              const read = reply.exec_client_message.read_result as Record<string, any>
-              const error = read.error?.error ?? (read.file_not_found ? "Runtime metadata file was not found" : undefined)
-              const frames = buildExecClientMessages({
-                execId: parsed.id, resultField: "mcp_result", toolName: "read",
-                output: read.success?.content ?? "", error,
-              })
-              if (!await writeExecFrames(frames, `runtime MCP read reply id=${esmId}`)) return
-              noteToolCallFinished(order, displayCallId)
-              if (displayCallId) session.displayToolCalls.delete(displayCallId)
-              continue
-            }
-          }
           const executableToolName = resolveCustomWebToolAlias(parsed.toolName, session.toolAliases)
           if (executableToolName !== parsed.toolName) {
             trace(`web tool alias resolved: ${parsed.toolName} -> ${executableToolName}`)

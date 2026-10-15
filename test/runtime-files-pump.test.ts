@@ -127,6 +127,23 @@ for (const host of [1, 2] as const) describe(`OpenCode ${host} runtime pump`, ()
     expect(messages(f.writes).some(m => m.exec_client_message?.write_result?.success)).toBe(true)
   })
 
+  it("answers a canonical MCP read of a spill at once behind an edit Cursor has not sent yet", async () => {
+    const f = fixture(host, [])
+    const file = path.join((f.session.requestContext.env as Record<string, string>).project_folder!, "agent-tools", spill)
+    fs.writeFileSync(file, "dynamic catalog")
+    const struct = readAllFields(encodeJsonAsValue({ [host === 1 ? "filePath" : "path"]: file }))[0]!.bytes!
+    f.frames.push(
+      frame({ interaction_update: { tool_call_started: { call_id: "edit", tool_call: { edit_tool_call: { args: { path: path.join(workspace, "a.txt") } } } } } }),
+      frame({ exec_server_message: { id: 2, mcp_args: {
+        name: "opencode-read", args: readAllFields(struct).map(field => field.bytes!), tool_call_id: "dynamic-read",
+      } } }), ended(),
+    )
+    await pump(f.session, f.controller, ids)
+    expect(calls(f.parts)).toHaveLength(0)
+    const read = messages(f.writes).find(m => m.exec_client_message?.mcp_result)?.exec_client_message.mcp_result
+    expect(JSON.stringify(read)).toContain("dynamic catalog")
+  })
+
   it("uses the same managed terminal through host hooks, continuation and native polling", async () => {
     const f = fixture(host, [frame({ exec_server_message: { id: 1, background_shell_spawn_args: { command: "sleep 0.2; printf 'fin%s' ished", tool_call_id: "shell-bg" } } })])
     await pump(f.session, f.controller, ids)
