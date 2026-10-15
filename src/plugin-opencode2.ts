@@ -684,6 +684,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
       disposeShellNotifier?.()
       releasePermissionCalls()
       refusals.clear()
+      await saveOpenTurnsForShutdown()
       disposeHostAgentModeSwitch?.()
       disposeNativePlansDir()
       trace(`opencode2 plugin: cleanup directory=${workspaceRoot}`)
@@ -692,6 +693,22 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
       }
     }
   },
+}
+
+const SHUTDOWN_SAVE_TIMEOUT_MS = 2_000
+
+/** Save every open turn for the next server start, without holding shutdown up for long. */
+async function saveOpenTurnsForShutdown(): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timedOut = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, SHUTDOWN_SAVE_TIMEOUT_MS)
+    timer.unref?.()
+  })
+  try {
+    await Promise.race([notifyHostInterrupt(undefined, "shutdown"), timedOut])
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 function subscribeSessionActivity(
@@ -840,9 +857,8 @@ function applySessionActivity(event: any, onCredentialSwitch?: () => void): void
       if (id) {
         sessionActivity.recordActivity(id)
         sessionActivity.endSessionTools(id)
-        // A shutdown keeps the turn for the next server start to resume.
-        if (event.type === "session.execution.interrupted" && payload?.reason !== "shutdown") {
-          notifyHostInterrupt(
+        if (event.type === "session.execution.interrupted") {
+          void notifyHostInterrupt(
             id,
             typeof payload?.reason === "string" ? payload.reason : "user",
             typeof event.created === "number" ? event.created : Date.now(),

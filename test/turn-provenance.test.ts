@@ -6,11 +6,14 @@ import { APICallError, type LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import {
   beginEmittedStep,
   detectForeignHistory,
+  finishEmittedStep,
   getTurnProvenance,
   MAX_PROVENANCE_SESSIONS,
   parseTurnProvenance,
   recordEmittedPart,
   resetTurnProvenanceForTests,
+  restoreTurnProvenance,
+  resumeEmittedStep,
   serializeTurnProvenance,
   trackTurnProvenance,
 } from "../src/protocol/turn-provenance.js"
@@ -22,6 +25,7 @@ import {
   resetTurnStateForTests,
 } from "../src/language-model.js"
 import { createCursor } from "../src/index.js"
+import { notifyHostInterrupt } from "../src/host-interrupt.js"
 import {
   getPersistedConversation,
   resetConversationPersistenceForTests,
@@ -97,14 +101,11 @@ describe("detectForeignHistory", () => {
     expect(detect(promptEndingWith(assistantToolCall("call_ours", "Reading it")))).toBeUndefined()
   })
 
-  it("accepts a turn carrying a tool call id this provider minted, even without its record", () => {
+  it("does not take a provider-minted tool call id missing from the record as this step", () => {
     trackTurnProvenance(SESSION, CONVERSATION)
     recordEmittedPart(SESSION, CONVERSATION, { type: "text-delta", delta: "Earlier step" })
-    const ours = "cursor_db32c773-3087-4d91-818c-9d0813c22cd4_900000"
-    expect(detect(promptEndingWith(assistantToolCall(ours, "Asking the user")))).toBeUndefined()
-    expect(detect(promptEndingWith(assistantToolCall("call_theirs", "Asking the user")))).toBe("foreign-assistant")
-    expect(detect(promptEndingWith(assistantToolCall("cursor_no-exec-id", "Asking the user"))))
-      .toBe("foreign-assistant")
+    const older = "cursor_db32c773-3087-4d91-818c-9d0813c22cd4_900000"
+    expect(detect(promptEndingWith(assistantToolCall(older, "Asking the user")))).toBe("foreign-assistant")
   })
 
   it("flags an assistant turn another model produced", () => {
@@ -161,8 +162,10 @@ describe("detectForeignHistory", () => {
     trackTurnProvenance(SESSION, CONVERSATION)
     beginEmittedStep(SESSION, CONVERSATION)
     recordEmittedPart(SESSION, CONVERSATION, { type: "text-delta", delta: "Earlier answer" })
+    finishEmittedStep(SESSION, CONVERSATION)
     beginEmittedStep(SESSION, CONVERSATION)
     recordEmittedPart(SESSION, CONVERSATION, { type: "reasoning-delta", delta: "Only thinking" })
+    finishEmittedStep(SESSION, CONVERSATION)
     expect(getTurnProvenance(SESSION)).toMatchObject({ text: "", textWithReasoning: "Onlythinking" })
     expect(detect(promptEndingWith(assistantText("Only thinking")))).toBeUndefined()
     expect(detect(promptEndingWith(assistantText("Earlier answer")))).toBe("foreign-assistant")
@@ -172,8 +175,10 @@ describe("detectForeignHistory", () => {
     trackTurnProvenance(SESSION, CONVERSATION)
     beginEmittedStep(SESSION, CONVERSATION)
     recordEmittedPart(SESSION, CONVERSATION, { type: "text-delta", delta: "Done." })
+    finishEmittedStep(SESSION, CONVERSATION)
     beginEmittedStep(SESSION, CONVERSATION)
     recordEmittedPart(SESSION, CONVERSATION, { type: "text-delta", delta: "Refactored the parser." })
+    finishEmittedStep(SESSION, CONVERSATION)
     // A foreign model answering "Done." must not match the older Cursor step.
     expect(detect(promptEndingWith(assistantText("Done.")))).toBe("foreign-assistant")
     expect(detect(promptEndingWith(assistantText("Refactored the parser.")))).toBeUndefined()
@@ -239,6 +244,68 @@ describe("detectForeignHistory", () => {
     expect(parseTurnProvenance(serializeTurnProvenance(value))).toEqual(value)
     expect(parseTurnProvenance("{not json")).toBeUndefined()
     expect(parseTurnProvenance("{}")).toBeUndefined()
+  })
+
+  it("matches a stopped step by what the host read of it, or the step before when the host dropped it", () => {
+    trackTurnProvenance(SESSION, CONVERSATION)
+    beginEmittedStep(SESSION, CONVERSATION)
+    recordEmittedPart(SESSION, CONVERSATION, { type: "tool-call", toolCallId: "call_ours" })
+    finishEmittedStep(SESSION, CONVERSATION)
+    beginEmittedStep(SESSION, CONVERSATION)
+    recordEmittedPart(SESSION, CONVERSATION, { type: "reasoning-delta", delta: "Checking the output" })
+    recordEmittedPart(SESSION, CONVERSATION, { type: "text-delta", delta: "The build passed and" })
+
+    expect(detect(promptEndingWith(assistantText("The build passed and")))).toBeUndefined()
+    expect(detect(promptEndingWith(assistantText("The build passed")))).toBeUndefined()
+    // OpenCode 2 replays an errored message's reasoning as text.
+    expect(detect(promptEndingWith(assistantText("Checking the output The build")))).toBeUndefined()
+    expect(detect(promptEndingWith(assistantToolCall("call_ours")))).toBeUndefined()
+    expect(detect(promptEndingWith(assistantText("Something else")))).toBe("foreign-assistant")
+    expect(detect(promptEndingWith(assistantToolCall("call_theirs")))).toBe("foreign-assistant")
+    expect(detect(promptEndingWith(assistantToolCall("call_theirs", "The build passed")))).toBe("foreign-assistant")
+
+    // Once the step finishes, only the whole step matches again.
+    finishEmittedStep(SESSION, CONVERSATION)
+    expect(detect(promptEndingWith(assistantText("The build passed")))).toBe("foreign-assistant")
+    expect(detect(promptEndingWith(assistantToolCall("call_ours")))).toBe("foreign-assistant")
+  })
+
+  it("treats a step continued after its turn ended as unfinished until it finishes again", () => {
+    trackTurnProvenance(SESSION, CONVERSATION)
+    beginEmittedStep(SESSION, CONVERSATION)
+    recordEmittedPart(SESSION, CONVERSATION, { type: "text-delta", delta: "Checking the workspace" })
+    finishEmittedStep(SESSION, CONVERSATION)
+    resumeEmittedStep(SESSION, CONVERSATION)
+    recordEmittedPart(SESSION, CONVERSATION, { type: "text-delta", delta: " Found the bug in parser.ts" })
+
+    expect(detect(promptEndingWith(assistantText("Checking the workspace Found the bug")))).toBeUndefined()
+    finishEmittedStep(SESSION, CONVERSATION)
+    expect(detect(promptEndingWith(assistantText("Checking the workspace Found the bug")))).toBe("foreign-assistant")
+  })
+
+  it("keeps a stopped step and the step before it through its persisted JSON form", () => {
+    trackTurnProvenance(SESSION, CONVERSATION)
+    beginEmittedStep(SESSION, CONVERSATION)
+    recordEmittedPart(SESSION, CONVERSATION, { type: "tool-call", toolCallId: "call_ours" })
+    finishEmittedStep(SESSION, CONVERSATION)
+    expect(serializeTurnProvenance(getTurnProvenance(SESSION)!)).not.toContain("unfinished")
+    beginEmittedStep(SESSION, CONVERSATION)
+    recordEmittedPart(SESSION, CONVERSATION, { type: "text-delta", delta: "Partial" })
+    const value = getTurnProvenance(SESSION)!
+    expect(value).toEqual({
+      conversationId: CONVERSATION,
+      toolCallIds: [],
+      text: "Partial",
+      textWithReasoning: "Partial",
+      unfinished: true,
+      previous: { toolCallIds: ["call_ours"], text: "", textWithReasoning: "" },
+    })
+    expect(parseTurnProvenance(serializeTurnProvenance(value))).toEqual(value)
+
+    resetTurnProvenanceForTests()
+    restoreTurnProvenance(SESSION, parseTurnProvenance(serializeTurnProvenance(value))!)
+    expect(detect(promptEndingWith(assistantToolCall("call_ours")))).toBeUndefined()
+    expect(detect(promptEndingWith(assistantText("Part")))).toBeUndefined()
   })
 })
 
@@ -602,7 +669,7 @@ describe("provenance through a Cursor Run", () => {
     expect((await getPersistedConversation(root, SESSION))?.conversationId).toBe(CONVERSATION)
   })
 
-  it("keeps the conversation when the restart comes before the held Run is saved", async () => {
+  it("keeps the conversation when the host shuts down before the held Run is saved", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "cursor-provenance-"))
     roots.push(root)
     jest.useFakeTimers()
@@ -614,9 +681,10 @@ describe("provenance through a Cursor Run", () => {
     } finally {
       jest.useRealTimers()
     }
+    await notifyHostInterrupt(undefined, "shutdown")
     restartProcess(session)
     expect(await conversationOfNextTurn(root, promptAfterRestart(toolCallId))).toBe(CONVERSATION)
-    expect(getCheckpoint(CONVERSATION)).toEqual(Uint8Array.from([1, 2, 3]))
+    expect(getCheckpoint(CONVERSATION)).toEqual(MID_RUN_CHECKPOINT)
   })
 
   it("still rebases after a restart when another model answered last", async () => {
@@ -636,7 +704,7 @@ describe("provenance through a Cursor Run", () => {
     expect(await conversationOfNextTurn(root, prompt)).not.toBe(CONVERSATION)
   })
 
-  it("saves only a Run still waiting on the host, and keeps the blobs the Run may still need", async () => {
+  it("saves only a Run still waiting on the host, and keeps in memory the blobs the Run may still need", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "cursor-provenance-"))
     roots.push(root)
     let session: CursorSession
@@ -662,7 +730,7 @@ describe("provenance through a Cursor Run", () => {
       jest.useRealTimers()
     }
     const saved = await persistedOnDisk(root, (value) => value?.checkpoint?.join() === LATER_CHECKPOINT.join())
-    expect(saved!.blobs.map((blob) => blob.id)).toContain("ab")
+    expect(saved!.blobs.map((blob) => blob.id)).not.toContain("ab")
     expect(conversationBlobCount(CONVERSATION)).toBe(1)
     sessionManager.close(session, "ordinary-cleanup")
   })

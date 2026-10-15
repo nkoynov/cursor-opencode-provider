@@ -1460,6 +1460,34 @@ describe("opencode2 setup", () => {
     }
   })
 
+  test("reports a stopped execution to the model, and a shutdown again from cleanup", async () => {
+    const heard: Array<[string | undefined, string, number | "now"]> = []
+    const before = Date.now()
+    const stop = onHostInterrupt((sessionID, reason, at) => {
+      heard.push([sessionID, reason, sessionID ? at : at >= before ? "now" : at])
+    })
+    const { ctx } = fakeContext([
+      { type: "session.execution.succeeded", data: { sessionID: "ses_done" } },
+      { type: "session.execution.failed", data: { sessionID: "ses_failed", error: { type: "unknown", message: "x" } } },
+      { type: "session.execution.interrupted", created: 1_790_000_000_000, data: { sessionID: "ses_restart", reason: "shutdown" } },
+      { type: "session.execution.interrupted", created: 1_790_000_000_001, data: { sessionID: "ses_stop", reason: "user" } },
+    ])
+    const cleanup = await setupPlugin(ctx)
+    try {
+      for (let i = 0; i < 100 && heard.length < 2; i++) await new Promise((resolve) => setTimeout(resolve, 5))
+      expect(heard).toEqual([
+        ["ses_restart", "shutdown", 1_790_000_000_000],
+        ["ses_stop", "user", 1_790_000_000_001],
+      ])
+      await cleanup()
+      expect(heard[heard.length - 1]).toEqual([undefined, "shutdown", "now"])
+    } finally {
+      stop()
+      await cleanup()
+      sessionActivity.clear()
+    }
+  })
+
   test("the session hook records the compaction agent", async () => {
     clearCompactionSessions()
     const { ctx, hooks, sessionLocations } = fakeContext()
@@ -2070,8 +2098,8 @@ describe("opencode2 running tool tracking", () => {
     }
   })
 
-  test("a stopped execution is reported to the model, except a shutdown and a normal end", async () => {
-    const heard: Array<[string, string, number]> = []
+  test("a stopped execution is reported to the model, a shutdown included, and a normal end is not", async () => {
+    const heard: Array<[string | undefined, string, number]> = []
     const stop = onHostInterrupt((sessionID, reason, at) => { heard.push([sessionID, reason, at]) })
     try {
       await withPluginEvents([
@@ -2080,10 +2108,12 @@ describe("opencode2 running tool tracking", () => {
         { type: "session.execution.interrupted", created: 1_790_000_000_000, data: { sessionID: "ses_restart", reason: "shutdown" } },
         { type: "session.execution.interrupted", created: 1_790_000_000_001, data: { sessionID: "ses_stop", reason: "user" } },
         { type: "session.execution.interrupted", created: 1_790_000_000_002, data: { sessionID: "ses_idle", reason: "inactivity" } },
-      ], () => heard.length >= 2)
+      ], () => heard.length >= 3)
       expect(heard).toEqual([
+        ["ses_restart", "shutdown", 1_790_000_000_000],
         ["ses_stop", "user", 1_790_000_000_001],
         ["ses_idle", "inactivity", 1_790_000_000_002],
+        [undefined, "shutdown", expect.any(Number)],
       ])
     } finally {
       stop()

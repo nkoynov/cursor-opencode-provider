@@ -103,8 +103,9 @@ export async function hydrateTurnProvenance(cacheDir: string, sessionKey: string
 }
 
 /**
- * Persist the resumable state at Cursor's TurnEnded, or while a Run waits on
- * host tools (`runInProgress`) so a restart resumes up to the latest checkpoint.
+ * Persist the resumable state at Cursor's TurnEnded, or before it
+ * (`runInProgress`) so a Run the host interrupts, or a restart, resumes from
+ * the latest checkpoint and still recognizes the step in progress.
  */
 export async function persistConversationState(
   cacheDir: string,
@@ -116,8 +117,8 @@ export async function persistConversationState(
     postCompactionRebase?: boolean
     hostAgent?: string
     systemPromptHash?: string
-    runInProgress?: boolean
     hostNote?: string
+    runInProgress?: boolean
     answeredSteers?: string[]
     modelFallbackStop?: string
   },
@@ -132,11 +133,10 @@ export async function persistConversationState(
     return
   }
   const checkpoint = getCheckpoint(input.conversationId)
-  // A Run still in progress may need blobs that only its next checkpoint references.
-  const blobCompaction = input.runInProgress
-    ? undefined
-    : compactConversationBlobs(input.conversationId, checkpoint)
-  const blobs = blobCompaction?.blobs ?? snapshotConversationBlobs(input.conversationId)
+  const blobCompaction = compactConversationBlobs(input.conversationId, checkpoint, {
+    keepInMemory: input.runInProgress,
+  })
+  const blobs = blobCompaction.blobs
   const requestContext = getFrozenRequestContext(input.conversationId) ?? input.requestContext
   const provenance = getTurnProvenance(input.sessionKey)
   const heldImages = heldHistoryImagesSnapshot(input.sessionKey, input.conversationId, checkpoint)
@@ -159,13 +159,11 @@ export async function persistConversationState(
       : {}),
   })
   trace(
-    `conversation persistence: saved${blobCompaction ? "" : " held Run"} sessionKey=${input.sessionKey} ` +
+    `conversation persistence: saved${input.runInProgress ? " in-progress" : ""} sessionKey=${input.sessionKey} ` +
       `conversationId=${input.conversationId} checkpoint=${checkpoint?.length ?? 0}B ` +
-      (blobCompaction
-        ? `blobs=${blobCompaction.beforeCount}->${blobCompaction.afterCount} ` +
-          `blobBytes=${blobCompaction.beforeBytes}->${blobCompaction.afterBytes}` +
-          (blobCompaction.fallbackReason ? ` compactionFallback=${blobCompaction.fallbackReason}` : "")
-        : `blobs=${blobs.length}`),
+      `blobs=${blobCompaction.beforeCount}->${blobCompaction.afterCount} ` +
+      `blobBytes=${blobCompaction.beforeBytes}->${blobCompaction.afterBytes}` +
+      (blobCompaction.fallbackReason ? ` compactionFallback=${blobCompaction.fallbackReason}` : ""),
   )
 }
 

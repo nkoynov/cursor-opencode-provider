@@ -606,8 +606,9 @@ export class SessionManager {
   }
 
   /** Every open Run a Stop of this OpenCode session cancels, including one a newer Run did not supersede. */
-  openSessionsStoppedWith(openCodeSessionId: string): CursorSession[] {
-    return [...this.sessions].filter((session) => !session.closed && stoppedWith(session) === openCodeSessionId)
+  openSessionsStoppedWith(openCodeSessionId: string | undefined): CursorSession[] {
+    return [...this.sessions].filter((session) =>
+      !session.closed && (openCodeSessionId === undefined || stoppedWith(session) === openCodeSessionId))
   }
 
   /**
@@ -619,7 +620,9 @@ export class SessionManager {
   abandonPending(session: CursorSession): number {
     if (session.closed) return 0
     const dropped = session.pending.size
-    for (const execId of session.pending.keys()) {
+    for (const [execId, pending] of session.pending) {
+      const directory = pending.resultMetadata?.managed_job_directory
+      if (typeof directory === "string") releaseUnstartedTerminal(directory)
       const key = this.key(session.sessionId, execId)
       this.byExecId.delete(key)
       this.putTombstone(key, "host-interrupted")
@@ -897,7 +900,8 @@ export class SessionManager {
     session.pumpActive = false
     const deferred = session.deferredTerminalReason
     session.deferredTerminalReason = null
-    if (deferred) this.close(session, deferred)
+    // A Run the host stopped is closed by its cancel, after it has read what Cursor sent last.
+    if (deferred && !session.hostInterrupted) this.close(session, deferred)
     return true
   }
 
@@ -1027,7 +1031,7 @@ export class SessionManager {
     if (event.kind === "local-close" || session.closed) return
     const reason = event.kind === "remote-error" ? "remote-error" : "remote-clean-close"
     if (event.kind === "remote-error") session.closeError = event.error
-    if (session.pumpOwner !== null) {
+    if (session.pumpOwner !== null || session.hostInterrupted) {
       session.deferredTerminalReason = reason
       return
     }

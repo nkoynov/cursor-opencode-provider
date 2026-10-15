@@ -165,7 +165,9 @@ import {
 import {
   beginEmittedStep,
   detectForeignHistory,
+  finishEmittedStep,
   recordEmittedPart,
+  resumeEmittedStep,
   trackTurnProvenance,
   type ForeignHistoryReason,
 } from "./protocol/turn-provenance.js"
@@ -1068,6 +1070,7 @@ async function doStreamImpl(
   }
 
   let activeSession = session
+  let pumpingThisStream = false
 
   return {
     stream: new ReadableStream<V3Part>({
@@ -1087,18 +1090,23 @@ async function doStreamImpl(
           if (activeSession.openCodeSessionId) {
             beginEmittedStep(activeSession.openCodeSessionId, activeSession.conversationId)
           }
-          activeSession = await pumpWithRecovery({
-            initialSession: activeSession,
-            controller,
-            abortSignal: callOptions.abortSignal,
-            retryPolicy,
-            recover: (recovery) => openSession({ recovery }),
-            onSession: (next) => { activeSession = next },
-            ...(steeredPrompt ? { steer: true } : {}),
-            ...(credentialRenewable
-              ? { renewRejectedCredential: () => { forceCredentialRefresh = true } }
-              : {}),
-          })
+          pumpingThisStream = true
+          try {
+            activeSession = await pumpWithRecovery({
+              initialSession: activeSession,
+              controller,
+              abortSignal: callOptions.abortSignal,
+              retryPolicy,
+              recover: (recovery) => openSession({ recovery }),
+              onSession: (next) => { activeSession = next },
+              ...(steeredPrompt ? { steer: true } : {}),
+              ...(credentialRenewable
+                ? { renewRejectedCredential: () => { forceCredentialRefresh = true } }
+                : {}),
+            })
+          } finally {
+            pumpingThisStream = false
+          }
           try {
             controller.close()
           } catch (e) {
@@ -1132,8 +1140,20 @@ async function doStreamImpl(
       cancel() {
         // OpenCode cancels the ReadableStream after "tool-calls"; keep the
         // Cursor Run stream alive so the next doStream can write results.
+        // Mid-generation with nothing owed, the host stopped reading: OpenCode 2
+        // cancels the stream on Stop before it reports the interrupt. Stop the
+        // Run as Cursor CLI does, so Cursor ends it and its checkpoint is kept.
+        // A step stream cancelled after a continuation took over the Run is not a Stop.
+        if (
+          pumpingThisStream && !activeSession.closed && !activeSession.hostInterrupted
+          && activeSession.pending.size === 0 && sessionManager.isActivelyPumping(activeSession)
+        ) {
+          trace("ReadableStream cancel() mid-generation → cancelling the Run")
+          cancelForHostInterrupt(activeSession, "stream-cancelled")
+          return
+        }
         trace("ReadableStream cancel() → closeUnlessPending")
-        sessionManager.closeUnlessPending(activeSession)
+        if (!activeSession.hostInterrupted) sessionManager.closeUnlessPending(activeSession)
       },
     }),
   }
@@ -2416,6 +2436,13 @@ export async function preparePriorSessionForFreshTurn(
 ): Promise<"drained" | "settled-only" | "busy" | "none"> {
   const prior = sessionManager.findOpenByOpenCodeSessionId(openCodeSessionId)
   if (!prior) return "none"
+  const hostCancel = cancelsInFlight.get(prior)
+  if (hostCancel) {
+    // The host stopped that turn; its cancel closes and saves the Run, and this turn resumes from it.
+    await hostCancel
+    trace(`fresh turn: prior session ${prior.sessionId} was cancelled for the host's stop`)
+    return "none"
+  }
 
   const settledBridged = sessionManager.settleBridgedPending(prior)
   if (settledBridged > 0) {
@@ -2538,6 +2565,45 @@ export async function cancelPendingExecsForFreshTurn(session: CursorSession): Pr
   return Math.max(0, before - session.pending.size)
 }
 
+/** Save a Run's conversation before Cursor ends its turn, with the latest checkpoint Cursor sent. */
+function persistRunInProgress(session: CursorSession, where: string): Promise<void> {
+  const sessionKey = session.openCodeSessionId
+  if (!sessionKey) return Promise.resolve()
+  return persistConversationState(session.cacheDir ?? opencodeGlobalCacheDir(), {
+    sessionKey,
+    conversationId: session.conversationId,
+    requestContext: session.requestContext,
+    toolCatalog: session.toolCatalog ?? [],
+    postCompactionRebase: session.postCompactionRebase,
+    hostAgent: session.hostAgent,
+    systemPromptHash: session.stableSystemPromptHash,
+    hostNote: encodePersistedHostNotes(persistableHostNotes(sessionKey)),
+    runInProgress: true,
+  }).catch((error) => {
+    trace(`conversation persistence: ${where} save failed sessionKey=${sessionKey}: ${String(error)}`)
+  })
+}
+
+/** How long a Run must wait on host tools before its state is saved for a restart. */
+export const HELD_RUN_SAVE_DELAY_MS = 1_000
+const heldRunSaveTimers = new WeakMap<CursorSession, ReturnType<typeof setTimeout>>()
+
+// A step that ended in a tool call is recorded only in memory until TurnEnded.
+// Save it once the host's tool runs a while, so a Stop or a restart during a
+// shell, question or permission prompt still finds this step on disk.
+function scheduleHeldRunSave(session: CursorSession): void {
+  if (!session.openCodeSessionId) return
+  clearTimeout(heldRunSaveTimers.get(session))
+  const timer = setTimeout(() => {
+    heldRunSaveTimers.delete(session)
+    if (session.closed || session.hostInterrupted || session.pending.size === 0) return
+    if (sessionManager.isActivelyPumping(session)) return
+    void persistRunInProgress(session, "held Run")
+  }, HELD_RUN_SAVE_DELAY_MS)
+  timer.unref?.()
+  heldRunSaveTimers.set(session, timer)
+}
+
 /** Cursor CLI's cancel reason for a user Stop. */
 const HOST_INTERRUPT_CANCEL_REASON = "user_cancelled"
 /** How long a cancelled Run may take to end by itself before its stream is closed. */
@@ -2548,14 +2614,29 @@ export const HOST_INTERRUPT_GRACE_MS = 3_000
  * the Run would keep generating, and a held one would wait on results that
  * never come. Cancel it as Cursor CLI's Stop does: forget what the host owed,
  * send `cancel_action`, give Cursor a moment to end the Run, then close it.
+ * A Run that ends without `turn_ended` is saved with the last checkpoint
+ * Cursor sent, so the next turn resumes it and recognizes the stopped step.
  */
-export async function cancelRunForHostInterrupt(
+export function cancelRunForHostInterrupt(
   session: CursorSession,
   reason: string,
   opts?: { graceMs?: number },
 ): Promise<void> {
-  if (session.closed || session.hostInterrupted) return
+  if (session.closed || session.hostInterrupted) return cancelsInFlight.get(session) ?? Promise.resolve()
+  const cancel = cancelRun(session, reason, opts).catch((error) => {
+    trace(`host interrupt: cancel failed sessionId=${session.sessionId} err=${(error as Error).message}`)
+  })
+  cancelsInFlight.set(session, cancel)
+  void cancel.finally(() => cancelsInFlight.delete(session))
+  return cancel
+}
+
+async function cancelRun(session: CursorSession, reason: string, opts?: { graceMs?: number }): Promise<void> {
   session.hostInterrupted = reason
+  // Stopped while its turn end was being saved, the host may have kept only part of the step.
+  if (session.openCodeSessionId && sessionManager.isActivelyPumping(session)) {
+    resumeEmittedStep(session.openCodeSessionId, session.conversationId)
+  }
   const graceMs = opts?.graceMs ?? HOST_INTERRUPT_GRACE_MS
   const dropped = sessionManager.abandonPending(session)
   session.heartbeatCancel?.()
@@ -2564,40 +2645,51 @@ export async function cancelRunForHostInterrupt(
       `pumping=${sessionManager.isActivelyPumping(session)} droppedPending=${dropped}`,
   )
   const startedAt = Date.now()
-  // Cursor usually ends a cancelled Run without turn_ended, where the note would otherwise be kept.
-  const close = () => {
-    keepUndeliveredHostNotes(session)
-    sessionManager.close(session, "host-interrupted")
-  }
+  const remainingMs = () => Math.max(1, graceMs - (Date.now() - startedAt))
+  type Outcome = Awaited<ReturnType<typeof drainSessionUntilTurnEnded>> | "written" | "write-failed" | "write-timeout" | "still-pumping"
+  let outcome: Outcome
+  const write = writeWithBackpressure(session.stream, buildCancelAction(HOST_INTERRUPT_CANCEL_REASON), "cancel action")
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const writeTimedOut = new Promise<Outcome>((resolve) => {
+    timer = setTimeout(() => resolve("write-timeout"), remainingMs())
+    timer.unref?.()
+  })
   try {
-    await writeWithBackpressure(session.stream, buildCancelAction(HOST_INTERRUPT_CANCEL_REASON), "cancel action")
+    outcome = await Promise.race([write.then((): Outcome => "written"), writeTimedOut])
   } catch (error) {
     trace(`host interrupt: cancel write failed sessionId=${session.sessionId} err=${(error as Error).message}`)
-    close()
-    return
+    outcome = "write-failed"
+  } finally {
+    clearTimeout(timer)
+    write.catch(() => {})
   }
-  const remainingMs = () => Math.max(1, graceMs - (Date.now() - startedAt))
-  // A pump stops at its next frame and leaves it queued for the drain.
-  if (!(await waitUntilNotPumping(session, { timeoutMs: remainingMs() }))) {
-    trace(`host interrupt: Run sessionId=${session.sessionId} still pumping after ${Date.now() - startedAt}ms`)
-    close()
-    return
+  if (outcome === "written") {
+    // A pump stops at its next frame and leaves it queued for the drain.
+    if (await waitUntilNotPumping(session, { timeoutMs: remainingMs() })) {
+      // The pump may have taken an exec it was already handling.
+      sessionManager.abandonPending(session)
+      outcome = await drainSessionUntilTurnEnded(session, { timeoutMs: remainingMs(), cancelled: true })
+    } else {
+      outcome = "still-pumping"
+    }
   }
-  // The pump may have taken an exec it was already handling.
-  sessionManager.abandonPending(session)
-  const outcome = await drainSessionUntilTurnEnded(session, { timeoutMs: remainingMs(), cancelled: true })
-  trace(`host interrupt: Run sessionId=${session.sessionId} drain outcome=${outcome} afterMs=${Date.now() - startedAt}`)
-  close()
+  trace(`host interrupt: Run sessionId=${session.sessionId} outcome=${outcome} afterMs=${Date.now() - startedAt}`)
+  const saved = outcome === "turn-ended" || outcome === "cancelled"
+  if (!saved) keepUndeliveredHostNotes(session)
+  sessionManager.close(session, "host-interrupted")
+  // Closing leaves the conversation's checkpoint and blobs in place for this save.
+  if (!saved) await persistRunInProgress(session, "host interrupt")
 }
 
 const HOST_INTERRUPT_MEMORY_MS = 10 * 60_000
 /** The latest stop per OpenCode session, for a Run whose model call started before it but opened after it. */
 const hostInterrupts = new Map<string, { at: number; reason: string }>()
 
+/** Cancels still draining; a shutdown or the next turn waits for them so their final save is not cut off. */
+const cancelsInFlight = new Map<CursorSession, Promise<void>>()
+
 function cancelForHostInterrupt(session: CursorSession, reason: string): void {
-  void cancelRunForHostInterrupt(session, reason).catch((error) => {
-    trace(`host interrupt: cancel failed sessionId=${session.sessionId} err=${(error as Error).message}`)
-  })
+  void cancelRunForHostInterrupt(session, reason)
 }
 
 /** Runs of the stopped call were requested before the stop; the next turn's after it. */
@@ -2611,7 +2703,20 @@ export function cancelIfHostStoppedSince(session: CursorSession): void {
   if (stop && requestedBefore(session, stop.at)) cancelForHostInterrupt(session, stop.reason)
 }
 
-onHostInterrupt((openCodeSessionId, reason, at) => {
+onHostInterrupt(async (openCodeSessionId, reason, at) => {
+  if (reason === "shutdown") {
+    // The next server start resumes the turn; keep what it needs on disk. A Run
+    // still being cancelled is saved now too, in case its drain is cut off.
+    const open = sessionManager.openSessionsStoppedWith(openCodeSessionId)
+      .filter((session) => session.openCodeSessionId)
+    if (open.length > 0) trace(`host interrupt: shutdown — saving ${open.length} open Run(s)`)
+    await Promise.all([
+      ...open.map((session) => persistRunInProgress(session, "shutdown")),
+      ...cancelsInFlight.values(),
+    ])
+    return
+  }
+  if (!openCodeSessionId) return
   for (const [id, stop] of hostInterrupts) {
     if (stop.at < at - HOST_INTERRUPT_MEMORY_MS) hostInterrupts.delete(id)
   }
@@ -2777,6 +2882,7 @@ export async function drainSessionUntilTurnEnded(
   const deadlineAt = Date.now() + timeoutMs
   let outcome: "turn-ended" | "cancelled" | "busy" | "timeout" | "interrupted" = "timeout"
   let cancellationCheckpoint = false
+  const cancelling = opts?.cancelReason !== undefined || opts?.cancelled === true
 
   try {
     if (opts?.cancelReason) {
@@ -2813,7 +2919,7 @@ export async function drainSessionUntilTurnEnded(
 
       const frame = next.value as Frame
       if (frame.flags & 0x02) {
-        if (opts?.cancelReason) {
+        if (cancelling) {
           try {
             const failure = connectFrameError(new TextDecoder().decode(decodeFramePayload(frame)))
             trace(`fresh turn drain: cancellation terminal code=${failure.code ?? "unknown"} checkpoint=${cancellationCheckpoint}`)
@@ -3403,6 +3509,7 @@ async function deliverContinuationResultsNow(
         trace(`continuation: mirrored todoread snapshot items=${snapshot.length}`)
       }
     }
+    if (pending.aborted) continue
     session.usageEstimate.inputTokens += estimateTokens(r.output.length)
     if (pending.bridged) {
       trace(
@@ -3789,37 +3896,6 @@ async function nextFrameWithSemanticDeadline(
     if (timer) clearTimeout(timer)
     session.semanticDeadlineCancel = null
   }
-}
-
-/** How long a Run must wait on host tools before its state is saved for a restart. */
-export const HELD_RUN_SAVE_DELAY_MS = 1_000
-const heldRunSaveTimers = new WeakMap<CursorSession, ReturnType<typeof setTimeout>>()
-
-// TurnEnded alone would leave a restart during a long host tool (a question, a
-// permission prompt, a slow shell) with the previous turn's checkpoint and record.
-function scheduleHeldRunSave(session: CursorSession): void {
-  const sessionKey = session.openCodeSessionId
-  if (!sessionKey) return
-  clearTimeout(heldRunSaveTimers.get(session))
-  const timer = setTimeout(() => {
-    heldRunSaveTimers.delete(session)
-    if (session.closed || session.pending.size === 0 || session.pumpActive || session.pumpOwner != null) return
-    persistConversationState(session.cacheDir ?? opencodeGlobalCacheDir(), {
-      sessionKey,
-      conversationId: session.conversationId,
-      requestContext: session.requestContext,
-      toolCatalog: session.toolCatalog ?? [],
-      postCompactionRebase: session.postCompactionRebase,
-      hostAgent: session.hostAgent,
-      systemPromptHash: session.stableSystemPromptHash,
-      hostNote: encodePersistedHostNotes(persistableHostNotes(sessionKey)),
-      runInProgress: true,
-    }).catch((error) => {
-      trace(`conversation persistence: held Run save failed sessionKey=${sessionKey}: ${String(error)}`)
-    })
-  }, HELD_RUN_SAVE_DELAY_MS)
-  timer.unref?.()
-  heldRunSaveTimers.set(session, timer)
 }
 
 /**
@@ -4614,6 +4690,10 @@ export async function pump(
       finishReason: reason,
       ...(providerMetadata ? { providerMetadata } : {}),
     } as V3Part)
+    if (delivered && session.openCodeSessionId) {
+      finishEmittedStep(session.openCodeSessionId, session.conversationId)
+      if (reason.unified === "tool-calls") scheduleHeldRunSave(session)
+    }
     if (delivered && shaped && occupancyDetails) {
       billingLedger.recordBilled(billing.key, shaped.costUsd, te ? undefined : billing)
       billing.prefixTokens = occupancyDetails.usedTokens
@@ -4625,7 +4705,6 @@ export async function pump(
         `sessionRealUsd=${booked.realUsd.toFixed(6)} sessionBilledUsd=${booked.billedUsd.toFixed(6)} ` +
         `sessionEstimatedUsd=${billingLedger.estimated(billing.key).toFixed(6)} key=${billing.key}`,
     )
-    if (delivered && reason.unified === "tool-calls") scheduleHeldRunSave(session)
     if (reason.unified === "tool-calls" && hasDeferredToolExecs(order)) carryToolStep()
   }
 
@@ -4795,6 +4874,7 @@ export async function pump(
           : await takeFrame(session)
       }
     } catch (error) {
+      if (session.hostInterrupted) stopForHostInterrupt()
       if (toolStep.hostCalls > 0) {
         closeHeldToolStepAtRunEnd("frame read failed", error instanceof CursorProviderError
           ? error
@@ -5061,6 +5141,7 @@ export async function pump(
         session.resumeCheckpoint = undefined
       }
       confirmRunImagesAtTurnEnd(session)
+      if (session.openCodeSessionId) finishEmittedStep(session.openCodeSessionId, session.conversationId)
       await persistTerminalCheckpoint(session)
       const checkpoint = session.resumeCheckpoint ?? getCheckpoint(session.conversationId)
       session.steerInjections = undefined
@@ -5083,6 +5164,7 @@ export async function pump(
         closeOpenSpans()
         textId = crypto.randomUUID()
         reasoningId = crypto.randomUUID()
+        if (session.openCodeSessionId) resumeEmittedStep(session.openCodeSessionId, session.conversationId)
         await session.reopenWithUserMessage(followUp, abortSignal)
         session.turnRequests = undelivered.map((i) => i.text)
         endingTurns.delete(session)
@@ -5109,6 +5191,7 @@ export async function pump(
       ) {
         progressContinuationAttempts += 1
         trace("progress-only: continuing attempt=1")
+        if (session.openCodeSessionId) resumeEmittedStep(session.openCodeSessionId, session.conversationId)
         try {
           await session.reopenWithUserMessage(
             progressOnlyContinuationPrompt(
@@ -7760,6 +7843,7 @@ export function resetTurnStateForTests(): void {
   resetHeldHistoryImagesForTests()
   undeliveredHostNotesBySession.clear()
   hostNoteInjectionsBySession.clear()
+  hostInterrupts.clear()
   resetContextEpochsForTests()
   cursorListsToolRequests = false
   resetEarlyToolRowsForTests()
