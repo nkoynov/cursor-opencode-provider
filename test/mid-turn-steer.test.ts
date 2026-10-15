@@ -17,6 +17,7 @@ import { CursorRunInterruptedError } from "../src/transport/connect.js"
 import { createCursor } from "../src/index.js"
 import { billingLedger } from "../src/billing.js"
 import { getCheckpoint, setCheckpoint } from "../src/protocol/checkpoint.js"
+import { getTurnProvenance } from "../src/protocol/turn-provenance.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { analyzeReplayFrame } from "../src/replay-safety.js"
 import { resetCursorShellCalls } from "../src/shell-timeout.js"
@@ -411,6 +412,29 @@ describe("doStream with a mid-turn user message", () => {
       "reasoning-start", "reasoning-delta:checking 3.ts", "reasoning-end",
       "text-start", "text-delta:ok", "text-end",
     ])
+  })
+
+  it("keeps the step unfinished while a steer's follow-up Run continues it, so a Stop there keeps the conversation", async () => {
+    const held = heldReads("rejected-stop")
+    held.resumeCheckpoint = new Uint8Array([1])
+    let unfinishedDuringFollowUp: boolean | undefined
+    held.reopenWithUserMessage = async () => {
+      unfinishedDuringFollowUp = getTurnProvenance(OPENCODE_SESSION)?.unfinished
+      serve(held, [() => serverFrame({ text_delta: { text: "ok" } }), turnEnded])
+    }
+    serve(held, [
+      () => injectionState(injections(held.writes)[0].injection_id, { rejected: { reason: "run_mismatch" } }),
+      completed("call_1"),
+      completed("call_2"),
+      () => serverFrame({ text_delta: { text: "Both files say alpha." } }),
+      checkpoint,
+      turnEnded,
+    ])
+
+    await streamSteer(held, steer("rejected-stop", user("also check 3.ts")))
+
+    expect(unfinishedDuringFollowUp).toBe(true)
+    expect(getTurnProvenance(OPENCODE_SESSION)?.unfinished).toBeUndefined()
   })
 
   it("bills both Cursor turns on the last step when a steer goes out as a follow-up Run", async () => {
