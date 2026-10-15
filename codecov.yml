@@ -1,0 +1,272 @@
+# Codecov configuration for cursor-opencode-provider.
+# Oriented on litellm's codecov.yaml + Codecov common recipes:
+# https://docs.codecov.com/docs/common-recipe-list
+# Validate: curl -X POST --data-binary @codecov.yml https://codecov.io/validate
+
+codecov:
+  # Post coverage status even if other CI checks fail.
+  require_ci_to_pass: false
+  notify:
+    # Post as soon as the expected upload arrives; do not wait on CI.
+    wait_for_ci: false
+    after_n_builds: 1
+  # Drop stale uploads rather than mixing them into the commit graph.
+  max_report_age: 24
+  # Single Bun lcov upload per CI run.
+  disable_default_path_fixes: false
+
+github_checks:
+  annotations: true
+
+# Generated / non-runtime surfaces. Keep executable provider code in the report.
+ignore:
+  - "dist/**"
+  - "coverage/**"
+  - "scripts/**"
+  - "scratch/**"
+  - "test/**"
+  - "test/fixtures/**"
+  - "**/pricing-data.ts"
+  - "**/*.d.ts"
+  - "node_modules/**"
+
+# Bun emits lcov; treat partial lines as hits so patch status is not flaky on
+# TypeScript branches the reporter only partially attributes.
+parsers:
+  lcov:
+    partials_as_hits: true
+  javascript:
+    enable_partials: true
+
+# CI uploads with flags: unit (see .github/workflows/ci.yml). carryforward lets a
+# commit reuse the parent flag when a re-run or fork tokenless upload races the
+# same SHA; a re-upload of the flag replaces the prior session.
+flag_management:
+  default_rules:
+    carryforward: true
+  individual_flags:
+    - name: unit
+      paths:
+        - src/
+      carryforward: true
+
+flags:
+  unit:
+    paths:
+      - src/
+    carryforward: true
+
+# Path-scoped components for the PR comment (layout includes `components`).
+# Paths are globs relative to the repo root; keep them aligned with AGENTS.md areas.
+component_management:
+  default_rules:
+    statuses:
+      - type: project
+        target: auto
+        threshold: 0%
+  individual_components:
+    - component_id: protocol
+      name: Protocol
+      paths:
+        - src/protocol/**
+    - component_id: transport
+      name: Transport
+      paths:
+        - src/transport/**
+    - component_id: context
+      name: Context
+      paths:
+        - src/context/**
+    - component_id: opencode2
+      name: OpenCode 2
+      paths:
+        - src/opencode2/**
+        - src/plugin-opencode2.ts
+    - component_id: session
+      name: Session
+      paths:
+        - src/session.ts
+        - src/session-directory.ts
+        - src/language-model.ts
+        - src/parallel-step.ts
+        - src/replay-safety.ts
+        - src/compaction-marker.ts
+        - src/stream-write.ts
+        - src/activity.ts
+        - src/usage.ts
+        - src/billing.ts
+    - component_id: shell_runtime
+      name: Shell / runtime
+      paths:
+        - src/shell-timeout.ts
+        - src/terminal-runner.ts
+        - src/runtime-files.ts
+        - src/deadline.ts
+    - component_id: auth
+      name: Auth
+      paths:
+        - src/auth.ts
+        - src/auth-renewal.ts
+        - src/agent-url.ts
+        - src/process-shared.ts
+    - component_id: plugins
+      name: Plugins
+      paths:
+        - src/plugin.ts
+        - src/plugin-v2.ts
+        - src/plugin-core.ts
+        - src/plugin-opencode2.ts
+        - src/classic-tools.ts
+        - src/classic-tool-results.ts
+        - src/host-agent-mode.ts
+        - src/host-event-bridge.ts
+        - src/host-plan-file.ts
+        - src/todo-store.ts
+    - component_id: models_pricing
+      name: Models / pricing
+      paths:
+        - src/models.ts
+        - src/model-config.ts
+        - src/model-metadata.ts
+        - src/pricing.ts
+    - component_id: images_web
+      name: Images / web
+      paths:
+        - src/image-input.ts
+        - src/image-save.ts
+        - src/image-save-tool.ts
+        - src/image-staging.ts
+        - src/web-tools.ts
+        - src/web-search-tool.ts
+
+comment:
+  # Show project + patch + per-area breakdown (recipe: show project coverage).
+  layout: "header, diff, flags, components, files"
+  behavior: default
+  require_changes: false
+  require_base: false
+  require_head: true
+  hide_project_coverage: false
+
+coverage:
+  precision: 2
+  round: down
+  # Green band for the coverage sunburst / totals.
+  range: "70...100"
+  status:
+    project:
+      default:
+        # Recipe: set project coverage checks on a pull request.
+        # auto = compare against the PR base / parent commit; do not allow drops.
+        target: auto
+        threshold: 0%
+        base: auto
+        if_ci_failed: error
+        if_not_found: success
+        only_pulls: false
+        informational: false
+        # Removing covered code should not fail the project check by itself.
+        removed_code_behavior: removals_only
+        flags:
+          - unit
+        paths:
+          - src/
+      # Area statuses (same bar as the default project check; surfaces in Checks).
+      protocol:
+        target: auto
+        threshold: 0%
+        flags:
+          - unit
+        paths:
+          - src/protocol/
+      transport:
+        target: auto
+        threshold: 0%
+        flags:
+          - unit
+        paths:
+          - src/transport/
+      context:
+        target: auto
+        threshold: 0%
+        flags:
+          - unit
+        paths:
+          - src/context/
+      session:
+        target: auto
+        threshold: 0%
+        flags:
+          - unit
+        paths:
+          - src/session.ts
+          - src/session-directory.ts
+          - src/language-model.ts
+          - src/parallel-step.ts
+          - src/replay-safety.ts
+          - src/compaction-marker.ts
+          - src/stream-write.ts
+          - src/activity.ts
+          - src/usage.ts
+          - src/billing.ts
+      shell_runtime:
+        target: auto
+        threshold: 0%
+        flags:
+          - unit
+        paths:
+          - src/shell-timeout.ts
+          - src/terminal-runner.ts
+          - src/runtime-files.ts
+          - src/deadline.ts
+      auth:
+        target: auto
+        threshold: 0%
+        flags:
+          - unit
+        paths:
+          - src/auth.ts
+          - src/auth-renewal.ts
+          - src/agent-url.ts
+          - src/process-shared.ts
+      plugins:
+        target: auto
+        threshold: 0%
+        flags:
+          - unit
+        paths:
+          - src/plugin.ts
+          - src/plugin-v2.ts
+          - src/plugin-core.ts
+          - src/plugin-opencode2.ts
+          - src/classic-tools.ts
+          - src/classic-tool-results.ts
+          - src/host-agent-mode.ts
+          - src/host-event-bridge.ts
+          - src/host-plan-file.ts
+          - src/todo-store.ts
+    patch:
+      default:
+        # Match litellm: auto + 0% means patch coverage must not regress vs base.
+        # (Recipe "ensure all code is covered" would set target: 100% instead.)
+        target: auto
+        threshold: 0%
+        base: auto
+        if_ci_failed: error
+        if_not_found: success
+        only_pulls: false
+        informational: false
+        flags:
+          - unit
+        paths:
+          - src/
+    changes:
+      default:
+        if_ci_failed: error
+        if_not_found: success
+        only_pulls: false
+        informational: false
+        flags:
+          - unit
+        paths:
+          - src/

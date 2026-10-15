@@ -12,6 +12,7 @@ import {
 } from "./transport/connect.js"
 import { waitForStreamWrites, writeStreamMessage as writeWithBackpressure } from "./stream-write.js"
 import { isDebugEnabled, trace, traceRequestContextPaths } from "./debug.js"
+import { TOOL_RESULT_STATUS_KEY, toolResultFailure, type ToolRefusal } from "./opencode2/tool-results.js"
 import { isExchangeableApiKey } from "./auth.js"
 import { resolveBearerToken } from "./auth-renewal.js"
 import { buildRunRequest, buildHeartbeat, buildExecHeartbeat, buildCancelAction, renderHistoryTranscript } from "./protocol/request.js"
@@ -58,7 +59,6 @@ import {
   remapEditToolsForCatalog,
   buildCompleteEditReadMessages,
   buildTaskAttachmentReadMessages,
-  buildTerminalFileReadMessages,
   rejectPartialReadMutation,
   binaryWritePayload,
   CUSTOM_WEBFETCH_TOOL,
@@ -72,6 +72,8 @@ import {
 } from "./protocol/tools.js"
 import { hostPatchTool, isHostPatchTool } from "./protocol/apply-patch.js"
 import { buildGitDiffExecMessages } from "./protocol/git-diff.js"
+import { runtimeExecMessages, runtimeRootFromContext } from "./runtime-files.js"
+import { createManagedTerminal } from "./terminal-runner.js"
 import { cursorExecVariantByRequestField, describeCursorExecVariant } from "./protocol/exec-variants.js"
 import { appendCheckpointUserGrounding, appendWorkspaceRootGrounding } from "./protocol/workspace-grounding.js"
 import {
@@ -246,7 +248,7 @@ import {
   type ContextEpoch,
   resetContextEpochsForTests,
 } from "./context/epoch.js"
-import { terminalsFolderFromRequestContext, workspaceRootFromRequestContext } from "./context/env.js"
+import { workspaceRootFromRequestContext } from "./context/env.js"
 import {
   ensureOpencodeProjectDir,
   opencodeGlobalCacheDir,
@@ -272,11 +274,13 @@ import {
 } from "./image-input.js"
 import { getDocumentedCursorModelContext, resolveCursorModelSupportsImages } from "./model-metadata.js"
 import {
+  CURSOR_TIMEOUT_BACKGROUND,
   consumeCursorShellResult,
-  peekCursorShellResult,
   registerCursorShellCall,
-  sweepStaleTerminalFiles,
+  resolveCursorShellPath,
+  shellPolicyFromMetadata,
   type CursorShellOutcome,
+  type CursorShellPolicy,
 } from "./shell-timeout.js"
 import {
   type HostNoteBatch,
@@ -1039,18 +1043,26 @@ async function doStreamImpl(
           }
         }
         clearEarlySteers(sessionKey)
+        let unfinishedPrior = false
         try {
-          await preparePriorSessionForFreshTurn(sessionKey, {
+          const prepared = await preparePriorSessionForFreshTurn(sessionKey, {
             toolResults: historicalResults,
             hostAgent: hostAgentFromCallOptions(callOptions),
           })
+          unfinishedPrior = prepared !== "drained" && prepared !== "none"
+          if (unfinishedPrior) trace(`fresh turn: prior preparation=${prepared} — rebasing from host history`)
         } catch (error) {
+          unfinishedPrior = true
           trace(
-            `fresh turn: prepare-prior failed — opening the new Run and leaving ` +
+            `fresh turn: prepare-prior failed — rebasing the new Run and leaving ` +
               `any still-pending prior held — ${(error as Error).message}`,
           )
         }
-        session = await openSession()
+        // Without TurnEnded, the checkpoint may predate completed side effects.
+        // Include their host results instead of resuming that model step.
+        session = await openSession(unfinishedPrior
+          ? { recovery: { kind: "rebase", reason: "unfinished-prior-run" } }
+          : undefined)
       }
     }
   }
@@ -1413,7 +1425,12 @@ export type CursorRunRecovery =
    * `steer`: the prompt ends with mid-turn user messages after the step's results.
    * `toolCallIds`: earlier results of this step that no checkpoint holds.
    */
-  | { kind: "rebase"; reason?: "checkpoint-unusable"; steer?: boolean; toolCallIds?: ReadonlySet<string> }
+  | {
+    kind: "rebase"
+    reason?: "checkpoint-unusable" | "unfinished-prior-run"
+    steer?: boolean
+    toolCallIds?: ReadonlySet<string>
+  }
   | { kind: "resume"; conversationId: string; checkpoint: Uint8Array; followUp?: string }
 
 const heartbeatWritePendingBySession = new WeakMap<CursorSession, boolean>()
@@ -1602,9 +1619,10 @@ async function startSession(
   const allowTools = toolState.allowTools
   const discoveredSubagentCatalog = extractHostSubagentCatalog(cursorTools)
   let recovery = startOptions?.recovery
+  const unfinishedPriorRun = recovery?.kind === "rebase" && recovery.reason === "unfinished-prior-run"
   let resumeRecovery = recovery?.kind === "resume" ? recovery : undefined
   let resuming = !!resumeRecovery
-  const lifecycle = !allowTools && !isCompaction && !recovery
+  const lifecycle = !allowTools && !isCompaction && (!recovery || unfinishedPriorRun)
   // Isolated helpers must not share the parent's openCodeSessionId or sticky
   // conversation: registerSession would otherwise supersede the held parent Run.
   const ephemeralRun = lifecycle || isolateHelper
@@ -1671,7 +1689,8 @@ async function startSession(
     : { count: 0, bytes: 0, complete: true }
   const forcedResetReason: string | undefined = foreignHistory
     ? `foreign-history:${foreignHistory}`
-    : checkpointUnusable ? "checkpoint-unusable" : undefined
+    : checkpointUnusable ? "checkpoint-unusable"
+    : unfinishedPriorRun ? "unfinished-prior-run" : undefined
   // CLI soft-reuses incomplete / oversized graphs (100 MiB is export-only).
   // Never remint — warn and keep the sticky conversation + checkpoint.
   if (conversationState) {
@@ -1709,7 +1728,7 @@ async function startSession(
   const liveTurn = allowTools && !isCompaction && !isolateHelper
     ? liveUserTurn(prompt, startOptions?.answeredSteers, !answeredSteersKnown && prompt.some((m) => m.role === "assistant"))
     : undefined
-  let userText = recovery?.kind === "rebase" && !checkpointUnusable
+  let userText = recovery?.kind === "rebase" && !checkpointUnusable && !unfinishedPriorRun
     ? "Continue the interrupted turn from the conversation history above. Do not repeat completed work."
     : ((liveTurn ? liveTurn.text : extractUserText(lastUser)) || ".")
   // The reply to a turn stopped on a model switch. That stop already bound the
@@ -1782,7 +1801,7 @@ async function startSession(
         server: resolveToolServerIdentity("plan_exit", "opencode", knownMcpServers).server,
       })
   const historyOptions: PromptHistoryOptions = {
-    preserveTrailingUser: recovery?.kind === "rebase" && !checkpointUnusable,
+    preserveTrailingUser: recovery?.kind === "rebase" && !checkpointUnusable && !unfinishedPriorRun,
     // A Run without a checkpoint replays every call and result whole, as a
     // resumed Claude Code session does, so the model keeps what it read and does
     // not take its earlier work for undone. Only a replay over the context
@@ -1950,7 +1969,10 @@ async function startSession(
     if (cut.length > 0) userText = appendMidConversationMessage(userText, wrapHostNotesForCursor(cut).join("\n\n"))
   }
 
-  if (foreignHistory || checkpointUnusable || (!conversationState && !ephemeralRun && history.some((entry) => entry.role !== "system"))) {
+  if (
+    foreignHistory || checkpointUnusable || unfinishedPriorRun
+    || (!conversationState && !ephemeralRun && history.some((entry) => entry.role !== "system"))
+  ) {
     assertForeignHistoryRebaseFits({
       modelInfo,
       cursorModelId,
@@ -2356,11 +2378,32 @@ export const FRESH_TURN_DRAIN_TIMEOUT_MS = 8_000
 export const FRESH_TURN_PENDING_CANCEL_REASON =
   "Host started a new user turn before this tool result was delivered"
 
+/** Persist an acknowledged terminal checkpoint without inventing usage counters. */
+async function persistTerminalCheckpoint(session: CursorSession): Promise<void> {
+  if (!session.openCodeSessionId) return
+  await persistConversationState(session.cacheDir ?? opencodeGlobalCacheDir(), {
+    sessionKey: session.openCodeSessionId,
+    conversationId: session.conversationId,
+    requestContext: session.requestContext,
+    toolCatalog: session.toolCatalog ?? [],
+    postCompactionRebase: session.postCompactionRebase,
+    hostAgent: session.hostAgent,
+    systemPromptHash: session.stableSystemPromptHash,
+    hostNote: encodePersistedHostNotes(undeliveredHostNotes(session.openCodeSessionId)),
+    answeredSteers: answeredEarlySteerTexts(
+      session.openCodeSessionId,
+      new Set((session.steerInjections ?? []).filter((i) => i.state === "delivered").map((i) => i.id)),
+    ),
+  }).catch((error) => {
+    trace(`conversation persistence: terminal save failed sessionKey=${session.openCodeSessionId}: ${String(error)}`)
+  })
+}
+
 /**
- * Before opening a new user-turn Run, finish the prior held-open Run cleanly:
- * settle display-only bridged pendings, cancel any real execs still waiting on
- * the host, then drain for `turn_ended`. That preserves the same
- * conversation_id / checkpoint prefix instead of aborting mid-tool.
+ * Before opening a new user-turn Run, settle the held Run's pending results
+ * and drain its terminal checkpoint. The unseen follow-up to results settled
+ * here can finish through Cursor's cancellation contract; an unacknowledged
+ * turn must rebase.
  */
 export async function preparePriorSessionForFreshTurn(
   openCodeSessionId: string | undefined,
@@ -2435,11 +2478,22 @@ export async function preparePriorSessionForFreshTurn(
     return "busy"
   }
 
-  const outcome = await drainSessionUntilTurnEnded(prior, {
+  let outcome = await drainSessionUntilTurnEnded(prior, {
     timeoutMs: opts?.timeoutMs ?? FRESH_TURN_DRAIN_TIMEOUT_MS,
   })
+  if (outcome === "busy" && (historicalPending.length > 0 || cancelled > 0)) {
+    // The host ended that turn (rejection, interruption, or an abandoned
+    // call) before its next model call; OpenCode 1.x and a restarted host do
+    // not say which. Cursor started a follow-up nobody will read. Cancel it
+    // through Cursor's protocol action; retain continuity only with its
+    // terminal acknowledgment and checkpoint.
+    outcome = await drainSessionUntilTurnEnded(prior, {
+      timeoutMs: opts?.timeoutMs ?? FRESH_TURN_DRAIN_TIMEOUT_MS,
+      cancelReason: "host_new_user_turn",
+    })
+  }
   trace(`fresh turn: prior session ${prior.sessionId} drain outcome=${outcome}`)
-  if (outcome === "turn-ended") return "drained"
+  if (outcome === "turn-ended" || outcome === "cancelled") return "drained"
   const settled = cancelled > 0 || settledBridged > 0 || outcome === "timeout" || outcome === "interrupted"
   // The new Run supersedes a prior that never reached turn_ended.
   if (settled) keepUndeliveredHostNotes(prior)
@@ -2706,22 +2760,31 @@ async function nextFrameWithin(
  * not a general pump substitute. `cancelled`: the Run was sent `cancel_action`,
  * so nothing it still sends (display updates, an exec already in flight) needs
  * the host, and Cursor's closing frames (the final checkpoint) are worth reading.
+ * `cancelReason`: send that `cancel_action` here first.
  */
 export async function drainSessionUntilTurnEnded(
   session: CursorSession,
-  opts?: { timeoutMs?: number; cancelled?: boolean },
-): Promise<"turn-ended" | "busy" | "timeout" | "interrupted" | "skipped"> {
+  opts?: { timeoutMs?: number; cancelled?: boolean; cancelReason?: string },
+): Promise<"turn-ended" | "cancelled" | "busy" | "timeout" | "interrupted" | "skipped"> {
+  const cancelled = opts?.cancelled === true || opts?.cancelReason !== undefined
   if (session.closed) return "skipped"
   if (session.pending.size > 0 || sessionManager.isActivelyPumping(session)) return "busy"
-  if (!opts?.cancelled && hasDeferredToolExecs(session.toolCallOrder)) return "busy"
+  if (!cancelled && hasDeferredToolExecs(session.toolCallOrder)) return "busy"
 
   const timeoutMs = Math.max(1, opts?.timeoutMs ?? FRESH_TURN_DRAIN_TIMEOUT_MS)
   const owner = Symbol(`fresh-turn-drain:${session.sessionId}`)
   sessionManager.beginPump(session, owner)
   const deadlineAt = Date.now() + timeoutMs
-  let outcome: "turn-ended" | "busy" | "timeout" | "interrupted" = "timeout"
+  let outcome: "turn-ended" | "cancelled" | "busy" | "timeout" | "interrupted" = "timeout"
+  let cancellationCheckpoint = false
 
   try {
+    if (opts?.cancelReason) {
+      session.heartbeatCancel?.()
+      await writeWithBackpressure(session.stream, encodeMessage("AgentClientMessage", {
+        conversation_action: { cancel_action: { reason: opts.cancelReason } },
+      }), "fresh-turn cancellation")
+    }
     while (Date.now() < deadlineAt) {
       if (session.closed) {
         outcome = "interrupted"
@@ -2750,6 +2813,19 @@ export async function drainSessionUntilTurnEnded(
 
       const frame = next.value as Frame
       if (frame.flags & 0x02) {
+        if (opts?.cancelReason) {
+          try {
+            const failure = connectFrameError(new TextDecoder().decode(decodeFramePayload(frame)))
+            trace(`fresh turn drain: cancellation terminal code=${failure.code ?? "unknown"} checkpoint=${cancellationCheckpoint}`)
+            if (failure.origin === "server" && failure.code === "canceled" && cancellationCheckpoint) {
+              keepUndeliveredHostNotes(session)
+              await persistTerminalCheckpoint(session)
+              sessionManager.close(session)
+              outcome = "cancelled"
+              break
+            }
+          } catch { /* an invalid terminal acknowledgment cannot preserve continuity */ }
+        }
         outcome = "interrupted"
         break
       }
@@ -2782,6 +2858,7 @@ export async function drainSessionUntilTurnEnded(
       if (checkpointRaw != null) {
         const bytes = normalizeCheckpointBytes(checkpointRaw)
         if (bytes && bytes.length > 0) {
+          cancellationCheckpoint = true
           if (session.cacheDiagnostics) session.cacheDiagnostics.checkpointUpdates++
           setCheckpoint(session.conversationId, bytes)
           session.resumeCheckpoint = Uint8Array.from(bytes)
@@ -2799,10 +2876,14 @@ export async function drainSessionUntilTurnEnded(
       if (iu?.context_injection_state) applyContextInjectionState(session, iu.context_injection_state)
 
       if (iu?.turn_ended) {
+        if (opts?.cancelReason && !cancellationCheckpoint) {
+          outcome = "interrupted"
+          break
+        }
         trace(`fresh turn drain: turn_ended raw wire fields: ${debugWalkTurnEnded(payload)}`)
         keepUndeliveredHostNotes(session)
         // A cancelled turn's last checkpoint may not hold the request it cancelled.
-        if (!opts?.cancelled) confirmRunImagesAtTurnEnd(session)
+        if (!cancelled) confirmRunImagesAtTurnEnd(session)
         if (session.openCodeSessionId) {
           await persistConversationState(
             session.cacheDir ?? opencodeGlobalCacheDir(),
@@ -2879,7 +2960,7 @@ export async function drainSessionUntilTurnEnded(
       }
 
       // A Run the host cancelled is read to its end, as Cursor CLI does.
-      if (opts?.cancelled) {
+      if (cancelled) {
         sessionManager.recordSemanticProgress(session)
         continue
       }
@@ -3110,7 +3191,8 @@ async function deliverContinuationResultsNow(
   // Host notes that trailed this step: injected once, after its results.
   const stepNotes = collectHostNoteBodies(trailingToolResults.flatMap((r) => r.notes ?? []))
   let deliveredResults = 0
-  for (const r of pendingResults) {
+  for (const original of pendingResults) {
+    const r = original.error === "" ? { ...original, error: "OpenCode tool execution failed" } : original
     const claim = sessionManager.claim(session.sessionId, r.execId)
     if ("kind" in claim) {
       if (claim.kind === "deliverable") {
@@ -3386,19 +3468,20 @@ function continuationResultInput(
   session: CursorSession,
   pending: PendingExec,
   r: ExtractedToolResult,
-  shellResult: { output: string; outcome?: CursorShellOutcome } | undefined,
+  shellResult: { output: string; outcome?: CursorShellOutcome; error?: string } | undefined,
 ): ToolResultInput {
   return {
     execId: r.execId,
     resultField: pending.resultField,
     output: shellResult?.output ?? r.output,
-    error: r.error,
+    error: r.error ?? shellResult?.error,
     toolName: pending.toolName ?? r.toolName,
     resultMetadata: pending.resultMetadata,
     shellOutcome: shellResult?.outcome,
     workspaceRoot: workspaceRootFromRequestContext(session.requestContext),
     images: r.error ? [] : execResultImages(pending.resultField, r.images),
-    refusal: hostToolRefusal(r.hostError),
+    refusal: r.refusal,
+    interrupted: r.interrupted,
   }
 }
 
@@ -3737,6 +3820,50 @@ function scheduleHeldRunSave(session: CursorSession): void {
   }, HELD_RUN_SAVE_DELAY_MS)
   timer.unref?.()
   heldRunSaveTimers.set(session, timer)
+}
+
+/**
+ * Hand a background or soft-background shell to a supervised terminal record.
+ * Where that is unavailable (native Windows, runtime storage this conversation
+ * never advertised or cannot create), the request keeps the unmanaged
+ * background wrappers it already carries.
+ */
+function manageBackgroundShell(
+  parsed: ParsedExecRequest,
+  policy: CursorShellPolicy,
+  context: Record<string, unknown> | undefined,
+): void {
+  const workspaceRoot = workspaceRootFromRequestContext(context)
+  // The host runs the command in the directory its wrapper records, so
+  // OpenCode 2's shell hook can correlate the two by command and directory.
+  // Resolve against the workspace here: the hook sees the host's directory,
+  // and a relative path resolved later would use the daemon's own cwd.
+  policy.workingDirectory = path.resolve(workspaceRoot, policy.workingDirectory || ".")
+  parsed.args.workdir = policy.workingDirectory
+  parsed.resultMetadata = { ...parsed.resultMetadata, working_directory: policy.workingDirectory }
+  const root = runtimeRootFromContext(context)
+  const env = context?.env as Record<string, unknown> | undefined
+  if (process.platform === "win32" || !root || env?.terminals_folder !== path.join(root, "terminals")) return
+  let managed: ReturnType<typeof createManagedTerminal>
+  try {
+    policy.shellPath = resolveCursorShellPath(undefined, workspaceRoot)
+    managed = createManagedTerminal(policy, root)
+  } catch (error) {
+    trace(`background shell: supervised terminal unavailable, keeping the unmanaged wrapper: ${(error as Error).message}`)
+    return
+  }
+  // A spawn's host command is the launcher, which embeds the command verbatim
+  // for approval. A soft-background command keeps its own text: shell hooks
+  // substitute the launcher, and a host without them runs it in the foreground.
+  // The launcher reports within its own startup deadline, so the host's
+  // default timeout stays in place for a host that runs the command as is.
+  if (policy.backgroundSpawn) parsed.args.command = managed.command
+  parsed.resultMetadata = {
+    ...parsed.resultMetadata,
+    managed_command: managed.command,
+    managed_job_directory: managed.directory,
+    managed_shell_path: policy.shellPath,
+  }
 }
 
 /**
@@ -4196,6 +4323,16 @@ export async function pump(
     }
   }
 
+  const noteBackgroundShellRead = (parsed: ParsedExecRequest): void => {
+    const requested = opencodePathArg(parsed.args)
+    if (!requested || isUriReadTarget(requested)) return
+    const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
+    recordBackgroundShellRead(resolveReadTargetPath(requested, workspaceRoot), session.openCodeSessionId, {
+      offset: typeof parsed.args.offset === "number" ? parsed.args.offset : undefined,
+      limit: typeof parsed.args.limit === "number" ? parsed.args.limit : undefined,
+    })
+  }
+
   /**
    * A read of a path that does not exist would otherwise reach OpenCode as a
    * real tool call and raise a permission prompt for a file the user never had.
@@ -4211,46 +4348,12 @@ export async function pump(
    * handshake read into an empty-file success. EACCES/EPERM and other stat
    * errors fall through to OpenCode so a genuine permission decision stands.
    */
-  /**
-   * Backgrounded shells write Cursor terminal files under the advertised
-   * `terminals_folder`, outside the workspace. Through OpenCode's read tool,
-   * every AwaitShell poll of one would ask for external-directory permission.
-   * An agent without a shell this turn has no terminals, and reads them through OpenCode.
-   */
-  const serveTerminalFileRead = async (parsed: ParsedExecRequest): Promise<"served" | "failed" | undefined> => {
-    if (parsed.toolName !== "read" || parsed.resultField !== "read_result") return undefined
-    const hasShell = (names: ReadonlySet<string>) => names.has("bash") || names.has("shell")
-    if (!hasShell(advertisedToolNameSet)) return undefined
-    // The advertised catalog can keep tools the host filtered this turn.
-    const permitted = session.permittedToolNames
-    if (permitted && permitted.size > 0 && !hasShell(permitted)) return undefined
-    const terminals = terminalsFolderFromRequestContext(session.requestContext)
-    const requested = opencodePathArg(parsed.args) ?? ""
-    if (!terminals || !requested || isUriReadTarget(requested)) return undefined
-    const absolutePath = resolveReadTargetPath(requested, workspaceRootFromRequestContext(session.requestContext))
-    if (path.dirname(absolutePath) !== terminals || !/^\d+\.txt$/.test(path.basename(absolutePath))) return undefined
-    const frames = await buildTerminalFileReadMessages(parsed.id, absolutePath, absolutePath, {
-      offset: typeof parsed.args.offset === "number" ? parsed.args.offset : undefined,
-      limit: typeof parsed.args.limit === "number" ? parsed.args.limit : undefined,
-    })
-    if (!frames) return undefined
-    if (!await writeExecFrames(frames, "answer a Cursor terminal file read")) return "failed"
-    trace(`exec: served terminal file read id=${parsed.id} path=${JSON.stringify(absolutePath)}`)
-    return "served"
-  }
-
-  const noteBackgroundShellRead = (parsed: ParsedExecRequest): void => {
-    const requested = opencodePathArg(parsed.args)
-    if (!requested || isUriReadTarget(requested)) return
-    const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
-    recordBackgroundShellRead(resolveReadTargetPath(requested, workspaceRoot), session.openCodeSessionId, {
-      offset: typeof parsed.args.offset === "number" ? parsed.args.offset : undefined,
-      limit: typeof parsed.args.limit === "number" ? parsed.args.limit : undefined,
-    })
-  }
-
   const rejectMissingReadTarget = async (parsed: ParsedExecRequest): Promise<boolean> => {
-    if (parsed.toolName !== "read") return false
+    // This validation belongs to Cursor's native LocalReadExecutor contract.
+    // MCP reads belong to the advertised OpenCode executor: both OpenCode
+    // generations support directories and permission-gate missing paths.
+    // Sending a typed ReadResult to an MCP call leaves it without mcp_result.
+    if (parsed.toolName !== "read" || parsed.resultField !== "read_result") return false
     const requested = opencodePathArg(parsed.args) ?? ""
     if (!requested) return false
     // A scheme-addressed target is the advertised host executor's to resolve,
@@ -4600,28 +4703,6 @@ export async function pump(
     return false
   }
 
-  const persistTerminalCheckpoint = async () => {
-    if (!session.openCodeSessionId) return
-    await persistConversationState(session.cacheDir ?? opencodeGlobalCacheDir(), {
-      sessionKey: session.openCodeSessionId,
-      conversationId: session.conversationId,
-      requestContext: session.requestContext,
-      toolCatalog: session.toolCatalog ?? [],
-      postCompactionRebase: session.postCompactionRebase,
-      hostAgent: session.hostAgent,
-      systemPromptHash: session.stableSystemPromptHash,
-      hostNote: encodePersistedHostNotes(
-        undeliveredHostNotes(session.openCodeSessionId),
-      ),
-      answeredSteers: answeredEarlySteerTexts(
-        session.openCodeSessionId,
-        new Set((session.steerInjections ?? []).filter((i) => i.state === "delivered").map((i) => i.id)),
-      ),
-    }).catch((error) => {
-      trace(`conversation persistence: terminal save failed sessionKey=${session.openCodeSessionId}: ${String(error)}`)
-    })
-  }
-
   while (true) {
     if (session.hostInterrupted) stopForHostInterrupt()
     if (session.modelSwitch && await takeModelSwitch()) return
@@ -4733,7 +4814,7 @@ export async function pump(
         // Cancellation is an explicit terminal acknowledgment, not TurnEnded.
         // Preserve its final checkpoint without inventing aggregate billing.
         keepUndeliveredHostNotes(session)
-        await persistTerminalCheckpoint()
+        await persistTerminalCheckpoint(session)
         trace("host-agent-mode: Run cancellation acknowledged for plan handoff")
         emitFinish(undefined, { unified: "stop", raw: undefined })
         sessionManager.close(session)
@@ -4960,7 +5041,7 @@ export async function pump(
         session.resumeCheckpoint = undefined
       }
       confirmRunImagesAtTurnEnd(session)
-      await persistTerminalCheckpoint()
+      await persistTerminalCheckpoint(session)
       const checkpoint = session.resumeCheckpoint ?? getCheckpoint(session.conversationId)
       session.steerInjections = undefined
       session.pendingFollowUp = undefined
@@ -5331,10 +5412,21 @@ export async function pump(
         replaySafety.markBarrier("non-control-exec")
         openModelStep()
         const displayCallId = extractExecDisplayCallId(esm)
-        const parsed = parseExecServerMessage(esm, session.hostToolDialect, {
-          terminalsFolder: terminalsFolderFromRequestContext(session.requestContext),
-          workspaceRoot: workspaceRootFromRequestContext(session.requestContext),
-        })
+        const parsed = parseExecServerMessage(esm, session.hostToolDialect)
+        // Provider-owned spills and terminal records never wait for, or hold back, the step's host calls.
+        // Before answering: an answer that starts on a finished terminal record shows its end.
+        if (parsed?.resultField === "read_result") noteBackgroundShellRead(parsed)
+        const runtimeMessages = await runtimeExecMessages(esm, session.requestContext, session.allowTools)
+        if (runtimeMessages) {
+          if (displayCallId) {
+            toolStep.resolved.add(displayCallId)
+            noteEarlyRowExec(displayCallId)
+            noteToolCallFinished(order, displayCallId)
+          }
+          if (!await writeExecFrames(runtimeMessages, `runtime metadata reply id=${esmId}`)) return
+          if (displayCallId) session.displayToolCalls.delete(displayCallId)
+          continue
+        }
         const taskAttachmentRead = !!displayCallId
           && parsed?.resultField === "read_result"
           && parsed.toolName === "read"
@@ -5368,6 +5460,29 @@ export async function pump(
         }
         if (ownRequestCallId) noteEarlyRowExec(ownRequestCallId)
         if (parsed) {
+          // The model can reach the same internal file through an advertised
+          // canonical read over MCP. It still must not ask the host to approve
+          // access to provider-owned cache metadata.
+          if (parsed.toolName === "read" && parsed.resultField === "mcp_result") {
+            noteBackgroundShellRead(parsed)
+            const internalRead = await runtimeExecMessages({
+              id: parsed.id,
+              read_args: { ...parsed.args, path: opencodePathArg(parsed.args) },
+            }, session.requestContext, session.allowTools)
+            if (internalRead) {
+              const reply = decodeMessage<Record<string, any>>("AgentClientMessage", internalRead[0]!)
+              const read = reply.exec_client_message.read_result as Record<string, any>
+              const error = read.error?.error ?? (read.file_not_found ? "Runtime metadata file was not found" : undefined)
+              const frames = buildExecClientMessages({
+                execId: parsed.id, resultField: "mcp_result", toolName: "read",
+                output: read.success?.content ?? "", error,
+              })
+              if (!await writeExecFrames(frames, `runtime MCP read reply id=${esmId}`)) return
+              noteToolCallFinished(order, displayCallId)
+              if (displayCallId) session.displayToolCalls.delete(displayCallId)
+              continue
+            }
+          }
           const executableToolName = resolveCustomWebToolAlias(parsed.toolName, session.toolAliases)
           if (executableToolName !== parsed.toolName) {
             trace(`web tool alias resolved: ${parsed.toolName} -> ${executableToolName}`)
@@ -5455,14 +5570,6 @@ export async function pump(
           if (taskAttachmentRead) {
             if (!await answerTaskAttachmentRead(parsed)) return
             ;(session.taskAttachmentCalls ??= new Set()).add(displayCallId!)
-            continue
-          }
-          if (parsed.toolName === "read") noteBackgroundShellRead(parsed)
-          // Ahead of the catalog checks: an agent with a shell but no read tool polls these too.
-          const terminalRead = await serveTerminalFileRead(parsed)
-          if (terminalRead === "failed") return
-          if (terminalRead === "served") {
-            if (displayCallId) session.displayToolCalls.delete(displayCallId)
             continue
           }
           // Cursor writes a generated image with an ordinary write exec whose
@@ -5605,6 +5712,10 @@ export async function pump(
             if (displayCallId) session.displayToolCalls.delete(displayCallId)
             continue
           }
+          const shellPolicy = shellPolicyFromMetadata(parsed.resultMetadata)
+          if (shellPolicy && (shellPolicy.backgroundSpawn || shellPolicy.timeoutBehavior === CURSOR_TIMEOUT_BACKGROUND)) {
+            manageBackgroundShell(parsed, shellPolicy, session.requestContext)
+          }
           if (displayCallId) {
             session.displayToolCalls.delete(displayCallId)
             trace(`exec: claimed display callId=${displayCallId}`)
@@ -5616,10 +5727,9 @@ export async function pump(
             parsed.resultField === "shell_stream"
             || parsed.resultField === "shell_result"
             || parsed.resultField === "background_shell_spawn_result"
+            || shellPolicy !== undefined
           ) {
             registerCursorShellCall(tc.toolCallId, parsed.resultMetadata)
-            const terminalsFolder = parsed.resultMetadata?.terminals_folder
-            if (typeof terminalsFolder === "string") sweepStaleTerminalFiles(terminalsFolder)
           }
           // Keep the stream open; the result arrives on the next doStream call.
           sessionManager.registerPending(
@@ -6025,6 +6135,8 @@ type ToolResultContent = {
   output: string
   error?: string
   hostError?: HostToolError
+  refusal?: ToolRefusal
+  interrupted?: boolean
   /** Host media parts of this result (own content, or the trailing media message). */
   media?: unknown[]
   /** `media` decoded for the exec result, with content hashes in the same order. */
@@ -6053,16 +6165,24 @@ function extractToolResultContent(prompt: LanguageModelV3CallOptions["prompt"]):
       const p = part as unknown as Record<string, unknown>
       if (p.type !== "tool-result") continue
       const toolCallId = (p.toolCallId as string) ?? ""
-      const { text, isError, hostError } = toolResultOutputToText(p.output)
-      const media = toolResultOutputMedia(p.output)
+      const failure = toolResultFailure(p.providerOptions, toolCallId)
+      const normalized = toolResultOutputToText(p.output, hasNativeToolStatus(p.providerOptions, toolCallId))
+      const text = failure?.text ?? normalized.text
+      const isError = failure !== undefined || normalized.isError
+      // Without the plugin's status, OpenCode's error envelope in the text still says why.
+      const hostError = failure ? undefined : normalized.hostError
+      const refusal = failure?.refusal ?? hostToolRefusal(hostError)
+      const media = isError ? [] : toolResultOutputMedia(p.output)
       const toolName = (p.toolName as string) ?? "mcp"
       const instruction = toolName === "read" && !isError ? extractOpenCodeReadInstruction(text) : undefined
       out.push({
         toolCallId,
         toolName,
         output: text,
-        error: isError ? text : undefined,
+        error: isError ? text || "OpenCode tool execution failed" : undefined,
         ...(hostError ? { hostError } : {}),
+        ...(refusal ? { refusal } : {}),
+        ...(failure?.type === "aborted" ? { interrupted: true } : {}),
         ...(media.length > 0 ? { media } : {}),
         ...(instruction ? { notes: [instruction] } : {}),
       })
@@ -6086,6 +6206,10 @@ const TOOL_MEDIA_CAPTION = "Attached media from tool result:"
 // of `Instructions from: <absolute path>\n<content>` blocks (the same text
 // OpenCode 1 puts in a read's <system-reminder>). No marker reaches the provider.
 const OPENCODE_INSTRUCTIONS = /^Instructions from: (?:\/|[A-Za-z]:[\\/])/
+// OpenCode 2 ShellResult.notification, packages/core/src/shell/result.ts.
+// Its raw command may contain quotes or newlines. Keep the complete notice as
+// context; do not derive execution status by parsing its command or output.
+const OPENCODE_SHELL_NOTIFICATION = /^<shell id="[^"\r\n]+" state="(?:completed|cancelled|error)" command="[\s\S]*">\r?\n[\s\S]*\r?\n<\/shell>$/
 
 type HostTailNote = { text?: string; media?: unknown[] }
 
@@ -6104,7 +6228,11 @@ function hostTailNote(message: LanguageModelV3CallOptions["prompt"][number]): Ho
   for (const part of message.content) {
     if (part.type !== "text") return undefined
     const text = part.text.trim()
-    if (wrappedHostNote(text, SYSTEM_UPDATE_OPEN, SYSTEM_UPDATE_CLOSE) || OPENCODE_INSTRUCTIONS.test(text)) {
+    if (
+      wrappedHostNote(text, SYSTEM_UPDATE_OPEN, SYSTEM_UPDATE_CLOSE)
+      || OPENCODE_INSTRUCTIONS.test(text)
+      || OPENCODE_SHELL_NOTIFICATION.test(text)
+    ) {
       texts.push(text)
       append = true
       continue
@@ -6175,11 +6303,13 @@ const MEDIA_READ_OUTPUTS = new Set(["Image read successfully", "PDF read success
 function attributeTrailingMedia(results: ToolResultContent[], media: unknown[]): void {
   if (results.length === 0) return
   if (results.length === 1) {
+    if (results[0]!.error !== undefined) return
     if (results[0]!.toolName === "read" && !MEDIA_READ_OUTPUTS.has(results[0]!.output)) return
     results[0]!.media = [...(results[0]!.media ?? []), ...media]
     return
   }
   const bounds = results.map(result => {
+    if (result.error !== undefined) return { min: 0, max: 0 }
     if (result.toolName === "read") {
       const count = MEDIA_READ_OUTPUTS.has(result.output) ? 1 : 0
       return { min: count, max: count }
@@ -6262,6 +6392,7 @@ export async function decodeTrailingToolImages(
 const OPENCODE_INTERRUPTED_TEXT = new Set(["Tool execution aborted", "[Tool execution was interrupted]"])
 
 function isInterruptedToolResult(result: ExtractedToolResult): boolean {
+  if (result.interrupted) return true
   if (result.hostError) return isHostToolInterrupted(result.hostError)
   return result.error !== undefined && OPENCODE_INTERRUPTED_TEXT.has(result.error.trim())
 }
@@ -6542,27 +6673,37 @@ export function hasApprovedUncorrelatedPlanStageResult(
     for (const part of message.content) {
       if (part.type !== "tool-result" || part.toolName !== CURSOR_PLAN_STAGE_TOOL) continue
       if (parseExecIdFromToolCallId(part.toolCallId)) continue
-      const result = toolResultOutputToText(part.output)
-      return !result.isError
+      const result = toolResultOutputToText(part.output, hasNativeToolStatus(part.providerOptions, part.toolCallId))
+      return !result.isError && !toolResultFailure(part.providerOptions, part.toolCallId)
     }
   }
   return false
 }
 
-function toolResultOutputToText(output: unknown): { text: string; isError: boolean; hostError?: HostToolError } {
+/** The plugin recorded this call's native status, so its text is never read as an error envelope. */
+function hasNativeToolStatus(providerOptions: unknown, toolCallId: unknown): boolean {
+  const cursor = (providerOptions as { cursor?: Record<string, unknown> } | undefined)?.cursor
+  const status = cursor?.[TOOL_RESULT_STATUS_KEY] as { callID?: unknown } | undefined
+  return typeof toolCallId === "string" && status?.callID === toolCallId
+}
+
+function toolResultOutputToText(
+  output: unknown,
+  nativeStatus = false,
+): { text: string; isError: boolean; hostError?: HostToolError } {
   if (output == null) return { text: "", isError: false }
   if (typeof output === "string") return { text: output, isError: false }
   const o = output as Record<string, unknown>
   // LanguageModelV3 tool-result output: { type: "text"|"json"|"error-text"|..., value }
   const isError = o.type === "execution-denied" || (typeof o.type === "string" && o.type.startsWith("error"))
   if (o.type === "execution-denied") {
-    return { text: String(o.reason ?? "Tool execution denied"), isError: true }
+    return { text: String(o.reason || "Tool execution denied"), isError: true }
   }
   if (o.type === "text" || o.type === "error-text") {
     const text = String(o.value ?? "")
-    const hostError = parseHostToolErrorEnvelope(text)
+    const hostError = nativeStatus ? undefined : parseHostToolErrorEnvelope(text)
     if (hostError) return { text: hostToolErrorText(hostError), isError: true, hostError }
-    return { text, isError }
+    return { text: text || (isError ? "OpenCode tool execution failed" : ""), isError }
   }
   if (o.type === "json" || o.type === "error-json") {
     return { text: JSON.stringify(o.value ?? null), isError }
@@ -7055,7 +7196,10 @@ function collectPromptHistory(
         const toolName = typeof p.toolName === "string" && p.toolName ? p.toolName : "tool"
         const toolCallId = typeof p.toolCallId === "string" ? p.toolCallId : ""
         if (keptOnly && !options?.keepToolCallIds?.has(toolCallId)) continue
-        const result = toolResultOutputToText(p.output)
+        const failure = toolResultFailure(p.providerOptions, toolCallId)
+        const result = failure
+          ? { text: failure.text, isError: true }
+          : toolResultOutputToText(p.output, hasNativeToolStatus(p.providerOptions, toolCallId))
         const output = earlier && !options?.keepToolCallIds?.has(toolCallId)
           ? shortenTranscriptPart(`${messageIndex}:${partIndex}`, result.text, TRANSCRIPT_TOOL_RESULT_CHARS, shorten, shortenable)
           : result.text

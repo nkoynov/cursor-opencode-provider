@@ -17,15 +17,17 @@ type ShellEnd = {
   status?: string
   exitCode?: number
   elapsedMs?: number
+  storageFailed?: boolean
 }
 
 type WatchedShell = {
   sessionID: string
+  shellId: number
+  /** The record's supervisor. */
   pid: number
   file: string
   command: string
   startedAt: number
-  terminal: boolean
   notifier: BackgroundShellNotifier
   end?: ShellEnd
   endSeenAt?: number
@@ -86,6 +88,7 @@ export function backgroundShellNoticesSupported(): boolean {
 
 export function watchBackgroundShell(input: {
   sessionID: string
+  shellId: number
   pid: number
   file: string
   command: string
@@ -94,14 +97,15 @@ export function watchBackgroundShell(input: {
 }): void {
   if (!input.sessionID || !Number.isSafeInteger(input.pid) || input.pid <= 0 || !input.file) return
   const file = resolve(input.file)
+  if (basename(file) !== `${input.shellId}.txt`) return
   state.watches.delete(file)
   state.watches.set(file, {
     sessionID: input.sessionID,
+    shellId: input.shellId,
     pid: input.pid,
     file,
     command: input.command,
     startedAt: input.now ?? Date.now(),
-    terminal: basename(file) === `${input.pid}.txt`,
     notifier: input.notifier,
   })
   // A tool call started it, so its session is in a turn.
@@ -109,9 +113,9 @@ export function watchBackgroundShell(input: {
   while (state.watches.size > MAX_WATCHES) {
     const [oldest, dropped] = state.watches.entries().next().value as [string, WatchedShell]
     state.watches.delete(oldest)
-    trace(`background shell: too many watched, dropped pid=${dropped.pid} sessionID=${dropped.sessionID}`)
+    trace(`background shell: too many watched, dropped shell=${dropped.shellId} sessionID=${dropped.sessionID}`)
   }
-  trace(`background shell: watching pid=${input.pid} sessionID=${input.sessionID} file=${JSON.stringify(file)}`)
+  trace(`background shell: watching shell=${input.shellId} pid=${input.pid} sessionID=${input.sessionID} file=${JSON.stringify(file)}`)
   ensureTimer()
 }
 
@@ -124,12 +128,12 @@ export function recordBackgroundShellRead(
   const watch = state.watches.get(resolve(file))
   if (!watch || !sessionID || watch.sessionID !== sessionID) return
   watch.lastReadAt = read.now ?? Date.now()
-  if (watch.observed || !watch.terminal) return
+  if (watch.observed) return
   const shown = readShowsEnd(watch.file, read)
-  trace(`background shell: read of pid=${watch.pid} offset=${read.offset ?? "-"} limit=${read.limit ?? "-"} shows end=${shown}`)
+  trace(`background shell: read of shell=${watch.shellId} offset=${read.offset ?? "-"} limit=${read.limit ?? "-"} shows end=${shown}`)
   if (!shown) return
   watch.observed = true
-  trace(`background shell: pid=${watch.pid} end read by the model; no note`)
+  trace(`background shell: shell=${watch.shellId} end read by the model; no note`)
 }
 
 export function noteSessionExecution(sessionID: string, event: "started" | "succeeded" | "failed" | "interrupted"): void {
@@ -177,7 +181,7 @@ function post(notifier: BackgroundShellNotifier, watch: WatchedShell): void {
     description: watch.command,
     metadata: {
       source: "shell",
-      shellID: String(watch.pid),
+      shellID: String(watch.shellId),
       state: end.state,
       ...(end.exitCode !== undefined ? { exit: end.exitCode } : {}),
       file: watch.file,
@@ -186,28 +190,24 @@ function post(notifier: BackgroundShellNotifier, watch: WatchedShell): void {
     ...(session && !session.busy && session.stopped ? { resume: false } : {}),
   }
   trace(
-    `background shell: posting note pid=${watch.pid} sessionID=${watch.sessionID} state=${end.state} ` +
+    `background shell: posting note shell=${watch.shellId} sessionID=${watch.sessionID} state=${end.state} ` +
       `exit=${end.exitCode ?? "-"} resume=${note.resume ?? true}`,
   )
   notifier(note).catch((error: unknown) => {
-    trace(`background shell: note for pid=${watch.pid} failed: ${error instanceof Error ? error.message : String(error)}`)
+    trace(`background shell: note for shell=${watch.shellId} failed: ${error instanceof Error ? error.message : String(error)}`)
   })
 }
 
 function probe(watch: WatchedShell, now: number): void {
-  if (!watch.terminal) {
-    if (processExists(watch.pid)) return
-    watch.end = { state: "completed" }
-    watch.endSeenAt = now
-    return
-  }
-  const end = readTerminalEnd(watch.file)
+  const supervised = processExists(watch.pid)
+  // The supervisor writes the final status before the footer; wait for the footer while it lives.
+  const end = readTerminalEnd(watch.file, !supervised)
   if (end) {
     watch.end = end
     watch.endSeenAt = now
     return
   }
-  if (processExists(watch.pid)) {
+  if (supervised) {
     watch.goneSince = undefined
     return
   }
@@ -260,13 +260,14 @@ function readHeader(fd: number, size: number): { end: number; text: string } | u
   }
 }
 
-// The runner rewrites the header's status only after it has written the footer.
 const FINAL_STATUS = /^status: (succeeded|failed|aborted) *$/m
-const FOOTER = /\n---\nexit_code: (-?\d+)\nelapsed_ms: (\d+)\nended_at: [^\n]*\n---\n/g
+// A lost supervisor's footer has `exit_code: unknown` and no `elapsed_ms`.
+const FOOTER_BODY = "exit_code: (-?\\d+|unknown)\\n(?:elapsed_ms: (\\d+)\\n)?ended_at: [^\\n]*\\n(output_storage_failed: true\\n)?---\\n"
+const FOOTER = new RegExp(`\\n---\\n${FOOTER_BODY}`, "g")
 const FOOTER_OPENING = "\n---\nexit_code: "
-const FOOTER_AT_START = /^\n---\nexit_code: -?\d+\nelapsed_ms: \d+\nended_at: [^\n]*\n---\n/
+const FOOTER_AT_START = new RegExp(`^\\n---\\n${FOOTER_BODY}`)
 
-function readTerminalEnd(file: string): ShellEnd | undefined {
+function readTerminalEnd(file: string, footerOptional: boolean): ShellEnd | undefined {
   const fd = openPlain(file)
   if (fd === undefined) return undefined
   try {
@@ -277,10 +278,13 @@ function readTerminalEnd(file: string): ShellEnd | undefined {
     // A descendant may keep writing after the footer.
     const start = Math.max(header.end, size - FOOTER_WINDOW_BYTES)
     const footer = lastFooter(readRange(fd, start, size - start).toString("utf8"))
+    if (!footer && !footerOptional) return undefined
+    if (footer && footer.exitCode === undefined) return { state: "error", status }
     return {
       state: status === "aborted" ? "cancelled" : "completed",
       status,
       ...(footer ? { exitCode: footer.exitCode, elapsedMs: footer.elapsedMs } : {}),
+      ...(footer?.storageFailed ? { storageFailed: true } : {}),
     }
   } catch {
     return undefined
@@ -332,10 +336,18 @@ function countNewlines(fd: number, end: number): number {
   return count
 }
 
-function lastFooter(text: string): { index: number; end: number; exitCode: number; elapsedMs: number } | undefined {
-  let last: { index: number; end: number; exitCode: number; elapsedMs: number } | undefined
+type Footer = { index: number; end: number; exitCode?: number; elapsedMs?: number; storageFailed: boolean }
+
+function lastFooter(text: string): Footer | undefined {
+  let last: Footer | undefined
   for (const match of text.matchAll(FOOTER)) {
-    last = { index: match.index!, end: match.index! + match[0].length, exitCode: Number(match[1]), elapsedMs: Number(match[2]) }
+    last = {
+      index: match.index!,
+      end: match.index! + match[0].length,
+      ...(match[1] === "unknown" ? {} : { exitCode: Number(match[1]) }),
+      ...(match[2] === undefined ? {} : { elapsedMs: Number(match[2]) }),
+      storageFailed: match[3] !== undefined,
+    }
   }
   return last
 }
@@ -345,11 +357,11 @@ function readOutputTail(watch: WatchedShell): { lines: string[]; omitted: boolea
   if (fd === undefined) return { lines: [], omitted: false }
   try {
     const size = fstatSync(fd).size
-    const outputStart = watch.terminal ? (readHeader(fd, size)?.end ?? 0) : 0
+    const outputStart = readHeader(fd, size)?.end ?? 0
     const start = Math.max(outputStart, size - TAIL_WINDOW_BYTES)
     let text = readRange(fd, start, size - start).toString("utf8")
     let omitted = start > outputStart
-    const footer = watch.terminal ? lastFooter(text) : undefined
+    const footer = lastFooter(text)
     if (footer) {
       const before = text.slice(0, footer.index)
       const after = text.slice(footer.end)
@@ -391,24 +403,23 @@ function attribute(value: string): string {
 
 // OpenCode's `<shell>` completion note, as a host `<system-update>` so it is never taken for a user message.
 export function backgroundShellNoteText(
-  watch: Pick<WatchedShell, "pid" | "file" | "command" | "startedAt" | "terminal" | "endSeenAt">,
+  watch: Pick<WatchedShell, "shellId" | "file" | "command" | "startedAt" | "endSeenAt">,
   end: ShellEnd,
   tail: { lines: string[]; omitted: boolean },
 ): string {
   const after = formatDuration(end.elapsedMs ?? (watch.endSeenAt ?? Date.now()) - watch.startedAt)
-  const name = `Background shell ${watch.pid}`
+  const name = `Background shell ${watch.shellId}`
   const headline =
     end.state === "error"
-      ? `${name} ended without reporting an exit code; its runner was stopped.`
-      : !watch.terminal
-        ? `${name} has finished; its exit code was not recorded.`
-        : end.state === "cancelled"
-          ? `${name} was stopped after ${after}${end.exitCode !== undefined ? ` (exit code ${end.exitCode})` : ""}.`
-          : end.exitCode === undefined
-            ? `${name} has ${end.status === "failed" ? "failed" : "finished"} after ${after}.`
-            : end.exitCode === 0
-              ? `${name} finished with exit code 0 after ${after}.`
-              : `${name} failed with exit code ${end.exitCode} after ${after}.`
+      ? `${name} ended without reporting an exit code; its supervisor stopped before the command finished.`
+      : end.state === "cancelled"
+        ? `${name} was stopped after ${after}${end.exitCode !== undefined ? ` (exit code ${end.exitCode})` : ""}.`
+        : end.exitCode === undefined
+          ? `${name} has ${end.status === "failed" ? "failed" : "finished"} after ${after}.`
+          : end.exitCode === 0
+            ? `${name} finished with exit code 0 after ${after}.`
+            : `${name} failed with exit code ${end.exitCode} after ${after}.`
+  const storage = end.storageFailed ? ["Its output could not be stored completely."] : []
   const output =
     tail.lines.length === 0
       ? [`It printed no output. Output file: ${watch.file}`]
@@ -420,8 +431,9 @@ export function backgroundShellNoteText(
         ]
   return [
     "<system-update>",
-    `<shell id="${watch.pid}" state="${end.state}" command="${attribute(watch.command)}">`,
+    `<shell id="${watch.shellId}" state="${end.state}" command="${attribute(watch.command)}">`,
     headline,
+    ...storage,
     ...output,
     "</shell>",
     "</system-update>",

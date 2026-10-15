@@ -149,7 +149,7 @@ A prompt sent before those servers finish connecting will not see their tools. O
 | `tool` hook (`custom_websearch`, `cursor_image_save`) | `ctx.tool.transform` registers handle-only `cursor_image_save` (`codemode: false`, `permission: "edit"`, output schema) so generated images can be committed. `todowrite`/`todoread` only when `CURSOR_OPENCODE2_TODOS=1` (or `true`) and the host catalog omits them. Off by default. OpenCode 2's native `websearch` tool owns permission checks and uses the provider registered through `ctx.websearch.transform`. The public 2.0 `ToolContext` has no permission-request method, so this entrypoint does not advertise a direct web-search fallback; image save uses catalog `edit` gating plus containment when `ask` is absent. |
 | `event` hook (session activity) | `ctx.event.subscribe` |
 | `tool.execute.before` / `.after` | `ctx.tool.hook(...)` |
-| `shell.env` injects the timeout wrapper | `ctx.shell.hook("create.before")` injects the same env; wrapper-file fallback remains for shells that ignore env |
+| Post-approval `shell.env` injects the timeout wrapper for bash/zsh | `ctx.shell.hook("create.before")` installs a same-basename executable adapter. The command stays unchanged for the host's later permission scan; the payload uses the actual selected shell. |
 | `chat.params` flags compaction turns and names the current agent | `session.hook("context")` / `"compaction"` sets `options.opencodeCompaction`, `options.opencodeHostAgent`, and the session marker |
 | `plan_enter` / `plan_exit` | OpenCode 2's primary `plan` / `build` agents are selected through `session.switchAgent`. Cursor mode entry is applied after its Run reaches a safe terminal boundary. CreatePlan records the plan in the Plan directory, shows it, and asks through `question` whether to switch to `build` and start implementing; Yes selects `build` and continues the turn. |
 | Host `todowrite` builtin | OpenCode 2 dropped host todo tools. Plugin-owned `todowrite`/`todoread` stay **off** unless `CURSOR_OPENCODE2_TODOS=1` (or `true`). When enabled they register as **direct** catalog tools (`codemode: false` + `output` schema, in-memory per session) unless `editor.get`/`list` already owns those names. With the flag unset, no provider todo tools are registered. Cursor TodoWrite/TodoRead mirror into them only when they are advertised. OpenCode 1.x still uses the host builtin and is not gated. |
@@ -157,8 +157,23 @@ A prompt sent before those servers finish connecting will not see their tools. O
 | — | `credential.switched` clears the token cache and reloads models |
 | — | `editor.add({ sourceConnection })` binds inventory to the active Cursor connection |
 | — | `ctx.websearch.transform` publishes Exa results as `{url,title,content,time}` for OpenCode 2's native permission-gated `websearch` tool |
-| — | A Cursor background shell that ends posts OpenCode's `<shell>` completion note (as a `<system-update>`) through `session.synthetic`: the model gets it at the next step, or it starts a turn in an idle session. It is dropped when the model already read the finished terminal file |
+| — | A Cursor background shell that ends posts OpenCode's `<shell>` completion note (as a `<system-update>`) through `session.synthetic`: the model gets it at the next step, or it starts a turn in an idle session. It is dropped when the model already read the finished terminal record |
 | Package root / `plugin` | OpenCode 2 `Host.resolve` loads `exports["./server"]` → this entry (`{ id, setup }`). The same module dual-exports `server: CursorPlugin` so OpenCode 1.18 still gets the classic plugin. |
+
+The shell integration follows each host's execution order. OpenCode 1.18.31
+[checks permissions before `shell.env`](https://github.com/anomalyco/opencode/blob/v1.18.31/packages/opencode/src/tool/shell.ts#L599-L637).
+OpenCode 2.0.27 [runs `create.before` before its permission callback and then spawns the selected executable](https://github.com/anomalyco/opencode/blob/v2.0.27/packages/core/src/shell.ts#L263-L307),
+so the adapter keeps the original command and shell basename intact for
+[the native scanner](https://github.com/anomalyco/opencode/blob/v2.0.27/packages/core/src/tool/plugin/shell.ts#L125-L145).
+OpenCode 2's [AI SDK conversion lowers tool errors to ordinary text](https://github.com/anomalyco/opencode/blob/v2.0.27/packages/core/src/aisdk.ts#L652-L685).
+The session hooks preserve the native result status in each tool part's provider
+metadata before conversion, so reads, writes, deletes and other tools remain
+failures in continuations and replayed history. The tool after hook retains typed
+permission causes to distinguish configured denials from user rejection;
+successful output that resembles an error is left successful.
+A [decline without feedback bypasses the tool after hook](https://github.com/anomalyco/opencode/blob/v2.0.27/packages/core/src/permission.ts#L244-L255).
+The permission and terminal-failure events release unstarted shell reservations
+immediately; running jobs retain their records.
 
 Generated-image saving uses the same handle-only `cursor_image_save` tool on classic and OpenCode 2.0. Classic/OCP surfaces raise `external_directory` then `edit` before the write. Stock OpenCode 2.0 has no public `ask`, so the 2.0 entrypoint still advertises the tool (`permission: "edit"` so agents that deny edits do not get it) and commits after containment; the id is opaque, so the model cannot write arbitrary files.
 

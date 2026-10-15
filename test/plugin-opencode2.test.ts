@@ -29,7 +29,9 @@ import {
   queueHostAgentModeSwitch,
   resetHostAgentModeSwitchForTests,
 } from "../src/host-agent-mode.js"
-import { registerCursorShellCall } from "../src/shell-timeout.js"
+import { consumeCursorShellResult, registerCursorShellCall, resetCursorShellCalls } from "../src/shell-timeout.js"
+import { createManagedTerminal } from "../src/terminal-runner.js"
+import { toolResultFailure } from "../src/opencode2/tool-results.js"
 import { sessionActivity } from "../src/activity.js"
 import { forgetEarlySteers, listenForHostSteers } from "../src/host-steer.js"
 import { onHostInterrupt } from "../src/host-interrupt.js"
@@ -689,8 +691,9 @@ describe("opencode2 setup", () => {
     resetBackgroundShellNotices()
   })
 
+  const BG_SHELL_ID = 4343
   const finishedTerminalFile = (dir: string, output: string) => {
-    const file = join(dir, `${process.pid}.txt`)
+    const file = join(dir, `${BG_SHELL_ID}.txt`)
     writeFileSync(file, [
       "---",
       `pid: ${process.pid}`,
@@ -698,7 +701,7 @@ describe("opencode2 setup", () => {
       'command: "sleep 90; echo done"',
       "status: succeeded",
       "started_at: 2026-10-07T10:00:00Z",
-      "running_for_ms: 90000    ",
+      "running_for_ms: 90000          ",
       "---",
       `${output}`,
       "---",
@@ -725,7 +728,7 @@ describe("opencode2 setup", () => {
         working_directory: "/tmp",
       })
       const file = finishedTerminalFile(dir, "done\n")
-      const raw = `__CURSOR_BACKGROUND_SHELL__${process.pid}:${file}\n`
+      const raw = `__CURSOR_BACKGROUND_SHELL__${BG_SHELL_ID}:${process.pid}:${file}\n`
       await hooks.get("tool.execute.after")!({
         tool: "shell",
         sessionID: "ses_bg",
@@ -743,7 +746,7 @@ describe("opencode2 setup", () => {
       expect(posted).toHaveLength(1)
       expect(posted[0].sessionID).toBe("ses_bg")
       expect(posted[0].description).toBe("sleep 90; echo done")
-      expect(posted[0].text).toStartWith(`<system-update>\n<shell id="${process.pid}" state="completed" command="sleep 90; echo done">`)
+      expect(posted[0].text).toStartWith(`<system-update>\n<shell id="${BG_SHELL_ID}" state="completed" command="sleep 90; echo done">`)
       expect(posted[0].text).toContain(`finished with exit code 0 after 1m 30s.\nIts output (also in ${file}):\ndone\n</shell>`)
       await cleanup()
     } finally {
@@ -779,7 +782,7 @@ describe("opencode2 setup", () => {
       const file = finishedTerminalFile(dir, "")
       const posted: any[] = []
       const notifier = async (input: any) => void posted.push(input)
-      watchBackgroundShell({ sessionID: "ses_stop", pid: process.pid, file, command: "make test", notifier })
+      watchBackgroundShell({ sessionID: "ses_stop", shellId: BG_SHELL_ID, pid: process.pid, file, command: "make test", notifier })
       const { ctx } = fakeContext([{ type: "session.execution.interrupted", data: { sessionID: "ses_stop", reason: "user" } }])
       ctx.session.synthetic = notifier
       const cleanup = await setupPlugin(ctx)
@@ -801,7 +804,7 @@ describe("opencode2 setup", () => {
       ctx.session.synthetic = async (input: any) => void posted.push(input)
       const cleanup = await setupPlugin(ctx)
       await cleanup()
-      watchBackgroundShell({ sessionID: "ses_gone", pid: process.pid, file: finishedTerminalFile(dir, ""), command: "x", notifier: ctx.session.synthetic })
+      watchBackgroundShell({ sessionID: "ses_gone", shellId: BG_SHELL_ID, pid: process.pid, file: finishedTerminalFile(dir, ""), command: "x", notifier: ctx.session.synthetic })
       pollBackgroundShells(Date.now() + BUSY_SETTLE_MS)
       expect(posted).toEqual([])
     } finally {
@@ -813,6 +816,7 @@ describe("opencode2 setup", () => {
     const pending = setupCleanups.splice(0)
     for (const cleanup of pending.reverse()) await cleanup()
     setNativePlansDir(undefined)
+    resetCursorShellCalls()
   })
 
   test("reloads the provider inventory from cache without writing opencode.json", async () => {
@@ -1765,7 +1769,7 @@ describe("opencode2 setup", () => {
     expect(queueHostAgentModeSwitch({ sessionID: "s-reload", targetModeID: "agent" })).toBe(false)
   })
 
-  test("shell create.before merges env for a matching pending command", async () => {
+  test("shell create.before preserves the approved command and selected shell grammar", async () => {
     const { ctx, hooks } = fakeContext()
     await setupPlugin(ctx)
     const executionID = "cursor_shell_env"
@@ -1785,7 +1789,36 @@ describe("opencode2 setup", () => {
     })
     const event = { command: "echo hello", cwd: "/tmp", timeout: 0, shell: "/bin/bash", env: {} as Record<string, string | undefined> }
     await hooks.get("shell.create.before")!(event)
-    expect(Object.keys(event.env).length).toBeGreaterThan(0)
+    expect(event.command).toBe("echo hello")
+    expect(event.shell.endsWith("/bash")).toBe(true)
+    expect(event.shell).not.toBe("/bin/bash")
+    expect(readFileSync(event.shell, "utf8")).toContain("CURSOR_SHELL_EXECUTABLE='/bin/bash'")
+    expect(event.env).toEqual({})
+  })
+
+  test("a shell whose command a later hook rewrote does not hold back identical shells", async () => {
+    const { ctx, hooks } = fakeContext()
+    await setupPlugin(ctx)
+    const event = (id: string, command: string) => ({
+      tool: "shell", sessionID: "session", agent: "agent", messageID: "message", id, input: { command } as unknown,
+    })
+    registerCursorShellCall("cursor_shell_rewritten", {
+      background_shell_spawn: true, command: "echo original", working_directory: "/tmp",
+    })
+    const rewrittenCall = event("cursor_shell_rewritten", "echo original")
+    await hooks.get("tool.execute.before")!(rewrittenCall)
+    // A plugin hooked after this one replaces the input, as OpenCode's own
+    // input repair does; OpenCode creates the shell from the replacement.
+    rewrittenCall.input = { command: "echo rewritten" }
+    const rewritten = { command: "echo rewritten", cwd: "/tmp", timeout: 0, shell: "/bin/bash", env: {} as Record<string, string | undefined> }
+    await hooks.get("shell.create.before")!(rewritten)
+    expect(rewritten.shell).toBe("/bin/bash")
+
+    const identical = await Promise.race([
+      Promise.resolve(hooks.get("tool.execute.before")!(event("cursor_shell_identical", "echo original"))).then(() => "armed"),
+      Bun.sleep(1_000).then(() => "blocked"),
+    ])
+    expect(identical).toBe("armed")
   })
 
   test("shell execute.after sanitizes structured output and content blocks", async () => {
@@ -1816,6 +1849,67 @@ describe("opencode2 setup", () => {
     expect(result.output.output).not.toContain("__CURSOR_BACKGROUND_SHELL__")
     expect(result.content[0].text).not.toContain("__CURSOR_BACKGROUND_SHELL__")
     expect(result.content[1]).toEqual({ type: "file", uri: "file:///tmp/log", mime: "text/plain" })
+  })
+
+  test("shell execute.after preserves an error status that the native SDK turns into text", async () => {
+    const { ctx, hooks } = fakeContext()
+    await setupPlugin(ctx)
+    const executionID = "cursor_shell_denied"
+    registerCursorShellCall(executionID, { background_shell_spawn: true, command: "echo denied", working_directory: "/tmp" })
+    await hooks.get("tool.execute.after")!({
+      tool: "shell", id: executionID, status: "error", error: new Error("Permission denied: shell"),
+    })
+    expect(consumeCursorShellResult(executionID, '{"error":{"type":"permission.rejected","message":"Permission denied: shell"},"content":[]}').error).toBe("Permission denied: shell")
+  })
+
+  test.each(["reject", "failed", "deleted", "disconnected"])("releases unstarted reservations on %s without execute.after or a next turn", async kind => {
+    const root = mkdtempSync(join(tmpdir(), "cursor-rejected-tool-"))
+    const callID = "cursor_reject_cleanup_1"
+    const terminal = createManagedTerminal({ command: "true", workingDirectory: root, timeoutMs: 0, timeoutBehavior: 0, backgroundSpawn: true }, root)
+    registerCursorShellCall(callID, { background_shell_spawn: true, command: "true", working_directory: root, managed_command: terminal.command, managed_job_directory: terminal.directory })
+    const asked = { type: "permission.asked", data: { id: "per_cleanup", sessionID: "s-cleanup", source: { type: "tool", id: callID, messageID: "m" } } }
+    const end = kind === "reject" ? { type: "permission.replied", data: { requestID: "per_cleanup", sessionID: "s-cleanup", reply: "reject" } }
+      : kind === "failed" ? { type: "session.tool.failed", data: { id: callID, sessionID: "s-cleanup", error: { type: "aborted", message: "Interrupted" } } }
+      : { type: "session.deleted", data: { sessionID: "s-cleanup" } }
+    try {
+      const { ctx } = fakeContext(kind === "disconnected" ? [asked] : [asked, end])
+      await setupPlugin(ctx)
+      for (let i = 0; i < 50 && existsSync(terminal.file); i++) await Bun.sleep(1)
+      expect(existsSync(terminal.file)).toBe(false)
+      expect(existsSync(terminal.directory)).toBe(false)
+      expect(existsSync(join(root, "terminals", ".jobs", `${terminal.shellId}.json`))).toBe(false)
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+
+  test("a rejected permission also releases the session's other pending shell reservations", async () => {
+    const root = mkdtempSync(join(tmpdir(), "cursor-rejected-siblings-"))
+    const first = createManagedTerminal({ command: "true", workingDirectory: root, timeoutMs: 0, timeoutBehavior: 0, backgroundSpawn: true }, root)
+    const second = createManagedTerminal({ command: "true", workingDirectory: root, timeoutMs: 0, timeoutBehavior: 0, backgroundSpawn: true }, root)
+    registerCursorShellCall("cursor_reject_a", { background_shell_spawn: true, command: "true", working_directory: root, managed_command: first.command, managed_job_directory: first.directory })
+    registerCursorShellCall("cursor_reject_b", { background_shell_spawn: true, command: "true", working_directory: root, managed_command: second.command, managed_job_directory: second.directory })
+    const asked = (id: string, callID: string) => ({ type: "permission.asked", data: { id, sessionID: "s-siblings", source: { type: "tool", id: callID, messageID: "m" } } })
+    try {
+      const { ctx } = fakeContext([
+        asked("per_a", "cursor_reject_a"),
+        asked("per_b", "cursor_reject_b"),
+        { type: "permission.replied", data: { requestID: "per_a", sessionID: "s-siblings", reply: "reject" } },
+      ])
+      await setupPlugin(ctx)
+      for (let i = 0; i < 50 && (existsSync(first.file) || existsSync(second.file)); i++) await Bun.sleep(1)
+      expect(existsSync(first.file)).toBe(false)
+      expect(existsSync(second.file)).toBe(false)
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+
+  test.each(["context", "compaction", "generate", "title"])("%s preserves authoritative non-shell status and the typed denial", async hook => {
+    const { ctx, hooks, sessionLocations } = fakeContext()
+    sessionLocations.set("s-results", "/workspace")
+    await setupPlugin(ctx)
+    const id = "cursor_results_1"
+    await hooks.get("tool.execute.after")!({ tool: "write", id, status: "error", error: { _tag: "Tool.Error", error: { _tag: "Permission.BlockedError" } } })
+    const event: any = { sessionID: "s-results", agent: "build", model: { providerID: "cursor" }, options: {}, messages: [{ role: "tool", content: [{ type: "tool-result", id, name: "write", result: { type: "error", value: { error: { type: "permission.rejected", message: "Denied" }, content: [] } } }] }] }
+    await hooks.get(`session.${hook}`)!(event)
+    expect(toolResultFailure(event.messages[0].content[0].providerMetadata, id)).toEqual({ type: "permission.rejected", text: "Denied", refusal: "permission_denied" })
   })
 
   test("session.compaction flags the compaction option", async () => {

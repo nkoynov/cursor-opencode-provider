@@ -1,0 +1,27 @@
+{
+  "files": [
+    {
+      "path": "docs/review-rules.md",
+      "description": "Review rubric: blockers, evidence, and how to write findings"
+    },
+    {
+      "path": "AGENTS.md",
+      "description": "Provider architecture, protocol constraints, and release gates",
+      "scope": ["src/**", "test/**", "package.json", "scripts/**"]
+    },
+    {
+      "path": "CONTRIBUTING.md",
+      "description": "Pull request scope, verification, and changelog requirements"
+    },
+    {
+      "path": "docs/cache-log-runbook.md",
+      "description": "How to read prompt-cache and token diagnostics",
+      "scope": ["src/context/**", "src/session.ts", "src/language-model.ts", "src/protocol/**", "src/billing.ts", "src/usage.ts"]
+    },
+    {
+      "path": "docs/host-compat-acceptance.md",
+      "description": "Interactive acceptance checklist for plan mode, SwitchMode, and catalog caching",
+      "scope": ["src/protocol/create-plan.ts", "src/protocol/switch-mode.ts", "src/host-agent-mode.ts", "src/host-plan-file.ts", "src/context/**"]
+    }
+  ]
+}

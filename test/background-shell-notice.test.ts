@@ -1,7 +1,17 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { createManagedTerminal, type ManagedTerminal } from "../src/terminal-runner.js"
+import { runtimeLayout } from "../src/runtime-files.js"
+import {
+  CURSOR_TIMEOUT_BACKGROUND,
+  captureCursorShellResult,
+  capturedCursorShellOutcome,
+  registerCursorShellCall,
+  resetCursorShellCalls,
+  type CursorShellPolicy,
+} from "../src/shell-timeout.js"
 import {
   AWAIT_GRACE_MS,
   BUSY_SETTLE_MS,
@@ -18,6 +28,7 @@ import {
   type BackgroundShellNote,
 } from "../src/background-shell-notice.js"
 
+const SHELL_ID = 4242
 const LIVE_PID = process.pid
 // Above Linux's pid_max and macOS's pid range, so never a live process.
 const GONE_PID = 2_000_000_000
@@ -28,8 +39,19 @@ const notifier = async (note: BackgroundShellNote) => {
   notes.push(note)
 }
 
-function terminalFile(pid: number, input: { status?: string; output?: string; exitCode?: number; elapsedMs?: number; after?: string } = {}): string {
-  const file = join(dir, `${pid}.txt`)
+type RecordFields = {
+  status?: string
+  output?: string
+  exitCode?: number | "unknown"
+  elapsedMs?: number
+  storageFailed?: boolean
+  footer?: boolean
+  after?: string
+}
+
+// The supervisor's record: a fixed-width header, the output, then the completion footer.
+function terminalFile(pid: number, input: RecordFields = {}): string {
+  const file = join(dir, `${SHELL_ID}.txt`)
   const status = input.status ?? "running"
   const header = [
     "---",
@@ -38,19 +60,24 @@ function terminalFile(pid: number, input: { status?: string; output?: string; ex
     'command: "sleep 90; echo done"',
     `status: ${status.padEnd(9)}`,
     "started_at: 2026-10-07T10:00:00Z",
-    "running_for_ms: 0        ",
+    `running_for_ms: ${"0".padEnd(15)}`,
     "---",
     "",
   ].join("\n")
-  const footer = status === "running"
+  const lost = input.exitCode === "unknown"
+  const footer = status === "running" || input.footer === false
     ? ""
-    : `\n---\nexit_code: ${input.exitCode ?? 0}\nelapsed_ms: ${input.elapsedMs ?? 90_000}\nended_at: 2026-10-07T10:01:30Z\n---\n`
+    : `\n---\nexit_code: ${input.exitCode ?? 0}\n`
+      + (lost ? "" : `elapsed_ms: ${input.elapsedMs ?? 90_000}\n`)
+      + "ended_at: 2026-10-07T10:01:30Z\n"
+      + (input.storageFailed ? "output_storage_failed: true\n" : "")
+      + "---\n"
   writeFileSync(file, header + (input.output ?? "") + footer + (input.after ?? ""))
   return file
 }
 
 function watch(pid: number, file: string, now = 0, sessionID = "ses_a") {
-  watchBackgroundShell({ sessionID, pid, file, command: "sleep 90; echo done", notifier, now })
+  watchBackgroundShell({ sessionID, shellId: SHELL_ID, pid, file, command: "sleep 90; echo done", notifier, now })
 }
 
 beforeEach(() => {
@@ -66,7 +93,7 @@ afterEach(() => {
 })
 
 describe("background shell notices", () => {
-  test("posts OpenCode's shell note once the runner finishes the terminal file", async () => {
+  test("posts OpenCode's shell note once the supervisor finishes the record", async () => {
     const file = terminalFile(LIVE_PID)
     watch(LIVE_PID, file)
     noteSessionExecution("ses_a", "succeeded")
@@ -81,11 +108,11 @@ describe("background shell notices", () => {
     expect(note!.sessionID).toBe("ses_a")
     expect(note!.resume).toBeUndefined()
     expect(note!.description).toBe("sleep 90; echo done")
-    expect(note!.metadata).toEqual({ source: "shell", shellID: String(LIVE_PID), state: "completed", exit: 0, file })
+    expect(note!.metadata).toEqual({ source: "shell", shellID: String(SHELL_ID), state: "completed", exit: 0, file })
     expect(note!.text).toBe([
       "<system-update>",
-      `<shell id="${LIVE_PID}" state="completed" command="sleep 90; echo done">`,
-      `Background shell ${LIVE_PID} finished with exit code 0 after 1m 30s.`,
+      `<shell id="${SHELL_ID}" state="completed" command="sleep 90; echo done">`,
+      `Background shell ${SHELL_ID} finished with exit code 0 after 1m 30s.`,
       `Its output (also in ${file}):`,
       "step 1",
       "done",
@@ -96,12 +123,21 @@ describe("background shell notices", () => {
     expect(notes).toHaveLength(1)
   })
 
+  test("only watches a record named after its shell id", () => {
+    const file = join(dir, `${LIVE_PID}.txt`)
+    writeFileSync(file, "")
+    watchBackgroundShell({ sessionID: "ses_a", shellId: SHELL_ID, pid: LIVE_PID, file, command: "x", notifier, now: 0 })
+    noteSessionExecution("ses_a", "succeeded")
+    pollBackgroundShells(MAX_HOLD_MS * 2)
+    expect(notes).toEqual([])
+  })
+
   test("reports a failing command's exit code and a stopped one as cancelled", () => {
     const failed = terminalFile(LIVE_PID, { status: "failed", exitCode: 3, elapsedMs: 4200, output: "boom\n" })
     watch(LIVE_PID, failed)
     noteSessionExecution("ses_a", "succeeded")
     pollBackgroundShells(1000)
-    expect(notes[0]!.text).toContain(`Background shell ${LIVE_PID} failed with exit code 3 after 4s.`)
+    expect(notes[0]!.text).toContain(`Background shell ${SHELL_ID} failed with exit code 3 after 4s.`)
     expect(notes[0]!.metadata.exit).toBe(3)
 
     const aborted = terminalFile(LIVE_PID, { status: "aborted", exitCode: 143, elapsedMs: 12_000 })
@@ -109,11 +145,54 @@ describe("background shell notices", () => {
     noteSessionExecution("ses_a", "succeeded")
     pollBackgroundShells(2000)
     expect(notes[1]!.text).toContain(`state="cancelled"`)
-    expect(notes[1]!.text).toContain(`Background shell ${LIVE_PID} was stopped after 12s (exit code 143).`)
+    expect(notes[1]!.text).toContain(`Background shell ${SHELL_ID} was stopped after 12s (exit code 143).`)
     expect(notes[1]!.text).toContain(`It printed no output. Output file: ${aborted}`)
   })
 
-  test("drops the note when the session read the finished terminal file", () => {
+  test("waits for the footer the supervisor writes after the final status", () => {
+    const file = terminalFile(LIVE_PID, { status: "failed", output: "boom\n", footer: false })
+    watch(LIVE_PID, file)
+    noteSessionExecution("ses_a", "succeeded")
+    pollBackgroundShells(1000)
+    expect(notes).toEqual([])
+    terminalFile(LIVE_PID, { status: "failed", exitCode: 2, output: "boom\n" })
+    pollBackgroundShells(2000)
+    expect(notes[0]!.text).toContain(`failed with exit code 2 after 1m 30s.`)
+  })
+
+  test("takes a final status without a footer once the supervisor is gone", () => {
+    const file = terminalFile(GONE_PID, { status: "failed", output: "boom\n", footer: false })
+    watch(GONE_PID, file)
+    noteSessionExecution("ses_a", "succeeded")
+    pollBackgroundShells(1000)
+    expect(notes[0]!.text).toContain(`Background shell ${SHELL_ID} has failed after`)
+    expect(notes[0]!.metadata.exit).toBeUndefined()
+  })
+
+  test("reports a record finalized for a lost supervisor as an error without an exit code", () => {
+    const output = "partial\n\n[Terminal supervisor stopped before the command finished; its exit status is unknown.]\n"
+    const file = terminalFile(GONE_PID, { status: "aborted", exitCode: "unknown", output })
+    watch(GONE_PID, file)
+    noteSessionExecution("ses_a", "succeeded")
+    pollBackgroundShells(1000)
+    expect(notes).toHaveLength(1)
+    expect(notes[0]!.text).toContain(`state="error"`)
+    expect(notes[0]!.text).toContain(`Background shell ${SHELL_ID} ended without reporting an exit code`)
+    expect(notes[0]!.text).toContain("partial\n")
+    expect(notes[0]!.text).not.toContain("exit_code")
+    expect(notes[0]!.metadata.exit).toBeUndefined()
+  })
+
+  test("says when the record's output could not be stored completely", () => {
+    const file = terminalFile(LIVE_PID, { status: "aborted", exitCode: 1, storageFailed: true, output: "some\n" })
+    watch(LIVE_PID, file)
+    noteSessionExecution("ses_a", "succeeded")
+    pollBackgroundShells(1000)
+    expect(notes[0]!.text).toContain(`(exit code 1).\nIts output could not be stored completely.\nIts output (also in ${file}):\nsome\n</shell>`)
+    expect(notes[0]!.text).not.toContain("output_storage_failed")
+  })
+
+  test("drops the note when the session read the finished record", () => {
     const file = terminalFile(LIVE_PID, { status: "succeeded" })
     watch(LIVE_PID, file)
     recordBackgroundShellRead(file, "ses_other", { now: 500 })
@@ -195,7 +274,7 @@ describe("background shell notices", () => {
     expect(notes).toHaveLength(1)
   })
 
-  test("waits while the file is being read, then posts when no read saw the end", () => {
+  test("waits while the record is being read, then posts when no read saw the end", () => {
     const file = terminalFile(LIVE_PID)
     watch(LIVE_PID, file)
     noteSessionExecution("ses_a", "succeeded")
@@ -207,7 +286,7 @@ describe("background shell notices", () => {
     expect(notes).toHaveLength(1)
   })
 
-  test("a read that starts on the finished file during the wait drops the note", () => {
+  test("a read that starts on the finished record during the wait drops the note", () => {
     const file = terminalFile(LIVE_PID)
     watch(LIVE_PID, file)
     noteSessionExecution("ses_a", "succeeded")
@@ -219,17 +298,17 @@ describe("background shell notices", () => {
     expect(notes).toEqual([])
   })
 
-  test("reads of a plain log, which shows no end, hold its note no longer than the cap", () => {
-    const file = join(dir, "cursor-opencode-bg.XYZ")
-    writeFileSync(file, "x\n")
-    watch(GONE_PID, file)
+  test("reads that never show the end hold the note no longer than the cap", () => {
+    const output = Array.from({ length: 30 }, (_, i) => `l${i + 1}`).join("\n") + "\n"
+    const file = terminalFile(LIVE_PID, { status: "succeeded", output })
+    watch(LIVE_PID, file)
     noteSessionExecution("ses_a", "succeeded")
     for (let t = 1000; t < 1000 + MAX_HOLD_MS; t += 1000) {
-      recordBackgroundShellRead(file, "ses_a", { now: t })
+      recordBackgroundShellRead(file, "ses_a", { offset: 10, limit: 1, now: t })
       pollBackgroundShells(t)
     }
     expect(notes).toEqual([])
-    recordBackgroundShellRead(file, "ses_a", { now: 1000 + MAX_HOLD_MS })
+    recordBackgroundShellRead(file, "ses_a", { offset: 10, limit: 1, now: 1000 + MAX_HOLD_MS })
     pollBackgroundShells(1000 + MAX_HOLD_MS)
     expect(notes).toHaveLength(1)
   })
@@ -282,19 +361,7 @@ describe("background shell notices", () => {
     expect(notes[0]!.resume).toBeUndefined()
   })
 
-  test("a plain log is done when its process is gone, without an exit code", () => {
-    const file = join(dir, "cursor-opencode-bg.ABC123")
-    writeFileSync(file, "building\nok\n")
-    watch(GONE_PID, file)
-    noteSessionExecution("ses_a", "succeeded")
-    pollBackgroundShells(1000)
-    expect(notes).toHaveLength(1)
-    expect(notes[0]!.text).toContain(`Background shell ${GONE_PID} has finished; its exit code was not recorded.`)
-    expect(notes[0]!.text).toContain("building\nok\n</shell>")
-    expect(notes[0]!.metadata.exit).toBeUndefined()
-  })
-
-  test("a runner gone without finishing its terminal file is reported after a grace period", () => {
+  test("a supervisor gone without finishing its record is reported after a grace period", () => {
     const file = terminalFile(GONE_PID, { output: "partial\n" })
     watch(GONE_PID, file)
     noteSessionExecution("ses_a", "succeeded")
@@ -323,7 +390,7 @@ describe("background shell notices", () => {
 
   test("escapes the command attribute", () => {
     const file = terminalFile(LIVE_PID, { status: "succeeded" })
-    watchBackgroundShell({ sessionID: "ses_a", pid: LIVE_PID, file, command: 'echo "a" <b>\nnext & more', notifier, now: 0 })
+    watchBackgroundShell({ sessionID: "ses_a", shellId: SHELL_ID, pid: LIVE_PID, file, command: 'echo "a" <b>\nnext & more', notifier, now: 0 })
     noteSessionExecution("ses_a", "succeeded")
     pollBackgroundShells(1000)
     expect(notes[0]!.text).toContain('command="echo &quot;a&quot; &lt;b>&#10;next &amp; more">')
@@ -335,7 +402,7 @@ describe("background shell notices", () => {
     const second: BackgroundShellNote[] = []
     const disposeFirst = registerBackgroundShellNotifier(async (note) => void first.push(note))
     const file = terminalFile(LIVE_PID, { status: "succeeded" })
-    watchBackgroundShell({ sessionID: "ses_a", pid: LIVE_PID, file, command: "x", notifier: async (note) => void first.push(note), now: 0 })
+    watchBackgroundShell({ sessionID: "ses_a", shellId: SHELL_ID, pid: LIVE_PID, file, command: "x", notifier: async (note) => void first.push(note), now: 0 })
     disposeFirst()
     noteSessionExecution("ses_a", "succeeded")
     pollBackgroundShells(1000)
@@ -363,11 +430,95 @@ describe("background shell notices", () => {
     }
     registerBackgroundShellNotifier(failing)
     const file = terminalFile(LIVE_PID, { status: "succeeded" })
-    watchBackgroundShell({ sessionID: "ses_a", pid: LIVE_PID, file, command: "x", notifier: failing, now: 0 })
+    watchBackgroundShell({ sessionID: "ses_a", shellId: SHELL_ID, pid: LIVE_PID, file, command: "x", notifier: failing, now: 0 })
     noteSessionExecution("ses_a", "succeeded")
     pollBackgroundShells(1000)
     await Promise.resolve()
     pollBackgroundShells(2000)
     expect(calls).toBe(1)
   })
+})
+
+describe("completion notes from supervised terminal records", () => {
+  const jobs: ManagedTerminal[] = []
+  afterEach(async () => {
+    for (const job of jobs.splice(0)) {
+      if (existsSync(join(job.directory, "done"))) continue
+      try { process.kill(Number(readFileSync(join(job.directory, "ready"), "utf8")), "SIGTERM") } catch { /* stopped */ }
+    }
+    resetCursorShellCalls()
+  })
+
+  async function run(callID: string, policy: CursorShellPolicy, metadata: Record<string, unknown>) {
+    runtimeLayout(dir, true)
+    const terminal = createManagedTerminal(policy, dir)
+    jobs.push(terminal)
+    registerCursorShellCall(callID, { ...metadata, managed_command: terminal.command, managed_job_directory: terminal.directory })
+    const proc = Bun.spawn(["/bin/sh", "-c", terminal.command], { stdout: "pipe", stderr: "pipe" })
+    const stdout = await new Response(proc.stdout).text()
+    await proc.exited
+    captureCursorShellResult(callID, stdout)
+    const outcome = capturedCursorShellOutcome(callID)
+    if (outcome?.kind !== "backgrounded" || !outcome.outputFile) throw new Error(`not backgrounded: ${stdout}`)
+    watchBackgroundShell({ sessionID: "ses_run", shellId: outcome.shellId, pid: outcome.pid, file: outcome.outputFile, command: outcome.command, notifier })
+    noteSessionExecution("ses_run", "succeeded")
+    return { terminal, outcome }
+  }
+
+  async function noteWithin(ms: number): Promise<BackgroundShellNote | undefined> {
+    const end = Date.now() + ms
+    while (notes.length === 0 && Date.now() < end) {
+      pollBackgroundShells()
+      await Bun.sleep(50)
+    }
+    return notes[0]
+  }
+
+  test("reports a background spawn's exit code and output", async () => {
+    const command = "sleep 0.3; printf 'a\\nb\\n'; exit 3"
+    const { terminal, outcome } = await run("cursor_note_spawn", {
+      command, workingDirectory: dir, timeoutMs: 0, timeoutBehavior: 0, backgroundSpawn: true,
+    }, { background_shell_spawn: true, command, working_directory: dir })
+    expect(outcome.outputFile).toBe(terminal.file)
+    const note = await noteWithin(8000)
+    expect(note?.text).toContain(`<shell id="${terminal.shellId}" state="completed" command="sleep 0.3; printf 'a\\nb\\n'; exit 3">`)
+    expect(note?.text).toMatch(new RegExp(`Background shell ${terminal.shellId} failed with exit code 3 after \\d+s\\.\\nIts output \\(also in [^)]+\\):\\na\\nb\\n</shell>`))
+    expect(note?.metadata.exit).toBe(3)
+  }, 15_000)
+
+  test("reports a soft-background command once it ends after its window", async () => {
+    const command = "printf 'start\\n'; sleep 1.2; printf 'end\\n'"
+    const { terminal } = await run("cursor_note_soft", {
+      command, workingDirectory: dir, timeoutMs: 300, timeoutBehavior: CURSOR_TIMEOUT_BACKGROUND,
+    }, { shell_stream: true, command, working_directory: dir, timeout_ms: 300, timeout_behavior: CURSOR_TIMEOUT_BACKGROUND })
+    const note = await noteWithin(8000)
+    expect(note?.text).toContain(`Background shell ${terminal.shellId} finished with exit code 0 after`)
+    expect(note?.text).toContain("start\nend\n</shell>")
+  }, 15_000)
+
+  test("reports a command stopped through its supervisor as cancelled", async () => {
+    const command = "printf 'start\\n'; sleep 30"
+    const { terminal, outcome } = await run("cursor_note_stop", {
+      command, workingDirectory: dir, timeoutMs: 0, timeoutBehavior: 0, backgroundSpawn: true,
+    }, { background_shell_spawn: true, command, working_directory: dir })
+    await Bun.sleep(300)
+    process.kill(outcome.pid, "SIGTERM")
+    const note = await noteWithin(8000)
+    expect(note?.text).toContain(`state="cancelled"`)
+    expect(note?.text).toContain(`Background shell ${terminal.shellId} was stopped after`)
+    expect(note?.text).toContain("(exit code 143)")
+  }, 15_000)
+
+  test("reports a killed supervisor's command as ended without an exit code", async () => {
+    const command = "printf 'start\\n'; sleep 30"
+    const { outcome } = await run("cursor_note_lost", {
+      command, workingDirectory: dir, timeoutMs: 0, timeoutBehavior: 0, backgroundSpawn: true,
+    }, { background_shell_spawn: true, command, working_directory: dir })
+    await Bun.sleep(300)
+    process.kill(outcome.pid, "SIGKILL")
+    const note = await noteWithin(RUNNER_GONE_GRACE_MS + 6000)
+    expect(note?.text).toContain(`state="error"`)
+    expect(note?.text).toContain("ended without reporting an exit code")
+    expect(note?.text).toContain("start")
+  }, 20_000)
 })

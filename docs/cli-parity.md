@@ -25,7 +25,7 @@ Parity target is interactive `cursor-agent` (`Run` client: TUI and `--print`). `
 |---|---|---|---|
 | read / write / edit / delete / grep / ls | Native | Native + OpenCode permission-aware read/write; edit via catalog-aware remap | ✅ |
 | apply_patch (edit/write substitution) | Native `apply_patch` exists | Synthesizes `apply_patch` envelopes when OpenCode 1.x drops edit/write | 🔶 (parity by design) |
-| shell (streaming, stdin, background, force-background, allowlist precheck) | Native pty | `shell_args` + `shell_stream` + `background_shell_spawn` (bash/nohup), with Cursor terminal files for background and timed-out shells; stdin / force-background / allowlist precheck unsupported | 🔶 |
+| shell (streaming, stdin, background, force-background, allowlist precheck) | Native pty | `shell_args` + `shell_stream` + `background_shell_spawn` (bash/nohup), with supervised terminal records for background and timed-out shells; stdin / force-background / allowlist precheck unsupported | 🔶 |
 | mcp, list_mcp_resources, read_mcp_resource, mcp_state | Native | MCP exec + provider-control variants | ✅ |
 | subagent, subagent_await | Full SubagentType oneof (computer_use, browser_use, explore, custom, bash, shell, vm_setup_helper, debug, cursor_guide, watch_video, media_review) + permission modes | subagent bridged to OpenCode `task`; subtype set limited to what OpenCode advertises; await unsupported | 🔶 |
 | request_context | Native | provider-control | ✅ |

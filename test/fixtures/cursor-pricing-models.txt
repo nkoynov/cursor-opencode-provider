@@ -33,6 +33,7 @@ gemini-3.5-flash
 gemini-3.6-flash
 gemini-3.7-flash
 gemini-3.8-flash
+gemini-4-argon
 glm-5.2
 glm-5.3
 glm-5.3-flash

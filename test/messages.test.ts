@@ -270,6 +270,43 @@ describe("canonical read-result wire fields", () => {
   })
 })
 
+describe("canonical shell request and refusal result wire fields", () => {
+  const text = (value: string) => [value.length, ...Buffer.from(value)]
+
+  it("decodes ShellArgs description from canonical field 15", () => {
+    const decoded = decodeMessage<Record<string, unknown>>("ShellArgs", Uint8Array.from([
+      0x0a, ...text("ls"), // command #1
+      0x68, 0x01, // timeout_behavior #13 = 1
+      0x70, 0xe8, 0x07, // hard_timeout #14 = 1000
+      0x7a, ...text("List files"), // description #15
+    ]))
+    expect(decoded.command).toBe("ls")
+    expect(decoded.timeout_behavior).toBe(1)
+    expect(decoded.hard_timeout).toBe(1000)
+    expect(decoded.description).toBe("List files")
+  })
+
+  const rejected = [0x0a, ...text("/f"), 0x12, ...text("no")] // path #1, reason #2
+  it.each([
+    ["ReadResult", { rejected: { path: "/f", reason: "no" } }, [0x1a, rejected.length, ...rejected]], // rejected #3
+    ["WriteResult", { rejected: { path: "/f", reason: "no" } }, [0x32, rejected.length, ...rejected]], // rejected #6
+    ["DeleteResult", { rejected: { path: "/f", reason: "no" } }, [0x32, rejected.length, ...rejected]], // rejected #6
+    ["LsResult", { rejected: { path: "/f", reason: "no" } }, [0x1a, rejected.length, ...rejected]], // rejected #3
+    // permission_denied #4 { path #1, client_visible_error #2, is_readonly #3 }
+    ["DeleteResult", { permission_denied: { path: "/f", client_visible_error: "no", is_readonly: true } },
+      [0x22, 10, 0x0a, ...text("/f"), 0x12, ...text("no"), 0x18, 0x01]],
+    // permission_denied #7 { command #1, working_directory #2, error #3 }
+    ["ShellResult", { permission_denied: { command: "ls", working_directory: "/w", error: "no" } },
+      [0x3a, 12, 0x0a, ...text("ls"), 0x12, ...text("/w"), 0x1a, ...text("no")]],
+    // rejected #3 { reason #1, is_readonly #2 }
+    ["McpResult", { rejected: { reason: "no", is_readonly: true } }, [0x1a, 6, 0x0a, ...text("no"), 0x10, 0x01]],
+    // permission_denied #4 { error #1, is_readonly #2 }
+    ["McpResult", { permission_denied: { error: "no", is_readonly: true } }, [0x22, 6, 0x0a, ...text("no"), 0x10, 0x01]],
+  ])("encodes %s %j on its canonical fields", (type, value, expected) => {
+    expect(Array.from(encodeMessage(type, value))).toEqual(expected)
+  })
+})
+
 describe("MCP image result wire fields", () => {
   it("encodes an image item as McpToolResultContentItem #2 McpImageContent{data #1, mime_type #2}", () => {
     const bytes = encodeMessage("McpToolResultContentItem", {

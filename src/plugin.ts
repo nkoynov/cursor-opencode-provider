@@ -17,6 +17,7 @@ import {
 } from "./auth-renewal.js"
 import { CursorAuthError } from "./errors.js"
 import { errorMessage, trace } from "./debug.js"
+import { normalizeClassicInterruptedResults } from "./classic-tool-results.js"
 import { readCache, discoverModels, isCacheFresh } from "./models.js"
 import { modelsToConfig } from "./model-config.js"
 import { loadClassicTools } from "./classic-tools.js"
@@ -27,10 +28,12 @@ import {
   captureCursorShellResult,
   cursorShellEnvForCall,
   cursorShellOriginalCommand,
+  cursorShellTimeoutMs,
   prepareCursorShellArgs,
   releaseCursorShellEnv,
   sanitizeRegisteredCursorShellOutput,
   setCursorShellPath,
+  resolveCursorShellPath,
 } from "./shell-timeout.js"
 import { applyHostPromptEvent, sessionActivity } from "./activity.js"
 import { dispatchHostEventBridge } from "./host-event-bridge.js"
@@ -351,6 +354,9 @@ export async function CursorPlugin(input: PluginInput): Promise<Hooks> {
           if (part.type === "tool") {
             if (part.state.status === "running") sessionActivity.toolStarted(part.sessionID, part.callID)
             else if (part.state.status === "completed" || part.state.status === "error") sessionActivity.toolEnded(part.callID)
+            // Rejection/abort can stop the classic host before a continuation or
+            // execute.after. Its persisted tool state is still authoritative.
+            if (part.state.status === "error") releaseCursorShellEnv(part.callID)
           }
           break
         }
@@ -366,12 +372,21 @@ export async function CursorPlugin(input: PluginInput): Promise<Hooks> {
       })
     },
 
+    async "experimental.chat.messages.transform"(_hookInput, output) {
+      // The classic host retains the original array and discards hook output.
+      // Replace entries with request-only clones, preserving array identity.
+      const normalized = normalizeClassicInterruptedResults(output.messages)
+      for (let index = 0; index < output.messages.length; index++) output.messages[index] = normalized[index]
+    },
+
     async "tool.execute.before"(hookInput, output) {
       if (hookInput.tool !== "bash") return
       // bash/zsh retain the original display/permission command and wrap via
-      // shell.env. sh/dash need a short wrapper-file command because their
+      // shell.env. sh/dash disclose the managed launcher inline because their
       // non-interactive `-c` path ignores BASH_ENV / ZDOTDIR.
-      prepareCursorShellArgs(hookInput.callID, output.args as Record<string, unknown>)
+      prepareCursorShellArgs(hookInput.callID, output.args as Record<string, unknown>, {
+        shellPath: resolveCursorShellPath(undefined, input.directory),
+      })
     },
 
     async "shell.env"(hookInput, output) {
@@ -396,6 +411,10 @@ export async function CursorPlugin(input: PluginInput): Promise<Hooks> {
           if (typeof metadata.output === "string") {
             metadata.output = sanitizeRegisteredCursorShellOutput(hookInput.callID, metadata.output)
           }
+          // The stored output keeps only a display notice, and the saved
+          // outcome does not survive consumption or a restart.
+          const timeoutMs = cursorShellTimeoutMs(hookInput.callID)
+          if (timeoutMs !== undefined) metadata.cursorShellTimeoutMs = timeoutMs
         }
       } finally {
         releaseCursorShellEnv(hookInput.callID)
@@ -433,7 +452,7 @@ export async function CursorPlugin(input: PluginInput): Promise<Hooks> {
     },
 
     async config(cfg: Config) {
-      setCursorShellPath((cfg as Config & { shell?: string }).shell)
+      setCursorShellPath((cfg as Config & { shell?: string }).shell, input.directory)
       cfg.provider ??= {}
       const models = await loadModels()
       const existing = cfg.provider[CURSOR_PROVIDER_ID]

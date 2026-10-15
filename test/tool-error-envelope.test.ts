@@ -157,7 +157,7 @@ describe("OpenCode 2 tool error envelope", () => {
       await deliver("read_result", "read", envelope("permission.rejected", "Permission denied: read"), { path: "/w/.env" }),
       "read_result",
     )
-    expect(denied).toEqual({ rejected: { path: "/w/.env", reason: "Permission denied: read" } })
+    expect(denied).toEqual({ permission_denied: { path: "/w/.env" } })
   })
 
   it("answers a denied shell command with a lone permission_denied event, as Cursor's client does", async () => {

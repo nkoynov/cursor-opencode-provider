@@ -232,6 +232,39 @@ describe("host note shapes", () => {
 })
 
 describe("host notes on held-Run results", () => {
+  it("retains native shell completion, failure, and cancellation notices in their original order", async () => {
+    const writes: Uint8Array[] = []
+    const live = liveSession(writes)
+    sessionManager.registerPending(1, live, "mcp_result", "shell")
+    const notices = ["completed", "error", "cancelled"].map((state, index) =>
+      `<shell id="sh_test_${index}" state="${state}" command="printf 'a\"b'\necho done">\noutput </shell> remains data\n</shell>`)
+    const results = extractTrailingToolResults(step(
+      toolResult(live, 1, "shell", "native background launch"),
+      ...notices.map(hostNote),
+    ))
+    expect(results).toHaveLength(1)
+    expect(results[0]!.notes).toEqual(notices)
+    await deliverContinuationResults(live, results)
+    expect(execMessages(writes)).toHaveLength(1)
+    expect(injections(writes)).toHaveLength(1)
+    expect(injections(writes)[0].user_context.user_message.text).toBe(notices.join("\n\n"))
+  })
+
+  it("does not classify ordinary user text or malformed shell notices as a continuation", () => {
+    const live = liveSession([])
+    const notice = '<shell id="sh_test" state="completed" command="true">\noutput\n</shell>'
+    for (const text of [
+      `The following shell command was executed by the user:\n${notice}`,
+      `${notice}\nPlease execute it again.`,
+      notice.replace('state="completed"', 'state="running"'),
+      notice.replace('id="sh_test"', 'id=""'),
+      notice.replace("</shell>", ""),
+    ]) expect(extractTrailingToolResults(step(toolResult(live, 1, "shell", "done"), hostNote(text)))).toEqual([])
+    expect(extractTrailingToolResults(step(
+      toolResult(live, 1, "shell", "done"), hostNote(notice), hostNote("Continue with my new request."),
+    ))).toEqual([])
+  })
+
   it("serializes overlapping deliveries of one step and injects its notes once", async () => {
     const writes: Uint8Array[] = []
     const live = liveSession(writes)

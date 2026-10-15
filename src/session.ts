@@ -1,5 +1,6 @@
 import type { BidiStream, BidiTerminalEvent } from "./transport/connect.js"
 import { trace } from "./debug.js"
+import { releaseUnstartedTerminal } from "./terminal-runner.js"
 import { CursorProtocolError, type CursorProviderError } from "./errors.js"
 import { StreamWriteDrainError, writeStreamMessage } from "./stream-write.js"
 import { sessionActivity, type SessionActivitySource } from "./activity.js"
@@ -960,7 +961,9 @@ export class SessionManager {
     session.terminalUnsubscribe?.()
     session.terminalUnsubscribe = null
     session.deferredTerminalReason = null
-    for (const id of session.pending.keys()) {
+    for (const [id, pending] of session.pending) {
+      const directory = pending.resultMetadata?.managed_job_directory
+      if (typeof directory === "string") releaseUnstartedTerminal(directory)
       const key = this.key(session.sessionId, id)
       this.byExecId.delete(key)
       if (this.isTerminalReason(reason)) this.putTombstone(key, reason)

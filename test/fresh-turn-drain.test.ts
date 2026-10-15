@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
+import { bindConversationId } from "../src/protocol/conversation-bind.js"
 import {
   cancelPendingExecsForFreshTurn,
   drainSessionUntilTurnEnded,
@@ -302,6 +306,66 @@ describe("in-session helper catalog isolation", () => {
     expect(reads).toBe(1)
     expect(session.closed).toBe(false)
     sessionManager.close(session, "ordinary-cleanup")
+  })
+
+  it("keeps draining a cancelled turn past a new exec until an uncheckpointed turn_ended", async () => {
+    const text = encodeMessage("AgentServerMessage", { interaction_update: { text_delta: { text: "no" } } })
+    const exec = encodeMessage("AgentServerMessage", { exec_server_message: { id: 9, read_args: { path: "/x" } } })
+    const session = fakeSessionWithPayloads([text, exec, turnEndedPayload(10, 8)])
+    sessionManager.registerPending(1, session, "read_result", "read", false)
+    expect(await preparePriorSessionForFreshTurn(session.openCodeSessionId, { timeoutMs: 1_000 })).toBe("settled-only")
+    sessionManager.close(session, "ordinary-cleanup")
+  })
+
+  it("keeps a cancelled turn when saving its checkpoint fails", async () => {
+    const checkpoint = encodeMessage("AgentServerMessage", {
+      conversation_checkpoint_update: Uint8Array.from([1, 2, 3]),
+    })
+    const session = fakeSessionWithPayloads([checkpoint])
+    const next = session.frames.next.bind(session.frames)
+    let ended = false
+    session.frames = {
+      next: async () => {
+        const frame = await next()
+        if (!frame.done) return frame
+        if (ended) return { done: true as const, value: undefined }
+        ended = true
+        return {
+          done: false as const,
+          value: {
+            flags: 0x02,
+            payload: new TextEncoder().encode(JSON.stringify({ error: { code: "canceled" } })),
+          },
+        }
+      },
+    } as never
+    session.conversationId = bindConversationId(session.openCodeSessionId).conversationId
+    const blocker = path.join(os.tmpdir(), `cursor-cache-file-${process.pid}-${Date.now()}`)
+    fs.writeFileSync(blocker, "not-a-directory")
+    session.cacheDir = blocker
+    try {
+      expect(await drainSessionUntilTurnEnded(session, {
+        timeoutMs: 1_000,
+        cancelReason: "host_new_user_turn",
+      })).toBe("cancelled")
+    } finally {
+      fs.rmSync(blocker, { force: true })
+      sessionManager.close(session, "ordinary-cleanup")
+    }
+  })
+
+  it("finishes the drain when the terminal checkpoint cannot be saved", async () => {
+    const session = fakeSessionWithPayloads([turnEndedPayload(10, 8)])
+    session.conversationId = bindConversationId(session.openCodeSessionId).conversationId
+    const blocker = path.join(os.tmpdir(), `cursor-cache-file-${process.pid}-${Date.now()}`)
+    fs.writeFileSync(blocker, "not-a-directory")
+    session.cacheDir = blocker
+    try {
+      expect(await drainSessionUntilTurnEnded(session, { timeoutMs: 1_000 })).toBe("turn-ended")
+    } finally {
+      fs.rmSync(blocker, { force: true })
+      sessionManager.close(session, "ordinary-cleanup")
+    }
   })
 
   it("stops draining when Cursor starts a new tool", async () => {

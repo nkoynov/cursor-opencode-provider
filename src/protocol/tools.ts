@@ -23,13 +23,8 @@ import {
 import {
   BACKGROUND_SHELL_MARKER,
   buildBackgroundShellCommand,
-  CURSOR_TIMEOUT_BACKGROUND,
-  openTerminalFile,
-  terminalTargetMetadata,
   type CursorShellOutcome,
-  type CursorTerminalTarget,
 } from "../shell-timeout.js"
-import type { HostToolRefusal } from "../tool-error-envelope.js"
 import { normalizeOpencodeQuestionArgs } from "./ask-question.js"
 import { normalizeOpencodeTodoArgs } from "../todo-store.js"
 
@@ -907,156 +902,6 @@ export function appendTaskAttachments(
   parsed.args.prompt = `${prompt}\n\nAttached files (open them with your file tools):\n${paths.join("\n")}`
 }
 
-const TERMINAL_TAIL_BYTES = 1024 * 1024
-const TERMINAL_READ_CHUNK_BYTES = 1024 * 1024
-
-/**
- * A Cursor terminal file. One past the read size limit (a long-lived dev
- * server) keeps its header and its latest output, which is what AwaitShell
- * and the model look for, instead of failing over to OpenCode's read tool.
- * One that does not exist (yet) is `file_not_found`, as polling expects.
- */
-export async function buildTerminalFileReadMessages(
-  execId: number,
-  sourcePath: string,
-  resultPath = sourcePath,
-  range: { offset?: number; limit?: number } = {},
-): Promise<Uint8Array[] | undefined> {
-  let fd: number
-  try {
-    // One descriptor for check and read: a separate check could be raced by swapping in a link out of the folder.
-    fd = openTerminalFile(sourcePath)
-  } catch (error) {
-    return (error as { code?: string }).code === "ENOENT"
-      ? buildReadRejectionMessages(execId, { file_not_found: { path: resultPath } })
-      : undefined
-  }
-  try {
-    const stat = fs.fstatSync(fd)
-    // The runner creates each terminal file by rename and never links it, so a second link leads outside the folder.
-    if (!stat.isFile() || stat.nlink !== 1) return undefined
-    // A running command keeps appending; describe the file as of this stat.
-    const whole = stat.size <= MAX_EDIT_SOURCE_BYTES
-    if (whole || range.offset !== undefined || range.limit !== undefined) {
-      const start = Math.max(0, (range.offset ?? 1) - 1)
-      const end = range.limit !== undefined ? start + range.limit : Infinity
-      const scan = await scanTerminalFile(fd, stat.size, start, end, whole ? Infinity : TERMINAL_TAIL_BYTES)
-      const notice = scan.cutInLine === undefined
-        ? ""
-        : `\n\n[Partial read: the content above stops at the ${TERMINAL_TAIL_BYTES}-byte limit, inside line ${scan.cutInLine}. ` +
-          "It is NOT the complete range requested.]"
-      return encodeLocalReadSuccess(execId, {
-        path: resultPath,
-        content: scan.content + notice,
-        total_lines: scan.lines,
-        file_size: stat.size,
-        truncated: scan.cutInLine !== undefined,
-        range_applied: readRangeApplied(range, scan.lines),
-      })
-    }
-    const { lines } = await scanTerminalFile(fd, stat.size, Infinity, Infinity, 0)
-    const slice = async (position: number, length: number): Promise<Buffer> => {
-      const buffer = Buffer.alloc(length)
-      return buffer.subarray(0, await readAt(fd, buffer, length, position))
-    }
-    // Header fields are quoted onto one line each, but a command or title can run to hundreds of KiB.
-    const headWindow = await slice(0, TERMINAL_TAIL_BYTES)
-    const headEnd = headWindow.subarray(0, 4).toString("utf8") === "---\n" ? headWindow.indexOf("\n---\n", 3) : -1
-    const head = headEnd === -1 ? "" : headWindow.subarray(0, headEnd + 5).toString("utf8")
-    const tailWindow = await slice(stat.size - TERMINAL_TAIL_BYTES, TERMINAL_TAIL_BYTES)
-    let skip = 0
-    while (skip < 3 && (tailWindow[skip]! & 0xc0) === 0x80) skip++
-    const tail = tailWindow.subarray(skip).toString("utf8")
-    const omitted = stat.size - Buffer.byteLength(head) - (tailWindow.length - skip)
-    return encodeLocalReadSuccess(execId, {
-      path: resultPath,
-      content: `${head}[${omitted} bytes of earlier output omitted]\n${tail}`,
-      total_lines: lines,
-      file_size: stat.size,
-      truncated: true,
-      range_applied: false,
-    })
-  } catch {
-    return undefined
-  } finally {
-    fs.closeSync(fd)
-  }
-}
-
-function readAt(fd: number, buffer: Buffer, length: number, position: number): Promise<number> {
-  return new Promise((resolve, reject) => {
-    fs.read(fd, buffer, 0, length, position, (error, read) => (error ? reject(error) : resolve(read)))
-  })
-}
-
-/**
- * One pass over a terminal file's first `size` bytes: its line count (as {@link countLines}
- * counts them), and lines `[start, end)` (0-based), at most `maxBytes` of them. `cutInLine` is
- * the 1-based line the byte limit stopped in. It reads asynchronously, chunk by chunk, so a
- * large file never holds up other Runs' streams.
- */
-async function scanTerminalFile(
-  fd: number,
-  size: number,
-  start: number,
-  end: number,
-  maxBytes: number,
-): Promise<{ lines: number; content: string; cutInLine?: number }> {
-  const chunk = Buffer.alloc(Math.min(size, TERMINAL_READ_CHUNK_BYTES))
-  const parts: Buffer[] = []
-  let taken = 0
-  let cutInLine: number | undefined
-  // Copies chunk[from, to), which starts in 0-based line `line`.
-  const take = (from: number, to: number, line: number): void => {
-    if (cutInLine !== undefined) return
-    const cut = Math.min(to, from + (maxBytes - taken))
-    parts.push(Buffer.from(chunk.subarray(from, cut)))
-    taken += cut - from
-    if (cut === to) return
-    for (let i = from; i < cut; i++) if (chunk[i] === 0x0a) line++
-    cutInLine = line + 1
-  }
-  let newlines = 0
-  let position = 0
-  while (position < size) {
-    const read = await readAt(fd, chunk, Math.min(chunk.length, size - position), position)
-    if (read === 0) break
-    let from = newlines >= start && newlines < end ? 0 : -1
-    let fromLine = newlines
-    // A byte loop: `indexOf` per newline is many times slower on short lines.
-    for (let i = 0; i < read; i++) {
-      if (chunk[i] !== 0x0a) continue
-      newlines++
-      if (newlines === start && start < end) {
-        from = i + 1
-        fromLine = newlines
-      } else if (newlines === end && from !== -1) {
-        take(from, i + 1, fromLine)
-        from = -1
-      }
-    }
-    if (from !== -1 && from < read) take(from, read, fromLine)
-    position += read
-  }
-  const content = Buffer.concat(parts)
-  return {
-    lines: position === 0 ? 0 : newlines + 1,
-    content: (cutInLine === undefined ? content : withoutCutCharacter(content)).toString("utf8"),
-    ...(cutInLine !== undefined ? { cutInLine } : {}),
-  }
-}
-
-/** `bytes` without a UTF-8 character the byte limit cut short at its end. */
-function withoutCutCharacter(bytes: Buffer): Buffer {
-  for (let back = 1; back <= Math.min(4, bytes.length); back++) {
-    const byte = bytes[bytes.length - back]!
-    if ((byte & 0xc0) === 0x80) continue
-    const length = byte >= 0xf0 ? 4 : byte >= 0xe0 ? 3 : byte >= 0xc0 ? 2 : 1
-    return length > back ? bytes.subarray(0, bytes.length - back) : bytes
-  }
-  return bytes
-}
-
 function encodeLocalReadSuccess(execId: number, success: Record<string, unknown>): Uint8Array[] {
   return [
     encodeMessage("AgentClientMessage", {
@@ -1391,27 +1236,10 @@ export function rejectPartialReadMutation(parsed: ParsedExecRequest): void {
       : "Read the remaining file ranges, then use a targeted edit or Update File patch.")
 }
 
-/** Session facts some exec mappings need. */
-export type ExecParseContext = {
-  /** The `terminals_folder` advertised to Cursor; backgrounded shells write their terminal files there. */
-  terminalsFolder?: string
-  workspaceRoot?: string
-}
-
 export function parseExecServerMessage(
   msg: Record<string, unknown>,
   dialect: HostToolDialect = OPENCODE_1_TOOL_DIALECT,
-  context: ExecParseContext = {},
 ): ParsedExecRequest | undefined {
-  const terminalTarget = (workingDirectory: string, description?: string): CursorTerminalTarget | undefined =>
-    context.terminalsFolder
-      ? {
-          folder: context.terminalsFolder,
-          cwd: workingDirectory || context.workspaceRoot || "",
-          ...(description?.trim() ? { title: description } : {}),
-        }
-      : undefined
-
   const id = msg.id as number | undefined
   if (id === undefined) return undefined
 
@@ -1440,9 +1268,8 @@ export function parseExecServerMessage(
     const raw = (msg.background_shell_spawn_args as Record<string, unknown>) ?? {}
     const command = str(raw.command)
     const workingDirectory = str(raw.working_directory) ?? ""
-    const terminal = terminalTarget(workingDirectory, str(raw.description))
     const args: Record<string, unknown> = {}
-    if (command) args.command = buildBackgroundShellCommand(command, terminal)
+    if (command) args.command = buildBackgroundShellCommand(command)
     if (workingDirectory) args.workdir = workingDirectory
     return {
       id,
@@ -1454,7 +1281,7 @@ export function parseExecServerMessage(
         background_shell_spawn: true,
         command: command ?? "",
         working_directory: workingDirectory,
-        ...terminalTargetMetadata(terminal),
+        ...(str(raw.description) ? { description: str(raw.description) } : {}),
       },
       localError:
         raw.enable_write_shell_stdin_tool === true
@@ -1555,7 +1382,7 @@ export function parseExecServerMessage(
   )
   const rawArgs = (msg[execVariant] as Record<string, unknown>) ?? {}
   const resultMetadata = execVariant === "shell_stream_args" || execVariant === "shell_args"
-    ? shellStreamResultMetadata(rawArgs, terminalTarget)
+    ? shellStreamResultMetadata(rawArgs)
     : execVariant === "read_args" || execVariant === "pi_read_args"
       ? readRequestResultMetadata(rawArgs, mapped.args)
       : execVariant === "write_args" || execVariant === "pi_write_args"
@@ -1597,14 +1424,10 @@ export function parseExecServerMessage(
   }
 }
 
-function shellStreamResultMetadata(
-  raw: Record<string, unknown>,
-  terminalTarget: (workingDirectory: string, description?: string) => CursorTerminalTarget | undefined,
-): Record<string, unknown> {
+function shellStreamResultMetadata(raw: Record<string, unknown>): Record<string, unknown> {
   const timeout = num(raw.timeout) ?? 0
   const timeoutBehavior = num(raw.timeout_behavior) ?? 0
   const hardTimeout = num(raw.hard_timeout)
-  const workingDirectory = str(raw.working_directory) ?? ""
   // Cursor CLI: a nonzero timeout is used verbatim. A zero foreground timeout
   // defaults to 30s; zero with background/hard-timeout semantics means an
   // immediate soft handoff governed by the separate hard deadline.
@@ -1614,13 +1437,11 @@ function shellStreamResultMetadata(
   return {
     shell_stream: true,
     command: str(raw.command) ?? "",
-    working_directory: workingDirectory,
+    ...(str(raw.description) ? { description: str(raw.description) } : {}),
+    working_directory: str(raw.working_directory) ?? "",
     timeout_ms: effectiveTimeout,
     timeout_behavior: timeoutBehavior,
     ...(hardTimeout !== undefined && hardTimeout > 0 ? { hard_timeout_ms: hardTimeout } : {}),
-    ...(timeoutBehavior === CURSOR_TIMEOUT_BACKGROUND
-      ? terminalTargetMetadata(terminalTarget(workingDirectory, str(raw.description)))
-      : {}),
   }
 }
 
@@ -1733,6 +1554,8 @@ export function mapCursorArgsToOpencode(
       if (workdir) args.workdir = workdir
       const timeout = num(cleaned.timeout)
       if (timeout !== undefined) args.timeout = timeout
+      // The model only sends this when the host's advertised shell schema has
+      // it (OpenCode 2); the host then owns the background job and its notice.
       if (cleaned.background === true) args.background = true
       return { toolName: dialect.shellTool, args }
     }
@@ -2070,6 +1893,9 @@ export type ToolResultInput = {
   resultField: string
   output: string
   error?: string
+  /** The host refused the call before running it; `error` holds the reason. */
+  refusal?: "permission_denied" | "rejected"
+  interrupted?: boolean
   executionTimeMs?: number
   /**
    * Resolved opencode tool name (read/write/grep/…). Gates read-envelope
@@ -2090,8 +1916,6 @@ export type ToolResultInput = {
   workspaceRoot?: string
   /** Images the host tool returned; see `execResultImages` for which results carry them. */
   images?: readonly CursorImageInput[]
-  /** The host refused the call before running it; `error` holds the reason. */
-  refusal?: HostToolRefusal
 }
 
 /**
@@ -2122,18 +1946,21 @@ function mcpImageItems(images: readonly CursorImageInput[]): Array<Record<string
  * shell execs hang on heartbeats forever).
  */
 export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
+  if (input.error === "") return buildExecClientMessages({ ...input, error: "OpenCode tool execution failed" })
   const resultField = input.resultField || "mcp_result"
   const frames: Uint8Array[] = []
 
-  if (resultField === "shell_stream" && input.refusal && input.error) {
+  const refused = refusedExecResult(input)
+  if (resultField === "shell_stream" && refused) {
     // Cursor's own client answers a refused command with this one event: no start, no exit.
-    frames.push(encodeShellStream(input.execId, undefined, shellRefusal(input.refusal, input.error, input.resultMetadata)))
+    frames.push(encodeShellStream(input.execId, input.executionTimeMs, refused))
   } else if (resultField === "shell_stream") {
     // Real clients always emit Start → Stdout/Stderr* → Exit (capture/tests).
     frames.push(encodeShellStream(input.execId, undefined, { start: {} }))
     if (input.error) {
       frames.push(encodeShellStream(input.execId, undefined, { stderr: { data: input.error } }))
-      frames.push(encodeShellStream(input.execId, input.executionTimeMs, { exit: { code: 1, aborted: false } }))
+      frames.push(encodeShellStream(input.execId, input.executionTimeMs, { exit: input.interrupted || input.shellOutcome?.kind === "aborted"
+        ? { code: 0, aborted: true, abort_reason: 1 } : { code: 1, aborted: false } }))
     } else {
       if (input.output) {
         frames.push(encodeShellStream(input.execId, undefined, { stdout: { data: input.output } }))
@@ -2154,6 +1981,10 @@ export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
           // Native CLI represents timeout structurally. ShellAbortReason.TIMEOUT=2.
           exit: { code: 0, aborted: true, abort_reason: 2 },
         }))
+      } else if (input.shellOutcome?.kind === "aborted") {
+        frames.push(encodeShellStream(input.execId, input.executionTimeMs, {
+          exit: { code: 0, aborted: true, abort_reason: 1 },
+        }))
       } else {
         const exitCode = input.shellOutcome?.kind === "exit"
           ? Math.max(0, Math.min(0xffff_ffff, input.shellOutcome.code))
@@ -2168,7 +1999,7 @@ export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
       id: input.execId,
       local_execution_time_ms: input.executionTimeMs ?? 0,
     }
-    const typed = refusedExecResult(resultField, input) ?? buildTypedExecResult(
+    clientMsg[resultField] = refused ?? buildTypedExecResult(
       resultField,
       input.output,
       input.error,
@@ -2178,7 +2009,10 @@ export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
       input.workspaceRoot,
       execResultImages(resultField, input.images),
     )
-    clientMsg[resultField] = typed
+    if ((input.interrupted || input.shellOutcome?.kind === "aborted") && resultField === "shell_result") {
+      const failure = (clientMsg[resultField] as { failure?: { aborted: boolean; exit_code: number } }).failure
+      if (failure) { failure.aborted = true; failure.exit_code = 0 }
+    }
     frames.push(
       encodeMessage("AgentClientMessage", {
         exec_client_message: clientMsg,
@@ -2243,6 +2077,37 @@ export function buildExecStreamClose(execId: number): Uint8Array {
       stream_close: { id: execId },
     },
   })
+}
+
+/** Refusal oneofs verified against the extracted agent.v1 protocol. */
+function refusedExecResult(input: ToolResultInput): Record<string, unknown> | undefined {
+  if (!input.refusal || !input.error) return undefined
+  const denied = input.refusal === "permission_denied"
+  const reason = input.error
+  const requested = str(input.resultMetadata?.path) ?? ""
+  const filePath = requested && input.workspaceRoot && !isUriReadTarget(requested)
+    ? resolveReadTargetPath(requested, input.workspaceRoot) : requested
+  const command = str(input.resultMetadata?.command) ?? ""
+  const working_directory = str(input.resultMetadata?.working_directory) ?? ""
+  switch (input.resultField) {
+    case "shell_stream": case "shell_result": case "background_shell_spawn_result":
+      return denied ? { permission_denied: { command, working_directory, error: reason } }
+        : { rejected: { command, working_directory, reason } }
+    case "write_result":
+      return denied ? { permission_denied: { path: filePath, directory: filePath ? path.dirname(filePath) : "", operation: "write", error: reason, is_readonly: false } }
+        : { rejected: { path: filePath, reason } }
+    case "read_result":
+      return denied ? { permission_denied: { path: filePath } } : { rejected: { path: filePath, reason } }
+    case "ls_result": return { rejected: { path: filePath, reason } }
+    case "delete_result":
+      return denied ? { permission_denied: { path: filePath, client_visible_error: reason, is_readonly: false } }
+        : { rejected: { path: filePath, reason } }
+    case "mcp_result":
+      return denied ? { permission_denied: { error: reason, is_readonly: false } }
+        : { rejected: { reason, is_readonly: false } }
+    case "pi_write_result": case "pi_edit_result": return { rejected: { reason } }
+    default: return undefined
+  }
 }
 
 export function buildUnsupportedExecDeny(input: {
@@ -3091,60 +2956,6 @@ export function unwrapReadOutput(output: string): string {
   return raw.join("\n")
 }
 
-function shellRefusal(
-  refusal: HostToolRefusal,
-  reason: string,
-  resultMetadata: Record<string, unknown> | undefined,
-): Record<string, unknown> {
-  const command = str(resultMetadata?.command) ?? ""
-  const workingDirectory = str(resultMetadata?.working_directory) ?? ""
-  return refusal === "permission_denied"
-    ? { permission_denied: { command, working_directory: workingDirectory, error: reason } }
-    : { rejected: { command, working_directory: workingDirectory, reason } }
-}
-
-// The refusal arm Cursor's own executors answer a blocked call with; results without one keep their `error` arm.
-function refusedExecResult(resultField: string, input: ToolResultInput): Record<string, unknown> | undefined {
-  const { refusal, error: reason, resultMetadata } = input
-  if (!refusal || !reason) return undefined
-  const denied = refusal === "permission_denied"
-  const filePath = resolveToolPath(str(resultMetadata?.path) ?? "", toolResultRoot(input.workspaceRoot))
-  switch (resultField) {
-    case "shell_result":
-    case "background_shell_spawn_result":
-      return shellRefusal(refusal, reason, resultMetadata)
-    case "write_result":
-      return denied
-        ? {
-            permission_denied: {
-              path: filePath,
-              directory: filePath ? path.dirname(filePath) : "",
-              operation: "write",
-              error: reason,
-              is_readonly: false,
-            },
-          }
-        : { rejected: { path: filePath, reason } }
-    // ReadPermissionDenied and LsResult carry no message, so both refusals keep the reason here.
-    case "read_result":
-    case "ls_result":
-      return { rejected: { path: filePath, reason } }
-    case "delete_result":
-      return denied
-        ? { permission_denied: { path: filePath, client_visible_error: reason, is_readonly: false } }
-        : { rejected: { path: filePath, reason } }
-    case "mcp_result":
-      return denied
-        ? { permission_denied: { error: reason, is_readonly: false } }
-        : { rejected: { reason, is_readonly: false } }
-    case "pi_write_result":
-    case "pi_edit_result":
-      return { rejected: { reason } }
-    default:
-      return undefined
-  }
-}
-
 function toolResultRoot(workspaceRoot: string | undefined): string | undefined {
   const trimmedRoot = typeof workspaceRoot === "string" ? workspaceRoot.trim() : ""
   // A posix process must not turn `C:/…` or `\\server\…` into `<cwd>/C:/…`.
@@ -3188,6 +2999,7 @@ export function buildTypedExecResult(
   workspaceRoot?: string,
   images: readonly CursorImageInput[] = [],
 ): Record<string, unknown> {
+  if (error === "") error = "OpenCode tool execution failed"
   // Prefer the session workspace; never advertise the host process cwd (daemon
   // often starts in $HOME) as the path Cursor shows the model for glob/ls.
   const resultRoot = toolResultRoot(workspaceRoot)
@@ -3337,15 +3149,15 @@ export function buildTypedExecResult(
     case "shell_result": {
       const command = str(resultMetadata?.command) ?? ""
       const workingDirectory = str(resultMetadata?.working_directory) ?? ""
-      if (error) {
+      if (error || shellOutcome?.kind === "aborted") {
         return {
           failure: {
             command,
             working_directory: workingDirectory,
-            exit_code: 1,
+            exit_code: shellOutcome?.kind === "aborted" ? 0 : 1,
             stdout: output || "",
-            stderr: error,
-            aborted: false,
+            stderr: error || "Shell execution interrupted",
+            aborted: shellOutcome?.kind === "aborted",
           },
         }
       }
@@ -3401,11 +3213,11 @@ export function buildTypedExecResult(
     }
     case "delete_result":
       if (error) return { error: { path: resolveToolPath(str(resultMetadata?.path) ?? "", resultRoot), error } }
-      return { success: { path: "", deleted_file: "" } }
+      return { success: { path: resolveToolPath(str(resultMetadata?.path) ?? "", resultRoot), deleted_file: "" } }
     case "background_shell_spawn_result": {
       const command = str(resultMetadata?.command) ?? ""
       const workingDirectory = str(resultMetadata?.working_directory) ?? ""
-      if (error) return { error: { command, working_directory: workingDirectory, error } }
+      if (error || shellOutcome?.kind === "aborted") return { error: { command, working_directory: workingDirectory, error: error || "Shell execution interrupted" } }
       // Prefer the structured outcome captured by the plugin after-hook; markers
       // are already stripped from the stored/rendered OpenCode output by then.
       if (shellOutcome?.kind === "backgrounded") {
@@ -3419,8 +3231,10 @@ export function buildTypedExecResult(
         }
       }
       // Fallback when no plugin hook ran: parse the private spawn marker inline.
-      const match = new RegExp(`${BACKGROUND_SHELL_MARKER}(\\d+):([^\\r\\n]+)`).exec(output)
-      const pid = match ? Number(match[1]) : 0
+      // A managed spawn reports `shell-id:pid:file`; the unmanaged wrapper `pid:file`.
+      const match = new RegExp(`${BACKGROUND_SHELL_MARKER}(\\d+):(?:(\\d+):)?([^\\r\\n]+)`).exec(output)
+      const shellId = match ? Number(match[1]) : 0
+      const pid = match ? Number(match[2] || match[1]) : 0
       if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 0xffff_ffff) {
         return {
           error: {
@@ -3432,7 +3246,7 @@ export function buildTypedExecResult(
       }
       return {
         success: {
-          shell_id: pid,
+          shell_id: shellId,
           command,
           working_directory: workingDirectory,
           pid,

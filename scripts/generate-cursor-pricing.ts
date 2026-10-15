@@ -77,6 +77,7 @@ const DISPLAY_NAME_TO_MODEL_ID: Record<string, string> = {
   "Gemini 3.6 Flash": "gemini-3.6-flash",
   "Gemini 3.7 Flash": "gemini-3.7-flash",
   "Gemini 3.8 Flash": "gemini-3.8-flash",
+  "Gemini 4 Argon": "gemini-4-argon",
   "GLM 5.2": "glm-5.2",
   "GLM 5.3": "glm-5.3",
   "GLM 5.3 Flash": "glm-5.3-flash",
@@ -108,6 +109,8 @@ const SKIP_DISPLAY_NAMES = new Set([
   "Claude Opus 4.7 (fast mode)",
   "Gemini 3 Pro",
   "Gemini 3 Pro Image Preview",
+  // Auto-review classifier only; not selectable as a chat/agent model.
+  "Gemini 3.5 Flash Lite",
   "GPT-5",
   "GPT-5 Fast",
   "GPT-5-Codex",
