@@ -39,7 +39,7 @@
  * - OpenCode 2.0 (`packages/core`) keeps the gate under a new name. The tool is
  *   `patch` (still `{ patchText }`, same envelope format), and
  *   `tool/plugin/patch.ts` applies the same model-id predicate in its session
- *   `context`/`generate` hooks, deleting `edit` and `write` for GPT models and
+ *   `context`/`compaction`/`generate` hooks, deleting `edit` and `write` for GPT models and
  *   `patch` for everyone else. Both names are recognised here; which one the
  *   host offers is read from the advertised set rather than a version check.
  *
@@ -73,8 +73,11 @@
  * - Every payload line is prefixed with `+`, `-`, or a space, and the parser
  *   only breaks on *unprefixed* `***` / `@@`. Content lines that themselves
  *   begin with `***` or `@@` therefore survive a round trip unharmed.
- * - `Add File` content is rejoined with `\n` and normalized to exactly one
- *   trailing newline. A write of content with no trailing newline gains one.
+ * - `Add File` content is rejoined with `\n`; the tool appends a final newline
+ *   only when nonempty content lacks one. Keep the trailing empty payload line
+ *   so blank lines survive. Nonempty unterminated content cannot round-trip.
+ * - OpenCode 2's `patch` parser strips a trailing `\r` from every payload
+ *   line, unlike 1.x `apply_patch`. Refuse that lossy encoding on `patch`.
  * - Update chunks match **whole lines** via `seekSequence`, unlike OpenCode
  *   `edit`, which is substring-based. Substring edits must be expanded to line
  *   boundaries before they can be expressed as a patch — see `planSubstringEdit`.
@@ -113,20 +116,42 @@ export type UpdateChunk = {
  * Whole-file write as `*** Add File:`. Valid whether or not the target exists —
  * OpenCode's add case overwrites unconditionally.
  */
-export function buildAddFilePatch(filePath: string, content: string): string {
-  const lines = splitLines(content)
+export function buildAddFilePatch(filePath: string, content: string, tool: HostPatchTool = APPLY_PATCH_TOOL): string {
+  assertPatchPath(filePath)
+  assertPatchText(content, tool)
+  if (content.startsWith("\uFEFF\uFEFF")) throw new Error("the patch tool cannot preserve repeated leading byte-order marks")
+  if (content && !content.endsWith("\n")) throw new Error("the patch tool cannot preserve content without a final newline")
+  const lines = content.split("\n")
   return [BEGIN, `*** Add File: ${filePath}`, ...lines.map((line) => `+${line}`), END].join("\n")
 }
 
 /** Targeted replacement as `*** Update File:` with one `@@` chunk per change. */
-export function buildUpdateFilePatch(filePath: string, chunks: UpdateChunk[]): string {
+export function buildUpdateFilePatch(filePath: string, chunks: UpdateChunk[], tool: HostPatchTool = APPLY_PATCH_TOOL): string {
+  assertPatchPath(filePath)
   const body: string[] = []
   for (const chunk of chunks) {
     body.push("@@")
-    for (const line of chunk.oldLines) body.push(`-${line}`)
-    for (const line of chunk.newLines) body.push(`+${line}`)
+    for (const [prefix, lines] of [["-", chunk.oldLines], ["+", chunk.newLines]] as const) {
+      for (const line of lines) {
+        if (line.includes("\n")) throw new Error("a patch payload line contains a newline")
+        assertPatchText(line, tool)
+        body.push(`${prefix}${line}`)
+      }
+    }
   }
   return [BEGIN, `*** Update File: ${filePath}`, ...body, END].join("\n")
+}
+
+function assertPatchPath(filePath: string): void {
+  if (!filePath || filePath.trim() !== filePath || /[\0\r\n]/.test(filePath)) {
+    throw new Error("the target path cannot be represented exactly in a patch header")
+  }
+}
+
+function assertPatchText(text: string, tool: HostPatchTool): void {
+  if (tool === PATCH_TOOL && /\r(?:\n|$)/.test(text)) {
+    throw new Error("the patch tool strips carriage returns from line endings; this content cannot be preserved")
+  }
 }
 
 export type SubstringEditPlan =
@@ -160,6 +185,14 @@ export function planSubstringEdit(
     }
   }
 
+  const target = replaceAll ? source.replaceAll(oldString, () => newString) : source.replace(oldString, () => newString)
+  if (target.startsWith("\uFEFF\uFEFF") || (source.startsWith("\uFEFF") && !target.startsWith("\uFEFF"))) {
+    return { ok: false, reason: "the patch tool preserves one leading byte-order mark; this replacement cannot be preserved" }
+  }
+  if (target && !target.endsWith("\n")) {
+    return { ok: false, reason: "the patch tool cannot preserve content without a final newline" }
+  }
+
   const targets = replaceAll ? offsets : offsets.slice(0, 1)
   const chunks: UpdateChunk[] = []
   let previousEnd = -1
@@ -175,24 +208,23 @@ export function planSubstringEdit(
 
     const before = source.slice(start, offset)
     const after = source.slice(offset + oldString.length, end)
-    chunks.push({
-      oldLines: splitLines(source.slice(start, end)),
-      newLines: splitLines(before + newString + after),
-    })
+    const oldLines = source.slice(start, end).split("\n")
+    // The host removes one final source terminator before matching. Interior
+    // empty lines are real context; stripping them deletes blank lines.
+    if (end === source.length && oldLines.at(-1) === "") oldLines.pop()
+    chunks.push({ oldLines, newLines: (before + newString + after).split("\n") })
+  }
+  // The host also removes one terminator before applying updates, then adds it
+  // back only when the last line is nonempty. Restore an untouched blank tail
+  // explicitly; an EOF replacement already carries its complete terminator.
+  if (previousEnd < source.length && (target === "\n" || target.endsWith("\n\n"))) {
+    chunks.push({ oldLines: [], newLines: [""] })
   }
   return { ok: true, chunks }
 }
 
-/**
- * Split into patch payload lines. A trailing newline is dropped so it is not
- * emitted as a spurious empty line — OpenCode re-adds exactly one on apply.
- */
-function splitLines(text: string): string[] {
-  const normalized = text.endsWith("\n") ? text.slice(0, -1) : text
-  return normalized.split("\n")
-}
-
 function lineStart(source: string, offset: number): number {
+  if (offset === 0) return 0
   const at = source.lastIndexOf("\n", offset - 1)
   return at === -1 ? 0 : at + 1
 }

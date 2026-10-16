@@ -4321,9 +4321,9 @@ export async function pump(
       !displayCallId ||
       parsed.resultField !== "read_result" ||
       parsed.toolName !== "read" ||
-      // The patch tool is the substitute this host offers when it withholds
-      // `write` — the follow-up write_args is remapped onto it either way.
-      !(advertisedToolNameSet.has("write") || hostPatchTool(advertisedToolNameSet))
+      // The follow-up write_args can be a targeted edit even when write is
+      // withheld. Every permitted mutation route needs the complete read.
+      !(fileToolNames().has("edit") || fileToolNames().has("write") || hostPatchTool(fileToolNames()))
     ) return false
 
     const stored = session.displayToolCalls.get(displayCallId)

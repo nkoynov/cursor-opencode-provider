@@ -4,7 +4,7 @@ import path from "node:path"
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { deliverContinuationResults, pump, pumpWithRecovery, resetTurnStateForTests } from "../src/language-model.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
-import { OPENCODE_2_TOOL_DIALECT, toolsToDescriptors } from "../src/protocol/tools.js"
+import { OPENCODE_1_TOOL_DIALECT, OPENCODE_2_TOOL_DIALECT, toolsToDescriptors } from "../src/protocol/tools.js"
 import { sessionManager, type Frame } from "../src/session.js"
 import { sessionFixture } from "./session-fixture.js"
 
@@ -194,16 +194,17 @@ describe("parallel tool-call pump", () => {
     }
   })
 
-  it.each([
-    ["gpt", "new", "patch", (target: string) => ({ patchText: `*** Begin Patch\n*** Add File: ${target}\n+created\n*** End Patch` })],
-    ["gpt", "existing", "patch", (target: string) => ({ patchText: `*** Begin Patch\n*** Update File: ${target}\n@@\n-before\n+created\n*** End Patch` })],
-    ["opus", "new", "write", (target: string) => ({ path: target, content: "created\n" })],
-    ["opus", "existing", "edit", (target: string) => ({ path: target, oldString: "before\n", newString: "created\n" })],
-    ["opus-then-gpt", "new", "patch", (target: string) => ({ patchText: `*** Begin Patch\n*** Add File: ${target}\n+created\n*** End Patch` })],
-    ["opus-then-gpt", "existing", "patch", (target: string) => ({ patchText: `*** Begin Patch\n*** Update File: ${target}\n@@\n-before\n+created\n*** End Patch` })],
-  ] as const)("sends an OpenCode 2 %s edit_tool_call (%s file) to `%s`", async (model, file, toolName, input) => {
+  const fileToolHosts = [
+    { host: "OpenCode 1.x", dialect: OPENCODE_1_TOOL_DIALECT, shell: "bash", patchTool: "apply_patch", pathKey: "filePath" },
+    { host: "OpenCode 2", dialect: OPENCODE_2_TOOL_DIALECT, shell: "shell", patchTool: "patch", pathKey: "path" },
+  ] as const
+  const fileToolCases = fileToolHosts.flatMap(host => (
+    ["gpt", "opus", "opus-then-gpt"] as const
+  ).flatMap(model => (["new", "existing"] as const).map(file => [host.host, model, file, host] as const)))
+
+  it.each(fileToolCases)("%s: sends a %s edit_tool_call (%s file) to the host file tool", async (_name, model, file, host) => {
     const existing = file === "existing"
-    const root = fs.mkdtempSync("/tmp/cursor-oc2-patch-")
+    const root = fs.mkdtempSync("/tmp/cursor-patch-tool-")
     const target = path.join(root, "target.txt")
     if (existing) fs.writeFileSync(target, "before\n")
     const { session, writes } = fixture([
@@ -214,8 +215,8 @@ describe("parallel tool-call pump", () => {
       frame({ exec_server_message: { id: 2, write_args: { path: target, file_text: "created\n", tool_call_id: "edit" } } }),
       ended(),
     ])
-    const base = [{ name: "shell", description: "Shell" }, { name: "read", description: "Read" }]
-    const patchTool = { name: "patch", description: "Patch" }
+    const base = [{ name: host.shell, description: "Shell" }, { name: "read", description: "Read" }]
+    const patchTool = { name: host.patchTool, description: "Patch" }
     const editTools = [{ name: "edit", description: "Edit" }, { name: "write", description: "Write" }]
     // After a model switch the epoch catalog keeps every tool seen; only this turn's host list drops edit/write.
     const tools = model === "gpt" ? [...base, patchTool]
@@ -224,14 +225,24 @@ describe("parallel tool-call pump", () => {
     session.toolCatalog = tools
     session.toolDescriptors = toolsToDescriptors(tools, "opencode")
     session.permittedToolNames = new Set((model === "opus" ? [...base, ...editTools] : [...base, patchTool]).map(t => t.name))
-    session.hostToolDialect = OPENCODE_2_TOOL_DIALECT
+    session.hostToolDialect = host.dialect
     session.requestContext.env = { workspace_paths: [root] }
+    const expected = model !== "opus"
+      ? {
+        toolName: host.patchTool,
+        input: { patchText: existing
+          ? `*** Begin Patch\n*** Update File: ${target}\n@@\n-before\n+created\n+\n*** End Patch`
+          : `*** Begin Patch\n*** Add File: ${target}\n+created\n+\n*** End Patch` },
+      }
+      : existing
+        ? { toolName: "edit", input: { [host.pathKey]: target, oldString: "before\n", newString: "created\n" } }
+        : { toolName: "write", input: { [host.pathKey]: target, content: "created\n" } }
     try {
       const { parts, controller } = collect()
       await pump(session, controller, ids)
       const calls = toolCalls(parts)
-      expect(calls.map(p => p.toolName)).toEqual([toolName])
-      expect(JSON.parse((calls[0] as { input: string }).input)).toEqual(input(target))
+      expect(calls.map(p => p.toolName)).toEqual([expected.toolName])
+      expect(JSON.parse((calls[0] as { input: string }).input)).toEqual(expected.input)
       const replies = writes.map(frame => decodeMessage<any>("AgentClientMessage", frame).exec_client_message)
       expect(replies.some(message => message?.write_result?.error)).toBe(false)
       expect(replies.find(message => message?.read_result)?.read_result.success.content).toBe(existing ? "before\n" : "")
@@ -239,6 +250,125 @@ describe("parallel tool-call pump", () => {
       fs.rmSync(root, { recursive: true, force: true })
     }
   })
+
+  it.each(fileToolHosts.map(host => [host.host, host] as const))(
+    "%s: preserves CRLF intent when Cursor returns an LF-only correlated write",
+    async (_name, host) => {
+      const root = fs.mkdtempSync("/tmp/cursor-crlf-edit-")
+      const target = path.join(root, "target.txt")
+      const source = "one\r\ntwo\r\nthree\r\n"
+      fs.writeFileSync(target, source)
+      const { session, writes } = fixture([
+        frame({ interaction_update: { tool_call_started: {
+          call_id: "edit", tool_call: { edit_tool_call: { args: { path: target } } },
+        } } }),
+        frame({ exec_server_message: { id: 1, read_args: { path: target, tool_call_id: "edit" } } }),
+        frame({ exec_server_message: { id: 2, write_args: {
+          path: target, file_text: "one\nTWO\nthree\n", tool_call_id: "edit",
+        } } }),
+        ended(),
+      ])
+      const tools = [{ name: "read" }, { name: host.patchTool }]
+      session.toolCatalog = tools
+      session.toolDescriptors = toolsToDescriptors(tools, "opencode")
+      session.permittedToolNames = new Set(tools.map(tool => tool.name))
+      session.hostToolDialect = host.dialect
+      session.requestContext.env = { workspace_paths: [root] }
+      try {
+        const { parts, controller } = collect()
+        await pump(session, controller, ids)
+        const replies = writes.map(bytes => decodeMessage<any>("AgentClientMessage", bytes).exec_client_message)
+        expect(replies.find(message => message?.read_result)?.read_result.success.content).toBe(source)
+        if (host.patchTool === "patch") {
+          expect(toolCalls(parts)).toHaveLength(0)
+          expect(replies.find(message => message?.write_result)?.write_result.error.error)
+            .toContain("carriage return")
+        } else {
+          const calls = toolCalls(parts)
+          expect(calls.map(call => call.toolName)).toEqual(["apply_patch"])
+          expect(JSON.parse(calls[0]!.input).patchText).toContain("+TWO\r\n")
+          expect(replies.some(message => message?.write_result?.error)).toBe(false)
+        }
+        expect(fs.readFileSync(target, "utf8")).toBe(source)
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it.each(fileToolHosts.map(host => [host.host, host] as const))(
+    "%s: completes a large private read when only edit remains permitted",
+    async (_name, host) => {
+      const root = fs.mkdtempSync("/tmp/cursor-edit-only-")
+      const target = path.join(root, "large.txt")
+      const source = "original content\n".repeat(5000)
+      const desired = source.replace("original content", "changed content")
+      fs.writeFileSync(target, source)
+      const { session, writes } = fixture([
+        frame({ interaction_update: { tool_call_started: {
+          call_id: "edit", tool_call: { edit_tool_call: { args: { path: target } } },
+        } } }),
+        frame({ exec_server_message: { id: 1, read_args: { path: target, tool_call_id: "edit" } } }),
+        frame({ exec_server_message: { id: 2, write_args: { path: target, file_text: desired, tool_call_id: "edit" } } }),
+        ended(),
+      ])
+      const tools = [{ name: "read" }, { name: "edit" }, { name: "write" }]
+      session.toolCatalog = tools
+      session.toolDescriptors = toolsToDescriptors(tools, "opencode")
+      session.permittedToolNames = new Set(["read", "edit"])
+      session.hostToolDialect = host.dialect
+      session.requestContext.env = { workspace_paths: [root] }
+      try {
+        const { parts, controller } = collect()
+        await pump(session, controller, ids)
+        const calls = toolCalls(parts)
+        expect(calls.map(call => call.toolName)).toEqual(["edit"])
+        const input = JSON.parse(calls[0]!.input)
+        expect(input[host.pathKey]).toBe(target)
+        expect(source.replace(input.oldString, input.newString)).toBe(desired)
+        const read = writes.map(bytes => decodeMessage<any>("AgentClientMessage", bytes).exec_client_message)
+          .find(message => message?.read_result)?.read_result.success
+        expect(read.content).toBe(source)
+        expect(read.truncated).toBe(false)
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it.each(fileToolHosts.map(host => [host.host, host] as const))(
+    "%s: leaves an edit read to the host read tool when no file tool is permitted this turn",
+    async (_name, host) => {
+      const root = fs.mkdtempSync("/tmp/cursor-patch-tool-")
+      const target = path.join(root, "target.txt")
+      fs.writeFileSync(target, "before\n")
+      const { session, writes } = fixture([
+        frame({ interaction_update: { tool_call_started: {
+          call_id: "edit", tool_call: { edit_tool_call: { args: { path: target } } },
+        } } }),
+        frame({ exec_server_message: { id: 1, read_args: { path: target, tool_call_id: "edit" } } }),
+      ])
+      const base = [{ name: host.shell, description: "Shell" }, { name: "read", description: "Read" }]
+      const tools = [...base, { name: "edit", description: "Edit" }, { name: "write", description: "Write" },
+        { name: host.patchTool, description: "Patch" }]
+      session.toolCatalog = tools
+      session.toolDescriptors = toolsToDescriptors(tools, "opencode")
+      session.permittedToolNames = new Set(base.map(t => t.name))
+      session.hostToolDialect = host.dialect
+      session.requestContext.env = { workspace_paths: [root] }
+      try {
+        const { parts, controller } = collect()
+        await pump(session, controller, ids)
+        const calls = toolCalls(parts)
+        expect(calls.map(p => p.toolName)).toEqual(["read"])
+        expect(JSON.parse((calls[0] as { input: string }).input)).toMatchObject({ [host.pathKey]: target })
+        const replies = writes.map(frame => decodeMessage<any>("AgentClientMessage", frame).exec_client_message)
+        expect(replies.some(message => message?.read_result)).toBe(false)
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    },
+  )
 
   it("includes a display-only todo mirror in the same host step", async () => {
     const tool_call = { update_todos_tool_call: { args: {

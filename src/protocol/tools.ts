@@ -1046,6 +1046,60 @@ export function remapCorrelatedEditWriteForCatalog(
   return true
 }
 
+/** Preserve file endings for direct dynamic patch calls as well as native edits. */
+function preserveDirectPatchLineEndings(parsed: ParsedExecRequest, workspaceRoot?: string): void {
+  const patchText = stringValue(parsed.args.patchText)
+  if (patchText === undefined) return
+  try {
+    if (parsed.toolName === "patch" && /\r(?:\n|$)/.test(patchText)) {
+      throw new Error("the patch tool strips carriage returns from line endings; this content cannot be preserved")
+    }
+    const lines = patchText.split("\n")
+    let crlf = false
+    for (let index = 0; index < lines.length; index++) {
+      const line = lines[index]!
+      if (line.startsWith("*** Update File:")) {
+        crlf = false
+        const target = path.resolve(workspaceRoot ?? process.cwd(), line.slice("*** Update File:".length).trim())
+        let source: string
+        try {
+          const stat = fs.statSync(target)
+          // Let the host report missing targets and wrong file kinds normally.
+          if (!stat.isFile()) continue
+          if (stat.size > MAX_EDIT_SOURCE_BYTES) {
+            throw new Error("the target file is too large to inspect safely for patch newline preservation")
+          }
+          source = fs.readFileSync(target, "utf8")
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code) continue
+          throw error
+        }
+        if (source && !source.endsWith("\n")) {
+          throw new Error("the patch tool cannot safely update content without a final newline")
+        }
+        crlf = source.includes("\r\n")
+        if (!crlf) continue
+        if (parsed.toolName === "patch") {
+          throw new Error("the patch tool strips carriage returns from line endings; the source content cannot be preserved")
+        }
+        if (/(^|[^\r])\n/.test(source)) {
+          throw new Error("direct patch context has mixed line endings; use a Cursor-native targeted edit to preserve them")
+        }
+      } else if (line.startsWith("***") && !line.startsWith("*** Move to:")) {
+        crlf = false
+      } else if (crlf && /^[ +\-]/.test(line)) {
+        // Context is copied into the result by the host, so it needs the same
+        // CRLF restoration as additions. File headers and Add File stay exact.
+        lines[index] = `${line.replace(/\r$/, "")}\r`
+      }
+    }
+    parsed.args.patchText = lines.join("\n")
+  } catch (error) {
+    parsed.args = {}
+    parsed.localError = `Cursor ${parsed.toolName} request cannot preserve file contents: ${error instanceof Error ? error.message : String(error)}.`
+  }
+}
+
 /**
  * Express a native Cursor write/edit as a patch call when the host swapped the
  * edit-tool family out from under us.
@@ -1066,13 +1120,17 @@ export function remapEditToolsForCatalog(
   advertisedToolNames: Iterable<string>,
   workspaceRoot?: string,
 ): void {
+  const advertised = new Set(advertisedToolNames)
+  if (isHostPatchTool(parsed.toolName)) {
+    if (advertised.has(parsed.toolName)) preserveDirectPatchLineEndings(parsed, workspaceRoot)
+    return
+  }
   if (parsed.toolName !== "write" && parsed.toolName !== "edit") return
   // Patch envelopes are text. A binary write has no patch form at all,
   // so it must stay a write and reach the byte-preserving path — converting it
   // here would drop the bytes and report a patch-translation failure instead of
   // the image Cursor asked to save.
   if (binaryWritePayload(parsed)) return
-  const advertised = new Set(advertisedToolNames)
   const patchTool = hostPatchTool(advertised)
   if (advertised.has(parsed.toolName) || !patchTool) return
 
@@ -1082,7 +1140,7 @@ export function remapEditToolsForCatalog(
     parsed.toolName = patchTool
     parsed.args = {}
     parsed.localError =
-      `Cursor ${requested} request cannot be expressed as a ${patchTool} call: ${reason}. ` +
+      `Cursor ${requested} request cannot be expressed as a call to \`${patchTool}\`: ${reason}. ` +
       `The host advertises \`${patchTool}\` instead of \`edit\`/\`write\` for this model.`
   }
 
@@ -1092,51 +1150,73 @@ export function remapEditToolsForCatalog(
   }
 
   let patchText: string
-  if (requested === "write") {
-    const content = stringValue(parsed.args.content)
-    if (content === undefined) {
-      refuse("no file content was provided")
-      return
-    }
-    // `*** Add File:` overwrites an existing target, so a whole-file write maps
-    // directly without reading the current contents or diffing.
-    patchText = buildAddFilePatch(filePath, content)
-  } else {
-    const oldString = stringValue(parsed.args.oldString)
-    const newString = stringValue(parsed.args.newString)
-    if (oldString === undefined || newString === undefined) {
-      refuse("the replacement is missing its old or new text")
-      return
-    }
-    // A patch matches whole lines, so a substring edit has to be widened to
-    // the lines it touches — which requires the file the model is editing.
-    const absolute = path.resolve(workspaceRoot ?? process.cwd(), filePath)
-    let source: string
-    try {
-      // Bounded because this read is synchronous on the Run pump. Cursor's own
-      // executor uses the same 50 MB threshold before reading a file it is
-      // about to write.
-      const size = fs.statSync(absolute).size
-      if (size > MAX_EDIT_SOURCE_BYTES) {
-        refuse(`the target file is ${Math.round(size / 1024 / 1024)} MB, too large to patch`)
+  try {
+    if (requested === "write") {
+      const content = stringValue(parsed.args.content)
+      if (content === undefined) {
+        refuse("no file content was provided")
         return
       }
-      source = fs.readFileSync(absolute, "utf8")
-    } catch (e) {
-      refuse(`the target file could not be read (${(e as Error).message})`)
-      return
+      // `*** Add File:` overwrites an existing target, so a whole-file write maps
+      // directly without reading the current contents or diffing.
+      patchText = buildAddFilePatch(filePath, content, patchTool)
+    } else {
+      const oldString = stringValue(parsed.args.oldString)
+      const newString = stringValue(parsed.args.newString)
+      if (oldString === undefined || newString === undefined) {
+        refuse("the replacement is missing its old or new text")
+        return
+      }
+      // A patch matches whole lines, so a substring edit has to be widened to
+      // the lines it touches — which requires the file the model is editing.
+      const absolute = path.resolve(workspaceRoot ?? process.cwd(), filePath)
+      let source: string
+      try {
+        // Bounded because this read is synchronous on the Run pump. Cursor's own
+        // executor uses the same 50 MB threshold before reading a file it is
+        // about to write.
+        const stat = fs.statSync(absolute)
+        if (!stat.isFile()) {
+          refuse("the target is not a regular file")
+          return
+        }
+        const size = stat.size
+        if (size > MAX_EDIT_SOURCE_BYTES) {
+          refuse(`the target file is ${Math.round(size / 1024 / 1024)} MB, too large to patch`)
+          return
+        }
+        source = fs.readFileSync(absolute, "utf8")
+      } catch (e) {
+        refuse(`the target file could not be read (${(e as Error).message})`)
+        return
+      }
+      if (patchTool === "patch" && /\r(?:\n|$)/.test(source)) {
+        refuse("the patch tool strips carriage returns from line endings; the source content cannot be preserved")
+        return
+      }
+      // Preserve native edit semantics rather than Cursor's whole-file wire
+      // representation. OpenCode 1.x normalizes both edit arguments to the
+      // source's newline convention; Cursor may send LF even after reading CRLF.
+      // https://github.com/anomalyco/opencode/blob/v1.19.1/packages/opencode/src/tool/edit.ts
+      const lineEnding = source.includes("\r\n") ? "\r\n" : "\n"
+      const editText = (value: string): string => patchTool === "apply_patch"
+        ? value.replace(/\r\n/g, "\n").replace(/\n/g, lineEnding)
+        : value
+      const plan = planSubstringEdit(
+        source,
+        editText(oldString),
+        editText(newString),
+        parsed.args.replaceAll === true,
+      )
+      if (!plan.ok) {
+        refuse(plan.reason)
+        return
+      }
+      patchText = buildUpdateFilePatch(filePath, plan.chunks, patchTool)
     }
-    const plan = planSubstringEdit(
-      source,
-      oldString,
-      newString,
-      parsed.args.replaceAll === true,
-    )
-    if (!plan.ok) {
-      refuse(plan.reason)
-      return
-    }
-    patchText = buildUpdateFilePatch(filePath, plan.chunks)
+  } catch (error) {
+    refuse(error instanceof Error ? error.message : String(error))
+    return
   }
 
   parsed.toolName = patchTool

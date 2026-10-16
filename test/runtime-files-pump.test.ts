@@ -82,11 +82,22 @@ for (const host of [1, 2] as const) describe(`OpenCode ${host} runtime pump`, ()
   })
 
   it("keeps workspace mutations on the host permission path", async () => {
-    const f = fixture(host, [frame({ exec_server_message: { id: 1, write_args: { path: path.join(workspace, "file.txt"), file_text: "user content" } } })])
+    const f = fixture(host, [frame({ exec_server_message: { id: 1, write_args: { path: path.join(workspace, "file.txt"), file_text: "user content\n" } } })])
     await pump(f.session, f.controller, ids)
     expect(calls(f.parts)).toHaveLength(1)
     expect(calls(f.parts)[0]!.toolName).toBe("apply_patch")
     expect(fs.existsSync(path.join(workspace, "file.txt"))).toBe(false)
+  })
+
+  it("returns a typed refusal instead of changing an unterminated workspace write", async () => {
+    const file = path.join(workspace, "file.txt")
+    const f = fixture(host, [frame({ exec_server_message: { id: 1, write_args: {
+      path: file, file_text: "user content",
+    } } }), ended()])
+    await pump(f.session, f.controller, ids)
+    expect(calls(f.parts)).toHaveLength(0)
+    expect(messages(f.writes)[0].exec_client_message.write_result.error.error).toContain("final newline")
+    expect(fs.existsSync(file)).toBe(false)
   })
 
   it("serves dynamic canonical reads of metadata without host permission prompts", async () => {

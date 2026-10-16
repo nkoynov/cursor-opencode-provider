@@ -390,17 +390,21 @@ If this guidance causes issues, update `buildOpenCodeInteractionGuidance` in [`s
 
 Cursor's legacy `edit_tool_call` is implemented internally as a correlated `read_args` followed by a whole-file `write_args`; the write is transport mechanics, not a new decision to replace OpenCode's `edit` tool. For regular files inside the workspace, the provider answers that private prerequisite read directly with the complete file (up to Cursor's own 50 MB edit limit), because routing it through OpenCode's ordinary 50 KB-capped `read` tool makes Cursor calculate a truncated replacement. This shortcut is restricted to the exact path named by the active edit call and rejects symlink escapes. External paths first take OpenCode's permission-aware read path; after that exact read succeeds, the provider upgrades its private result to complete content so an explicitly authorized external edit does not inherit OpenCode's preview cap.
 
-The provider retains the correlation and exposes the resulting existing-file mutation as one unique, line-bounded OpenCode `edit`. It still returns Cursor's expected typed `write_result`. New-file creation remains a `write`, and an `apply_patch`-only catalog receives the same targeted change as an `*** Update File:` patch.
+The provider retains the correlation and exposes the resulting existing-file mutation as one unique, line-bounded OpenCode `edit`, including turns that permit `edit` but withhold `write`. It still returns Cursor's expected typed `write_result`. New-file creation remains a `write`, and a patch-only catalog receives the same targeted change as an `*** Update File:` patch.
 
 Ordinary complete native reads also preserve an existing final LF/CRLF. OpenCode's numbered read envelope cannot represent that terminator, and dropping it made exact edit matching fail. This restoration applies only to confirmed-complete, unbounded reads; paged and capped reads keep their existing truncation behavior.
 
 ### `apply_patch` models (GPT-5 and friends)
 
-OpenCode 1.x does not simply add `apply_patch` for GPT-series models — it **removes** `edit` and `write` from the tool catalog and advertises `apply_patch` in their place (`ToolRegistry.tools`; the model id must contain `gpt-` and neither `oss` nor `gpt-4`). Cursor keeps sending its native write/edit requests regardless, so without translation every file change on a `gpt-5*` model is refused as an unavailable tool.
+OpenCode replaces `edit` and `write` with a patch tool for GPT-series models: `apply_patch` on 1.x and `patch` on 2.0. Cursor keeps sending native write/edit requests, so the provider translates them using the tools permitted on the current turn, including after a model switch.
 
-The provider translates transparently: an uncorrelated native write becomes an `*** Add File:` patch, while a correlated legacy edit or Pi edit becomes a minimal `*** Update File:` chunk widened to whole lines. This is keyed purely off what the host advertises — it is inert whenever `edit`/`write` are offered normally, and inert again when the host offers neither those nor `apply_patch`. An edit that cannot be expressed faithfully (target unreadable, or the text to replace is absent or ambiguous) is refused with a specific message rather than applied to the wrong region.
+An uncorrelated write becomes `*** Add File:`; a correlated legacy edit or Pi edit becomes a targeted `*** Update File:` patch. Blank lines and representable line endings are preserved. Native `edit`/`write` calls stay unchanged when those tools are permitted.
 
-OpenCode 2.0 does not perform this substitution, so the path is 1.x-only in practice. See [`src/protocol/apply-patch.ts`](src/protocol/apply-patch.ts) for the upstream references.
+Conversions that cannot preserve the requested operation return a specific error before a host mutation is emitted. These include paths containing newlines or trimmed whitespace, unreadable or ambiguous edits, and nonempty content without a final newline.
+
+On 1.x, translated edits normalize their old/new text to the existing file's LF/CRLF convention, matching native `edit` even when Cursor sends an LF-only correlated write. Direct `apply_patch` updates also restore CRLF in context and added lines. Direct updates of mixed-ending or unterminated files are refused when their bytes cannot be safely preserved; use a Cursor-native targeted edit for mixed-ending files. Intentional whole-file writes and `*** Add File:` payloads keep the requested line endings.
+
+OpenCode 2's parser strips CRLF carriage returns, so both native conversions and direct `patch` calls that would lose them are refused. See [`src/protocol/apply-patch.ts`](src/protocol/apply-patch.ts) for host-source references.
 
 ### Native subagent routing
 

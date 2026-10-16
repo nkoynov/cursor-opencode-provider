@@ -304,7 +304,17 @@ it supersedes. Cite tests and symbols rather than line numbers, which drift.
 - **A translation needs compatible semantics, not similar names.** Decline a
   bridge that would turn a read into a replacement write, lose merge state,
   substitute a search term for a URL, or invent a structured choice from a
-  boolean.
+  boolean. Patch synthesis must round-trip paths and file bytes through the
+  actual executor: 2.0's parser strips CRLF carriage returns while 1.x retains
+  them, and removing an empty payload line loses a real blank line. Parser
+  support alone does not preserve edit semantics: Cursor can return LF-only
+  whole-file content after a CRLF read. Match native edit's normalization of
+  old/new arguments to the source convention, while leaving explicit writes
+  alone. Test that wire mismatch, not only CRLF-in/CRLF-out. Also exercise
+  direct dynamic patch calls: `mcp_result` bypasses the native `write_result`
+  translation, and copied context lines can change endings too. Reject
+  unrepresentable inputs and verify decoded contents, not only patch strings
+  (`test/apply-patch.test.ts`).
 - **A completed display event is not authority to execute.** Mirror only
   self-contained final UI state; data, answers, side effects and failures need
   a request/reply channel.
@@ -367,7 +377,8 @@ it supersedes. Cite tests and symbols rather than line numbers, which drift.
   `edit_tool_call`, `read_args`, then `write_args`. Answer a correlated
   missing target's read as an empty file, satisfy the private read with
   complete content, and translate only the correlated whole-file write back to
-  a targeted host edit.
+  a targeted host edit. Permitted `edit` alone is enough for that prerequisite
+  read; requiring `write` broke edit-only turns (`test/parallel-pump.test.ts`).
 - **Check that a fallback in a dispatch path is reachable.** A display bridge
   gated on a small variant allowlist never saw the variant its fallback
   handled.
@@ -701,7 +712,10 @@ it supersedes. Cite tests and symbols rather than line numbers, which drift.
 - **Capture per-test state before awaiting in a shared `afterEach`.** A hook
   timeout otherwise deletes the next test's files. Clear installed host-agent
   switches after each fixture, because Bun's file order differs across
-  filesystems (`test/switch-mode.test.ts`).
+  filesystems (`test/switch-mode.test.ts`). Restore the cache override after a
+  fixture calls `createCursor({ cacheDir })`; the interrupt test left it pinned
+  and made 15 later plugin tests read the wrong model cache
+  (`test/host-interrupt.test.ts`, `test/plugin.test.ts`).
 - **Choose fixtures that fail the same way for every user.** A permission-mode
   fixture does not fail under root; a malformed Git index does
   (`test/workspace-facts.test.ts`).
