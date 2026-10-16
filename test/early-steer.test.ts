@@ -301,8 +301,16 @@ function readStep(call: { toolCallId: string; input: string }, file: string, ste
 function readOnSteer(file: string) {
   return (run: FakeRun, injectionId: string) => {
     injectionState(run, injectionId, "queued")
+    run.send({ interaction_update: { tool_call_started: {
+      call_id: "tc-1", tool_call: { tool_call_id: "tc-1", read_tool_call: { args: { path: file } } },
+    } } })
     run.send({ exec_server_message: { id: 1, exec_id: "exec-1", read_args: { path: file, tool_call_id: "tc-1" } } })
   }
+}
+
+/** Cursor completes the read's tool call once it has the result, as it does before checkpointing past it. */
+function completeRead(run: FakeRun): void {
+  run.send({ interaction_update: { tool_call_completed: { call_id: "tc-1" } } })
 }
 
 const readCall = (parts: LanguageModelV3StreamPart[]) =>
@@ -327,6 +335,7 @@ describe("Greptile receipt matching regressions", () => {
             next: (run, message) => {
               if (message.exec_client_message?.read_result) {
                 if (mode !== "not taken") injectionState(run, injectionId, "delivered")
+                completeRead(run)
                 endTurn(run, "Read complete.")
               } else if (message.run_request) endTurn(run, "FOLLOWUP_COMPLETE")
             },
@@ -778,6 +787,7 @@ describe("a steer sent while Cursor waits inside a step", () => {
           next: (run, message) => {
             if (message.exec_client_message?.read_result) {
               if (delivered) injectionState(run, injectionId, "delivered")
+              completeRead(run)
               endTurn(run, delivered ? "Read it. STEERED" : "Read it.")
             } else if (message.run_request && mode === "follow-up drops" && runs.indexOf(run) === 1) {
               // The follow-up Run drops before any checkpoint holds the steer.
@@ -1039,7 +1049,7 @@ describe("steer restart and mixed-message regressions", () => {
         const { first, announce } = await waitingRun(model, sessionKey, {
           inject: (run, id) => { injectionState(run, id, "delivered"); readOnSteer(file)(run, id) },
           next: (run, next) => {
-            if (next.exec_client_message?.read_result) endTurn(run, "STEERED")
+            if (next.exec_client_message?.read_result) { completeRead(run); endTurn(run, "STEERED") }
             else if (next.run_request) endTurn(run, "FRESH_REPLY")
           },
         })
@@ -1057,6 +1067,46 @@ describe("steer restart and mixed-message regressions", () => {
     }, 30_000)
   }
 
+  it("refuses the follow-up of a steer Cursor never took from a checkpoint older than the step's results", async () => {
+    await withModel("untaken-stale", async (model, cacheDir) => {
+      const file = probeFile(cacheDir)
+      const sessionKey = "ses_edge_untaken_stale"
+      const { first, announce } = await waitingRun(model, sessionKey, {
+        inject: readOnSteer(file),
+        next: (run, next) => {
+          if (!next.exec_client_message?.read_result) return
+          run.send({ interaction_update: { text_delta: { text: "Read it." } } })
+          run.send({ interaction_update: { turn_ended: { input_tokens: 10, output_tokens: 2 } } })
+        },
+      })
+      const early = announce("UNTAKEN_STALE_STEER")
+      const error = await failure(collect(model, readStep(readCall(await first), file, early.text), sessionKey))
+      expect(error?.message).toContain("no checkpoint to send it as a follow-up")
+      expect(runs).toHaveLength(1)
+    })
+  }, 30_000)
+
+  it("refuses a mixed promotion's follow-up from a checkpoint older than the step's results", async () => {
+    await withModel("mixed-stale", async (model, cacheDir) => {
+      const file = probeFile(cacheDir)
+      const sessionKey = "ses_edge_mixed_stale"
+      const { first, announce } = await waitingRun(model, sessionKey, {
+        inject: (run, id) => { injectionState(run, id, "delivered"); readOnSteer(file)(run, id) },
+        next: (run, next) => {
+          if (!next.exec_client_message?.read_result) return
+          run.send({ interaction_update: { text_delta: { text: "STEERED" } } })
+          run.send({ interaction_update: { turn_ended: { input_tokens: 10, output_tokens: 2 } } })
+        },
+      })
+      const early = announce("EARLY_STALE_STEER")
+      const step = readStep(readCall(await first), file, early.text)
+      step.push(user("NEW_STALE_STEER"))
+      const error = await failure(collect(model, step, sessionKey))
+      expect(error?.message).toContain("no checkpoint to send it as a follow-up")
+      expect(runs).toHaveLength(1)
+    })
+  }, 30_000)
+
   for (const restart of [false, true]) {
     it(`does not repeat a mixed promoted steer on host retry (${restart ? "after restart" : "same process"})`, async () => {
       let rejectRenewal = false
@@ -1067,7 +1117,7 @@ describe("steer restart and mixed-message regressions", () => {
         const { first, announce } = await waitingRun(model, sessionKey, {
           inject: (run, id) => { injectionState(run, id, "delivered"); readOnSteer(file)(run, id) },
           next: (run, next) => {
-            if (next.exec_client_message?.read_result) endTurn(run, "STEERED")
+            if (next.exec_client_message?.read_result) { completeRead(run); endTurn(run, "STEERED") }
             else if (next.run_request && !failedOnce) {
               failedOnce = true
               rejectRenewal = true

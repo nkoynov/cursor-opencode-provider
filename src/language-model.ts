@@ -931,7 +931,8 @@ async function doStreamImpl(
     })
     if (steered) {
       ({ results: trailingToolResults, session: steeredSession, inject: steerInjections } = steered)
-      steeredPrompt = steerInjections.length > 0
+      // Any of the step's messages may go out as a follow-up, which needs a checkpoint that holds the step's results.
+      steeredPrompt = true
     }
   }
   if (trailingToolResults.length > 0 && trailingToolResults.every((r) => toolCallsOfStoppedTurns.has(r.toolCallId))) {
