@@ -2970,6 +2970,7 @@ export async function drainSessionUntilTurnEnded(
         keepUndeliveredHostNotes(session)
         // A cancelled turn's last checkpoint may not hold the request it cancelled.
         if (!cancelled) confirmRunImagesAtTurnEnd(session)
+        settleEarlySteers(session.openCodeSessionId, session.sessionId)
         if (session.openCodeSessionId) {
           await persistConversationState(
             session.cacheDir ?? opencodeGlobalCacheDir(),

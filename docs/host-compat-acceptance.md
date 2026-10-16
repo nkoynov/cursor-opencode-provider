@@ -1,15 +1,14 @@
 # Host compatibility acceptance checklist
 
-Run this checklist before releasing changes to CreatePlan, SwitchMode, tool-catalog caching, or the structural host boundary. Unit/type tests support the result; they are not proof of interactive behavior.
+Run this checklist for changes to CreatePlan, SwitchMode, file-tool substitution, early steers, tool-catalog caching, or the structural host boundary. Unit/type tests support the result; they are not proof of interactive behavior. This is a reusable procedure, not a record of passed tests.
 
 ## Build/install preflight
 
-- [ ] Provider HARD STOP: `bun run generate:pricing && bun run check:pricing` must both exit 0; commit mapping/`pricing-data.ts` updates before any version bump or `v*` tag (do not tag first and rely on publish CI)
+- [ ] For a release/version/tag only: follow the [pricing and changelog gate](../AGENTS.md#hard-stop--release--version-bump--tag-gate-non-optional); do not tag first and rely on publish CI
 - [ ] Provider: `bun test && bun run typecheck && bun run build`
 - [ ] Provider: `bun test test/architecture.test.ts` again **after** build (covers `dist/`)
-- [ ] OCP: `bun test ./test && bun run typecheck && bun run build`
-- [ ] OCP: `bun test test/architecture.test.ts` again after build
-- [ ] `git diff --check` in both repositories
+- [ ] For structural/OCP boundary changes, also build/test OCP and run its architecture checks after build
+- [ ] `git diff --check` in each affected repository
 - [ ] Rebuild/reinstall the exact package entries the stock host loads; verify symlink/install tree, loaded `dist` path, and copied package manifests/exports as well as file contents
 - [ ] OCP plugin discovery accepts valid JSONC without joining tokens across comments, and rejects malformed JSONC and unterminated block comments
 - [ ] Do not modify a host/vendor checkout
@@ -44,6 +43,8 @@ Install and leftover-dump cleanup: [OpenCode 2.0 setup](./opencode-2.md) ([safe 
 6. Verify no private/unsupported host API is invoked.
 
 ## OMP interactive plan review
+
+This is a separate OCP-owned compatibility run, not native OpenCode acceptance.
 
 For each choice, start from a fresh plan-mode session:
 
@@ -88,10 +89,10 @@ Run on stock MiMo, Kilo, Pi, OMP, and DSH through OCP, using the shared
 
 For one cold session followed by a normal continuation:
 
-- a compaction call may arrive with `incomingTools=0`, but wire advertisement equals the full sibling catalog; a title or other zero-tool call advertises no tools and does not wait for the catalog;
-- compaction and real Run use identical RequestContext hashes;
-- tool order and definitions are byte-stable;
-- with tools present, `allowTools=false` only affects execution permission, not advertisement;
+- host-empty lifecycle calls advertise `[]` on an ephemeral conversation and do not wait for a sibling catalog;
+- score lifecycle RequestContext separately from the real Run; identical hashes are not required;
+- nonempty epoch catalogs keep existing descriptors/order and append new names; a permission shrink does not rewrite them;
+- execution uses the current permitted set, independently of epoch advertisement; OpenCode 2 compaction can retain a nonempty advertisement while refusing all execution;
 - subsequent diagnostics show warm continuity/cache reads rather than a catalog-induced rebuild;
 - a smaller incoming catalog that carries a result matching a pending parent call reconciles that result on the parent conversation before helper isolation;
 - a real helper uses its own conversation and leaves the held parent intact;
@@ -99,6 +100,37 @@ For one cold session followed by a normal continuation:
 - every emitted usage-validation record reports `status=ok`; a later warm Run does not excuse an earlier unexpected parent reset.
 
 Use `docs/cache-log-runbook.md` for exact fields and handoff evidence.
+
+## File edits on both majors
+
+1. Build and verify the loaded provider in native 1.x and 2.0 separately, with
+   both `CURSOR_PROVIDER_DEBUG=1` and a fresh `CURSOR_PROVIDER_DEBUG_FILE`.
+2. Use an eligible GPT model. Verify the host advertises `apply_patch` on 1.x or
+   `patch` on 2.0. Create a file, make a native targeted edit, and exercise a direct
+   dynamic patch call. Verify file bytes and exactly one mutation per request.
+3. Cover blank lines, substring changes, existing-file replacement, LF and CRLF.
+   1.x targeted edits retain the existing newline convention; 2.0 patch requests
+   that would lose CRLF must return a typed refusal and leave the file unchanged.
+4. Switch to a model/turn that permits native edit/write, then back. Verify
+   translation follows the current permitted catalog, including edit-only and
+   restricted turns; a frozen advertisement must not authorize a forbidden tool.
+5. Compare the next ordinary turn's conversation/checkpoint/RequestContext and
+   raw cache counters. Report refusals separately from unexpected protocol or
+   dynamic-wrapper failures ([patch details](../README.md#apply_patch--patch-on-gpt-models)).
+
+## OpenCode 2 early steers and Stop
+
+1. While Cursor waits on a known background job, send a plain-text steer without
+   files or skills. Verify its answer arrives before the job ends and only once.
+2. Send a queued message, change it to steer, and verify the same behavior. A
+   message that cannot be admitted early must remain available at the host boundary.
+3. Exercise Stop followed by multiple messages, mixed tool continuations, and
+   restart/retry before the host promotes its copy. Preserve every unmatched
+   message and attachment; repeat the same words later and require a fresh answer.
+4. Inspect complete host/provider logs for duplicate Runs, lost receipts, invalid
+   calls, usage mismatches or unexpected resets. Compare a separate warm follow-up.
+   Use [deterministic regressions](../test/early-steer.test.ts) for exact promotion
+   and attachment cases; label those separately from live-model observations.
 
 ## Filesystem hygiene
 

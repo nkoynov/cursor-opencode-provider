@@ -1,6 +1,6 @@
-# PR #51: shell, error, cancellation, and runtime-file self-verification
+# Shell, error, cancellation, and runtime-file self-verification
 
-Run native OpenCode 1 and native OpenCode 2 separately. A pass on one does not establish the other. Additional OCP consumers are separate compatibility runs. This prompt tests the current implementation; the native-shell redesign remains a separate task in `tasks/todo.md`.
+Run native OpenCode 1 and native OpenCode 2 separately. A pass on one does not establish the other. Additional OCP consumers are separate compatibility runs. This reusable procedure originated with PR #51; it tests the loaded revision, not an assumed historical build. The native-shell redesign remains a separate task in [tasks/todo.md](../tasks/todo.md). File-tool and early-steer checks are in [host acceptance](host-compat-acceptance.md).
 
 ## Operator setup — do not paste this section as an agent task
 
@@ -44,7 +44,7 @@ Execute the Agent prompt in docs/execution-self-verify.md for this lane.
 
 ## Agent prompt — copy/paste or ask the agent to execute this section
 
-Perform an adversarial live self-check of PR #51's shell execution, native tool-error preservation, cancellation cleanup, history recovery, and runtime-file behavior. Read this entire Agent prompt before starting; finish any truncated read. Execute only the configured lane, retain a checklist, and resume at the next unfinished case after human intervention. Do not implement fixes, edit source checkouts, change permissions, commit, or push.
+Perform an adversarial live self-check of the loaded provider's shell execution, native tool-error preservation, cancellation cleanup, history recovery, and runtime-file behavior. Read this entire Agent prompt before starting; finish any truncated read. Execute only the configured lane, retain a checklist, and resume at the next unfinished case after human intervention. Do not implement fixes, edit source checkouts, change permissions, commit, or push.
 
 When an ordinary question or feedback-bearing tool rejection returns, process its result and execute the next unfinished case; do not ask for a separate `continue`. Group necessary setup questions at the beginning. Run deliberate no-feedback rejection and interruption cases last: the native host may end those turns, and this prompt cannot restart them. Save the next unfinished step before each such case. Do not silently substitute a feedback-bearing rejection for the no-feedback case.
 

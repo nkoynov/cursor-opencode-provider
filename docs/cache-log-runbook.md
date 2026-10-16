@@ -150,7 +150,7 @@ Also inspect the outbound flags:
   system-prompt identity is diagnostics only; sticky conversations stay held
   (CLI keeps the same agentId across mode flips).
 
-At provider startup, `conversation persistence: restored` confirms that the
+On demand, `conversation persistence: restored` confirms that the
 session binding, checkpoint, reachable blobs, and frozen context were hydrated.
 `missing`, `invalid`, `expired`, or restore failure means the next Run may be
 cold even though OpenCode still has its own chat history.
@@ -159,7 +159,7 @@ The first resumed normal Run preserves the persisted system-instructions rule
 and reasserts current host instructions on the user-turn tail. The last source
 snapshot is not persisted: even if live instructions match the original rule,
 the checkpoint may contain a later instruction change. Subsequent Runs admit
-only new source changes (`src/context/epoch.ts:160`, `test/context-epoch.test.ts:158`).
+only new source changes ([`admitContextEpoch`](../src/context/epoch.ts), [`test/context-epoch.test.ts`](../test/context-epoch.test.ts)).
 
 ### 2. Check prefix stability
 
@@ -175,10 +175,12 @@ only new source changes (`src/context/epoch.ts:160`, `test/context-epoch.test.ts
 The checkpoint hash is expected to change as the conversation changes. Do not
 use checkpoint-hash equality as the definition of prompt-cache reuse.
 
-Capabilities are deliberately live. Enabling/disabling tools, MCP servers,
-skills, agents, or plugins may produce `requestContext=built`, a new hash, and
-category changes. That is correct; cache stability must not freeze capability
-truth.
+Capabilities are rediscovered, but a nonempty epoch catalog retains existing
+names/descriptors and appends new names. A permission shrink alone does not
+rewrite the advertised prefix; execution still uses the current permitted set.
+New capabilities or a new epoch may change the materialized bytes. Host-empty
+lifecycle calls instead advertise empty tools on their own conversation. See
+[`resolveTurnToolState`](../src/language-model.ts).
 
 ### 3. Validate the totals sent to OpenCode
 
@@ -269,22 +271,22 @@ Captured Cursor Runs commonly report `rawCacheWrite=0`. This is an upstream
 value, not evidence that the provider dropped writes: the provider decodes
 `TurnEnded` field 4 (`turn_ended raw wire fields: … f4:wt0=`), and some models
 report it (gpt-5.6-luna sent `f4=8201` on a cold call). Where writes are 0,
-new prefix tokens are billed as uncached input instead — `rawUncached` tracks
-the context the Run added (`currentContext` on a first turn, `contextDelta`
-on a warm one).
+`rawUncached` remains the arithmetic remainder of the
+reported aggregate input. It is not a measurement of new context: repeated
+internal model calls can process uncached text more than once.
 
 | Field | Interpretation |
 |---|---|
 | `priorContext` | Cursor `usedTokens` decoded from the checkpoint supplied at Run start. |
 | `currentContext` | Latest known checkpoint `usedTokens` at Run end. |
 | `contextDelta` | Current minus prior occupancy. Negative values are possible after summarization/compaction; positive values include new user/tool/output context. |
-| `rawReadVsPriorContext` | Aggregate cache-read tokens as a multiple of prior context (`3.00x`). Each internal model call in the Run re-reads the prefix, so a Run with three generations (`pumpPasses=3`) reads about `3.00x`; one generation about `0.96x`–`1.00x`. A multiple well below the generation count on a warm Run is the low-reuse signal. |
+| `rawReadVsPriorContext` | Aggregate cache-read tokens divided by prior context (`3.00x`). Values above one can reflect repeated prefix reads within a Run. Neither this multiple nor `pumpPasses` establishes the number of internal model calls or a per-call hit rate. |
 | `sameSizedCategoryTokens` | Sum of current categories whose token count exactly matches the prior checkpoint. This compares sizes only, not content identity. |
 | `categoryDelta` | Per-category token-count change (`current - prior`); `new`/`removed` indicate category appearance/disappearance. |
 | `toolsCategoryChurn` | `none`, `upstream-stable-overlay` (tools tokens moved while RequestContext overlay bytes were reused), or `client-overlay-changed` (tools moved and RequestContext was rebuilt). See `createPlanInTurn` / `switchModeInTurn` for the common in-turn trigger. |
 | `checkpointUpdates` | All non-empty checkpoints seen during this held Run. |
 | `tokenDetailUpdates` | Those checkpoints that included decodable token details. Zero explains a stale `checkpoint-previous-turn` source. |
-| `pumpPasses` | Number of OpenCode stream pulls over the held Run. More than one is normal when tools were executed. |
+| `pumpPasses` | Number of provider pump invocations over the held Run. More than one is normal across tool continuations; it is not a model-call count. |
 | `steps=started/completed` | Cursor protocol step events. Useful activity evidence, but **not** a proven model-call count. |
 | `displayToolCalls` | Cursor display tool-start events. |
 | `execRequests` | Cursor exec/control requests, including provider-handled probes and host-tool requests. |
@@ -340,19 +342,13 @@ outstanding) historically cratered cache even with a reused conversation_id.
   or prove that upstream omitted a counter. Keep the zero counter as reported
   and assess subsequent turns independently.
 
-This is Cursor's backend filing first-use native call/result content (CreatePlan
-call envelope plus its fixed result boilerplate) under the `tools` category. It
-is one-time per conversation — a second plan in the same conversation adds +0 —
-and it also fires on some non-CreatePlan server-side prompt rebuilds, so the
-CreatePlan tag confirms the common case but its absence does not rule this out.
-Our overlay bytes stay identical throughout; there is no client prefix rebuild
-to fix. Do not remint to escape it (strictly worse than one cold turn).
-
-Cost policy: the crater costs ~94% of current context at full price, once per
-planning conversation. Prefer recording the first plan early (small context)
-and refining afterward — follow-up plans are free — over deferring planning
-until investigation is complete. At very large contexts, compact first and plan
-on the fresh small prefix.
+This pattern is consistent with upstream prompt expansion while the client
+keeps its overlay stable. The category shift and interaction tag do not prove
+which backend content changed, whether the effect is once per conversation,
+or which internal call missed the cache. Preserve the measured zero counter,
+compare later turns, and do not remint a healthy conversation to chase a ratio.
+There is no general promise that repeated plans are free or that a fixed
+percentage of a plan turn is billed uncached.
 
 ### Client-side context changed
 

@@ -2,7 +2,7 @@
 
 Status: **approved & implemented**  
 Repo: `cursor-opencode-provider`  
-CLI oracle: `<cursor-cli-checkout>/cursor/cli/cursor-agent-decompiled`  
+CLI evidence: decompiled Cursor CLI 2026.09.28 (local evidence retained privately)
 Related: [`cache-log-runbook.md`](./cache-log-runbook.md)
 
 ## Checklist
@@ -16,7 +16,11 @@ Related: [`cache-log-runbook.md`](./cache-log-runbook.md)
 | 5 | Hydrate / binding — CLI-shaped | Soft-evict; keep state + lastBound; disk hydrate on miss | **Done** |
 | 6 | Never remint incomplete/oversized graph | Warm reuse + warn | **Done** |
 
-Compaction remint: unchanged (out of scope).
+Compaction and post-compaction rebase still rotate the conversation; they transfer
+the stable workspace base. This is a design decision record, not a fresh live
+acceptance result. Source guards: [`resolveTurnConversationReset`](../src/language-model.ts),
+[`admitContextEpoch`](../src/context/epoch.ts), [frozen-context tests](../test/frozen-request-context.test.ts)
+and the [cache runbook](cache-log-runbook.md).
 
 ## Locked decisions
 

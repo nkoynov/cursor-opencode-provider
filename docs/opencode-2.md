@@ -6,6 +6,9 @@ For OpenCode 1.x, see [opencode-1.md](./opencode-1.md). Shared catalog behavior 
 
 If you previously ran this plugin against **OpenCode 2.0 next** (`ctx.catalog`) or against a build that **wrote Cursor models into `opencode.json`**, start at [Safe transition](#safe-transition).
 
+This guide follows the development checkout. Check [Unreleased](../CHANGELOG.md#unreleased)
+for fixes that require a rebuilt local install until the next release.
+
 ## How models register (current)
 
 Discovered Cursor models are published **in memory** through `ctx.provider.transform` → `editor.add({ info, models })` → `ctx.provider.reload()`. The plugin does **not** write a model list into `opencode.json`.
@@ -24,7 +27,7 @@ Synced models set `time.released` to `0` (Cursor AvailableModels does not expose
 }
 ```
 
-Pin a version if you want: `"cursor-opencode-provider@0.4.1/plugin/opencode2"`.
+Pin a version if you want: `"cursor-opencode-provider@0.8.2/plugin/opencode2"`.
 
 OpenCode 2.0 installs the published package into its host cache and loads the AI SDK entry from there (`aisdk:cursor-opencode-provider@<version>`, pinned to the version of the plugin that registered it, so a pinned plugin never runs a newer language model). No extra env vars are required.
 
@@ -176,6 +179,25 @@ The permission and terminal-failure events release unstarted shell reservations
 immediately; running jobs retain their records.
 
 Generated-image saving uses the same handle-only `cursor_image_save` tool on classic and OpenCode 2.0. Classic/OCP surfaces raise `external_directory` then `edit` before the write. Stock OpenCode 2.0 has no public `ask`, so the 2.0 entrypoint still advertises the tool (`permission: "edit"` so agents that deny edits do not get it) and commits after containment; the id is opaque, so the model cannot write arbitrary files.
+
+## File editing
+
+OpenCode 2 selects `patch` (input `{ patchText }`) for eligible GPT models and
+removes `edit` / `write`. The provider accepts direct dynamic patch calls and
+converts Cursor-native file execs from the current permitted catalog. It refuses
+patch operations that would lose CRLF bytes before changing a file. Native
+`edit` / `write` remain unchanged when permitted; see [shared patch behavior](../README.md#apply_patch--patch-on-gpt-models).
+
+## Mid-turn steers and Stop
+
+A plain-text steer without files or skills can reach an actively pumping Cursor
+Run before OpenCode reaches its next step boundary, including during AwaitShell.
+Messages that cannot be admitted early retain the normal host delivery path.
+Answered copies are deduplicated across restart/retry, while later identical
+requests, unmatched messages and attachments remain intact. Stop notifies the
+Cursor Run and saves recoverable state; the next turn preserves the checkpoint
+when safe and otherwise rebuilds from host history. See [2.0 incident lessons](../tasks/lessons/opencode-2.md#early-steers-stop-and-restart)
+and [acceptance checks](host-compat-acceptance.md#opencode-2-early-steers-and-stop).
 
 ## Planning and prompt ownership
 

@@ -2,6 +2,9 @@
 
 Classic OpenCode and the 1.18 Effect/Promise **v2** plugin API. For OpenCode 2.0, see [opencode-2.md](./opencode-2.md). Shared catalog behavior (variants, 1M, Fast, images) lives in the [root README](../README.md#select-a-model).
 
+This guide follows the development checkout. Check [Unreleased](../CHANGELOG.md#unreleased)
+for fixes that require a rebuilt local install until the next release.
+
 ## From npm
 
 OpenCode installs npm plugins with Bun at startup (cached under `~/.cache/opencode/node_modules/`):
@@ -20,7 +23,7 @@ OpenCode installs npm plugins with Bun at startup (cached under `~/.cache/openco
 }
 ```
 
-Pin a version if you want: `"cursor-opencode-provider@0.4.1"`.
+Pin a version if you want: `"cursor-opencode-provider@0.8.2"`.
 
 You can also install it yourself first:
 
@@ -90,6 +93,15 @@ opencode run --model cursor/composer-2.5 "Hello from Cursor via OpenCode"
 ```
 
 Variant, long-context, Fast, image, and Max Mode behavior is the same on every host — see [Select a model](../README.md#select-a-model) in the root README.
+
+## File editing
+
+Eligible GPT models receive `apply_patch` instead of `edit` / `write`. The
+provider advertises that host tool and converts Cursor-native file execs using
+the current permitted catalog, including after a model switch. Targeted edits
+preserve existing LF/CRLF conventions; intentional whole-file writes retain
+their requested contents. See [shared patch behavior](../README.md#apply_patch--patch-on-gpt-models)
+and [1.x incident lessons](../tasks/lessons/opencode-1.md).
 
 ## Shell failures and interruption
 

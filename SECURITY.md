@@ -21,19 +21,28 @@ OpenCode's `opencode.json` / `opencode.jsonc` `instructions` array may list:
 - relative paths / globs (e.g. `.cursor/rules/*.md`)
 - absolute paths
 - home-relative paths (`~/…`)
-- remote URLs (`https://…`; this provider fetches HTTPS only)
+- remote URLs supported by the host
 
-OpenCode itself expands `~/`, accepts absolute paths, and injects those file contents into the model prompt for **every** provider. This package does the same discovery when building Cursor `RequestContext.rules`.
+OpenCode owns instruction discovery and supplies the resulting system prompt
+to the AI SDK provider. This package forwards that prompt as Cursor's
+always-apply system-instructions rule; it does not independently read instruction
+or skill file bodies or fetch instruction URLs. Its merged-config read supplies
+MCP server ids, plugin metadata and interaction guidance
+([`src/context/rules.ts`](src/context/rules.ts),
+[`src/context/build.ts`](src/context/build.ts)).
 
 So a project config like:
 
 ```json
 {
-  "instructions": ["~/.ssh/id_rsa", "/etc/passwd"]
+  "instructions": ["docs/project-guide.md", "/absolute/path/to/approved-guide.md"]
 }
 ```
 
-can cause those files to be read and sent to the model provider (OpenCode prompt path and/or this provider's Cursor `RequestContext`). That is intentional OpenCode parity, not a Cursor-only hole. There is no path allowlist that rejects absolute/`~/` instruction paths (matching OpenCode; OpenCode has not treated this as a defect).
+can cause those files to be read by OpenCode and included in the prompt sent to
+Cursor. The provider does not add an instruction-path allowlist or remove content
+already supplied by the host. Review instruction paths before enabling project
+configuration, especially if they could refer to sensitive local files.
 
 Treat project `opencode.json` as **trusted**. Do not open untrusted repositories with project config enabled if that is unacceptable.
 
@@ -45,13 +54,16 @@ To ignore project-level OpenCode config (including project `instructions` and pr
 export OPENCODE_DISABLE_PROJECT_CONFIG=1
 ```
 
-OpenCode honors this flag when loading config and assembling prompts. This provider honors the same flag when collecting rules for Cursor `RequestContext`, so project `instructions` are not merged and project instruction files are not auto-discovered. Global config under `~/.config/opencode` (and `~/.claude/CLAUDE.md` when applicable) still applies.
+Set this before starting OpenCode and use the host's project-config controls to
+suppress project instructions. The provider also skips its own project config
+metadata reads when this flag is set; global config still applies. It cannot
+remove instruction text that a host has already included in the supplied prompt
+([`loadMergedConfig`](src/context/rules.ts)).
 
 Truthy values: `1` or `true` (case-insensitive), same as OpenCode.
 
-#### Related hardening in this provider
-
-- Remote `instructions` URLs are **HTTPS-only** (`http://` is skipped). Redirects (including to a local proxy) are intentional and not blocked.
+Instruction URL fetching and redirect policy belong to the host; this provider
+has no separate instruction-fetch policy.
 
 ### Out of Scope
 

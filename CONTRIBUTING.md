@@ -32,7 +32,10 @@ bun run typecheck
 bun test
 ```
 
-Full commands, architecture, and release rules: [AGENTS.md](./AGENTS.md). Install and operator docs: [README.md](./README.md).
+Full commands, architecture, and release rules: [AGENTS.md](./AGENTS.md). Install
+and operator docs: [README.md](./README.md) and the [documentation index](docs/README.md).
+Before changing behavior, read the [general and host-specific lessons](tasks/lessons.md).
+Merge new incident lessons with existing causes rather than appending duplicates.
 
 ## Pull requests
 
@@ -46,10 +49,17 @@ When opening one:
 - **New features must follow OpenCode's security, sandbox, and permission model.** If OpenCode does not provide acceptable footing for a Cursor capability, mimic Cursor CLI's own client-side restrictions instead — and explain that choice and the permission/sandbox path in the PR.
 - Link `Fixes #123` / `Closes #123` when applicable.
 - Update [CHANGELOG.md](./CHANGELOG.md) under `## [Unreleased]` for user-facing changes.
+- Update affected guides and acceptance criteria together; pure documentation corrections do not need a changelog entry. Keep released changelog sections immutable.
 - Prefer conventional-commit titles (`fix:`, `docs:`, `test:`, …).
 - PR descriptions must be human-readable: concise, concrete, and written for people — not verbose and not in LLM speak.
 - **Bug fixes must not regress prompt caching** — confirm RequestContext / checkpoint continuity stays warm where it should (see `cache diagnosis:` lines in `CURSOR_PROVIDER_DEBUG` logs and [docs/cache-log-runbook.md](./docs/cache-log-runbook.md)).
 - **Consider both OpenCode 1.x and OpenCode 2.0** for every fix — apply or verify the change on both majors unless the bug is specific to one entrypoint.
+
+### Review and coverage requirements
+
+- **Resolve every Greptile finding before merge, regardless of severity**, including minor issues and nits. Address each finding and resolve its review thread; leave no open Greptile issues.
+- **Provide sufficient test coverage for new and changed behavior**, including relevant error paths. Address uncovered changes and coverage regressions reported by Codecov; all applicable Codecov checks must pass under the repository's [coverage configuration](codecov.yml).
+- **PRs with unresolved Greptile findings or Codecov coverage issues will be closed if they go 3 days without an update addressing those issues.** Keep the PR updated while working through review and coverage feedback.
 
 ## License
 
