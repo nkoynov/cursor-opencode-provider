@@ -205,13 +205,13 @@ export function forgetEarlySteerRecords(sessionID: string, records: readonly Ear
 }
 
 /**
- * A steer of a Run that ended without answering it (a stop, a failed recovery) on which host history and
- * the checkpoint disagree: OpenCode placed it in its history but no checkpoint holds it, or a checkpoint
- * holds it while OpenCode's copy is still to come.
+ * A steer of a Run that ended without answering it (a stop, a failed recovery) that only host history
+ * holds reliably: OpenCode placed it in its history (a checkpoint may hold it too, and resuming would
+ * then send it twice), or a checkpoint holds it while OpenCode's copy is still to come.
  */
 export function needsHostHistory(sessionID: string | undefined, openRun: string | undefined): boolean {
   return !!sessionID && !!state.injected.get(sessionID)?.some((record) =>
-    !record.answered && record.run !== openRun && (record.promoted ? !record.checkpointed : record.checkpointed))
+    !record.answered && record.run !== openRun && (record.promoted || record.checkpointed))
 }
 
 /** Keep answered receipts until the new turn succeeds, so a host retry still omits its copies. */

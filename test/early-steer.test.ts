@@ -688,6 +688,42 @@ describe("a steer sent while Cursor waits inside a step", () => {
     })
   }, 30_000)
 
+  it("rebuilds the retried step from host history when a promoted steer's Run drops after its checkpoint and recovery fails", async () => {
+    let refuseToken = false
+    await withModel("promoted-recovery-fails", async (model, cacheDir) => {
+      const file = probeFile(cacheDir)
+      const sessionKey = "ses_early_promoted_recovery_fails"
+      let injectionId = ""
+      const { first, announce } = await waitingRun(model, sessionKey, {
+        inject: (run, id) => {
+          injectionId = id
+          readOnSteer(file)(run, id)
+        },
+        next: (run, message) => {
+          if (message.exec_client_message?.read_result) {
+            injectionState(run, injectionId, "delivered")
+            run.send({ interaction_update: { text_delta: { text: "STEER" } } })
+            run.send({ conversation_checkpoint_update: Uint8Array.from([0x0a, 0x01, 0x36]) })
+            refuseToken = true
+            run.end()
+          } else if (message.run_request) {
+            endTurn(run, "Answered once.")
+          }
+        },
+      })
+      const message = announce("Then read probe.txt and say STEERED.")
+      const step = readStep(readCall(await first), file, message.text)
+      expect(await failure(collect(model, step, sessionKey))).toBeInstanceOf(Error)
+      refuseToken = false
+      await collect(model, step, sessionKey)
+      const request = runs.at(-1)!.received[0]!.run_request
+      expect(request.conversation_state.length > 0 && userText(runs.at(-1)!).includes(message.text)).toBe(false)
+    }, async () => {
+      if (refuseToken) throw new Error("login expired")
+      return "test-token"
+    })
+  }, 30_000)
+
   it("is answered once when the Run drops after Cursor checkpointed it", async () => {
     await withModel("resume", async (model) => {
       const sessionKey = "ses_early_resume"
