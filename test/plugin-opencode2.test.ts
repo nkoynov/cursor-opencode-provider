@@ -31,9 +31,9 @@ import {
 } from "../src/host-agent-mode.js"
 import { consumeCursorShellResult, registerCursorShellCall, resetCursorShellCalls } from "../src/shell-timeout.js"
 import { createManagedTerminal } from "../src/terminal-runner.js"
+import { listenForHostSteers, matchEarlySteers, recordEarlySteer, resetHostSteersForTests } from "../src/host-steer.js"
 import { toolResultFailure } from "../src/opencode2/tool-results.js"
 import { sessionActivity } from "../src/activity.js"
-import { forgetEarlySteers, listenForHostSteers } from "../src/host-steer.js"
 import { onHostInterrupt } from "../src/host-interrupt.js"
 import { stageCursorImage } from "../src/image-staging.js"
 import { hostPlansDir, opencode2PlanDir, setHostCacheDirOverride, setNativePlansDir } from "../src/context/paths.js"
@@ -2075,29 +2075,6 @@ describe("opencode2 running tool tracking", () => {
     }
   })
 
-  test("announces a plain-text message enqueued as a steer, or switched to one", async () => {
-    const seen: string[] = []
-    const stop = listenForHostSteers("ses_inbox", (steer) => { seen.push(`${steer.inboxID}:${steer.text}`); return true })
-    const enqueued = (inboxID: string, delivery: string, payload: Record<string, unknown>) => ({
-      type: "session.inbox.enqueued",
-      data: { sessionID: "ses_inbox", inboxID, item: { type: "user", delivery, payload } },
-    })
-    try {
-      await withPluginEvents([
-        enqueued("msg_inbox_1", "steer", { text: "change of plan" }),
-        enqueued("msg_inbox_2", "steer", { text: "see this", files: [{ data: "AA==", mime: "image/png", source: { type: "inline" } }] }),
-        enqueued("msg_inbox_3", "queue", { text: "after the turn" }),
-        { type: "session.inbox.enqueued", data: { sessionID: "ses_inbox", inboxID: "msg_inbox_4", item: { type: "synthetic", delivery: "steer", payload: { text: "note" } } } },
-        enqueued("msg_inbox_5", "queue", { text: "now please" }),
-        { type: "session.inbox.delivery.changed", data: { sessionID: "ses_inbox", inboxID: "msg_inbox_5", delivery: "steer" } },
-      ], () => seen.length >= 2)
-      expect(seen).toEqual(["msg_inbox_1:change of plan", "msg_inbox_5:now please"])
-    } finally {
-      stop()
-      forgetEarlySteers("ses_inbox")
-    }
-  })
-
   test("a stopped execution is reported to the model, a shutdown included, and a normal end is not", async () => {
     const heard: Array<[string | undefined, string, number]> = []
     const stop = onHostInterrupt((sessionID, reason, at) => { heard.push([sessionID, reason, at]) })
@@ -2118,6 +2095,69 @@ describe("opencode2 running tool tracking", () => {
     } finally {
       stop()
       sessionActivity.clear()
+    }
+  })
+})
+
+describe("opencode2 inbox steers", () => {
+  async function withPluginEvents(events: unknown[], check: () => boolean): Promise<void> {
+    const configDir = mkdtempSync(join(tmpdir(), "cursor-oc2-inbox-config-"))
+    const cacheDir = mkdtempSync(join(tmpdir(), "cursor-oc2-inbox-cache-"))
+    const previousConfigDir = process.env.OPENCODE_CONFIG_DIR
+    process.env.OPENCODE_CONFIG_DIR = configDir
+    setHostCacheDirOverride(cacheDir)
+    try {
+      await writeCache(cacheDir, { models: [baseModel], fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION })
+      const cleanup = await plugin.setup(fakeContext(events).ctx)
+      try {
+        for (let i = 0; i < 100 && !check(); i++) await new Promise((resolve) => setTimeout(resolve, 5))
+      } finally {
+        if (typeof cleanup === "function") await cleanup()
+      }
+    } finally {
+      setHostCacheDirOverride(undefined)
+      if (previousConfigDir === undefined) delete process.env.OPENCODE_CONFIG_DIR
+      else process.env.OPENCODE_CONFIG_DIR = previousConfigDir
+      rmSync(configDir, { recursive: true, force: true })
+      rmSync(cacheDir, { recursive: true, force: true })
+    }
+  }
+
+  test("announces a plain-text message enqueued as a steer, or switched to one", async () => {
+    const seen: string[] = []
+    const stop = listenForHostSteers("ses_inbox", (steer) => { seen.push(`${steer.inboxID}:${steer.text}`); return true })
+    const enqueued = (inboxID: string, delivery: string, payload: Record<string, unknown>) => ({
+      type: "session.inbox.enqueued",
+      data: { sessionID: "ses_inbox", inboxID, item: { type: "user", delivery, payload } },
+    })
+    try {
+      await withPluginEvents([
+        enqueued("msg_inbox_1", "steer", { text: "change of plan" }),
+        enqueued("msg_inbox_2", "steer", { text: "see this", files: [{ data: "AA==", mime: "image/png", source: { type: "inline" } }] }),
+        enqueued("msg_inbox_3", "queue", { text: "after the turn" }),
+        { type: "session.inbox.enqueued", data: { sessionID: "ses_inbox", inboxID: "msg_inbox_4", item: { type: "synthetic", delivery: "steer", payload: { text: "note" } } } },
+        enqueued("msg_inbox_5", "queue", { text: "now please" }),
+        { type: "session.inbox.delivery.changed", data: { sessionID: "ses_inbox", inboxID: "msg_inbox_5", delivery: "steer" } },
+      ], () => seen.length >= 2)
+      expect(seen).toEqual(["msg_inbox_1:change of plan", "msg_inbox_5:now please"])
+    } finally {
+      stop()
+      resetHostSteersForTests()
+    }
+  })
+
+  test("forgets an injected steer when the host cancels its inbox message", async () => {
+    recordEarlySteer({
+      sessionID: "ses_inbox", inboxID: "msg_inbox_cancel", text: "yes", injectionId: "inj_cancel", run: "run_a",
+      delivered: true, checkpointed: false, answered: true,
+    })
+    try {
+      await withPluginEvents([
+        { type: "session.inbox.cancelled", data: { sessionID: "ses_inbox", inboxID: "msg_inbox_cancel" } },
+      ], () => matchEarlySteers("ses_inbox", ["yes"], () => true).length === 0)
+      expect(matchEarlySteers("ses_inbox", ["yes"], () => true)).toEqual([])
+    } finally {
+      resetHostSteersForTests()
     }
   })
 })

@@ -713,20 +713,19 @@ describe("extractPromptHistory", () => {
     expect(history.some((entry) => entry.unanswered)).toBe(false)
   })
 
-  it("marks a steer the model answered early in the user turn, also when the Run is rebased", () => {
+  it("leaves the live user turn out of the history, but not out of a rebased Run's", () => {
     const prompt = [
       { role: "user", content: [{ type: "text", text: "Read the notes" }] },
       { role: "assistant", content: [{ type: "text", text: "One mentions a zebra. And 17 * 23 = 391." }] },
       { role: "user", content: [{ type: "text", text: "Also, what is 17 * 23?" }] },
       { role: "user", content: [{ type: "text", text: "<system-update>\nSkill repro is available.\n</system-update>" }] },
     ] as LanguageModelV3CallOptions["prompt"]
-    const answeredSteers = new Set([2])
 
-    const fresh = extractPromptHistory(prompt, { toolResults: "transcript", liveTurnStart: 2, answeredSteers })
-    expect(fresh.slice(-1)).toEqual([{ role: "user", content: "Also, what is 17 * 23?", unanswered: true }])
+    const fresh = extractPromptHistory(prompt, { toolResults: "transcript", liveTurnStart: 2 })
+    expect(fresh.map((entry) => entry.content)).toEqual(["Read the notes", "One mentions a zebra. And 17 * 23 = 391."])
 
-    const rebased = extractPromptHistory(prompt, { preserveTrailingUser: true, toolResults: "transcript", liveTurnStart: 2, answeredSteers })
-    expect(rebased.find((entry) => entry.content === "Also, what is 17 * 23?")?.unanswered).toBe(true)
+    const rebased = extractPromptHistory(prompt, { preserveTrailingUser: true, toolResults: "transcript", liveTurnStart: 2 })
+    expect(rebased.find((entry) => entry.content === "Also, what is 17 * 23?")).toBeDefined()
     expect(rebased.at(-1)?.content).toContain("Skill repro is available.")
   })
 })

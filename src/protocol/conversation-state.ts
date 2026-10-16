@@ -1,4 +1,5 @@
 import { trace } from "../debug.js"
+import { restoreEarlySteers, serializeEarlySteers } from "../host-steer.js"
 import {
   getFrozenRequestContext,
   setFrozenRequestContext,
@@ -32,7 +33,6 @@ import {
 } from "./sent-history-images.js"
 import {
   deletePersistedConversation,
-  getPersistedAnsweredSteers,
   getPersistedTurnProvenance,
   loadPersistedConversation,
   persistConversation,
@@ -63,6 +63,7 @@ export async function hydrateConversationState(
   }
 
   restoreConversationBinding(sessionKey, persisted.conversationId)
+  restoreEarlySteers(sessionKey, persisted.earlySteers)
   if (persisted.checkpoint) setCheckpoint(persisted.conversationId, persisted.checkpoint)
   restoreConversationBlobs(persisted.conversationId, persisted.blobs)
   setFrozenRequestContext(persisted.conversationId, persisted.requestContext)
@@ -86,11 +87,6 @@ export async function hydrateConversationState(
     ...(persisted.hostNote ? { hostNote: persisted.hostNote } : {}),
     ...(persisted.modelFallbackStop ? { modelFallbackStop: persisted.modelFallbackStop } : {}),
   }
-}
-
-/** Early steers the session's last turn answered, from its restart snapshot. */
-export async function persistedAnsweredSteers(cacheDir: string, sessionKey: string): Promise<string[]> {
-  return getPersistedAnsweredSteers(cacheDir, sessionKey)
 }
 
 /** Restore only turn provenance when its in-memory entry was evicted. */
@@ -119,7 +115,6 @@ export async function persistConversationState(
     systemPromptHash?: string
     hostNote?: string
     runInProgress?: boolean
-    answeredSteers?: string[]
     modelFallbackStop?: string
   },
 ): Promise<void> {
@@ -151,7 +146,7 @@ export async function persistConversationState(
     hostAgent: input.hostAgent,
     systemPromptHash: input.systemPromptHash,
     hostNote: input.hostNote,
-    ...(input.answeredSteers?.length ? { answeredSteers: [...input.answeredSteers] } : {}),
+    earlySteers: serializeEarlySteers(input.sessionKey),
     ...(input.modelFallbackStop ? { modelFallbackStop: input.modelFallbackStop } : {}),
     ...(heldImages ? { sentImageHashes: heldImages.hashes, sentImagesCheckpoint: heldImages.checkpoint } : {}),
     ...(provenance?.conversationId === input.conversationId

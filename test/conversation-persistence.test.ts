@@ -45,7 +45,7 @@ import {
   runHistoryImages,
   snapshotHeldHistoryImagesForTests,
 } from "../src/protocol/sent-history-images.js"
-import { CONVERSATION_CACHE_TTL_MS } from "../src/shared.js"
+import { CONVERSATION_CACHE_SCHEMA_VERSION, CONVERSATION_CACHE_TTL_MS } from "../src/shared.js"
 import { encodeMessage } from "../src/protocol/messages.js"
 import {
   pump,
@@ -54,10 +54,20 @@ import {
   restoreTurnToolCatalog,
 } from "../src/language-model.js"
 import type { CursorSession, Frame } from "../src/session.js"
-import { forgetEarlySteers, recordEarlySteer } from "../src/host-steer.js"
+import { forgetEarlySteers, recordEarlySteer, serializeEarlySteers } from "../src/host-steer.js"
 import { sessionFixture } from "./session-fixture.js"
 
 const roots: string[] = []
+
+function varint(value: number): Buffer {
+  const out: number[] = []
+  while (value >= 0x80) {
+    out.push((value % 0x80) | 0x80)
+    value = Math.floor(value / 0x80)
+  }
+  out.push(value)
+  return Buffer.from(out)
+}
 
 async function cacheRoot(): Promise<string> {
   const root = await mkdtemp(path.join(os.tmpdir(), "cursor-conversation-cache-"))
@@ -311,17 +321,18 @@ describe("conversation restart persistence", () => {
     const session = turnEndedSession(root, Uint8Array.from([7]))
     const sessionKey = session.openCodeSessionId!
     restoreConversationBinding(sessionKey, session.conversationId)
-    const steer = (text: string, injectionId: string) => ({
+    const steer = (text: string, injectionId: string, delivered: boolean) => ({
       sessionID: sessionKey,
       inboxID: `msg_${injectionId}`,
       text,
       injectionId,
-      conversationId: session.conversationId,
+      run: session.sessionId,
+      delivered,
+      checkpointed: delivered,
       answered: false,
     })
-    recordEarlySteer(steer("Also check the README", "inj_delivered"))
-    recordEarlySteer(steer("Not taken by this Run", "inj_other"))
-    session.steerInjections = [{ id: "inj_delivered", text: "Also check the README", state: "delivered", checkpointed: true }]
+    recordEarlySteer(steer("Also check the README", "inj_delivered", true))
+    recordEarlySteer(steer("Not taken by this Run", "inj_other", false))
     try {
       await pump(session, {
         enqueue() {},
@@ -329,10 +340,77 @@ describe("conversation restart persistence", () => {
       } as unknown as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
 
       clearMemory()
-      expect((await getPersistedConversation(root, sessionKey))?.answeredSteers).toEqual(["Also check the README"])
+      const saved = await getPersistedConversation(root, sessionKey)
+      expect(JSON.parse(saved!.earlySteers!).records).toMatchObject([{ text: "Also check the README", answered: true }])
+      const filePath = conversationCacheFilePath(root, sessionKey)
+      // Field 14 (tag 0x72) holds them, as upstream writes it.
+      const bytes = gunzipSync(await readFile(filePath))
+      expect(bytes.includes(Buffer.concat([Buffer.from([0x72]), varint(saved!.earlySteers!.length), Buffer.from(saved!.earlySteers!)]))).toBe(true)
     } finally {
       forgetEarlySteers(sessionKey)
     }
+  })
+
+  it("restores an older fork build's snapshot, whose field 14 holds answered-steer texts, without them", async () => {
+    const root = await cacheRoot()
+    const sessionKey = "ses_old_fork_snapshot"
+    const conversationId = "conversation-old-fork"
+    const fallbackStop = JSON.stringify({ servedModel: "claude-opus-4-8", userText: "Fix the build" })
+    const bytes = (field: number, value: Uint8Array | string) => {
+      const data = typeof value === "string" ? Buffer.from(value) : Buffer.from(value)
+      return Buffer.concat([varint((field << 3) | 2), varint(data.length), data])
+    }
+    // The layout fork main f40dbcc wrote: answered_steers=14 (repeated), model_fallback_stop_json=15.
+    const snapshot = Buffer.concat([
+      varint(1 << 3), varint(CONVERSATION_CACHE_SCHEMA_VERSION),
+      bytes(2, sessionKey),
+      bytes(3, conversationId),
+      varint(4 << 3), varint(Date.now()),
+      bytes(5, Uint8Array.from([0x0a, 0x02, 0x08, 0x01])),
+      bytes(7, encodeMessage("RequestContext", { rules_info_complete: true })),
+      bytes(14, "Also check the README"),
+      bytes(14, "{\"version\":1,\"records\":[]}"),
+      bytes(14, "Then run the tests"),
+      bytes(15, fallbackStop),
+    ])
+    await mkdir(conversationCacheDirectoryPath(root), { recursive: true })
+    await writeFile(conversationCacheFilePath(root, sessionKey), gzipSync(snapshot))
+
+    const loaded = await loadPersistedConversation(root, sessionKey)
+    expect(loaded.status).toBe("restored")
+    expect(loaded.value?.conversationId).toBe(conversationId)
+    expect(loaded.value?.checkpoint).toEqual(Uint8Array.from([0x0a, 0x02, 0x08, 0x01]))
+    expect(loaded.value?.modelFallbackStop).toBe(fallbackStop)
+    expect(loaded.value?.earlySteers).toBeUndefined()
+
+    clearMemory()
+    const hydrated = await hydrateConversationState(root, sessionKey)
+    expect(hydrated).toMatchObject({ conversationId, modelFallbackStop: fallbackStop })
+    expect(getCheckpoint(conversationId)).toEqual(Uint8Array.from([0x0a, 0x02, 0x08, 0x01]))
+    expect(serializeEarlySteers(sessionKey)).toBeUndefined()
+  })
+
+  it("ignores a lone field-14 text that is not early-steer receipts", async () => {
+    const root = await cacheRoot()
+    const sessionKey = "ses_old_fork_one_steer"
+    await persistConversation(root, {
+      sessionKey,
+      conversationId: "conversation-old-fork-one",
+      checkpoint: Uint8Array.from([1]),
+      blobs: [],
+      requestContext: { rules_info_complete: true },
+      toolCatalog: [],
+      postCompactionRebase: false,
+    })
+    const filePath = conversationCacheFilePath(root, sessionKey)
+    const text = Buffer.from("{not json")
+    await writeFile(filePath, gzipSync(Buffer.concat([gunzipSync(await readFile(filePath)), Buffer.from([0x72, text.length]), text])))
+    clearMemory()
+
+    const loaded = await loadPersistedConversation(root, sessionKey)
+    expect(loaded.status).toBe("restored")
+    expect(loaded.value?.checkpoint).toEqual(Uint8Array.from([1]))
+    expect(loaded.value?.earlySteers).toBeUndefined()
   })
 
   it("does not migrate legacy JSON snapshots", async () => {

@@ -36,14 +36,14 @@ export type PersistedConversation = {
    * via encodePersistedHostNotes). The Cursor checkpoint does not hold them.
    */
   hostNote?: string
-  /** Early steers the last turn answered; OpenCode records them after that answer. */
-  answeredSteers?: string[]
   /** JSON-encoded ModelFallbackStop: the last turn stopped on a model switch and awaits the user's reply. */
   modelFallbackStop?: string
   /** Content hashes of the history images `sentImagesCheckpoint` holds. */
   sentImageHashes?: string[]
   /** SHA-256 hex of the checkpoint `sentImageHashes` belongs to; without it no image counts as held. */
   sentImagesCheckpoint?: string
+  /** Bounded early-steer delivery receipts for the saved checkpoint. */
+  earlySteers?: string
 }
 
 /** Small per-session facts kept for the process; full snapshots stay on disk. */
@@ -51,7 +51,6 @@ type ConversationHead = {
   conversationId: string
   updatedAt: number
   turnProvenance?: string
-  answeredSteers?: string[]
 }
 
 type ConversationStore = {
@@ -189,7 +188,6 @@ function cloneConversation(value: PersistedConversation): PersistedConversation 
     requestContext: structuredClone(value.requestContext),
     toolCatalog: structuredClone(value.toolCatalog),
     postCompactionRebase: value.postCompactionRebase,
-    ...(value.answeredSteers ? { answeredSteers: [...value.answeredSteers] } : {}),
     ...(value.sentImageHashes ? { sentImageHashes: [...value.sentImageHashes] } : {}),
   }
 }
@@ -201,9 +199,10 @@ function cloneConversation(value: PersistedConversation): PersistedConversation 
  * ConversationCache: schema_version=1, session_key=2, conversation_id=3,
  * updated_at=4, checkpoint=5, blobs=6, request_context=7, tool_catalog=8,
  * post_compaction_rebase=9, host_agent=10, system_prompt_hash=11,
- * turn_provenance_json=12, host_note=13, answered_steers=14 (repeated),
+ * turn_provenance_json=12, host_note=13, early_steers_json=14,
  * model_fallback_stop_json=15, sent_image_hashes=16 (repeated),
- * sent_images_checkpoint_sha256=17.
+ * sent_images_checkpoint_sha256=17. Older fork builds wrote field 14 as
+ * repeated answered-steer strings; those are ignored on read.
  * Blob: id=1, data=2. Tool: name=1, description=2,
  * input_schema_json=3, source_name=4.
  *
@@ -327,7 +326,7 @@ function encodeCacheFile(value: PersistedConversation): {
   if (value.systemPromptHash) writer.uint32(fieldTag(11, 2)).string(value.systemPromptHash)
   if (value.turnProvenance) writer.uint32(fieldTag(12, 2)).string(value.turnProvenance)
   if (value.hostNote) writer.uint32(fieldTag(13, 2)).string(value.hostNote)
-  for (const steer of value.answeredSteers ?? []) writer.uint32(fieldTag(14, 2)).string(steer)
+  if (value.earlySteers) writer.uint32(fieldTag(14, 2)).string(value.earlySteers)
   if (value.modelFallbackStop) writer.uint32(fieldTag(15, 2)).string(value.modelFallbackStop)
   if (value.sentImagesCheckpoint && value.sentImageHashes?.length) {
     for (const hash of value.sentImageHashes) writer.uint32(fieldTag(16, 2)).string(hash)
@@ -351,10 +350,10 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
   let systemPromptHash: string | undefined
   let turnProvenance: string | undefined
   let hostNote: string | undefined
-  const answeredSteers: string[] = []
   let modelFallbackStop: string | undefined
   const sentImageHashes: string[] = []
   let sentImagesCheckpoint: string | undefined
+  const earlySteerValues: string[] = []
   while (reader.pos < reader.len) {
     const tag = reader.uint32()
     const wireType = tag & 7
@@ -412,8 +411,8 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
         hostNote = reader.string()
         break
       case 14:
-        if (wireType !== 2) throw new Error("invalid answered steer")
-        answeredSteers.push(reader.string())
+        if (wireType !== 2) throw new Error("invalid early steers")
+        earlySteerValues.push(reader.string())
         break
       case 15:
         if (wireType !== 2) throw new Error("invalid model fallback stop")
@@ -453,9 +452,19 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
     ...(systemPromptHash ? { systemPromptHash } : {}),
     ...(turnProvenance ? { turnProvenance } : {}),
     ...(hostNote ? { hostNote } : {}),
-    ...(answeredSteers.length > 0 ? { answeredSteers } : {}),
     ...(modelFallbackStop ? { modelFallbackStop } : {}),
     ...(sentImagesCheckpoint && sentImageHashes.length > 0 ? { sentImageHashes, sentImagesCheckpoint } : {}),
+    ...(earlySteerValues.length === 1 && isEarlySteersJson(earlySteerValues[0]!) ? { earlySteers: earlySteerValues[0] } : {}),
+  }
+}
+
+/** Older fork builds wrote field 14 as repeated answered-steer texts, which are no receipts. */
+function isEarlySteersJson(value: string): boolean {
+  try {
+    const parsed = JSON.parse(value) as { version?: unknown; records?: unknown } | null
+    return !!parsed && typeof parsed === "object" && parsed.version === 1 && Array.isArray(parsed.records)
+  } catch {
+    return false
   }
 }
 
@@ -935,7 +944,6 @@ function conversationHead(value: PersistedConversation): ConversationHead {
     conversationId: value.conversationId,
     updatedAt: value.updatedAt,
     ...(value.turnProvenance ? { turnProvenance: value.turnProvenance } : {}),
-    ...(value.answeredSteers?.length ? { answeredSteers: [...value.answeredSteers] } : {}),
   }
 }
 
@@ -1009,16 +1017,6 @@ export async function getPersistedTurnProvenance(
   const head = (await getStore(cacheDir, sessionKey, now)).head
   if (!head?.turnProvenance || !isFresh(head, now)) return undefined
   return { conversationId: head.conversationId, turnProvenance: head.turnProvenance }
-}
-
-/** Early steers the current snapshot's turn answered, without decoding its payload. */
-export async function getPersistedAnsweredSteers(
-  cacheDir: string,
-  sessionKey: string,
-  now = Date.now(),
-): Promise<string[]> {
-  const head = (await getStore(cacheDir, sessionKey, now)).head
-  return head && isFresh(head, now) ? [...head.answeredSteers ?? []] : []
 }
 
 /** Replace one session's durable snapshot and refresh its 24-hour lease. */

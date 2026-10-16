@@ -13,8 +13,8 @@ import { notifyHostInterrupt } from "./host-interrupt.js"
 import { takeFinalFailure } from "./host-retry.js"
 import {
   announceHostSteer,
+  forgetEarlySteerOfInbox,
   forgetEarlySteers,
-  forgetQueuedSteer,
   rememberQueuedSteer,
   takeQueuedSteer,
   type HostSteer,
@@ -847,7 +847,9 @@ function applySessionActivity(event: any, onCredentialSwitch?: () => void): void
     case "session.inbox.cancelled": {
       const id = payload?.sessionID
       if (id) sessionActivity.recordActivity(id)
-      if (typeof payload?.inboxID === "string") forgetQueuedSteer(payload.inboxID)
+      if (typeof payload?.inboxID !== "string") break
+      takeQueuedSteer(payload.inboxID)
+      if (event.type === "session.inbox.cancelled" && typeof id === "string") forgetEarlySteerOfInbox(id, payload.inboxID)
       break
     }
     case "session.execution.succeeded":
@@ -882,7 +884,7 @@ function applySessionActivity(event: any, onCredentialSwitch?: () => void): void
   }
 }
 
-/** A plain-text user message; one with files or skill text reaches the prompt in another shape. */
+/** A plain-text user message; one with files or skills reaches the prompt in another shape. */
 function inboxSteer(sessionID: unknown, inboxID: unknown, item: any): HostSteer | undefined {
   if (typeof sessionID !== "string" || !sessionID || typeof inboxID !== "string" || !inboxID) return undefined
   if (item?.type !== "user" || (item.delivery !== "steer" && item.delivery !== "queue")) return undefined

@@ -19,6 +19,7 @@ import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
 import { hydrateConversationState } from "../src/protocol/conversation-state.js"
 import { decodePersistedHostNotes } from "../src/protocol/host-notes.js"
+import { recordEarlySteer, serializeEarlySteers, type EarlySteer } from "../src/host-steer.js"
 import fs from "node:fs"
 import path from "node:path"
 
@@ -27,8 +28,6 @@ type Prompt = LanguageModelV3CallOptions["prompt"]
 const NOTE = "<system-update>\nInstructions from: /repo/pkg/AGENTS.md\nIndent with tabs.\n</system-update>"
 const NOTE_TEXT = "Instructions from: /repo/pkg/AGENTS.md\nIndent with tabs."
 const LATER = "<system-update>\nThe subagent finished: 3 files changed.\n</system-update>"
-const LATER_TEXT = "The subagent finished: 3 files changed."
-
 let seq = 0
 function heldRun(writes: Uint8Array[], frames: Array<{ flags: number; payload: Uint8Array }> = []): CursorSession {
   const id = `steernotes${++seq}`
@@ -113,32 +112,42 @@ afterEach(() => {
   resetCheckpointsForTests()
 })
 
+function promotedSteer(live: CursorSession, text: string): EarlySteer {
+  const steer: EarlySteer = {
+    sessionID: live.openCodeSessionId!, inboxID: `inbox-${text}`, injectionId: `inj-${text}`, run: live.sessionId, text,
+    delivered: false, checkpointed: false, answered: false, promoted: true,
+  }
+  recordEarlySteer(steer)
+  return steer
+}
+
 describe("host notes in a steer step", () => {
-  it("injects the step's notes, then the steer's messages and notes, after the results in prompt order", async () => {
+  it("injects the step's notes, then the steer's messages, after the results", async () => {
     const writes: Uint8Array[] = []
     const live = heldRun(writes)
     sessionManager.registerSession(live)
     const results = extractTrailingToolResults([user("go"), readResult(live, 1), user(NOTE)] as Prompt)
 
     expect(await deliverContinuationResults(live, results, {
-      steer: [{ text: "also check b.ts" }, { text: LATER, hostNote: true }, { text: "then stop" }],
+      steer: [promotedSteer(live, "also check b.ts"), promotedSteer(live, "then stop")],
     })).toBe(live)
 
     const messages = clientMessages(writes)
     const readAt = messages.findIndex((message) => message.exec_client_message?.read_result)
     const firstInjection = messages.findIndex((message) => message.conversation_action?.inject_context_action)
     expect(firstInjection).toBeGreaterThan(readAt)
-    expect(injected(writes).map((injection) => injection.text)).toEqual([NOTE_TEXT, "also check b.ts", LATER_TEXT, "then stop"])
-    expect(live.steerInjections?.map((injection) => injection.text)).toEqual(["also check b.ts", "then stop"])
+    expect(injected(writes)).toMatchObject([
+      { text: NOTE_TEXT }, { id: "inj-also check b.ts", text: "also check b.ts" }, { id: "inj-then stop", text: "then stop" },
+    ])
   })
 
-  it("tracks a steer's acknowledgement on the Run and a note's in the note store, from one handler", async () => {
+  it("tracks a steer's delivery on its record and a note's in the note store, from one handler", async () => {
     const writes: Uint8Array[] = []
     const live = heldRun(writes)
     sessionManager.registerSession(live)
-    const results = extractTrailingToolResults([user("go"), readResult(live, 1)] as Prompt)
-    await deliverContinuationResults(live, results, { steer: [{ text: "also check b.ts" }, { text: LATER, hostNote: true }] })
-    const [steer, note] = injected(writes)
+    const results = extractTrailingToolResults([user("go"), readResult(live, 1), user(LATER)] as Prompt)
+    await deliverContinuationResults(live, results, { steer: [promotedSteer(live, "also check b.ts")] })
+    const [note, steer] = injected(writes)
 
     const frames = [
       injectionState(steer!.id, { delivered: {} }),
@@ -151,29 +160,17 @@ describe("host notes in a steer step", () => {
     await pump(live, collect(), { textId: "t", reasoningId: "r" })
 
     expect(releaseHostNoteInjectionsForTests(live.openCodeSessionId!)).toEqual({ inFlight: [], undelivered: [LATER] })
+    expect(JSON.parse(serializeEarlySteers(live.openCodeSessionId!)!).records).toMatchObject([{ text: "also check b.ts", answered: true }])
   })
 
-  it("injects a message an earlier delivery of the same results did not carry", async () => {
+  it("injects a message an earlier delivery of the same results did not carry, without the step's notes again", async () => {
     const writes: Uint8Array[] = []
     const live = heldRun(writes)
     sessionManager.registerSession(live)
     const results = extractTrailingToolResults([user("go"), readResult(live, 1), user(NOTE)] as Prompt)
 
     await deliverContinuationResults(live, results)
-    await deliverContinuationResults(live, results, { steer: [{ text: "also check b.ts" }, { text: LATER, hostNote: true }] })
-
-    expect(injected(writes).map((injection) => injection.text)).toEqual([NOTE_TEXT, "also check b.ts", LATER_TEXT])
-  })
-
-  it("does not inject a step's notes or messages again when its results were already delivered", async () => {
-    const writes: Uint8Array[] = []
-    const live = heldRun(writes)
-    sessionManager.registerSession(live)
-    const results = extractTrailingToolResults([user("go"), readResult(live, 1), user(NOTE)] as Prompt)
-    const steer = [{ text: "also check b.ts" }]
-
-    await deliverContinuationResults(live, results, { steer })
-    await deliverContinuationResults(live, results, { steer })
+    await deliverContinuationResults(live, results, { steer: [promotedSteer(live, "also check b.ts")] })
 
     expect(injected(writes).map((injection) => injection.text)).toEqual([NOTE_TEXT, "also check b.ts"])
   })

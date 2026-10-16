@@ -271,6 +271,16 @@ it supersedes. Cite tests and symbols rather than line numbers, which drift.
   arrive as trailing user messages beside pending tool results; keep the
   results on the held Run and inject the notices after them
   (`test/host-notes-run.test.ts`).
+- **One host step can promote several user messages.** PR #57's mixed inbox
+  and Stop cases lost a request because fresh Runs selected only the last
+  message. The live-turn range must agree with the range excluded from seeded
+  history (`liveUserTurn`, `test/early-steer.test.ts`).
+- **Scope receipts wherever a host copy is consumed.** PR #57 scoped copies
+  handled after an answer but missed promotions after tool results, so a later
+  identical request disappeared. Rejecting the whole message range when one
+  neighbor carried an attachment also repeated an answered request. The
+  Greptile receipt regressions cover both promotion paths and preserve the
+  unmatched message parts and image bytes (`test/early-steer.test.ts`).
 - **A busy or incomplete fresh-turn drain does not establish a safe
   checkpoint.** Rebuild from the host's results while keeping the new user
   request, and never deduplicate commands by their text.
@@ -548,7 +558,11 @@ it supersedes. Cite tests and symbols rather than line numbers, which drift.
 
 - **A checkpoint alone is not restart recovery.** Its session binding, blobs,
   stable context base, lifecycle tool fallback and pending compaction rebase
-  must be saved together at a successful turn end. Keep only blobs reachable
+  must be saved together at a successful turn end. PR #57 also needed steer
+  delivery receipts: restoring only the checkpoint repeated an answered
+  request when the inbox later promoted its copy. Restart and mixed-message
+  retry regressions in `test/early-steer.test.ts` cover the durable receipts.
+  Keep only blobs reachable
   from the latest checkpoint, and keep everything when the graph cannot be
   proven complete.
 - **Measure before choosing a storage format.** Protobuf bytes plus whole-file

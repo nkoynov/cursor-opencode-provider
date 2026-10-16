@@ -2,17 +2,16 @@ import { describe, it, expect, afterEach } from "bun:test"
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import {
-  answeredSteersInUserTurn,
-  extractLiveSteerResults,
+  continuationAfterEarlySteers,
   extractPromptHistory,
   extractTrailingToolResults,
   FRESH_TURN_PENDING_CANCEL_REASON,
   mayBeUserStep,
   pumpWithRecovery,
-  remainingRunInjections,
   resetTurnStateForTests,
   type CursorRunRecovery,
 } from "../src/language-model.js"
+import { needsHostHistory, recordEarlySteer } from "../src/host-steer.js"
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
 import { createCursor } from "../src/index.js"
 import { billingLedger } from "../src/billing.js"
@@ -150,40 +149,45 @@ afterEach(() => {
   resetTurnStateForTests()
 })
 
+const TOOLS = [{ name: "read" }]
+
+/** The held-Run continuation of a user step for `wireModelId`, and the messages it injects. */
+function steered(prompt: Prompt, sessionKey: string | undefined = OPENCODE_SESSION, wireModelId = MODEL, incomingTools = TOOLS) {
+  const found = continuationAfterEarlySteers(prompt, sessionKey, { userStep: true, wireModelId, incomingTools })
+  return found && { results: found.results, messages: found.inject.map((record) => record.text) }
+}
+
+/** A message the held Run `run` was sent, as OpenCode promoted it after the step's results. */
+function promoted(run: string, text: string, fields: { delivered?: boolean; checkpointed?: boolean } = {}) {
+  recordEarlySteer({
+    sessionID: OPENCODE_SESSION, inboxID: `inbox-${text}`, injectionId: `inj-${text}`, run, text,
+    delivered: fields.delivered ?? false, checkpointed: fields.checkpointed ?? false, answered: false, promoted: true,
+  })
+}
+
 describe("mid-turn user message after a complete step", () => {
   it("returns the step's results unchanged and the message for injection", () => {
     heldReads("reads")
     const prompt = steer("reads", user("also check 3.ts", "and 4.ts"))
     expect(extractTrailingToolResults(prompt)).toEqual([])
 
-    const steered = extractLiveSteerResults(prompt, OPENCODE_SESSION, MODEL)!
-    expect(steered.results.map((r) => [r.execId, r.notes])).toEqual([[1, undefined], [2, undefined]])
-    expect(steered.messages).toEqual(["also check 3.ts\nand 4.ts"])
+    const found = steered(prompt)!
+    expect(found.results.map((r) => [r.execId, r.notes])).toEqual([[1, undefined], [2, undefined]])
+    expect(found.messages).toEqual(["also check 3.ts\nand 4.ts"])
   })
 
-  it("keeps each message and host note separate, in prompt order", () => {
+  it("injects a message once when the host repeats the step", () => {
+    heldReads("repeated")
+    const prompt = steer("repeated", user("also check 3.ts"))
+    expect(steered(prompt)?.messages).toEqual(["also check 3.ts"])
+    expect(steered(prompt)?.messages).toEqual([])
+  })
+
+  it("keeps each message separate, and the step's host notes with its results", () => {
     heldReads("ordered")
-    const steered = extractLiveSteerResults(
-      steer("ordered", user("also check 3.ts"), user(NOTE), user("then stop")),
-      OPENCODE_SESSION,
-      MODEL,
-    )!
-    expect(steered.messages).toEqual(["also check 3.ts", "then stop"])
-    expect(steered.injections).toEqual([{ text: "also check 3.ts" }, { text: NOTE, hostNote: true }, { text: "then stop" }])
-    expect(steered.results.at(-1)!.notes).toBeUndefined()
-  })
-
-  it("never takes a host note that quotes an answered steer for that steer", () => {
-    const quoting = `<system-update>\nInstructions from: /w/AGENTS.md\nRun tests.\nUse tabs.\n</system-update>`
-    const prompt = [user("look"), { role: "assistant", content: [{ type: "text", text: "done" }] }, user(quoting), user("Run tests.")] as Prompt
-    expect([...answeredSteersInUserTurn(prompt, ["Run tests."])]).toEqual([3])
-  })
-
-  it("leaves out the messages injected while Cursor worked on the step, keeping a later message with the same text", () => {
-    const note = { text: NOTE, hostNote: true as const }
-    expect(remainingRunInjections([{ text: "x" }, note, { text: "x" }], ["x"])).toEqual([note, { text: "x" }])
-    expect(remainingRunInjections([{ text: "a" }, note, { text: "b" }], ["b"])).toEqual([note, { text: "b" }])
-    expect(remainingRunInjections([{ text: "a" }, note, { text: "b" }], [])).toEqual([note])
+    const found = steered(steer("ordered", user("also check 3.ts"), user(NOTE), user("then stop")))!
+    expect(found.messages).toEqual(["also check 3.ts", "then stop"])
+    expect(found.results.at(-1)!.notes).toEqual([NOTE])
   })
 
   it("takes a completed result that only looks like OpenCode's interrupted-tool error for a result", () => {
@@ -198,7 +202,7 @@ describe("mid-turn user message after a complete step", () => {
       const sid = `lookalike_${i}`
       heldReads(sid)
       const prompt = [...readStep(sid, output), user("b")] as Prompt
-      expect({ output, steered: extractLiveSteerResults(prompt, OPENCODE_SESSION, MODEL)?.messages }).toEqual({ output, steered: ["b"] })
+      expect({ output, steered: steered(prompt)?.messages }).toEqual({ output, steered: ["b"] })
       sessionManager.dispose()
     }
   })
@@ -207,7 +211,7 @@ describe("mid-turn user message after a complete step", () => {
     const held = heldSession("writes")
     sessionManager.registerPending(1, held, "write_result", "write", false, { path: "/w/out.ts" })
     const prompt = [user("a"), toolResult("writes", 1, "Wrote file successfully.", "write"), user("b")] as Prompt
-    expect(extractLiveSteerResults(prompt, OPENCODE_SESSION, MODEL)?.messages).toEqual(["b"])
+    expect(steered(prompt)?.messages).toEqual(["b"])
   })
 
   it("keeps the step's results in the seed history if the held Run has to be rebased", () => {
@@ -265,7 +269,7 @@ describe("cases that stay a fresh turn", () => {
   it("a stop then a new message", () => {
     heldReads("stopped")
     const prompt = [...readStep("stopped", ABORTED), user("b")] as Prompt
-    expect(extractLiveSteerResults(prompt, OPENCODE_SESSION, MODEL)).toBeUndefined()
+    expect(steered(prompt)).toBeUndefined()
   })
 
   it("a stop then a new message, as OpenCode 1.x reports the interrupted tool", () => {
@@ -280,7 +284,7 @@ describe("cases that stay a fresh turn", () => {
       heldReads(sid)
       const step = readStep(sid)
       step[3] = { role: "tool", content: [{ type: "tool-result", toolCallId: `cursor_${sid}_2`, toolName: "read", output }] }
-      expect(extractLiveSteerResults([...step, user("b")] as Prompt, OPENCODE_SESSION, MODEL)).toBeUndefined()
+      expect(steered([...step, user("b")] as Prompt)).toBeUndefined()
       sessionManager.dispose()
     }
   })
@@ -289,29 +293,41 @@ describe("cases that stay a fresh turn", () => {
     const held = heldReads("helper")
     held.toolCatalog = [{ name: "read" }, { name: "bash" }, { name: "task" }] as CursorSession["toolCatalog"]
     const prompt = steer("helper", user("summarize the session so far"))
-    expect(extractLiveSteerResults(prompt, OPENCODE_SESSION, MODEL, [{ name: "read" }, { name: "bash" }])).toBeUndefined()
-    expect(extractLiveSteerResults(prompt, OPENCODE_SESSION, MODEL, [{ name: "read" }, { name: "bash" }, { name: "task" }])).toBeDefined()
+    expect(steered(prompt, OPENCODE_SESSION, MODEL, [{ name: "read" }, { name: "bash" }])).toBeUndefined()
+    expect(steered(prompt, OPENCODE_SESSION, MODEL, [{ name: "read" }, { name: "bash" }, { name: "task" }])).toBeDefined()
+  })
+
+  it("a title, summary or compaction call", () => {
+    heldReads("helper-call")
+    const prompt = steer("helper-call", user("summarize the session so far"))
+    expect(continuationAfterEarlySteers(prompt, OPENCODE_SESSION, { userStep: false, wireModelId: MODEL, incomingTools: TOOLS })).toBeUndefined()
   })
 
   it("no held Run waiting on the results", () => {
-    expect(extractLiveSteerResults(steer("gone", user("b")), OPENCODE_SESSION, MODEL)).toBeUndefined()
+    expect(steered(steer("gone", user("b")))).toBeUndefined()
   })
 
   it("a held Run of another OpenCode session", () => {
     heldReads("other")
-    expect(extractLiveSteerResults(steer("other", user("b")), "ses_someone_else", MODEL)).toBeUndefined()
-    expect(extractLiveSteerResults(steer("other", user("b")), undefined, MODEL)).toBeUndefined()
+    expect(steered(steer("other", user("b")), "ses_someone_else")).toBeUndefined()
+    expect(continuationAfterEarlySteers(steer("other", user("b")), undefined, { userStep: true, wireModelId: MODEL, incomingTools: TOOLS })).toBeUndefined()
   })
 
   it("a held Run still waiting on another exec", () => {
     heldReads("partial", [1, 2, 3])
-    expect(extractLiveSteerResults(steer("partial", user("b")), OPENCODE_SESSION, MODEL)).toBeUndefined()
+    expect(steered(steer("partial", user("b")))).toBeUndefined()
   })
 
   it("a held Run without a known run id", () => {
     const held = heldReads("norun")
     held.runId = undefined
-    expect(extractLiveSteerResults(steer("norun", user("b")), OPENCODE_SESSION, MODEL)).toBeUndefined()
+    expect(steered(steer("norun", user("b")))).toBeUndefined()
+  })
+
+  it("a held Run the host stopped", () => {
+    const held = heldReads("stopped-run")
+    held.hostInterrupted = "user"
+    expect(steered(steer("stopped-run", user("b")))).toBeUndefined()
   })
 
   it("a turn that already ended with assistant text", () => {
@@ -323,26 +339,26 @@ describe("cases that stay a fresh turn", () => {
       { role: "assistant", content: [{ type: "text", text: "done" }] },
       user("b"),
     ] as Prompt
-    expect(extractLiveSteerResults(prompt, OPENCODE_SESSION, MODEL)).toBeUndefined()
+    expect(steered(prompt)).toBeUndefined()
   })
 
   it("a message with an attachment", () => {
     heldReads("image")
     const message = { role: "user", content: [{ type: "text", text: "see this" }, { type: "file", mediaType: "image/png", data: "AA==" }] }
-    expect(extractLiveSteerResults(steer("image", message), OPENCODE_SESSION, MODEL)).toBeUndefined()
+    expect(steered(steer("image", message))).toBeUndefined()
   })
 
   it("a host note alone, which stays an ordinary continuation", () => {
     heldReads("note")
     const prompt = steer("note", user(NOTE))
-    expect(extractLiveSteerResults(prompt, OPENCODE_SESSION, MODEL)).toBeUndefined()
+    expect(steered(prompt)).toBeUndefined()
     expect(extractTrailingToolResults(prompt).map((r) => r.execId)).toEqual([1, 2])
   })
 
   it("a message sent with another model selected", () => {
     heldReads("switched", [1, 2], "claude-opus")
-    expect(extractLiveSteerResults(steer("switched", user("b")), OPENCODE_SESSION, "gpt-5")).toBeUndefined()
-    expect(extractLiveSteerResults(steer("switched", user("b")), OPENCODE_SESSION, "claude-opus")).toBeDefined()
+    expect(steered(steer("switched", user("b")), OPENCODE_SESSION, "gpt-5")).toBeUndefined()
+    expect(steered(steer("switched", user("b")), OPENCODE_SESSION, "claude-opus")).toBeDefined()
   })
 })
 
@@ -410,7 +426,7 @@ describe("doStream with a mid-turn user message", () => {
     expect(spans).toEqual([
       "text-start", "text-delta:Both files say alpha.", "text-end",
       "reasoning-start", "reasoning-delta:checking 3.ts", "reasoning-end",
-      "text-start", "text-delta:ok", "text-end",
+      "text-start", "text-delta:\n\nok", "text-end",
     ])
   })
 
@@ -617,7 +633,7 @@ describe("doStream with a mid-turn user message", () => {
     })
   })
 
-  it("injects messages and host notes in prompt order, after the step's results", async () => {
+  it("injects the step's host notes, then its messages, after the step's results", async () => {
     const held = heldReads("interleaved")
     serve(held, [
       () => injectionState(injections(held.writes)[0].injection_id, { delivered: { step: 2 } }),
@@ -629,7 +645,7 @@ describe("doStream with a mid-turn user message", () => {
     await streamSteer(held, steer("interleaved", user("also check 3.ts"), user(NOTE), user("then stop")))
 
     const messages = clientMessages(held.writes)
-    expect(injections(held.writes).map((action) => action.user_context.user_message.text)).toEqual(["also check 3.ts", NOTE_TEXT, "then stop"])
+    expect(injections(held.writes).map((action) => action.user_context.user_message.text)).toEqual([NOTE_TEXT, "also check 3.ts", "then stop"])
     expect(messages.findIndex((message) => message.conversation_action))
       .toBeGreaterThan(messages.map((message) => !!message.exec_client_message).lastIndexOf(true))
     expect(JSON.stringify(execMessages(held.writes))).not.toContain("system-update")
@@ -680,28 +696,26 @@ describe("Run recovery around a mid-turn user message", () => {
     error(error: Error) { throw error },
   }) as unknown as ReadableStreamDefaultController<any>
 
-  it("resends the follow-up when opening its Run fails", async () => {
+  it("fails the turn when the follow-up Run cannot open, and the next turn rebuilds from host history", async () => {
     const held = heldSession("reopen-fails")
     held.resumeCheckpoint = new Uint8Array([1])
-    held.steerInjections = [{ id: "inj-1", text: "also check 3.ts", state: "rejected", checkpointed: true }]
+    promoted(held.sessionId, "also check 3.ts")
     held.reopenWithUserMessage = async () => { throw new CursorRunInterruptedError() }
     serve(held, [turnEnded])
     const recoveries: CursorRunRecovery[] = []
-    let recovered: HeldSession | undefined
 
-    await pumpWithRecovery({
+    const error = await pumpWithRecovery({
       initialSession: held,
       controller: controller([]),
       recover: async (recovery) => {
         recoveries.push(recovery)
-        recovered = heldSession("reopen-recovered")
-        serve(recovered, [() => serverFrame({ text_delta: { text: "ok" } }), turnEnded])
-        return recovered
+        return heldSession("reopen-recovered")
       },
-    })
+    }).then(() => undefined, (failure: Error) => failure)
 
-    expect(recoveries).toEqual([{ kind: "resume", conversationId: held.conversationId, checkpoint: new Uint8Array([1]), followUp: "also check 3.ts" }])
-    expect(recovered!.closed).toBe(true)
+    expect(error?.message).toContain("sending it again failed")
+    expect(recoveries).toEqual([])
+    expect(needsHostHistory(OPENCODE_SESSION, undefined)).toBe(true)
   })
 
   it("rebases a steer's Run that drops before any checkpoint as a steer, and no other", async () => {
@@ -763,10 +777,8 @@ describe("Run recovery around a mid-turn user message", () => {
   it("resends only the messages the resumed checkpoint may not hold", async () => {
     const held = heldSession("partial-resume")
     held.resumeCheckpoint = new Uint8Array([1])
-    held.steerInjections = [
-      { id: "inj-a", text: "first", state: "delivered", checkpointed: true },
-      { id: "inj-b", text: "second", state: "delivered" },
-    ]
+    promoted(held.sessionId, "first", { delivered: true, checkpointed: true })
+    promoted(held.sessionId, "second", { delivered: true })
     serve(held, [])
     const followUps: string[] = []
 
@@ -791,7 +803,7 @@ describe("Run recovery around a mid-turn user message", () => {
   it("resends even a delivered message when the Run resumes from a checkpoint older than it", async () => {
     const held = heldSession("stale-resume")
     held.resumeCheckpoint = new Uint8Array([1])
-    held.steerInjections = [{ id: "inj-4", text: "also check 3.ts", state: "delivered" }]
+    promoted(held.sessionId, "also check 3.ts", { delivered: true })
     serve(held, [])
     const followUps: string[] = []
 
@@ -816,7 +828,7 @@ describe("Run recovery around a mid-turn user message", () => {
   it("keeps undelivered messages across a resumed Run and sends them when it ends", async () => {
     const held = heldSession("resumed")
     held.resumeCheckpoint = new Uint8Array([1])
-    held.steerInjections = [{ id: "inj-2", text: "then stop", state: "queued" }]
+    promoted(held.sessionId, "then stop")
     serve(held, [])
     const followUps: string[] = []
     const recover = async () => {

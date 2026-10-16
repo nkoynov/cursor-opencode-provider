@@ -343,10 +343,6 @@ export type CursorSession = {
   earlyToolRows?: EarlyToolRowState
   /** AgentRunRequest.run_id of the Run on `stream`; Cursor checks injections against it. */
   runId?: string
-  /** Mid-turn user messages and host notes injected into this Run, in send order. */
-  steerInjections?: SteerInjection[]
-  /** User text of a follow-up Run that has not reached its first checkpoint; a resume must resend it. */
-  pendingFollowUp?: string
   /**
    * A steer call's results went to this Run after its last checkpoint; resuming that checkpoint would
    * drop them. A checkpoint may already be in flight when they are written, so only one read after
@@ -456,15 +452,6 @@ export type DetectedModelSwitch = ModelSwitch & {
   holdsTurn: boolean
   toolsKept: HostToolRun[]
   toolsSwitched: HostToolRun[]
-}
-
-export type SteerInjection = {
-  id: string
-  text: string
-  /** Cursor's last answer; `sent` before one, `carried` when inherited from a Run that dropped. */
-  state: "sent" | "carried" | "queued" | "delivered" | "queued_for_next_turn" | "cancelled" | "rejected"
-  /** A checkpoint arrived after Cursor answered this injection, so it holds the message and the step. */
-  checkpointed?: boolean
 }
 
 type Tombstone = {

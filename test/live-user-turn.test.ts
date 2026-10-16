@@ -174,7 +174,9 @@ describe("the user turn of a fresh Run", () => {
     inboxID: `msg_${text.length}`,
     text,
     injectionId: `inj_${text.length}`,
-    conversationId: `conv-${sessionKey}`,
+    run: `run-${sessionKey}`,
+    delivered: true,
+    checkpointed: true,
     answered: true,
   })
 
@@ -303,7 +305,7 @@ describe("the user turn of a fresh Run", () => {
     expect(userText(run)).not.toContain(STEER)
   })
 
-  it("keeps an answered steer in the replay as a message with no reply", async () => {
+  it("leaves an answered steer out of the replay and the request of a Run without a checkpoint", async () => {
     const sessionKey = newSession({ bound: true })
     answeredEarly(sessionKey, STEER)
 
@@ -317,16 +319,17 @@ describe("the user turn of a fresh Run", () => {
     const { transcript, live } = splitTranscript(run)
     expect(live).toStartWith(QUESTION)
     expect(live).not.toContain(STEER)
-    expect(transcript).toContain(`<user unanswered="true">\n${STEER}\n</user>`)
+    expect(transcript).not.toContain(STEER)
   })
 
   /** The last turn ended and saved its snapshot; then the provider restarted. */
   async function savedBeforeRestart(sessionKey: string, saved: { answeredSteers?: string[]; hostNote?: string }): Promise<void> {
+    for (const steer of saved.answeredSteers ?? []) answeredEarly(sessionKey, steer)
     await persistConversationState(opencodeGlobalCacheDir(), {
       sessionKey,
       conversationId: `conv-${sessionKey}`,
       requestContext: { rules_info_complete: true, rules: [systemInstructionsRule(SYSTEM)] },
-      ...saved,
+      ...(saved.hostNote ? { hostNote: saved.hostNote } : {}),
     })
     resetConversationPersistenceForTests()
     resetConversationBindingsForTests()
@@ -372,7 +375,7 @@ describe("the user turn of a fresh Run", () => {
     expect(decodes).toBe(1)
   })
 
-  it("after a restart that lost the snapshot, sends the last message and replays the earlier ones as no reply", async () => {
+  it("after a restart that lost the snapshot, sends every message of the user turn", async () => {
     const run = await step(newSession(), [
       user("What is 17 * 23?"),
       assistant("391"),
@@ -380,10 +383,7 @@ describe("the user turn of a fresh Run", () => {
       user(QUESTION),
     ] as Prompt)
 
-    const { transcript, live } = splitTranscript(run)
-    expect(live).toStartWith(QUESTION)
-    expect(live).not.toContain(STEER)
-    expect(transcript).toContain(`<user unanswered="true">\n${STEER}\n</user>`)
+    expect(splitTranscript(run).live).toStartWith(`${STEER}\n\n${QUESTION}`)
   })
 
   it("sends a note and the user's first message of a new session together", async () => {
@@ -394,20 +394,6 @@ describe("the user turn of a fresh Run", () => {
     ] as Prompt)
 
     expect(splitTranscript(run).live).toStartWith(`${SYSTEM_UPDATE}\n\n${QUESTION}`)
-  })
-
-  it("still sends a user turn the restart snapshot would leave empty", async () => {
-    const sessionKey = newSession({ checkpointed: true })
-    await savedBeforeRestart(sessionKey, { answeredSteers: [STEER, QUESTION] })
-
-    const run = await step(sessionKey, [
-      user("Read the docs"),
-      assistant("Read them, and the README too."),
-      user(STEER),
-      user(QUESTION),
-    ] as Prompt)
-
-    expect(userText(run)).toStartWith(`${STEER}\n\n${QUESTION}`)
   })
 
   it("sends an undelivered host note once when the user turn holds it too", async () => {
@@ -434,7 +420,9 @@ describe("the user turn of a fresh Run", () => {
       inboxID: "msg_open",
       text: STEER,
       injectionId: "inj_open",
-      conversationId: `conv-${sessionKey}`,
+      run: `run-${sessionKey}`,
+      delivered: false,
+      checkpointed: false,
       answered: false,
     })
 

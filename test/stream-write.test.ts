@@ -30,6 +30,23 @@ describe("writeStreamMessage", () => {
     expect(s.written).toEqual([1])
   })
 
+  it("asks shouldWrite only when the message's turn comes, and skips it on false", async () => {
+    let drain!: () => void
+    const s = stream({
+      write: (message) => message[0] !== 1,
+      waitForDrain: () => new Promise<void>((resolve) => { drain = resolve }),
+    })
+    let allowed = true
+    const first = writeStreamMessage(s, frame(1), "first")
+    const second = writeStreamMessage(s, frame(2), "second", () => allowed)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    allowed = false
+    drain()
+    await first
+    expect(await second).toBe(false)
+    expect(s.written).toEqual([1])
+  })
+
   it("waits for drain after a backpressured write and keeps later writes behind it", async () => {
     const drains: Array<() => void> = []
     const s = stream({
