@@ -150,7 +150,9 @@ opencode run --model cursor/composer-2.5 "Hello from Cursor via OpenCode"
 
 Cursor models often expose parameterized variants (effort, thinking, fast, context tier, …). The plugin materializes those as OpenCode **model variants**. In the TUI, pick one from the variant dialog or cycle with OpenCode’s `variant_cycle` keybind (default `ctrl+t`).
 
-The selected variant’s Cursor parameter map is forwarded on the Run as `requested_model.parameters` (isolated under `providerOptions.cursor.cursorVariantParameters` so unrelated OpenCode options are not leaked onto the wire). The provider validates that explicit selection against the current cached tuple; malformed, reordered, or stale selections fail clearly instead of silently falling back to another variant.
+The selected variant’s Cursor parameter map is forwarded on the Run as `requested_model.parameters` (isolated under `providerOptions.cursor.cursorVariantParameters` so unrelated OpenCode options are not leaked onto the wire). The provider validates that explicit selection against the current cached tuple; malformed, duplicate-id, or stale selections fail clearly instead of silently falling back to another variant. Parameter order does not matter.
+
+Without an explicit selection, an effort hint stays within the requested base or max tier and changes only the effort of that tier's default variant (thinking and other parameters keep the default's values). The provider prefers non-Fast variants within that tier and keeps Cursor's declared default effort when the default is Fast. An unavailable effort falls back to an advertised default tuple rather than inventing parameter values.
 
 #### 1M / long context
 
@@ -162,6 +164,19 @@ OpenCode’s context limit is static per model entry, while Cursor’s long-cont
 - the real Cursor model id carried in `options.cursorModelId` (not `config.id`, which would make OpenCode merge base variants into the 1M entry)
 
 The Run still uses Cursor’s original model id; OpenCode’s synthetic `-1m` id is only for picking and limits.
+
+Other advertised max-context tiers also get separate entries. For example,
+Grok 4.7's marked 500k variants appear under `grok-4.7-500k`, with a 500,000-token
+context limit; `grok-4.7-500k-fast` carries the Fast variants and pricing.
+Each dedicated context entry keeps only its tier's variants and retains the declared default
+effort, including when the default's non-Fast twin is needed. Non-1M entries
+retain the base output limit of 32,000 tokens.
+
+Existing non-1M variant names also remain on the original base/Fast entries so
+saved selections such as `grok-4.7#Grok 4.7 High 500k` keep working after an
+upgrade. These legacy selections send the selected 500k parameters and max-mode
+flag, but keep the original entry's conservative static context budget. Select
+`grok-4.7-500k` or `grok-4.7-500k-fast` to give OpenCode the full 500k budget.
 
 #### Fast variants with distinct prices
 
@@ -207,10 +222,11 @@ One 20 MiB decoded-byte budget covers all image-bearing pending results in a con
 
 #### Max mode
 
-Cursor IDE has a separate **Max Mode** toggle that sets `requested_model.max_mode` and selects the default max / 1m variant. OpenCode has no equivalent custom toggle, so this provider approximates it:
+Cursor IDE has a separate **Max Mode** toggle that sets `requested_model.max_mode` and selects the default max variant. OpenCode has no equivalent custom toggle, so this provider approximates it:
 
-- Selecting a `*-1m` model (or any resolved params with `context=1m`) sets wire `max_mode` to `true`
-- An explicit `providerOptions.cursor.maxMode` hint also turns it on
+- Selecting a variant that Cursor's model list marks as max mode sets wire `max_mode` to `true`, as Cursor CLI does. That covers `*-1m` models and other max tiers such as Grok 4.7's 500k variants; a variant without the marker falls back to `context=1m`
+- A model Cursor reports as not supporting non-max mode always runs in max mode
+- An explicit `providerOptions.cursor.maxMode` hint without a picked variant also turns it on and selects the declared max default, using its non-Fast twin when available. A tier with only Fast variants remains selectable
 
 There is no independent Max Mode chrome in OpenCode beyond choosing the 1M model / long-context variant.
 

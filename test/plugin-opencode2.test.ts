@@ -2,6 +2,7 @@ import { describe, expect, test, beforeEach, afterEach, setSystemTime } from "bu
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
+import { APICallError } from "@ai-sdk/provider"
 import plugin from "../src/plugin-opencode2.js"
 import { CursorPlugin } from "../src/plugin.js"
 import { applyCursorProviderInventory, CURSOR_AISDK_PACKAGE, modelConfigEntryToInfo, ownPackageSpec } from "../src/opencode2/catalog.js"
@@ -13,8 +14,7 @@ import {
 } from "../src/opencode2/integration.js"
 import { resetAuthRenewalState } from "../src/auth-renewal.js"
 import { decodeJwtExpiryMs } from "../src/auth.js"
-import { CursorAuthError, CursorRetryExhaustedError, CursorServerError } from "../src/errors.js"
-import { recordFinalFailure, resetFinalFailuresForTests } from "../src/host-retry.js"
+import { CursorAuthError } from "../src/errors.js"
 import { clearCompactionSessions, isCompactionSession, markCompactionSession } from "../src/compaction-marker.js"
 import {
   clearSessionDirectories,
@@ -1244,9 +1244,18 @@ describe("opencode2 setup", () => {
       await hooks.get("aisdk.sdk")!(event)
       expect(event.sdk).not.toBe(fallback)
       expect(resolves).toBe(0)
-      await expect(event.sdk.languageModel("m").doStream({
+      const failure: unknown = await event.sdk.languageModel("m").doStream({
         prompt: [{ role: "user", content: [{ type: "text", text: "Respond briefly" }] }],
-      })).rejects.toThrow("synthetic credential unavailable")
+      }).catch((error: unknown) => error)
+      expect(APICallError.isInstance(failure)).toBe(true)
+      if (!APICallError.isInstance(failure)) throw new Error("Expected terminal sign-in failure")
+      expect(failure).toMatchObject({
+        statusCode: 401,
+        isRetryable: false,
+        responseHeaders: { "x-should-retry": "false" },
+      })
+      expect(failure.message).toContain("synthetic credential capacity_limit")
+      expect(failure.cause).toBeInstanceOf(CursorAuthError)
       expect(resolves).toBe(1)
     } finally {
       await cleanup()
@@ -1986,38 +1995,6 @@ describe("opencode2 setup", () => {
     }
     await hooks.get("session.title")!(event)
     expect(event.options.opencodeCompaction).toBe(false)
-  })
-
-  test("retry: OpenCode does not retry a step the provider ended for good", async () => {
-    resetFinalFailuresForTests()
-    const { ctx, hooks } = fakeContext()
-    await plugin.setup(ctx)
-    const failure = new CursorRetryExhaustedError(6, new CursorServerError("Cursor API error (code=resource_exhausted)", {
-      transient: true, replaySafe: true, code: "resource_exhausted",
-    }))
-    const retry = (sessionID: string, message: string, providerID = "cursor"): any => ({
-      sessionID,
-      agent: "build",
-      model: { providerID, id: "claude-opus-5-5-1m" },
-      error: { type: "provider.internal", message },
-      attempt: 2,
-      decision: { retry: true, delay: 2_000 },
-    })
-
-    recordFinalFailure("s-final", failure)
-    const other = retry("s-final", failure.message, "anthropic")
-    await hooks.get("session.retry")!(other)
-    expect(other.decision).toEqual({ retry: true, delay: 2_000 })
-    const stalled = retry("s-final", "Cursor semantic-progress timeout after 120000ms; automatic retry unsafe (attempt 1/3)")
-    await hooks.get("session.retry")!(stalled)
-    expect(stalled.decision).toEqual({ retry: true, delay: 2_000 })
-
-    const final = retry("s-final", failure.message)
-    await hooks.get("session.retry")!(final)
-    expect(final.decision).toEqual({ retry: false })
-    const unrecorded = retry("s-other", failure.message)
-    await hooks.get("session.retry")!(unrecorded)
-    expect(unrecorded.decision).toEqual({ retry: true, delay: 2_000 })
   })
 })
 

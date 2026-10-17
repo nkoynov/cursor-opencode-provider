@@ -57,6 +57,13 @@ Inside `opencode2`, run `/connect`, choose **Cursor**, then browser login or an 
 
 After auth, Cursor models appear in the picker from the in-memory inventory. The `<host-cache>/cursor-models.json` cache is still used as the discovery source; it is not copied into config.
 
+The 500k max tier appears as `grok-4.7-500k` (and `grok-4.7-500k-fast`),
+with its own context limit and variant list. These entries still send
+`grok-4.7` to Cursor and retain the tier's declared default effort;
+see [shared model selection](../README.md#select-a-model).
+Saved 500k variants on the original base/Fast entries remain available after
+upgrading. Select the dedicated 500k entry for its full host context budget.
+
 The plugin supplies its own Cursor SDK even when the host's generic package loader already created one. Each new Run resolves the active integration credential and applies on-demand renewal; a token captured by the generic loader or its options cannot bypass that resolver.
 
 ## From a local clone (`CURSOR_OPENCODE2_DEV_ENTRY`)

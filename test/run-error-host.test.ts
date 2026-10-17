@@ -6,9 +6,9 @@ import os from "node:os"
 import path from "node:path"
 import { APICallError, type LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
-import { CursorServerError } from "../src/errors.js"
+import { CursorAuthError, CursorRetryExhaustedError, CursorServerError } from "../src/errors.js"
 import { decodeFramePayload } from "../src/protocol/framing.js"
-import { decodeMessage } from "../src/protocol/messages.js"
+import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { sessionManager } from "../src/session.js"
@@ -26,6 +26,7 @@ let server: http2.Http2Server
 let client: http2.ClientHttp2Session
 let trailer: Record<string, unknown> = {}
 let runs = 0
+let partialOutput = false
 const savedProxy: Record<string, string | undefined> = {}
 
 function frame(payload: Uint8Array, flags = 0): Buffer {
@@ -54,6 +55,11 @@ beforeAll(async () => {
         pending = pending.subarray(5 + length)
         if (!message.run_request) continue
         runs++
+        if (partialOutput) {
+          stream.write(frame(encodeMessage("AgentServerMessage", {
+            interaction_update: { thinking_delta: { text: "Already delivered" } },
+          })))
+        }
         stream.write(frame(Buffer.from(JSON.stringify(trailer)), 2))
         stream.end()
       }
@@ -89,13 +95,17 @@ afterEach(() => {
   resetConversationBindingsForTests()
   resetCheckpointsForTests()
   runs = 0
+  partialOutput = false
 })
 
 async function streamError(sessionKey: string): Promise<unknown> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-run-error-"))
   cacheHttp2SessionForTests(ORIGIN, client)
   try {
-    const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root })
+    const model = createCursor({
+      name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root,
+      retry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 },
+    })
       .languageModel("composer-2.5")
     const { stream } = await model.doStream({
       prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
@@ -114,6 +124,48 @@ async function streamError(sessionKey: string): Promise<unknown> {
 }
 
 describe("Run errors as the host sees them", () => {
+  for (const method of ["doStream", "doGenerate"] as const) {
+    for (const failure of ["empty token", "rejected login"] as const) {
+      it(`ends ${method} on a pre-stream ${failure} without opening a Run`, async () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-run-auth-error-"))
+        let requests = 0
+        const authError = new CursorAuthError("Cursor login expired; sign in again")
+        try {
+          const model = createCursor({
+            name: "cursor",
+            cacheDir: root,
+            getAccessToken: async () => {
+              requests++
+              if (failure === "rejected login") throw authError
+              return ""
+            },
+          }).languageModel("composer-2.5")
+          let caught: unknown
+          try {
+            await model[method]({
+              prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+              headers: { "x-opencode-session-id": `ses_auth_${method}_${failure}` },
+            })
+          } catch (error) {
+            caught = error
+          }
+          expect(APICallError.isInstance(caught)).toBe(true)
+          expect(caught).toMatchObject({
+            statusCode: 401,
+            isRetryable: false,
+            responseHeaders: { "x-should-retry": "false" },
+          })
+          expect((caught as APICallError).cause).toBeInstanceOf(CursorAuthError)
+          if (failure === "rejected login") expect((caught as APICallError).cause).toBe(authError)
+          expect(requests).toBe(1)
+          expect(runs).toBe(0)
+        } finally {
+          fs.rmSync(root, { recursive: true, force: true })
+        }
+      })
+    }
+  }
+
   it("reports a request Cursor declared not retryable as a 400 APICallError, without a provider retry", async () => {
     trailer = {
       error: { code: "invalid_argument", message: "Error", details: [{ type: "aiserver.v1.ErrorDetails", value: POLICY_BLOCK }] },
@@ -136,4 +188,24 @@ describe("Run errors as the host sees them", () => {
     expect((error as Error).message).toBe("Cursor API error (code=invalid_argument)")
     expect(runs).toBe(1)
   }, 30_000)
+
+  for (const unsafeReplay of [false, true]) {
+    it(`stops host retries after ${unsafeReplay ? "visible output makes replay unsafe" : "the Run retry budget is spent"}`, async () => {
+      trailer = { error: { code: "unavailable" } }
+      partialOutput = unsafeReplay
+      const error = await streamError(`ses_terminal_${unsafeReplay}`)
+
+      expect(APICallError.isInstance(error)).toBe(true)
+      expect(error).toMatchObject({
+        statusCode: 400,
+        isRetryable: false,
+        responseHeaders: { "x-should-retry": "false" },
+      })
+      const cause = (error as APICallError).cause
+      expect(cause).toMatchObject({ transient: false, replaySafe: false, code: "unavailable" })
+      if (unsafeReplay) expect((error as Error).message).toContain("automatic retry unsafe")
+      else expect(cause).toBeInstanceOf(CursorRetryExhaustedError)
+      expect(runs).toBe(unsafeReplay ? 1 : 2)
+    }, 30_000)
+  }
 })

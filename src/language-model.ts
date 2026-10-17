@@ -275,11 +275,9 @@ import {
   isRejectedCredentialError,
   isTransientGrpcStatus,
   retrySuppressedError,
-  sanitizeHostTerminalMessage,
   toCursorProviderError,
 } from "./errors.js"
-import { recordFinalFailure } from "./host-retry.js"
-import { readCache, cacheFilePath, resolveVariantParameters, resolveVariantMaxMode, extractCursorVariantParameters, resolveCursorWireModelId, type ModelInfo } from "./models.js"
+import { readCache, cacheFilePath, resolveVariantParameters, resolveVariantMaxMode, extractCursorVariantParameters, resolveCursorWireModelId, parseCursorContextLimit, type ModelInfo, type ModelParameterValue } from "./models.js"
 import { getFrozenRequestContext, getOrBuildRequestContext, resetFrozenRequestContextsForTests } from "./context/frozen.js"
 import { systemInstructionsRuleText, type SystemInstructions } from "./context/build.js"
 import { loadMergedConfig, type OpencodeJson } from "./context/rules.js"
@@ -637,41 +635,100 @@ function retryInfoProtobufDelayMs(encoded: string): number | undefined {
   return Math.ceil(Number(seconds) * 1_000 + Number(nanos) / 1_000_000)
 }
 
-function cursorCustomErrorMessage(record: Record<string, unknown>): string | undefined {
+type CursorErrorDetails = {
+  /** `ErrorDetails.error` enum (#1); 0 when omitted, as protobuf decodes it. */
+  error: number
+  title?: string
+  detail?: string
+  isRetryable?: boolean
+  /** `details.analytics_metadata.action_required` (#10 → #1). */
+  actionRequired?: string
+}
+
+/**
+ * An account-level refusal ("Too many computers.") read from the details' JSON
+ * `debug` rendering, for when its protobuf `value` does not decode.
+ */
+function customMessageFromDebug(record: Record<string, unknown>): CursorErrorDetails | undefined {
   if (record.type !== "aiserver.v1.ErrorDetails" || !record.debug || typeof record.debug !== "object") return undefined
   const debug = record.debug as { error?: unknown; details?: unknown }
   if (debug.error !== "ERROR_CUSTOM_MESSAGE" || !debug.details || typeof debug.details !== "object") return undefined
-  const { title, detail } = debug.details as { title?: unknown; detail?: unknown }
-  const parts = [title, detail].filter((part): part is string => typeof part === "string" && part.trim() !== "")
-  return parts.length > 0 ? parts.map((part) => part.trim()).join(" ") : undefined
+  const { title, detail, isRetryable } = debug.details as { title?: unknown; detail?: unknown; isRetryable?: unknown }
+  const text = (value: unknown) => typeof value === "string" && value.trim() ? value.trim() : undefined
+  return {
+    error: CURSOR_ERROR_CUSTOM_MESSAGE,
+    title: text(title),
+    detail: text(detail),
+    ...(typeof isRetryable === "boolean" ? { isRetryable } : {}),
+  }
 }
 
-type CursorErrorDetails = { title?: string; detail?: string; isRetryable?: boolean }
-
-/** Decode `aiserver.v1.ErrorDetails.details` (#2): title #1, detail #2, is_retryable #4. */
+/**
+ * Decode `aiserver.v1.ErrorDetails`: error #1 and details #2 (title #1,
+ * detail #2, is_retryable #4, analytics_metadata #10 { action_required #1 }).
+ */
 function decodeCursorErrorDetails(encoded: string): CursorErrorDetails | undefined {
   try {
     const outer = protobuf.Reader.create(Buffer.from(encoded, "base64"))
+    const details: CursorErrorDetails = { error: 0 }
     while (outer.pos < outer.len) {
       const tag = outer.uint32()
+      if (tag === 0x08) {
+        details.error = outer.int32()
+        continue
+      }
       if (tag !== 0x12) {
         outer.skipType(tag & 7)
         continue
       }
       const inner = protobuf.Reader.create(outer.bytes())
-      const details: CursorErrorDetails = {}
       while (inner.pos < inner.len) {
         const innerTag = inner.uint32()
         if (innerTag === 0x0a) details.title = inner.string().trim() || undefined
         else if (innerTag === 0x12) details.detail = inner.string().trim() || undefined
         else if (innerTag === 0x20) details.isRetryable = inner.bool()
-        else inner.skipType(innerTag & 7)
+        else if (innerTag === 0x52) {
+          const analytics = protobuf.Reader.create(inner.bytes())
+          while (analytics.pos < analytics.len) {
+            const analyticsTag = analytics.uint32()
+            if (analyticsTag === 0x0a) details.actionRequired = analytics.string() || undefined
+            else analytics.skipType(analyticsTag & 7)
+          }
+        } else inner.skipType(innerTag & 7)
       }
-      return details
     }
+    return details
   } catch {
     return undefined
   }
+}
+
+// `ErrorDetails.Error` values Cursor CLI never retries: cancellation
+// (USER_ABORTED_REQUEST, DEBOUNCED) and login, usage/rate limit, usage pricing
+// and API-key/outdated-client actions.
+const CURSOR_FINAL_ERRORS = new Set([
+  21, 35,
+  2, 18, 11, 12, 3, 38, 46, 47,
+  9, 7, 23, 10, 8, 50, 51, 22,
+  44, 45,
+  1, 42, 30,
+])
+const CURSOR_ERROR_CUSTOM_MESSAGE = 29
+
+/**
+ * Cursor CLI's retry verdict for a Connect error (its `ErrorDetails`
+ * classifier): cancellation, a required user action, an explicit
+ * `isRetryable: false`, an unflagged custom message, or a bare
+ * `permission_denied` end the request; anything else may be retried.
+ */
+function cursorCliRetryable(code: string, details: CursorErrorDetails | undefined): boolean | undefined {
+  if (code === "canceled" || code === "aborted") return false
+  if (details) {
+    if (CURSOR_FINAL_ERRORS.has(details.error) || details.actionRequired) return false
+    if (details.error === CURSOR_ERROR_CUSTOM_MESSAGE && details.isRetryable !== true) return false
+    if (details.isRetryable !== undefined) return details.isRetryable
+  }
+  if (code === "permission_denied") return false
   return undefined
 }
 
@@ -687,18 +744,11 @@ export function connectFrameError(payload: string): CursorProviderError {
       trace(`connect error: code=${code} message=${JSON.stringify(envelope.error.message)?.slice(0, 2_000)} details=${JSON.stringify(envelope.error.details)?.slice(0, 4_000)}`)
     }
     const serverMessage = typeof envelope.error?.message === "string" ? envelope.error.message : undefined
-    if (code === "unauthenticated" || code === "permission_denied") {
-      return new CursorAuthError(`Cursor authentication failed (${code}); reauthenticate with Cursor`, {
-        code,
-        serverMessage,
-        replaySafe: code === "unauthenticated",
-      })
-    }
     let retryAfterMs = retryDelayFromValue(
       envelope.error?.retryAfter ?? envelope.error?.retry_after,
     )
     let hasRetryInfo = false
-    let customMessage: string | undefined
+    let debugDetails: CursorErrorDetails | undefined
     let cursorDetails: CursorErrorDetails | undefined
     if (Array.isArray(envelope.error?.details)) {
       for (const detail of envelope.error.details) {
@@ -711,27 +761,27 @@ export function connectFrameError(payload: string): CursorProviderError {
             record.retryDelay ?? record.retry_delay ?? record.value,
           )
         }
-        customMessage ??= cursorCustomErrorMessage(record)
+        debugDetails ??= customMessageFromDebug(record)
         if (type === "aiserver.v1.ErrorDetails" && typeof record.value === "string") {
           cursorDetails ??= decodeCursorErrorDetails(record.value)
         }
       }
     }
-    if (customMessage !== undefined) {
-      // An account-level refusal ("Too many computers.", usage caps): retrying only adds refused
-      // requests, and OpenCode retries any text saying "try again".
-      const refusal = new CursorServerError(
-        `Cursor refused the request: ${sanitizeHostTerminalMessage(customMessage).replace(/\btry again\b/gi, "retry")}`,
-        { transient: false, replaySafe: false, code, serverMessage },
-      )
-      refusal.hostRetryUseless = true
-      return refusal
-    }
-    // Cursor CLI shows `${title} ${detail}` and obeys an explicit isRetryable.
+    if (debugDetails && !cursorDetails?.title && !cursorDetails?.detail) cursorDetails = debugDetails
+    // Cursor CLI shows `${title} ${detail}` and follows its own retry verdict.
     const explanation = [cursorDetails?.title, cursorDetails?.detail].filter(Boolean).join(" ")
+    const retryable = cursorCliRetryable(code, cursorDetails)
+    // Cursor's final details take precedence over the Connect login code.
+    // Only a bare credential rejection is eligible for one forced renewal.
+    if (code === "unauthenticated" && retryable !== false) {
+      return new CursorAuthError(
+        explanation || `Cursor authentication failed (${code}); reauthenticate with Cursor`,
+        { code, serverMessage, replaySafe: true },
+      )
+    }
     return new CursorServerError(`Cursor API error (code=${code})${explanation ? `: ${explanation}` : ""}`, {
-      transient: cursorDetails?.isRetryable ?? (isTransientGrpcStatus(code) || hasRetryInfo),
-      retryable: cursorDetails?.isRetryable,
+      transient: retryable ?? (isTransientGrpcStatus(code) || hasRetryInfo),
+      retryable,
       replaySafe: true,
       code,
       serverMessage,
@@ -905,18 +955,20 @@ export function createCursorLanguageModel(
   void initializeConversationPersistence(opencodeGlobalCacheDir()).catch((error) => {
     trace(`conversation persistence: startup load failed: ${String(error)}`)
   })
+  // Credential resolution and session setup can fail before a stream exists.
+  // Both public entrypoints must project those failures just like pump errors.
+  const doStream = (callOptions: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> =>
+    doStreamImpl(modelId, options, callOptions).catch((error) => { throw hostFacingError(error) })
   return {
     specificationVersion: "v3",
     provider: providerId,
     modelId,
     supportedUrls: {},
 
-    async doStream(callOptions: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> {
-      return doStreamImpl(modelId, options, callOptions)
-    },
+    doStream,
 
     async doGenerate(callOptions: LanguageModelV3CallOptions): Promise<LanguageModelV3GenerateResult> {
-      const result = await doStreamImpl(modelId, options, callOptions)
+      const result = await doStream(callOptions)
       const parts: V3Part[] = []
       const reader = result.stream.getReader()
       while (true) {
@@ -1218,7 +1270,6 @@ async function doStreamImpl(
             }
             sessionManager.close(activeSession)
           }
-          recordFinalFailure(opencodeSessionKey(callOptions), e)
           try {
             controller.error(hostFacingError(e))
           } catch {
@@ -2185,7 +2236,8 @@ async function startSession(
     picked,
   })
   // An explicit pick owns the context tier; otherwise honor the maxMode hint.
-  // OpenCode's variant paramMap does not include maxMode when the user selects 1m.
+  // OpenCode's variant paramMap does not include maxMode, so the cataloged
+  // variant's isMaxMode marker decides it (1m tiers, Grok 4.7's 500k).
   const maxMode = resolveVariantMaxMode(parameterValues, {
     picked,
     maxMode: hintMaxMode,
@@ -2194,7 +2246,7 @@ async function startSession(
 
   const history = extractPromptHistory(prompt, {
     ...historyOptions,
-    maxChars: replayContextBudget({ modelInfo, cursorModelId, maxMode }).budget * REPLAY_CHARS_PER_TOKEN
+    maxChars: replayContextBudget({ modelInfo, cursorModelId, maxMode, parameters: parameterValues }).budget * REPLAY_CHARS_PER_TOKEN
       - (systemPrompt?.length ?? 0) - userText.length,
   })
   if (userTurnHostNotes.seededNotes.length > 0) {
@@ -2212,6 +2264,7 @@ async function startSession(
       modelInfo,
       cursorModelId,
       maxMode,
+      parameters: parameterValues,
       history,
       systemPrompt,
       userText,
@@ -7784,11 +7837,18 @@ export function replayContextBudget(input: {
   modelInfo: ModelInfo | undefined
   cursorModelId: string
   maxMode: boolean
+  /** Resolved variant tuple; its `context` is the Run's window when present. */
+  parameters?: ModelParameterValue[]
 }): { limit: number; budget: number } {
   const documented = getDocumentedCursorModelContext(input.cursorModelId)
-  const limit = input.maxMode
+  // Max mode does not imply the model's largest tier: Opus 300k Fast is a
+  // max-mode variant with a 300k window.
+  const variantContext = parseCursorContextLimit(
+    input.parameters?.find((parameter) => parameter.id === "context")?.value,
+  )
+  const limit = variantContext ?? (input.maxMode
     ? (input.modelInfo?.maxContextForMaxMode ?? documented?.maxContextForMaxMode ?? 1_000_000)
-    : (input.modelInfo?.maxContext ?? documented?.maxContext ?? 200_000)
+    : (input.modelInfo?.maxContext ?? documented?.maxContext ?? 200_000))
   return { limit, budget: Math.floor(limit * FOREIGN_HISTORY_REBASE_CONTEXT_SHARE) }
 }
 
@@ -7806,6 +7866,8 @@ export function assertForeignHistoryRebaseFits(input: {
   modelInfo: ModelInfo | undefined
   cursorModelId: string
   maxMode: boolean
+  /** Resolved variant tuple; its `context` is the Run's window when present. */
+  parameters?: ModelParameterValue[]
   history: SeedHistoryMessage[]
   systemPrompt: string | undefined
   userText: string

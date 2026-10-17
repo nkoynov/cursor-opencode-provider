@@ -36,14 +36,12 @@ export class CursorProviderError extends Error {
    * Recovery must reseed a new conversation instead of resuming that checkpoint.
    */
   checkpointUnusable?: boolean
-  /** Another attempt by the host cannot succeed soon (account refusal, capacity after our own backoff). */
-  hostRetryUseless?: boolean
   readonly statusCode?: number
   readonly grpcStatus?: number | string
   readonly rstCode?: number
   readonly code?: string
   readonly retryAfterMs?: number
-  /** Cursor's own verdict (`ErrorDetails.details.isRetryable`), when it gave one. */
+  /** Cursor's classified verdict, or false once provider retries must stop. */
   readonly retryable?: boolean
   readonly serverMessage?: string
 
@@ -83,24 +81,34 @@ const CONNECT_CODE_HTTP_STATUS: Readonly<Record<string, number>> = {
   unauthenticated: 401,
 }
 
+/** Status for a final failure whose Connect code maps to 5xx (internal, unknown, …). */
+const NON_RETRYABLE_SERVER_STATUS = 400
+
 /**
- * The error the host receives. A request Cursor declared not retryable becomes
- * an AI SDK `APICallError` with the Connect code's HTTP status (an unrecognized
- * code is Connect `unknown`): OpenCode 2 retries any failure that has no status
- * or recognized code. A host may classify by status alone, and 408/409/429/5xx
- * read as retryable, so the verdict also travels as the conventional
- * `x-should-retry: false` response header, which overrides the status.
+ * The error the host receives. Like Cursor CLI, a request Cursor declared not
+ * retryable (see `cursorCliRetryable`), a spent/unsafe provider retry, or an
+ * authentication failure ends the turn: it becomes an AI SDK `APICallError`
+ * with `isRetryable: false` and the
+ * conventional `x-should-retry: false` header, which OpenCode 2 checks first
+ * (it retries a failure with no status or recognized code). OpenCode 1.x
+ * ignores both and retries any status >= 500 or a message matching its retry
+ * patterns, so the status is the Connect code's HTTP status capped below 500
+ * (Cursor CLI decides from the verdict, never the code) and the message is
+ * sanitized. The original code stays on `cause`.
  */
 export function hostFacingError(error: unknown): Error {
   if (!(error instanceof Error)) return new Error(String(error))
-  if (!(error instanceof CursorServerError) || error.retryable !== false) return error
+  const auth = error instanceof CursorAuthError
+  if (!auth && (!(error instanceof CursorProviderError) || error.retryable !== false)) return error
+  const connectStatus = error.code !== undefined && Object.hasOwn(CONNECT_CODE_HTTP_STATUS, error.code)
+    ? CONNECT_CODE_HTTP_STATUS[error.code]!
+    : CONNECT_CODE_HTTP_STATUS.unknown!
+  const status = auth ? (error.statusCode === 403 ? 403 : 401) : connectStatus
   return new APICallError({
-    message: error.message,
+    message: sanitizeHostTerminalMessage(error.message),
     url: "cursor://agent.v1.AgentService/Run",
     requestBodyValues: {},
-    statusCode: error.code !== undefined && Object.hasOwn(CONNECT_CODE_HTTP_STATUS, error.code)
-      ? CONNECT_CODE_HTTP_STATUS[error.code]
-      : CONNECT_CODE_HTTP_STATUS.unknown,
+    statusCode: status >= 500 ? NON_RETRYABLE_SERVER_STATUS : status,
     responseHeaders: { "x-should-retry": "false" },
     isRetryable: false,
     cause: error,
@@ -186,22 +194,54 @@ export function isRejectedCredentialError(error: unknown): error is CursorAuthEr
 }
 
 /**
- * OpenCode's SessionRetry treats several substrings in provider error messages
- * as always-retryable — notably bare "unavailable" and "exhausted", plus a
- * broader regex set (resource_exhausted, service unavailable, …).
- *
- * When this provider has already spent its Run retry budget, or has decided a
- * replay would be unsafe, the host-facing message must not re-arm that loop.
- * Keep the real gRPC/HTTP code on structured fields (`code`, `grpcStatus`).
+ * OpenCode 1.x SessionRetry retries an error whose message matches these
+ * patterns even when it is marked non-retryable (`RETRYABLE_MESSAGE_PATTERNS`
+ * and the `exhausted` / `unavailable` / `too_many_requests` substrings in
+ * upstream `packages/opencode/src/session/retry.ts`, v1.19). The status
+ * patterns match anywhere, so "$1500" or "500k" also re-arm it.
+ */
+const HOST_RETRY_MESSAGE_PATTERNS: readonly RegExp[] = [
+  /429|500|502|503|504|524/gi,
+  /rate increased too quickly|rate limit|rate-limit|rate_limit|too many requests|too_many_requests/gi,
+  /overloaded|service unavailable|service_unavailable|service-unavailable|internal error|internal_error|internal server error|server error|server_error|server-error|provider returned error|provider_returned_error|provider-returned-error/gi,
+  /terminated|fetch failed|failed to fetch|network[-_\s]error|upstream connect|connection error|connection refused|connection lost|socket connection was closed|socket hang up|reset before headers|getaddrinfo|enotfound|eai_again|econnrefused|econnreset|etimedout/gi,
+  /^timeout$|\b(?:request|response|connection|network|stream|read) (?:timeout|timed out|time out)\b/gi,
+  /try your request again|retry your request|resource exhausted|resource_exhausted/gi,
+  /\btry again (?:later|in\b)|\b(?:currently|temporarily) at capacity\b/gi,
+  /exhausted|unavailable/gi,
+]
+
+/** Invisible U+2060 WORD JOINER: the text reads the same but no longer matches. */
+const WORD_JOINER = "\u2060"
+
+/**
+ * When this provider has already spent its Run retry budget, decided a replay
+ * would be unsafe, or Cursor declared the request not retryable, the
+ * host-facing message must not re-arm OpenCode's SessionRetry loop. Common
+ * trigger words get readable replacements; any remaining match (status-like
+ * digits, Cursor's own wording) is split with a word joiner. Keep the real
+ * gRPC/HTTP code on structured fields (`code`, `grpcStatus`).
  */
 export function sanitizeHostTerminalMessage(message: string): string {
-  return message
+  let text = message
     .replace(/\bresource[_\s-]?exhausted\b/gi, "capacity_limit")
     .replace(/\bservice[_\s-]?unavailable\b/gi, "capacity_limit")
     .replace(/\bunavailable\b/gi, "capacity_limit")
     .replace(/\boverloaded\b/gi, "capacity_limit")
     .replace(/\bretry exhausted\b/gi, "retries finished")
     .replace(/\bexhausted\b/gi, "finished")
+  // A joiner can add a `\b` boundary, so repeat until nothing matches.
+  for (let pass = 0; pass < 4; pass++) {
+    let changed = false
+    for (const pattern of HOST_RETRY_MESSAGE_PATTERNS) {
+      text = text.replace(pattern, (match) => {
+        changed = true
+        return `${match[0]}${WORD_JOINER}${match.slice(1)}`
+      })
+    }
+    if (!changed) break
+  }
+  return text
 }
 
 export class CursorRetryExhaustedError extends CursorProviderError {
@@ -220,6 +260,7 @@ export class CursorRetryExhaustedError extends CursorProviderError {
         origin: last.origin,
         transient: false,
         replaySafe: false,
+        retryable: false,
         statusCode: last.statusCode,
         grpcStatus: last.grpcStatus,
         rstCode: last.rstCode,
@@ -230,7 +271,6 @@ export class CursorRetryExhaustedError extends CursorProviderError {
     )
     this.name = "CursorRetryExhaustedError"
     this.attempts = attempts
-    this.hostRetryUseless = isCapacityFailure(last)
   }
 }
 
@@ -406,6 +446,7 @@ export function retrySuppressedError(
       origin: cause.origin,
       transient: false,
       replaySafe: false,
+      retryable: false,
       statusCode: cause.statusCode,
       grpcStatus: cause.grpcStatus,
       rstCode: cause.rstCode,

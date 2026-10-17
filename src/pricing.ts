@@ -81,12 +81,12 @@ export function isOpenCodeModelCost(value: unknown): value is OpenCodeModelCost 
   return validateOpenCodeModelCost(value).valid
 }
 
-/** Strip synthetic OpenCode suffixes (`…-1m`, `…-1m-2`, `…-1m-fast`, …). */
+/** Strip synthetic context suffixes (`…-1m`, `…-500k`, `…-500k-2-fast`, …). */
 export function wireModelIdForPricing(modelId: string): {
   baseId: string
   longContextEntry: boolean
 } {
-  const match = /^(.*)-1m(?:-\d+)?(-fast)?$/.exec(modelId)
+  const match = /^(.*)-\d+(?:\.\d+)?[km](?:-\d+)?(-fast)?$/.exec(modelId)
   if (match) {
     return { baseId: `${match[1]!}${match[2] ?? ""}`, longContextEntry: true }
   }
@@ -117,8 +117,11 @@ function asMutableCost(value: OpenCodeModelCost): OpenCodeModelCost {
  * Synthetic `-fast` entries are stored as their own keys.
  */
 export function getCursorModelCost(modelId: string): OpenCodeModelCost | undefined {
-  const { baseId } = wireModelIdForPricing(modelId)
-  const found = (CURSOR_MODEL_COSTS as Record<string, OpenCodeModelCost>)[baseId]
+  const costs = CURSOR_MODEL_COSTS as Record<string, OpenCodeModelCost>
+  // A priced wire id wins over suffix stripping (`-<n>k` / `-<n>m` may be real).
+  const found = Object.hasOwn(costs, modelId)
+    ? costs[modelId]
+    : costs[wireModelIdForPricing(modelId).baseId]
   if (!found) return undefined
   return asMutableCost(found)
 }

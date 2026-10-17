@@ -17,6 +17,7 @@ import {
   buildPricingTable,
   catalogIdForPricingDisplayName,
 } from "../scripts/generate-cursor-pricing.js"
+import { CURSOR_MODEL_COSTS } from "../src/pricing-data.js"
 
 describe("pricing", () => {
   it("maps third-party Cursor docs rates onto wire model ids", () => {
@@ -31,6 +32,17 @@ describe("pricing", () => {
       output: 4.5,
       cache_read: 0.075,
     })
+  })
+
+  it("prices a real wire id with a context-like suffix before stripping it", () => {
+    const costs = CURSOR_MODEL_COSTS as Record<string, unknown>
+    costs["grok-4.7-32k"] = { input: 9, output: 9 }
+    try {
+      expect(getCursorModelCost("grok-4.7-32k")).toEqual({ input: 9, output: 9 })
+      expect(getCursorModelCost("grok-4.7-64k")?.input).toBe(2)
+    } finally {
+      delete costs["grok-4.7-32k"]
+    }
   })
 
   it("attaches documented long-context rates", () => {

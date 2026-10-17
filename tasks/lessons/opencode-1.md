@@ -18,6 +18,13 @@ Operator setup: [OpenCode 1.x](../../docs/opencode-1.md).
 - **Mutate the messages array, not its container.** The experimental hook's
   returned object was ignored; request-only clones must replace entries in the
   original array without rewriting stored history (`test/plugin.test.ts`).
+- **SessionRetry reads message text, not the verdict.** A usage-limit refusal
+  with `isRetryable: false` and `x-should-retry: false` was still sent six
+  times because its message said `resource_exhausted`; bare `429`/`500` digits
+  (`$1500`, `500k`) match too. Terminal host messages pass through
+  `sanitizeHostTerminalMessage`. 1.x also retries every status >= 500, so a
+  final `internal`/`unknown` error is reported below 500; Cursor CLI decides
+  from the verdict, never the code (`test/errors.test.ts`).
 
 ## File tools and planning
 

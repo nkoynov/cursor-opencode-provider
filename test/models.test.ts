@@ -22,6 +22,7 @@ import {
   type ModelCache,
 } from "../src/models.js"
 import { cursorModelFamily, modelInfoToConfig, modelsToConfig } from "../src/model-config.js"
+import { MODEL_CACHE_SCHEMA_VERSION } from "../src/shared.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
 
 const tempDirs: string[] = []
@@ -835,8 +836,12 @@ describe("modelsToConfig (context-tier materialization)", () => {
 })
 
 describe("isCacheFresh", () => {
+  it("refreshes schema-4 caches that collapsed absent max markers to false", () => {
+    expect(isCacheFresh({ models: [], fetchedAt: Date.now(), schemaVersion: 4 })).toBe(false)
+  })
+
   it("returns true for recently fetched cache with current schema", () => {
-    const cache = { models: [], fetchedAt: Date.now(), schemaVersion: 3 }
+    const cache = { models: [], fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION }
     expect(isCacheFresh(cache)).toBe(true)
   })
 
@@ -846,12 +851,12 @@ describe("isCacheFresh", () => {
   })
 
   it("returns false for expired cache", () => {
-    const cache = { models: [], fetchedAt: Date.now() - 86400_000 - 1000, schemaVersion: 3 }
+    const cache = { models: [], fetchedAt: Date.now() - 86400_000 - 1000, schemaVersion: MODEL_CACHE_SCHEMA_VERSION }
     expect(isCacheFresh(cache)).toBe(false)
   })
 
   it("respects custom TTL", () => {
-    const cache = { models: [], fetchedAt: Date.now() - 5000, schemaVersion: 3 }
+    const cache = { models: [], fetchedAt: Date.now() - 5000, schemaVersion: MODEL_CACHE_SCHEMA_VERSION }
     expect(isCacheFresh(cache, 10000)).toBe(true)
     expect(isCacheFresh(cache, 1000)).toBe(false)
   })
@@ -862,6 +867,35 @@ describe("cacheFilePath", () => {
     const result = cacheFilePath("/home/user/.config/cursor")
     expect(result).toContain("cursor-models.json")
     expect(result).toContain("/home/user/.config/cursor")
+  })
+})
+
+describe("resolveVariantParameters (reasoning_effort models)", () => {
+  const argon: Parameters<typeof resolveVariantParameters>[0] = {
+    id: "gemini-4-argon",
+    maxContext: 1_000_000,
+    maxContextForMaxMode: 1_000_000,
+    variants: [
+      { key: "argon", displayName: "Argon Low", isDefaultNonMax: false, isDefaultMax: false,
+        parameterValues: [{ id: "reasoning_effort", value: "low" }] },
+      { key: "argon", displayName: "Argon Medium", isDefaultNonMax: true, isDefaultMax: true,
+        parameterValues: [{ id: "reasoning_effort", value: "medium" }] },
+      { key: "argon", displayName: "Argon High", isDefaultNonMax: false, isDefaultMax: false,
+        parameterValues: [{ id: "reasoning_effort", value: "high" }] },
+    ],
+  }
+
+  it("honors a reasoning effort hint when the parameter id is reasoning_effort", () => {
+    expect(resolveVariantParameters(argon, { reasoningEffort: "high" })).toEqual([
+      { id: "reasoning_effort", value: "high" },
+    ])
+    expect(resolveVariantParameters(argon, { reasoningEffort: "low" })).toEqual([
+      { id: "reasoning_effort", value: "low" },
+    ])
+  })
+
+  it("keeps the default variant when no effort hint is given", () => {
+    expect(resolveVariantParameters(argon)).toEqual([{ id: "reasoning_effort", value: "medium" }])
   })
 })
 
@@ -1140,133 +1174,6 @@ describe("paramsImplyMaxMode", () => {
     expect(paramsImplyMaxMode([{ id: "context", value: "300k" }])).toBe(false)
     expect(paramsImplyMaxMode([])).toBe(false)
   })
-
-  it("measures a tier against the model's base window", () => {
-    const base = (maxContext?: number) => ({ id: "m", variants: [], ...(maxContext ? { maxContext } : {}) })
-    expect(paramsImplyMaxMode([{ id: "context", value: "500k" }], base(256_000))).toBe(true)
-    expect(paramsImplyMaxMode([{ id: "context", value: "256k" }], base(256_000))).toBe(false)
-    expect(paramsImplyMaxMode([{ id: "context", value: "500k" }], base())).toBe(false)
-    expect(paramsImplyMaxMode([{ id: "context", value: "500k" }])).toBe(false)
-    expect(paramsImplyMaxMode([{ id: "context", value: "1m" }], base(1_000_000))).toBe(true)
-    expect(paramsImplyMaxMode([{ id: "effort", value: "high" }], base(256_000))).toBe(false)
-  })
-})
-
-describe("max mode for long-context variants (Grok, GPT, Opus)", () => {
-  // Shaped like Cursor's AvailableModels: Grok 4.7's max tier is 500k over a
-  // 256k base and repeats the base display names (its defaults are the Fast
-  // variants); GPT-5.6 Sol and Opus 5.5 put 1m over 272k and 300k.
-  function cursorEntry(opts: {
-    name: string
-    displayName: string
-    effortId: string
-    base: string
-    long: string
-    longLabel: string
-    defaultFast: boolean
-  }) {
-    const variants = []
-    for (const context of [opts.base, opts.long]) {
-      for (const fast of [false, true]) {
-        const label = context === opts.long ? opts.longLabel : ""
-        variants.push({
-          displayName: `${opts.displayName}${label} High${fast ? " Fast" : ""}`,
-          isDefaultNonMaxConfig: context === opts.base && fast === opts.defaultFast,
-          isDefaultMaxConfig: context === opts.long && fast === opts.defaultFast,
-          parameterValues: [
-            { id: "context", value: context },
-            { id: opts.effortId, value: "high" },
-            { id: "fast", value: String(fast) },
-          ],
-        })
-      }
-    }
-    return {
-      name: opts.name,
-      clientDisplayName: opts.displayName,
-      supportsAgent: true,
-      supportsThinking: true,
-      supportsMaxMode: true,
-      variants,
-    }
-  }
-  const models = mapAvailableModelsResponse({
-    models: [
-      cursorEntry({ name: "grok-4.7", displayName: "Grok 4.7", effortId: "reasoning_effort", base: "256k", long: "500k", longLabel: "", defaultFast: true }),
-      cursorEntry({ name: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", effortId: "reasoning", base: "272k", long: "1m", longLabel: " 1M", defaultFast: false }),
-      cursorEntry({ name: "claude-opus-5-5", displayName: "Claude Opus 5.5", effortId: "effort", base: "300k", long: "1m", longLabel: " 1M", defaultFast: false }),
-    ],
-  })
-  const [grok, gpt, opus] = models
-
-  it("sets max mode for the variants above each model's base window only", () => {
-    const tiers = (model: (typeof models)[number]) =>
-      model.variants.map((variant) => [
-        variant.parameterValues.map((parameter) => parameter.value).join(","),
-        paramsImplyMaxMode(variant.parameterValues, model),
-      ])
-    expect(grok.maxContext).toBe(256_000)
-    expect(tiers(grok)).toEqual([
-      ["256k,high,false", false],
-      ["256k,high,true", false],
-      ["500k,high,false", true],
-      ["500k,high,true", true],
-    ])
-    expect(tiers(gpt)).toEqual([
-      ["272k,high,false", false],
-      ["272k,high,true", false],
-      ["1m,high,false", true],
-      ["1m,high,true", true],
-    ])
-    expect(tiers(opus)).toEqual([
-      ["300k,high,false", false],
-      ["300k,high,true", false],
-      ["1m,high,false", true],
-      ["1m,high,true", true],
-    ])
-  })
-
-  it("sends max mode for every catalog variant whose context exceeds the base window", () => {
-    const config = modelsToConfig(models)
-    const wire: Record<string, boolean> = {}
-    for (const [id, entry] of Object.entries(config)) {
-      const model = models.find((m) => m.id === (entry.options?.[CURSOR_WIRE_MODEL_ID_KEY] ?? id))!
-      for (const [name, options] of Object.entries(entry.variants as Record<string, Record<string, unknown>>)) {
-        const picked = extractCursorVariantParameters(options)
-        const params = resolveVariantParameters(model, { picked, maxMode: false })
-        const maxMode = resolveVariantMaxMode(params, { picked, maxMode: false, model })
-        const context = params.find((p) => p.id === "context")!.value
-        expect(maxMode).toBe(context === "500k" || context === "1m")
-        wire[`${id} | ${name}`] = maxMode
-      }
-    }
-    expect(wire).toMatchObject({
-      "grok-4.7 | Grok 4.7 High": false,
-      "grok-4.7 | Grok 4.7 High 500k": true,
-      "gpt-5.6-sol | GPT-5.6 Sol High": false,
-      "gpt-5.6-sol-1m | GPT-5.6 Sol 1M High": true,
-      "claude-opus-5-5 | Claude Opus 5.5 High": false,
-      "claude-opus-5-5-1m | Claude Opus 5.5 1M High": true,
-    })
-    expect(Object.keys(wire)).toHaveLength(12)
-  })
-
-  it("lands a maxMode hint on Grok's 500k tier", () => {
-    const params = resolveVariantParameters(grok, { maxMode: true })
-    expect(params).toEqual([
-      { id: "context", value: "500k" },
-      { id: "reasoning_effort", value: "high" },
-      { id: "fast", value: "false" },
-    ])
-    expect(resolveVariantMaxMode(params, { maxMode: true, model: grok })).toBe(true)
-  })
-
-  it("keeps the default variants out of max mode", () => {
-    for (const model of models) {
-      const params = resolveVariantParameters(model, {})
-      expect(resolveVariantMaxMode(params, { model })).toBe(false)
-    }
-  })
 })
 
 describe("parseCursorContextLimit", () => {
@@ -1283,7 +1190,7 @@ describe("parseCursorContextLimit", () => {
 function testCache(id = "cached"): ModelCache {
   return {
     fetchedAt: Date.now(),
-    schemaVersion: 3,
+    schemaVersion: MODEL_CACHE_SCHEMA_VERSION,
     models: [{
       id,
       variants: [{
@@ -1447,5 +1354,171 @@ describe("model cache integrity", () => {
       else process.env.CURSOR_CLIENT_VERSION = previousVersion
       resetClientVersionCache()
     }
+  })
+})
+
+describe("resolveVariantParameters (declared default is a Fast variant)", () => {
+  const variant = (effort: string, fast: boolean, isDefaultNonMax = false) => ({
+    key: "grok",
+    displayName: `${effort} ${fast ? "fast" : "standard"}`,
+    isDefaultNonMax,
+    isDefaultMax: false,
+    parameterValues: [
+      { id: "effort", value: effort },
+      { id: "fast", value: String(fast) },
+    ],
+  })
+  // Mirrors Grok 4.6: lowest effort listed first, "High Fast" declared as the default.
+  const grok: Parameters<typeof resolveVariantParameters>[0] = {
+    id: "grok-4.6",
+    maxContext: 256_000,
+    maxContextForMaxMode: 256_000,
+    variants: [
+      variant("low", false),
+      variant("low", true),
+      variant("medium", false),
+      variant("medium", true),
+      variant("high", false),
+      variant("high", true, true),
+    ],
+  }
+
+  it("sends the non-Fast twin of the declared default when no hint is given", () => {
+    expect(resolveVariantParameters(grok)).toEqual([
+      { id: "effort", value: "high" },
+      { id: "fast", value: "false" },
+    ])
+  })
+
+  it("still sends a picked Fast variant verbatim", () => {
+    const picked = [
+      { id: "effort", value: "low" },
+      { id: "fast", value: "true" },
+    ]
+    expect(resolveVariantParameters(grok, { picked })).toEqual(picked)
+  })
+
+  it("keeps a non-Fast declared default as is", () => {
+    const plain = {
+      ...grok,
+      variants: [variant("low", false), variant("medium", false, true), variant("high", false)],
+    }
+    expect(resolveVariantParameters(plain)).toEqual([
+      { id: "effort", value: "medium" },
+      { id: "fast", value: "false" },
+    ])
+  })
+})
+
+describe("max mode from Cursor's isMaxMode marker", () => {
+  it.each(["isMaxMode", "is_max_mode"])("preserves absent, false and true %s markers through the cache", (key) => {
+    const [model] = mapAvailableModelsResponse({ models: [{ name: "optional-marker", variants: [
+      { parameterValues: [{ id: "context", value: "1m" }] },
+      { [key]: false, parameterValues: [{ id: "context", value: "1000k" }] },
+      { [key]: true, parameterValues: [{ id: "context", value: "500k" }] },
+    ] }] })
+    expect(model!.variants[0]).not.toHaveProperty("isMaxMode")
+    expect(model!.variants.map((v) => v.isMaxMode)).toEqual([undefined, false, true])
+    const restored = normalizeModelCache(JSON.parse(JSON.stringify({
+      models: [model], fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION,
+    })))!
+    const cached = restored.models[0]!
+    expect(cached.variants).toEqual(model!.variants)
+    for (const [index, maxMode] of [true, false, true].entries()) {
+      const picked = cached.variants[index]!.parameterValues
+      expect(resolveVariantMaxMode(picked, { model: cached, picked })).toBe(maxMode)
+    }
+    expect(resolveVariantParameters(cached, { maxMode: true })).toEqual(cached.variants[0]!.parameterValues)
+    expect(resolveVariantParameters(cached, { maxMode: false })).toEqual(cached.variants[1]!.parameterValues)
+    for (const invalid of [null, "false", 0]) {
+      expect(() => mapAvailableModelsResponse({ models: [{ name: "invalid-marker", variants: [
+        { [key]: invalid, parameterValues: [] },
+      ] }] })).toThrow(/non-boolean/)
+    }
+  })
+
+  // AvailableModels JSON shaped like Grok 4.7 (#67): a 500k max tier over a 256k
+  // base, `reasoning_effort` ids, Fast variants as both declared defaults, and
+  // proto3 JSON omitting false booleans.
+  const grokEntry = {
+    name: "grok-4.7",
+    variants: ["256k", "500k"].flatMap((context) =>
+      ["low", "medium", "high"].flatMap((effort) =>
+        [false, true].map((fast) => ({
+          displayName: `Grok 4.7 ${effort}${fast ? " Fast" : ""}${context === "500k" ? " 500k" : ""}`,
+          parameterValues: [
+            { id: "context", value: context },
+            { id: "reasoning_effort", value: effort },
+            { id: "fast", value: String(fast) },
+          ],
+          ...(context === "500k" ? { isMaxMode: true } : {}),
+          ...(effort === "high" && fast && context === "256k" ? { isDefaultNonMaxConfig: true } : {}),
+          ...(effort === "high" && fast && context === "500k" ? { isDefaultMaxConfig: true } : {}),
+        })),
+      ),
+    ),
+  }
+  // GPT-5.2 shape: no context parameter, max default "High Fast", no isMaxMode.
+  const gptEntry = {
+    name: "gpt-5.2",
+    variants: ["low", "medium", "high"].flatMap((reasoning) =>
+      [false, true].map((fast) => ({
+        displayName: `GPT-5.2 ${reasoning}${fast ? " Fast" : ""}`,
+        parameterValues: [
+          { id: "reasoning", value: reasoning },
+          { id: "fast", value: String(fast) },
+        ],
+        ...(reasoning === "medium" && !fast ? { isDefaultNonMaxConfig: true } : {}),
+        ...(reasoning === "high" && fast ? { isDefaultMaxConfig: true } : {}),
+      })),
+    ),
+  }
+  const [grok, gpt] = mapAvailableModelsResponse({ models: [grokEntry, gptEntry] })
+  const grok500kHigh = [
+    { id: "context", value: "500k" },
+    { id: "reasoning_effort", value: "high" },
+    { id: "fast", value: "false" },
+  ]
+
+  it("records the marker from AvailableModels and keeps it through the cache", () => {
+    expect(grok!.variants.filter((v) => v.isMaxMode).map((v) => v.parameterValues[0]!.value))
+      .toEqual(Array(6).fill("500k"))
+    expect(grok!.variants.filter((v) => v.isMaxMode === undefined)).toHaveLength(6)
+    const restored = normalizeModelCache(JSON.parse(JSON.stringify({
+      models: [grok], fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION,
+    })))
+    expect(restored?.models[0]?.variants).toEqual(grok!.variants)
+    const malformed = { ...grok!, variants: [{ ...grok!.variants[0]!, isMaxMode: "yes" }] }
+    expect(normalizeModelCache({ models: [malformed], fetchedAt: Date.now() })).toBeNull()
+  })
+
+  it("runs a picked 500k variant in max mode (#67)", () => {
+    const params = resolveVariantParameters(grok, { picked: grok500kHigh })
+    expect(params).toEqual(grok500kHigh)
+    expect(resolveVariantMaxMode(params, { picked: grok500kHigh, model: grok })).toBe(true)
+    const base = grok500kHigh.map((p) => (p.id === "context" ? { ...p, value: "256k" } : p))
+    expect(resolveVariantMaxMode(base, { picked: base, model: grok })).toBe(false)
+  })
+
+  it("takes the non-Fast twin of a Fast declared max default for a maxMode hint", () => {
+    const params = resolveVariantParameters(grok, { maxMode: true })
+    expect(params).toEqual(grok500kHigh)
+    expect(resolveVariantMaxMode(params, { maxMode: true, model: grok })).toBe(true)
+    expect(resolveVariantParameters(gpt, { maxMode: true })).toEqual([
+      { id: "reasoning", value: "high" },
+      { id: "fast", value: "false" },
+    ])
+    expect(resolveVariantParameters(gpt)).toEqual([
+      { id: "reasoning", value: "medium" },
+      { id: "fast", value: "false" },
+    ])
+  })
+
+  it("matches an effort hint within the marked max tier", () => {
+    expect(resolveVariantParameters(grok, { maxMode: true, reasoningEffort: "low" })).toEqual([
+      { id: "context", value: "500k" },
+      { id: "reasoning_effort", value: "low" },
+      { id: "fast", value: "false" },
+    ])
   })
 })

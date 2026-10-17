@@ -12,7 +12,7 @@ import { CursorAuthError } from "../src/errors.js"
 import { CURSOR_VARIANT_PARAMETERS_KEY, readCache, writeCache, type ModelInfo } from "../src/models.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
 import { resetAgentUrlCache } from "../src/agent-url.js"
-import { CURSOR_COMPACTION_OPTION, CURSOR_HOST_AGENT_OPTION } from "../src/shared.js"
+import { CURSOR_COMPACTION_OPTION, CURSOR_HOST_AGENT_OPTION, MODEL_CACHE_SCHEMA_VERSION } from "../src/shared.js"
 import {
   CURSOR_TIMEOUT_BACKGROUND,
   buildBackgroundShellCommand,
@@ -1047,6 +1047,7 @@ describe("loadModels on cache miss", () => {
   it("refreshes an old-schema nonempty cache before config materializes models", async () => {
     await writeCache(cacheDir, {
       fetchedAt: Date.now(),
+      schemaVersion: MODEL_CACHE_SCHEMA_VERSION - 1,
       models: [{ id: "stale-model", displayName: "Stale", variants: [] }],
     })
     await writeAuth({
@@ -1064,7 +1065,7 @@ describe("loadModels on cache miss", () => {
     expect(config.provider?.cursor?.models).not.toHaveProperty("stale-model")
     expect(availableModelsCalls).toBe(1)
     expect(await readCache(cacheDir)).toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: MODEL_CACHE_SCHEMA_VERSION,
       models: [{ id: "fetched-model" }],
     })
   })

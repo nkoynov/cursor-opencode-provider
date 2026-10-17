@@ -137,9 +137,15 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   budget, and the origin stays uncompressed; a refusal during the upload is
   resent by `sendRunRequest` inside `openRunWithRequest`, under its listeners.
   Frame arrival numbers (`frameArrival`) go on the parsed frame readers gunzip.
-- Decode Cursor's error title/detail and retry verdict. A non-retryable server
-  error reaches the host as `APICallError` with its status and
-  `x-should-retry: false` (`src/errors.ts`), including on OpenCode 2.
+- Decode Cursor's error title/detail and retry verdict like Cursor CLI: required
+  actions, final error codes, `isRetryable: false` and bare `permission_denied`
+  end the turn. Final and auth failures reach both hosts as `APICallError` with
+  `x-should-retry: false`, a status below 500 and a message without OpenCode 1.x
+  retry triggers (`src/errors.ts`); the Connect code stays on `cause`.
+- Fork: a capacity refusal without a final verdict (`isCapacityFailure`) gets six
+  attempts with a longer backoff before it ends as final. An
+  `ERROR_CUSTOM_MESSAGE` whose protobuf `value` does not decode is read from the
+  details' JSON `debug` (`customMessageFromDebug`), so it still ends the turn.
 
 ## Context, identity and persistence
 

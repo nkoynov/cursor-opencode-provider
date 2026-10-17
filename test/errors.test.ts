@@ -64,7 +64,7 @@ describe("Cursor provider errors", () => {
     expect(failure).toMatchObject({ transient: true, retryAfterMs: 30_000 })
   })
 
-  it("surfaces Cursor's custom message and doesn't retry it", () => {
+  it("surfaces Cursor's custom message from its JSON details and doesn't retry it", () => {
     const failure = connectFrameError(JSON.stringify({
       error: {
         code: "resource_exhausted",
@@ -83,12 +83,16 @@ describe("Cursor provider errors", () => {
         }],
       },
     }))
-    expect(failure).toMatchObject({ code: "resource_exhausted", transient: false, replaySafe: false })
+    expect(failure).toMatchObject({ code: "resource_exhausted", transient: false, retryable: false })
     expect(failure.message).toBe(
-      "Cursor refused the request: Too many computers. Too many computers used within the last 24 hours " +
-        "for the same Cursor account. Please retry later.",
+      "Cursor API error (code=resource_exhausted): Too many computers. Too many computers used within the last 24 hours " +
+        "for the same Cursor account. Please try again later.",
     )
-    expect(failure.message).not.toMatch(/try again|exhausted|capacity/i)
+    const forHost = hostFacingError(failure) as APICallError
+    expect(forHost.isRetryable).toBe(false)
+    expect(forHost.responseHeaders?.["x-should-retry"]).toBe("false")
+    expect(forHost.message).toContain("Too many computers.")
+    expect(forHost.message).not.toMatch(/try again|exhausted/i)
   })
 
   it("keeps the code-only message for other ErrorDetails", () => {
@@ -141,7 +145,8 @@ describe("Cursor provider errors", () => {
   it("keeps a non-retryable verdict on codes whose HTTP status reads as retryable", () => {
     // ErrorDetails{details{title:"Limit", is_retryable:false}}
     const value = Buffer.from([0x12, 0x09, 0x0a, 0x05, ...Buffer.from("Limit"), 0x20, 0x00]).toString("base64")
-    for (const [code, statusCode] of [["resource_exhausted", 429], ["internal", 500], ["aborted", 409], ["constructor", 500]] as const) {
+    // OpenCode 1.x retries any status >= 500, so 5xx codes are reported as 400.
+    for (const [code, statusCode] of [["resource_exhausted", 429], ["internal", 400], ["aborted", 409], ["constructor", 400]] as const) {
       const failure = connectFrameError(JSON.stringify({
         error: { code, details: [{ type: "aiserver.v1.ErrorDetails", value }] },
       }))
@@ -152,6 +157,89 @@ describe("Cursor provider errors", () => {
         responseHeaders: { "x-should-retry": "false" },
       })
     }
+  })
+
+  it("keeps OpenCode 1.x from retrying a non-retryable verdict through its message text", () => {
+    // OpenCode 1.19 SessionRetry retries any APIError whose message matches these,
+    // even with isRetryable false (upstream packages/opencode/src/session/retry.ts).
+    const opencode1Retries = (message: string) => [
+      /429|500|502|503|504|524/i,
+      /rate increased too quickly|rate limit|rate-limit|rate_limit|too many requests/i,
+      /overloaded|service unavailable|internal error|server error|provider returned error/i,
+      /terminated|fetch failed|network[-_\s]error|connection error|socket hang up|econnreset|etimedout/i,
+      /try your request again|retry your request|resource exhausted|resource_exhausted/i,
+      /\btry again (?:later|in\b)|\b(?:currently|temporarily) at capacity\b/i,
+    ].some((pattern) => pattern.test(message))
+    // ErrorDetails{details{title, detail, is_retryable:false}}, shaped like a live usage-limit refusal.
+    const title = Buffer.from("You've hit your usage limit")
+    const detail = Buffer.from("Saved $1500 on the 500k tier. Rate limit: try again later.")
+    const inner = Buffer.from([0x0a, title.length, ...title, 0x12, detail.length, ...detail, 0x20, 0x00])
+    const value = Buffer.from([0x12, inner.length, ...inner]).toString("base64")
+    const failure = connectFrameError(JSON.stringify({
+      error: { code: "resource_exhausted", details: [{ type: "aiserver.v1.ErrorDetails", value }] },
+    }))
+    expect(failure).toMatchObject({ code: "resource_exhausted", retryable: false })
+    expect(opencode1Retries(failure.message)).toBe(true)
+
+    const host = hostFacingError(failure) as APICallError
+    expect(host).toMatchObject({ statusCode: 429, isRetryable: false })
+    expect(opencode1Retries(host.message)).toBe(false)
+    expect(host.message.toLowerCase()).not.toMatch(/exhausted|unavailable/)
+    expect(host.message.replaceAll("\u2060", "")).toBe(
+      "Cursor API error (code=capacity_limit): You've hit your usage limit " +
+        "Saved $1500 on the 500k tier. Rate limit: try again later.",
+    )
+    expect(sanitizeHostTerminalMessage("Request blocked by Anthropic")).toBe("Request blocked by Anthropic")
+  })
+
+  it("follows Cursor CLI's verdict for error codes, required actions and permission_denied", () => {
+    // Hand-encoded ErrorDetails{error #1, details #2{title #1, is_retryable #4,
+    // analytics_metadata #10{action_required #1}}} per aiserver.v1.
+    const text = (field: number, value: string) => [(field << 3) | 2, value.length, ...Buffer.from(value)]
+    const nested = (field: number, bytes: number[]) => [(field << 3) | 2, bytes.length, ...bytes]
+    const errorFor = (code: string, error: number, options: { retryable?: boolean; action?: string } = {}) => {
+      const details = nested(2, [
+        ...text(1, "Stop"),
+        ...(options.retryable === undefined ? [] : [0x20, options.retryable ? 1 : 0]),
+        ...(options.action ? nested(10, text(1, options.action)) : []),
+      ])
+      const value = Buffer.from([...(error ? [0x08, error] : []), ...details]).toString("base64")
+      return connectFrameError(JSON.stringify({
+        error: { code, details: [{ type: "aiserver.v1.ErrorDetails", value }] },
+      }))
+    }
+    // Cursor CLI ends the request on usage/rate limits, login, pricing and API-key
+    // errors and on cancellation, even when is_retryable says true.
+    for (const error of [51, 50, 10, 2, 44, 1, 30, 21, 35]) {
+      expect(errorFor("resource_exhausted", error, { retryable: true }).retryable).toBe(false)
+    }
+    expect(errorFor("internal", 0, { retryable: true, action: "upgrade" }).retryable).toBe(false)
+    expect(errorFor("internal", 29).retryable).toBe(false)
+    expect(errorFor("internal", 29, { retryable: true })).toMatchObject({ retryable: true, transient: true })
+    expect(errorFor("internal", 13)).toMatchObject({ transient: true })
+    expect(errorFor("internal", 13).retryable).toBeUndefined()
+    expect(errorFor("permission_denied", 0, { retryable: true })).toMatchObject({ retryable: true })
+    expect(errorFor("canceled", 0).retryable).toBe(false)
+
+    const denied = connectFrameError(JSON.stringify({ error: { code: "permission_denied" } }))
+    expect(denied).toBeInstanceOf(CursorServerError)
+    expect(denied).toMatchObject({ code: "permission_denied", retryable: false, transient: false })
+    expect(hostFacingError(denied)).toMatchObject({ statusCode: 403, isRetryable: false })
+
+    const final = hostFacingError(errorFor("unknown", 29)) as APICallError
+    expect(final).toMatchObject({ statusCode: 400, isRetryable: false, responseHeaders: { "x-should-retry": "false" } })
+    expect((final.cause as CursorServerError).code).toBe("unknown")
+  })
+
+  it("ends the turn on an authentication failure as Cursor CLI does", () => {
+    const expired = connectFrameError(JSON.stringify({ error: { code: "unauthenticated" } }))
+    expect(expired).toBeInstanceOf(CursorAuthError)
+    expect(hostFacingError(expired)).toMatchObject({
+      statusCode: 401,
+      isRetryable: false,
+      responseHeaders: { "x-should-retry": "false" },
+    })
+    expect(hostFacingError(new CursorAuthError(undefined, { statusCode: 403 }))).toMatchObject({ statusCode: 403 })
   })
 
   it("obeys an explicit retryable verdict and keeps other errors unchanged for the host", () => {
@@ -224,5 +312,24 @@ describe("Cursor provider errors", () => {
     expect(suppressed.code).toBe("unavailable")
     expect(suppressed.message.toLowerCase()).not.toMatch(/unavailable|exhausted/)
     expect(suppressed.message).toContain("automatic retry unsafe")
+  })
+
+  it("projects spent and unsafe retries as terminal even when their cause was an HTTP 503", () => {
+    const last = cursorHttpError("Cursor request failed:", 503)
+    for (const failure of [
+      new CursorRetryExhaustedError(3, last),
+      retrySuppressedError(last, "after visible output", 1, 3),
+    ]) {
+      expect(failure).toMatchObject({ statusCode: 503, transient: false, retryable: false })
+      const host = hostFacingError(failure)
+      expect(APICallError.isInstance(host)).toBe(true)
+      expect(host).toMatchObject({
+        statusCode: 400,
+        isRetryable: false,
+        responseHeaders: { "x-should-retry": "false" },
+      })
+      expect((host as APICallError).cause).toBe(failure)
+      expect(host.message).not.toContain("503")
+    }
   })
 })

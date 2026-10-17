@@ -417,6 +417,24 @@ describe("foreign-history rebase", () => {
       userText: "next",
     })).not.toThrow()
   })
+
+  it("budgets a max-mode variant by its own context, not the largest tier", () => {
+    // Live Claude Opus 300k Fast variants carry isMaxMode with a 300k window.
+    const input = {
+      modelInfo: { id: "m", maxContext: 1_000, maxContextForMaxMode: 100_000, variants: [] },
+      cursorModelId: "m",
+      maxMode: true,
+      history: [{ role: "user" as const, content: "x".repeat(4_000) }],
+      systemPrompt: undefined,
+      userText: "next",
+    }
+    expect(() => assertForeignHistoryRebaseFits({
+      ...input, parameters: [{ id: "context", value: "1k" }, { id: "fast", value: "true" }],
+    })).toThrow(/prompt is too long/i)
+    expect(() => assertForeignHistoryRebaseFits({
+      ...input, maxMode: false, parameters: [{ id: "context", value: "100k" }],
+    })).not.toThrow()
+  })
 })
 
 describe("provenance through a Cursor Run", () => {

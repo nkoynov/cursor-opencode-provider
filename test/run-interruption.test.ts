@@ -13,7 +13,7 @@ import {
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
-import { CursorAuthError, CursorRetryExhaustedError } from "../src/errors.js"
+import { CursorAuthError, CursorRetryExhaustedError, CursorServerError } from "../src/errors.js"
 import { billingLedger } from "../src/billing.js"
 import { sessionFixture } from "./session-fixture.js"
 
@@ -493,6 +493,27 @@ describe("interrupted Cursor Run handling", () => {
     expect(renewals).toBe(1)
   })
 
+  it("honors a final Cursor verdict before treating unauthenticated as a renewable login", async () => {
+    let renewals = 0
+    const failure = await pumpWithRecovery({
+      initialSession: fakeSession("final-auth-code", [{
+        flags: 0x02,
+        payload: new TextEncoder().encode(JSON.stringify({ error: {
+          code: "unauthenticated",
+          // aiserver.v1.ErrorDetails{error:RATE_LIMITED_CHANGEABLE (51)}.
+          details: [{ type: "aiserver.v1.ErrorDetails", value: "CDM=" }],
+        } })),
+      }]),
+      controller: controller([]),
+      recover: async () => { throw new Error("A final verdict must not reopen the Run") },
+      renewRejectedCredential: () => { renewals++ },
+    }).catch((error: unknown) => error)
+
+    expect(failure).toBeInstanceOf(CursorServerError)
+    expect(failure).toMatchObject({ code: "unauthenticated", transient: false, retryable: false })
+    expect(renewals).toBe(0)
+  })
+
   it("does not renew when the source cannot, after visible output, or on permission_denied", async () => {
     const cases = [
       { session: fakeSession("static", [endStreamError("unauthenticated")]), renew: false },
@@ -503,9 +524,10 @@ describe("interrupted Cursor Run handling", () => {
         ]),
         renew: true,
       },
-      { session: fakeSession("denied", [endStreamError("permission_denied")]), renew: true },
+      // Cursor CLI treats a bare permission_denied as a final error, not a login prompt.
+      { session: fakeSession("denied", [endStreamError("permission_denied")]), renew: true, error: CursorServerError },
     ]
-    for (const { session, renew } of cases) {
+    for (const { session, renew, error = CursorAuthError } of cases) {
       let renewals = 0
       let recoveries = 0
       const failure = await pumpWithRecovery({
@@ -517,7 +539,7 @@ describe("interrupted Cursor Run handling", () => {
         },
         ...(renew ? { renewRejectedCredential: () => { renewals++ } } : {}),
       }).catch((e: unknown) => e)
-      expect(failure).toBeInstanceOf(CursorAuthError)
+      expect(failure).toBeInstanceOf(error)
       expect(renewals).toBe(0)
       expect(recoveries).toBe(0)
     }

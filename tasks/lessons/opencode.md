@@ -305,6 +305,9 @@ These are failure lessons shared by both hosts, not a replacement for
   The IDE's 1272-hour renewal threshold applies to browser sessions; raw keys
   use their own exchange and never stand in for that refresh. An idle expired
   session requires login again (`src/auth.ts`, `test/auth-renewal.test.ts`).
+  Cursor's final error details precede the Connect login code; reading
+  `unauthenticated` first reopened final usage refusals with a renewed token
+  (`test/run-interruption.test.ts`).
 - **Keep secrets out of serializable SDK options.** OpenCode exposes provider
   options. Resolve credentials on demand, persist only unchanged credentials,
   and hash secrets only for private lookup keys (`test/plugin.test.ts`).
@@ -317,13 +320,33 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Model metadata has separate owners.** Keep wire parameters isolated; make
   metadata-changing variants separate catalog entries. Invalidate cache schema
   before config consumes it; live negative capabilities outrank docs
-  (`test/model-metadata.test.ts`).
+  (`test/model-metadata.test.ts`). PRs #84/#86/#95 showed that tier selection
+  must precede speed preference, defaults must survive catalog partitioning,
+  and unmatched hints must not rewrite an advertised tuple. Exercise marked
+  non-1M tiers and duplicate ids (`test/model-selection-review.test.ts`,
+  `test/model-effort-review.test.ts`, `test/model-selection-run.test.ts`).
+  Collapsing an absent max marker to false also disabled the 1M fallback;
+  preserve absence through discovery and cache, test explicit false separately,
+  and invalidate caches that already erased the distinction (`test/models.test.ts`).
+  A max marker is not a context size: Opus 300k Fast is marked, so budgets come
+  from the resolved `context` parameter (`test/turn-provenance.test.ts`). Effort
+  ties break toward the tier default, as Cursor CLI does, or a hint silently
+  dropped Claude thinking (`test/model-effort-review.test.ts`).
+  Context-tier splits must retain persisted base/Fast variant ids and collision
+  labels, including a Fast entry whose variants all move to another tier. Keep
+  legacy selections usable with their old static budget; dedicated entries
+  provide the larger budget (`test/model-selection-review.test.ts`,
+  `test/model-selection-run.test.ts`).
 - **Inspect generator inputs before changing mappings.** Pricing and model
   metadata came from distinct markdown endpoints. Run the live pricing gate
   before a bump; the v0.6.4 failure forced a retag ([release gate](../../AGENTS.md#hard-stop--release--version-bump--tag-gate-non-optional)).
 - **Make tests capable of failing.** Type guards once sat outside tsc's include;
   root ignored permission fixtures. Use real usages, deterministic faults and
   independent host/frame evidence (`test/workspace-facts.test.ts`).
+- **Publication checks must stop publication.** A failed history scan did not
+  stop later pushes in the same shell sequence. Require successful exit before
+  publishing, and scan commit bodies and coauthor trailers as well as author /
+  committer identities. A clean file diff alone does not establish privacy.
 - **Isolate fixture state.** Capture teardown paths before awaiting; restore
   host-agent callbacks and cache overrides. One leaked cache root broke later
   plugin tests (`test/host-interrupt.test.ts`).
@@ -332,7 +355,9 @@ These are failure lessons shared by both hosts, not a replacement for
   include Bun editor types (`scripts/strip-copied-coverage.ts`).
 - **Keep one current policy across docs and prompts.** A rebase can add review
   rules; reviewer patches still need whole-path validation. Changelog fixes
-  compare with the release, not an intermediate PR state. Keep AGENTS.md to
+  compare with the release, not an intermediate PR state. Concurrent Unreleased
+  insertions can conflict despite independent code; compare the union of entries
+  after each dependency merge. Keep AGENTS.md to
   current invariants and source pointers; merge incident rationale here or in
   the owning host lesson instead of growing implementation transcripts.
   Acceptance checklists stay reusable; dated counts and logs stay in run reports.

@@ -9,28 +9,15 @@ import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { decodeFramePayload, encodeFrame } from "../src/protocol/framing.js"
 import { decodeMessage } from "../src/protocol/messages.js"
 import { closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
-import {
-  CursorRetryExhaustedError,
-  CursorServerError,
-  CursorTransportError,
-  retrySuppressedError,
-} from "../src/errors.js"
-import {
-  FINAL_FAILURE_TTL_MS,
-  isFinalForHost,
-  recordFinalFailure,
-  resetFinalFailuresForTests,
-  takeFinalFailure,
-} from "../src/host-retry.js"
+import { CursorRetryExhaustedError, hostFacingError } from "../src/errors.js"
 import { createCursor } from "../src/index.js"
 import { pumpWithRecovery, resetTurnStateForTests } from "../src/language-model.js"
 import { toolsToDescriptors } from "../src/protocol/tools.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { resetCursorShellCalls } from "../src/shell-timeout.js"
 
-const capacity = () => new CursorServerError("Cursor API error (code=resource_exhausted)", {
-  transient: true, replaySafe: true, code: "resource_exhausted",
-})
+// A Cursor account refusal as Cursor renders it in the JSON envelope: the
+// details' `debug` carries the message, so it must be read without `value`.
 const refusalEnvelope = JSON.stringify({
   error: {
     code: "resource_exhausted",
@@ -47,59 +34,22 @@ const refusalEnvelope = JSON.stringify({
 })
 const endStream = (body: string): Frame => ({ flags: 0x02, payload: new TextEncoder().encode(body) })
 
+function expectFinalForHost(error: unknown): void {
+  expect(APICallError.isInstance(error)).toBe(true)
+  const apiError = error as APICallError
+  expect(apiError.isRetryable).toBe(false)
+  expect(apiError.responseHeaders?.["x-should-retry"]).toBe("false")
+  expect(apiError.statusCode).toBeLessThan(500)
+}
+
 afterEach(() => {
-  resetFinalFailuresForTests()
   sessionManager.dispose()
   resetCursorShellCalls()
   resetTurnStateForTests()
 })
 
-describe("final failures OpenCode must not retry", () => {
-  it("counts only account refusals and capacity after the provider's own attempts", () => {
-    expect(isFinalForHost(new CursorRetryExhaustedError(6, capacity()))).toBe(true)
-    const internal = new CursorServerError("Cursor API error (code=internal)", { transient: true, replaySafe: true, code: "internal" })
-    expect(isFinalForHost(new CursorRetryExhaustedError(3, internal))).toBe(false)
-    expect(isFinalForHost(new CursorRetryExhaustedError(3, new CursorTransportError("Cursor transport failure (ECONNRESET)")))).toBe(false)
-    expect(isFinalForHost(retrySuppressedError(capacity(), "after visible output", 1, 6))).toBe(false)
-    expect(isFinalForHost(new Error("Cursor refused the request: x"))).toBe(false)
-    const overflow = new APICallError({
-      message: "prompt is too long: rebasing this session onto Cursor needs ~900000 tokens",
-      url: "cursor://agent.v1.AgentService/Run",
-      requestBodyValues: {},
-      statusCode: 413,
-      isRetryable: false,
-    })
-    expect(isFinalForHost(overflow)).toBe(false)
-  })
-
-  it("vetoes once, for the recorded session and message only", () => {
-    const failure = new CursorRetryExhaustedError(6, capacity())
-    recordFinalFailure("ses_a", failure)
-    expect(takeFinalFailure("ses_b", failure.message)).toBe(false)
-    expect(takeFinalFailure("ses_a", "Cursor stream stalled")).toBe(false)
-    expect(takeFinalFailure("ses_a", undefined)).toBe(false)
-    expect(takeFinalFailure("ses_a", failure.message)).toBe(true)
-    expect(takeFinalFailure("ses_a", failure.message)).toBe(false)
-  })
-
-  it("ignores failures the host may retry, and stale records", () => {
-    recordFinalFailure("ses_t", new CursorTransportError("Cursor transport failure (ECONNRESET)"))
-    expect(takeFinalFailure("ses_t", "Cursor transport failure (ECONNRESET)")).toBe(false)
-
-    const failure = new CursorRetryExhaustedError(6, capacity())
-    recordFinalFailure("ses_old", failure, 1_000)
-    expect(takeFinalFailure("ses_old", failure.message, 1_000 + FINAL_FAILURE_TTL_MS + 1)).toBe(false)
-    recordFinalFailure(undefined, failure)
-  })
-
-  it("is visible to another copy of the module (the plugin's)", async () => {
-    const pluginCopy = await import(`../src/host-retry.js?copy=${Date.now()}`) as typeof import("../src/host-retry.js")
-    const failure = new CursorRetryExhaustedError(6, capacity())
-    recordFinalFailure("ses_copy", failure)
-    expect(pluginCopy.takeFinalFailure("ses_copy", failure.message)).toBe(true)
-  })
-
-  it("marks the error that ends a Run refused for capacity six times", async () => {
+describe("final failures reach the host as not retryable", () => {
+  it("ends a Run refused for capacity six times with a final error", async () => {
     const refused = (id: string): CursorSession => ({
       sessionId: id,
       conversationId: `conv-${id}`,
@@ -125,10 +75,11 @@ describe("final failures OpenCode must not retry", () => {
       recover: async () => refused(`full-${++n}`),
     }).catch((error: unknown) => error)
     expect(failure).toBeInstanceOf(CursorRetryExhaustedError)
-    expect(isFinalForHost(failure)).toBe(true)
+    expect((failure as CursorRetryExhaustedError).attempts).toBe(6)
+    expectFinalForHost(hostFacingError(failure))
   })
 
-  it("records Cursor's account refusal when it ends the step's stream", async () => {
+  it("ends the step's stream with Cursor's account refusal, final and with its message", async () => {
     const queue: Frame[] = []
     let wake: ((result: IteratorResult<Frame>) => void) | undefined
     const frames: AsyncIterator<Frame> = {
@@ -191,15 +142,15 @@ describe("final failures OpenCode must not retry", () => {
       push(endStream(refusalEnvelope))
 
       const error = await consumed.then(() => undefined, (failure: unknown) => failure as Error)
-      expect(error?.message).toStartWith("Cursor refused the request: Too many computers.")
-      expect(takeFinalFailure("ses_refused", `${error?.message}`)).toBe(true)
+      expect(error?.message).toContain("Too many computers.")
+      expectFinalForHost(error)
     } finally {
       globalThis.fetch = realFetch
     }
   })
 
-  it("records it for a tool-less step, whose Run is not bound to the session", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-host-retry-"))
+  it("refuses a tool-less step once, final for the host", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-final-error-"))
     setHostCacheDirOverride(path.join(root, "cache"))
     const connect = http2.connect
     let runs = 0
@@ -251,8 +202,8 @@ describe("final failures OpenCode must not retry", () => {
       const error = await (async () => { for await (const _ of result.stream as unknown as AsyncIterable<LanguageModelV3StreamPart>) { /* drain */ } })()
         .then(() => undefined, (failure: unknown) => failure as Error)
       expect(runs).toBe(1)
-      expect(error?.message).toStartWith("Cursor refused the request: Too many computers.")
-      expect(takeFinalFailure("ses_max_steps", `${error?.message}`)).toBe(true)
+      expect(error?.message).toContain("Too many computers.")
+      expectFinalForHost(error)
     } finally {
       globalThis.fetch = realFetch
       ;(http2 as any).connect = connect
