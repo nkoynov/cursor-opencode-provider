@@ -30,6 +30,8 @@ function fakeCursorRuns(script: ScriptedFrame[][], refused = { requests: 0 }): {
     const session: any = Object.assign(new EventEmitter(), {
       closed: false,
       destroyed: false,
+      ref() {},
+      unref() {},
       request() {
         if (refused.requests > 0) {
           refused.requests--

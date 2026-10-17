@@ -589,6 +589,8 @@ function fakeCursorRuns(script: Array<Array<Record<string, unknown>>>): { runs: 
     const session: any = Object.assign(new EventEmitter(), {
       closed: false,
       destroyed: false,
+      ref() {},
+      unref() {},
       request() {
         const stream: any = Object.assign(new EventEmitter(), {
           closed: false,

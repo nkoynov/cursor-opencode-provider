@@ -207,6 +207,8 @@ describe("final failures OpenCode must not retry", () => {
       const session: any = Object.assign(new EventEmitter(), {
         closed: false,
         destroyed: false,
+        ref() {},
+        unref() {},
         request() {
           const stream: any = Object.assign(new EventEmitter(), {
             closed: false,

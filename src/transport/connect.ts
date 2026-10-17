@@ -385,6 +385,12 @@ const _http2SessionLastInboundAt = new WeakMap<http2.ClientHttp2Session, number>
 const _http2SessionGoawayLastStreamId = new WeakMap<http2.ClientHttp2Session, number>()
 const _http2SessionTransportLost = new WeakSet<http2.ClientHttp2Session>()
 const _http2SessionListenerCleanup = new WeakMap<http2.ClientHttp2Session, () => void>()
+// As in Cursor CLI's transport (@connectrpc/connect-node 1.6.1
+// Http2SessionManager), a cached session keeps the process alive only while a
+// Run stream or a reuse ping is live on it: unref'd once connected, ref'd while
+// it holds one. A Run held open on a pending exec keeps its stream, so it stays
+// ref'd; an idle session would otherwise stop a headless host from exiting.
+const _http2SessionHolds = new WeakMap<http2.ClientHttp2Session, number>()
 // Validation and connect work for the same origin shares one Promise.
 const _http2Connecting = new Map<string, Promise<http2.ClientHttp2Session>>()
 
@@ -453,6 +459,29 @@ function dropSession(origin: string, session: http2.ClientHttp2Session): void {
 function retireCachedSession(origin: string, session: http2.ClientHttp2Session): void {
   dropSession(origin, session)
   try { session.close() } catch { /* already closed */ }
+}
+
+function holdHttp2Session(session: http2.ClientHttp2Session): void {
+  const holds = _http2SessionHolds.get(session) ?? 0
+  _http2SessionHolds.set(session, holds + 1)
+  if (holds === 0) session.ref()
+}
+
+function releaseHttp2Session(session: http2.ClientHttp2Session): void {
+  const holds = (_http2SessionHolds.get(session) ?? 0) - 1
+  if (holds > 0) {
+    _http2SessionHolds.set(session, holds)
+    return
+  }
+  _http2SessionHolds.delete(session)
+  if (!session.destroyed) session.unref()
+}
+
+/** Offer a connected session for new Runs; it stays unref'd until one holds it. */
+function cacheReadySession(origin: string, session: http2.ClientHttp2Session): void {
+  if (!_http2SessionHolds.has(session)) session.unref()
+  _http2SessionCreatedAt.set(session, Date.now())
+  _http2Sessions.set(origin, session)
 }
 
 /** Test cleanup for local HTTP/2 fixtures; production sessions stay process-cached. */
@@ -565,8 +594,7 @@ export function cacheHttp2SessionForTests(
   // Tests re-cache one client per turn; replace its listeners rather than stack them.
   _http2SessionListenerCleanup.get(session)?.()
   installSessionInvalidation(origin, session)
-  _http2SessionCreatedAt.set(session, Date.now())
-  _http2Sessions.set(origin, session)
+  cacheReadySession(origin, session)
 }
 
 function invalidateSession(origin: string, session: http2.ClientHttp2Session): void {
@@ -666,9 +694,8 @@ function connectSession(origin: string): Promise<http2.ClientHttp2Session> {
       }
       // The TLS socket (if any) is owned by the HTTP/2 session from here on.
       tunnelSocket = undefined
-      _http2SessionCreatedAt.set(session, Date.now())
+      cacheReadySession(origin, session)
       noteSessionInbound(session)
-      _http2Sessions.set(origin, session)
       trace(`h2 session connected: origin=${origin}`)
       resolve(session)
     }
@@ -767,7 +794,12 @@ function acquireSession(
         retireCachedSession(origin, existing)
       } else {
         try {
-          await validateCachedSession(existing, pingTimeoutMs)
+          holdHttp2Session(existing)
+          try {
+            await validateCachedSession(existing, pingTimeoutMs)
+          } finally {
+            releaseHttp2Session(existing)
+          }
           if (_http2Sessions.get(origin) === existing && !existing.destroyed && !existing.closed) {
             trace(`h2 cached session ping ok: origin=${origin}`)
             noteSessionInbound(existing)
@@ -852,9 +884,14 @@ export async function bidiRunStream(
   }
 
   let session = lease.session
-  const openStream = () => session.request(headers as unknown as http2.OutgoingHttpHeaders, {
-    endStream: false,
-  })
+  // Each stream holds its own session until that stream closes, a replaced one included.
+  const openStream = () => {
+    const owner = session
+    const opened = owner.request(headers as unknown as http2.OutgoingHttpHeaders, { endStream: false })
+    holdHttp2Session(owner)
+    opened.once("close", () => releaseHttp2Session(owner))
+    return opened
+  }
   // A Run on a session reused without its ping keeps its frames until Cursor answers, so it can
   // be sent once more on a new connection if that session turns out dead.
   let unanswered: Uint8Array[] | undefined = lease.verified ? undefined : []

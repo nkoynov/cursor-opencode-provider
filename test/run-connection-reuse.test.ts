@@ -266,6 +266,40 @@ describe("Run connection reuse", () => {
     },
   )
 
+  it("releases the connection a Run left for a new one, and holds the new one only while the Run is open", async () => {
+    await completedRun()
+    const calls = new Map<http2.ClientHttp2Session, string[]>()
+    const watch = (session: http2.ClientHttp2Session) => {
+      const log: string[] = []
+      calls.set(session, log)
+      const ref = session.ref.bind(session)
+      const unref = session.unref.bind(session)
+      session.ref = () => { log.push("ref"); ref() }
+      session.unref = () => { log.push("unref"); unref() }
+      return session
+    }
+    const first = watch(await getSession(ORIGIN))
+    const connect = http2.connect.bind(http2)
+    const connectSpy = spyOn(http2, "connect").mockImplementation(((...args: Parameters<typeof http2.connect>) =>
+      watch(connect(...args))) as typeof http2.connect)
+    try {
+      fake.answers.push("refuse")
+      const run = await bidiRunStream("token", { baseURL: ORIGIN })
+      run.write(new Uint8Array([8]))
+      expect((await nextFrame(run)).done).toBe(false)
+
+      const second = [...calls.keys()].find((session) => session !== first)!
+      expect(fake.connections).toBe(2)
+      expect(calls.get(first)!.at(-1)).toBe("unref")
+      expect(calls.get(second)!.at(-1)).toBe("ref")
+      run.end()
+      await until(() => calls.get(second)!.at(-1) === "unref")
+      expect(calls.get(second)!.at(-1)).toBe("unref")
+    } finally {
+      connectSpy.mockRestore()
+    }
+  })
+
   it("follows the new connection when the dead one held a request still draining", async () => {
     // Uncompressed, so the request stays larger than the socket buffers on the wire.
     resetRunCompressionForTests(ORIGIN)

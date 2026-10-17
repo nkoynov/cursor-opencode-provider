@@ -43,6 +43,8 @@ function fakeCursorRuns(): { runs: any[]; restore: () => void } {
     const session: any = Object.assign(new EventEmitter(), {
       closed: false,
       destroyed: false,
+      ref() {},
+      unref() {},
       request() {
         let written = Buffer.alloc(0)
         const stream: any = Object.assign(new EventEmitter(), {

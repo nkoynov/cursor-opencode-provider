@@ -64,6 +64,7 @@
 - A message Cursor never checkpointed is sent again ahead of the next message on the same conversation. Stopping the turn, or a rebuild from the host's history, drops it. It also survives an OpenCode restart after the failed turn, and repeated failed retries no longer add the same interruption note again each time ([#66](https://github.com/oakimov/cursor-opencode-provider/issues/66))
 - On OpenCode 2, a title or summary request sent while a tool is still running no longer cancels the Cursor Run waiting on that tool
 - While a tool runs, the provider answers Cursor's blob requests and stop requests at once, as Cursor CLI does, instead of after the tool finishes
+- A headless process now exits after its last Cursor Run instead of hanging on the idle cached HTTP/2 connection ([#88](https://github.com/oakimov/cursor-opencode-provider/pull/88) by [@willowite](https://github.com/willowite), [#87](https://github.com/oakimov/cursor-opencode-provider/issues/87))
 - A message Cursor never checkpointed is also sent again when it was a steer Cursor did not take (sent as a follow-up Run) or a reply to a safety-filter stop, is dropped by a Stop during OpenCode's retry wait too, and is left out of a helper Run on the same session whose prompt does not hold it
 - An edit's early tool row opens as `write` for an empty existing file, which the edit stays as, and not while an earlier call of the step is still on its way, so neither case shows a failed row next to the real call
 
