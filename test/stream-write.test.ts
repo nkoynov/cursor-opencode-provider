@@ -7,7 +7,7 @@ type FakeStream = BidiStream & { written: number[] }
 
 function stream(options: {
   write?: (message: Uint8Array) => boolean | void
-  waitForDrain?: ((timeoutMs: number) => Promise<void>) | null
+  waitForDrain?: (() => Promise<void>) | null
 } = {}): FakeStream {
   const written: number[] = []
   const fake = {

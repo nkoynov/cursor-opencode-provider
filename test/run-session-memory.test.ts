@@ -1,19 +1,23 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import http2 from "node:http2"
 import net from "node:net"
+import tls from "node:tls"
 import { encodeFrame } from "../src/protocol/framing.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
 import {
   bidiRunStream,
   closeCachedHttp2SessionsForTests,
   getSession,
-  resetRunCompressionForTests,
-  routeHttp2ConnectionsForTests,
   type BidiStream,
 } from "../src/transport/connect.js"
 
+// From #79 (by @nkoynov).
+
 const ORIGIN = "https://agentn.session-memory-test.cursor.sh"
 const MiB = 1024 * 1024
+const PROXY_KEYS = ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"] as const
+const realConnect = http2.connect
+const realTlsConnect = tls.connect
 
 /** An h2c "Cursor" that answers every Run but, like a busy agent host, reads none of its request yet. */
 async function startBusyCursor() {
@@ -33,11 +37,46 @@ async function startBusyCursor() {
   })
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
   const port = (server.address() as net.AddressInfo).port
-  routeHttp2ConnectionsForTests(() => net.connect(port, "127.0.0.1"))
+  // The provider's own connect call and options, over plain TCP to this server (or the proxy's tunnel to it).
+  ;(http2 as { connect: unknown }).connect = (origin: string, options?: http2.ClientSessionOptions) =>
+    realConnect(origin, { ...options, createConnection: options?.createConnection ?? (() => net.connect(port, "127.0.0.1")) })
   return {
+    port,
     get streams() { return streams },
     async close() {
       for (const session of sessions) session.destroy()
+      await new Promise((resolve) => server.close(resolve))
+    },
+  }
+}
+
+/** A CONNECT proxy that tunnels to the busy Cursor; TLS over the tunnel is a pass-through. */
+async function startTunnelProxy(cursorPort: number) {
+  const requests: string[] = []
+  const sockets = new Set<net.Socket>()
+  const server = net.createServer((client) => {
+    sockets.add(client)
+    client.on("error", () => {})
+    client.once("data", (head) => {
+      requests.push(head.toString("utf8"))
+      const upstream = net.connect(cursorPort, "127.0.0.1", () => {
+        client.write("HTTP/1.1 200 Connection Established\r\n\r\n")
+        client.pipe(upstream).pipe(client)
+      })
+      sockets.add(upstream)
+      upstream.on("error", () => {})
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+  ;(tls as { connect: unknown }).connect = ({ socket }: { socket: net.Socket }) => {
+    setImmediate(() => socket.emit("secureConnect"))
+    return socket
+  }
+  return {
+    port: (server.address() as net.AddressInfo).port,
+    requests,
+    async close() {
+      for (const socket of sockets) socket.destroy()
       await new Promise((resolve) => server.close(resolve))
     },
   }
@@ -56,20 +95,27 @@ async function firstAnswer(run: BidiStream): Promise<string> {
 
 let cursor: Awaited<ReturnType<typeof startBusyCursor>>
 const savedClientVersion = process.env.CURSOR_CLIENT_VERSION
+const savedProxy: Record<string, string | undefined> = {}
 
 beforeEach(async () => {
+  for (const key of PROXY_KEYS) {
+    savedProxy[key] = process.env[key]
+    delete process.env[key]
+  }
   process.env.CURSOR_CLIENT_VERSION = "cli-session-memory-test-1"
   resetClientVersionCache()
-  // The pending requests must stay megabytes on the wire, which gzip would shrink to almost nothing.
-  resetRunCompressionForTests(ORIGIN)
   cursor = await startBusyCursor()
 })
 
 afterEach(async () => {
-  resetRunCompressionForTests()
   closeCachedHttp2SessionsForTests()
-  routeHttp2ConnectionsForTests()
+  ;(http2 as { connect: unknown }).connect = realConnect
+  ;(tls as { connect: unknown }).connect = realTlsConnect
   await cursor.close()
+  for (const key of PROXY_KEYS) {
+    if (savedProxy[key] === undefined) delete process.env[key]
+    else process.env[key] = savedProxy[key]
+  }
   if (savedClientVersion === undefined) delete process.env.CURSOR_CLIENT_VERSION
   else process.env.CURSOR_CLIENT_VERSION = savedClientVersion
   resetClientVersionCache()
@@ -95,7 +141,7 @@ describe("Runs sharing a connection with requests Cursor has not read yet", () =
     for (const sibling of siblings) sibling.destroy()
   })
 
-  it("still opens a new Run when the connection holds more unsent bytes than the runtime's default session memory", async () => {
+  async function expectRunOpensPastDefaultSessionMemory() {
     const opener = await bidiRunStream("token", { baseURL: ORIGIN })
     expect((await nextFrame(opener)).done).toBe(false)
     const session = await getSession(ORIGIN)
@@ -111,5 +157,21 @@ describe("Runs sharing a connection with requests Cursor has not read yet", () =
     run.destroy()
     backlog.close()
     opener.destroy()
+  }
+
+  it("still opens a new Run when the connection holds more unsent bytes than the runtime's default session memory", async () => {
+    await expectRunOpensPastDefaultSessionMemory()
+  })
+
+  it("gives a connection through HTTPS_PROXY the same session memory", async () => {
+    const proxy = await startTunnelProxy(cursor.port)
+    process.env.HTTPS_PROXY = `http://127.0.0.1:${proxy.port}`
+    try {
+      await expectRunOpensPastDefaultSessionMemory()
+      expect(proxy.requests).toHaveLength(1)
+      expect(proxy.requests[0]).toStartWith("CONNECT agentn.session-memory-test.cursor.sh:443 HTTP/1.1")
+    } finally {
+      await proxy.close()
+    }
   })
 })

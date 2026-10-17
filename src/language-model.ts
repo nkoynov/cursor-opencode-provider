@@ -1031,10 +1031,27 @@ async function doStreamImpl(
       : undefined
     session.hostEditsDenied = hostEditsDeniedFromCallOptions(callOptions)
     const held = session
-    session = await deliverContinuationResults(session, results, {
-      steer: steerInjections,
-      hostAgent: hostAgentFromCallOptions(callOptions),
-    })
+    const cancelled = () => new CursorLocalCancellationError("Cursor continuation upload cancelled")
+    const cancelUpload = () => {
+      dropLostRequest(held.openCodeSessionId)
+      sessionManager.close(held, "host-interrupted", cancelled())
+    }
+    const signal = callOptions.abortSignal
+    signal?.addEventListener("abort", cancelUpload, { once: true })
+    try {
+      if (signal?.aborted) {
+        cancelUpload()
+        throw cancelled()
+      }
+      session = await deliverContinuationResults(held, results, {
+        steer: steerInjections,
+        hostAgent: hostAgentFromCallOptions(callOptions),
+      })
+      // Cancellation is not a failed delivery to rebase and upload again.
+      if (signal?.aborted) throw cancelled()
+    } finally {
+      signal?.removeEventListener("abort", cancelUpload)
+    }
     if (session && resultsAfterCheckpoint) session.resultsAfterCheckpoint = resultsAfterCheckpoint
     if (session) await refreshHeldSessionToolCatalog(session, callOptions)
     // The rebase below seeds from host history, which holds OpenCode's copy of any promoted steer.
@@ -1338,6 +1355,12 @@ export async function pumpWithRecovery(input: {
     const pumpedSession = session
     const pumpOwner = Symbol("cursor-pump")
     sessionManager.beginPump(pumpedSession, pumpOwner)
+    const cancelPumpUpload = () => {
+      if (!sessionManager.isPumpOwner(pumpedSession, pumpOwner) || pumpedSession.pending.size > 0 || pumpedSession.hostInterrupted) return
+      dropLostRequest(pumpedSession.openCodeSessionId)
+      sessionManager.close(pumpedSession, "host-interrupted", new CursorLocalCancellationError("Cursor Run cancelled locally"))
+    }
+    input.abortSignal?.addEventListener("abort", cancelPumpUpload, { once: true })
     // A compaction Run keeps the session id, but a steer is for the agent, not the summarizer.
     const stopSteers = pumpedSession.openCodeSessionId && !pumpedSession.postCompactionRebase
       ? listenForHostSteers(pumpedSession.openCodeSessionId, (steer) => injectHostSteer(pumpedSession, steer))
@@ -1355,7 +1378,7 @@ export async function pumpWithRecovery(input: {
       return session
     } catch (error) {
       // A cancelled Run's stream fails or ends on purpose; recovering would restart the stopped turn.
-      if (pumpedSession.hostInterrupted) {
+      if (pumpedSession.hostInterrupted || input.abortSignal?.aborted) {
         if (error instanceof CursorLocalCancellationError) throw error
         throw new CursorLocalCancellationError("Cursor Run cancelled: the host stopped the turn", error)
       }
@@ -1423,6 +1446,7 @@ export async function pumpWithRecovery(input: {
       await sleepForRetry(delayMs, input.abortSignal)
       session = await reopen(pumpedSession, failure, checkpoint)
     } finally {
+      input.abortSignal?.removeEventListener("abort", cancelPumpUpload)
       stopSteers?.()
       // Cancellation cleanup inside pump() must keep an active owner alive.
       // Retry after releasing this owner so a stopped consumer with no pending
@@ -1703,6 +1727,49 @@ async function restoreSessionState(sessionKey: string | undefined, cacheDir: str
     await hydrateTurnProvenance(cacheDir, sessionKey).catch((error) => {
       trace(`turn provenance: restore failed sessionKey=${sessionKey}: ${String(error)}`)
     })
+  }
+}
+
+/** Own cancellation until an opening Run has uploaded its request and can be registered. */
+async function openRunWithRequest(
+  token: string,
+  options: { baseURL: string; headers?: Record<string, string> },
+  request: Uint8Array,
+  operation: string,
+  owner: { signal?: AbortSignal; stoppedWithSessionId?: string; requestedAt: number },
+): Promise<BidiStream> {
+  let stream: BidiStream | undefined
+  let cancelled = false
+  const cancel = () => {
+    cancelled = true
+    dropLostRequest(owner.stoppedWithSessionId)
+    stream?.destroy()
+  }
+  // Only the opening phase follows this signal. The host's later tool-calls
+  // abort must leave the registered Run alive for its continuation.
+  owner.signal?.addEventListener("abort", cancel, { once: true })
+  const unsubscribe = onHostInterrupt((sessionId, reason, at) => {
+    if (reason !== "shutdown" && sessionId && sessionId === owner.stoppedWithSessionId && owner.requestedAt < at) cancel()
+  })
+  const previousStop = owner.stoppedWithSessionId ? hostInterrupts.get(owner.stoppedWithSessionId) : undefined
+  if (owner.signal?.aborted || (previousStop && owner.requestedAt < previousStop.at)) cancel()
+  const open = async () => {
+    if (cancelled) throw new CursorLocalCancellationError(`Cursor ${operation} cancelled`)
+    stream = await bidiRunStream(token, options)
+    if (cancelled) throw new CursorLocalCancellationError(`Cursor ${operation} cancelled`)
+    return stream
+  }
+  try {
+    stream = await sendRunRequest(await open(), request, operation, open)
+    if (cancelled) throw new CursorLocalCancellationError(`Cursor ${operation} cancelled`)
+    return stream
+  } catch (error) {
+    stream?.destroy()
+    if (cancelled) throw new CursorLocalCancellationError(`Cursor ${operation} cancelled`, error)
+    throw error
+  } finally {
+    owner.signal?.removeEventListener("abort", cancel)
+    unsubscribe()
   }
 }
 
@@ -2130,13 +2197,6 @@ async function startSession(
     })
   }
 
-  // Do NOT pass callOptions.abortSignal into the h2 Run stream. OpenCode aborts
-  // that signal when a turn ends with tool-calls; the Cursor stream must stay
-  // open until we write the exec results on the next doStream.
-  let stream = await bidiRunStream(token, {
-    baseURL: agentBaseUrl,
-    headers: options.headers,
-  })
   // Freeze RequestContext per conversation_id (CLI parity). Rebuilding every
   // Run mutates volatile slices (git porcelain, layout) and breaks prompt cache.
   const { context: requestContext, reused: requestContextReused } = await getOrBuildRequestContext(
@@ -2247,15 +2307,15 @@ async function startSession(
   trace(`hash requestContext sha256=${requestContextHash}`)
   if (conversationState) trace(`hash checkpoint sha256=${sha(conversationState)}`)
 
-  try {
-    stream = await sendRunRequest(stream, reqBytes, "initial Run request",
-      () => bidiRunStream(token, { baseURL: agentBaseUrl, headers: options.headers }))
-    userTurnHostNotes.sent()
-    if (sessionKey && fallbackReply) forgetModelFallbackStop(sessionKey, fallbackReply.stop)
-  } catch (error) {
-    stream.destroy()
-    throw error
-  }
+  const stream = await openRunWithRequest(token, {
+    baseURL: agentBaseUrl, headers: options.headers,
+  }, reqBytes, "initial Run request", {
+    signal: callOptions.abortSignal,
+    stoppedWithSessionId: lifecycle ? undefined : sessionKey,
+    requestedAt: startOptions?.requestedAt ?? Date.now(),
+  })
+  userTurnHostNotes.sent()
+  if (sessionKey && fallbackReply) forgetModelFallbackStop(sessionKey, fallbackReply.stop)
   const historyImages = sessionKey && !ephemeralRun ? runHistoryImages(heldImages) : undefined
   if (historyImages) noteHistoryImagesSent(historyImages, imageExtraction.hashes, lastFrameArrival())
 
@@ -2376,26 +2436,19 @@ async function startSession(
 
   attachSessionHeartbeat(session)
 
-  session.reopenWithUserMessage = async (text: string, abortSignal = callOptions.abortSignal) => {
-    const abortIfNeeded = (stream?: BidiStream): void => {
-      if (!session.closed && !abortSignal?.aborted && !session.hostInterrupted) return
-      try { stream?.destroy() } catch { /* already closed */ }
-      if (abortSignal?.aborted || session.hostInterrupted) {
-        throw new CursorLocalCancellationError("Cursor progress-only continuation cancelled")
-      }
-      throw new CursorProtocolError("Cannot reopen a closed Cursor session")
+  const abortIfNeeded = (signal: AbortSignal | undefined, stream?: BidiStream): void => {
+    if (!session.closed && !signal?.aborted && !session.hostInterrupted) return
+    try { stream?.destroy() } catch { /* already closed */ }
+    if (signal?.aborted || session.hostInterrupted) {
+      throw new CursorLocalCancellationError("Cursor progress-only continuation cancelled")
     }
-    abortIfNeeded()
+    throw new CursorProtocolError("Cannot reopen a closed Cursor session")
+  }
+
+  session.reopenWithUserMessage = async (text: string, signal?: AbortSignal) => {
+    abortIfNeeded(signal)
     const freshToken = await resolveRunBearerToken(options)
-    abortIfNeeded()
-    // Do not pass OpenCode's abortSignal into the h2 stream: a tool-calls abort
-    // must not tear down a Run we still need to pump. Check abort around open.
-    const openNext = async () => {
-      const opened = await bidiRunStream(freshToken, { baseURL: agentBaseUrl, headers: options.headers })
-      abortIfNeeded(opened)
-      return opened
-    }
-    let next = await openNext()
+    abortIfNeeded(signal)
     const conversationState = session.resumeCheckpoint ?? getCheckpoint(session.conversationId)
     const nextRunId = crypto.randomUUID()
     const reqBytes = buildRunRequest({
@@ -2412,16 +2465,17 @@ async function startSession(
       action: "user",
       mode: cursorAgentModeWireValue(getActiveCursorMode(session.openCodeSessionId)),
     })
-    try {
-      next = await sendRunRequest(next, reqBytes, "progress-only continuation Run", openNext)
-    } catch (error) {
-      try { next.destroy() } catch {}
-      throw error
-    }
-    abortIfNeeded(next)
+    const next = await openRunWithRequest(freshToken, {
+      baseURL: agentBaseUrl, headers: options.headers,
+    }, reqBytes, "progress-only continuation Run", {
+      signal,
+      stoppedWithSessionId: session.stoppedWithSessionId ?? session.openCodeSessionId,
+      requestedAt: session.requestedAt ?? session.createdAt,
+    })
+    abortIfNeeded(signal, next)
     session.heartbeatCancel?.()
     await waitForStreamWrites(session.stream)
-    abortIfNeeded(next)
+    abortIfNeeded(signal, next)
     sessionManager.replaceStream(session, next, nextRunId)
     attachSessionHeartbeat(session)
   }
@@ -5517,6 +5571,7 @@ export async function pump(
             progressOnlyContinuationPrompt(
               workspaceRootFromRequestContext(session.requestContext),
             ),
+            abortSignal,
           )
           endingTurns.delete(session)
           assistantText = ""

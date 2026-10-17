@@ -73,9 +73,12 @@ async function writeStreamMessageNow(
   if (!stream.waitForDrain) {
     throw new StreamWriteDrainError(`Cursor ${operation} write was backpressured`)
   }
+  // No deadline: HTTP/2 emits `drain` only once the whole buffered message is
+  // out, so a timeout here would cap the upload, not detect a stall. Cursor CLI
+  // (connect-node) waits the same way; a closed or idle stream settles it.
   const startedAt = Date.now()
   try {
-    await stream.waitForDrain(5_000)
+    await stream.waitForDrain()
     trace(`stream write drained: operation=${operation} bytes=${message.length} ms=${Date.now() - startedAt}`)
   } catch (cause) {
     throw new StreamWriteDrainError(

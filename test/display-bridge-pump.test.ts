@@ -1988,7 +1988,10 @@ describe("progress-only continuation pump", () => {
     )
     session.resumeCheckpoint = Uint8Array.of(1, 2, 3)
     let reopenCalls = 0
-    session.reopenWithUserMessage = async () => {
+    const abort = new AbortController()
+    let reopenSignal: AbortSignal | undefined
+    session.reopenWithUserMessage = async (_text, signal) => {
+      reopenSignal = signal
       reopenCalls++
       session.frames = iteratorFrom([
         textDeltaPayload("Checking the workspace"),
@@ -2002,9 +2005,10 @@ describe("progress-only continuation pump", () => {
       error() {},
     } as unknown as ReadableStreamDefaultController<any>
 
-    await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
+    await pump(session, controller, { textId: "text", reasoningId: "reasoning" }, abort.signal)
 
     expect(reopenCalls).toBe(1)
+    expect(reopenSignal).toBe(abort.signal)
     expect(parts.some((p) => p.type === "finish" && p.finishReason?.unified === "stop")).toBe(true)
     expect(session.closed).toBe(true)
   })

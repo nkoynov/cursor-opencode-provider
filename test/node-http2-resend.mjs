@@ -177,7 +177,7 @@ await scenario("dead-connection-resent-after-slow-reconnect", async (fake) => {
   const run = await bidiRunStream("token", { baseURL: ORIGIN })
   const request = new Uint8Array(8_000_000).fill(5)
   assert.equal(run.write(request), false)
-  await run.waitForDrain(5_000)
+  await run.waitForDrain()
   assert.equal((await nextFrame(run)).done, false)
   for (let i = 0; i < 400 && fake.streams.at(-1)?.bytes !== 5 + request.length; i++) await sleep(5)
   assert.equal(fake.connections, 2)

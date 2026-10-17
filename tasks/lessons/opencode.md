@@ -93,8 +93,17 @@ These are failure lessons shared by both hosts, not a replacement for
   Run is held again (`test/held-run-run.test.ts`).
 - **Backpressure belongs to every response-required write.** KV replies filled
   the stream before an awaited heartbeat exposed it. Serialize writes, label the
-  failing operation, and do not replay ambiguous buffered delivery
-  (`test/stream-write.test.ts`).
+  failing operation, and do not replay ambiguous buffered delivery. Without an
+  upload deadline, transport-only abort tests missed the actual provider: an
+  initial or replacement Run had no registered cancellation owner, and a
+  continuation still had the previous step's signal. Cover cancellation through
+  `doStream` during each upload, including a protocol reply inside the pump, and
+  keep a completed tool step's abort separate. Replacement callbacks also held
+  the first step's aborted signal; pass the current pump's signal explicitly
+  (`test/stream-write.test.ts`, `test/write-drain.test.ts`). Rejecting a drain
+  alone does not release its stream: `end()` left buffered bytes live, and
+  `destroy()` then skipped the reset because it was already locally closed
+  (`test/session-exit.test.ts`, `test/node-http2-drain.mjs`).
 - **A checkpoint is not permission to replay side effects.** Resume the newest
   eligible checkpoint only behind the replay barrier; a late tool result needs
   history recovery because `resume_action` re-requests that tool

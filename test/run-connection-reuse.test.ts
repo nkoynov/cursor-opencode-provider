@@ -310,7 +310,7 @@ describe("Run connection reuse", () => {
     // Larger than the socket buffers, so the write is still waiting to drain when the connection dies.
     const request = new Uint8Array(16_000_000).fill(5)
     expect(run.write(request)).toBe(false)
-    await run.waitForDrain!(5_000)
+    await run.waitForDrain!()
     expect((await nextFrame(run)).done).toBe(false)
     await until(() => fake.streams.at(-1)?.bytes === 5 + request.length)
 
