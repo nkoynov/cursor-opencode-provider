@@ -15,7 +15,8 @@ variables and limitations. Host setup belongs in the matching guide.
 | [Review rules](review-rules.md) | PR review criteria |
 
 Maintainers: [AGENTS.md](../AGENTS.md) owns current architecture and release
-requirements; [CONTRIBUTING.md](../CONTRIBUTING.md) owns contribution workflow.
+requirements, with implementation pointers rather than incident histories;
+[CONTRIBUTING.md](../CONTRIBUTING.md) owns contribution workflow.
 The [lessons index](../tasks/lessons.md) separates general, 1.x and 2.0 incident
 rationale. Future work is tracked in [tasks/todo.md](../tasks/todo.md).
 

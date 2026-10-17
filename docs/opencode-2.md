@@ -194,8 +194,10 @@ A plain-text steer without files or skills can reach an actively pumping Cursor
 Run before OpenCode reaches its next step boundary, including during AwaitShell.
 Messages that cannot be admitted early retain the normal host delivery path.
 Answered copies are deduplicated across restart/retry, while later identical
-requests, unmatched messages and attachments remain intact. Stop notifies the
-Cursor Run and saves recoverable state; the next turn preserves the checkpoint
+requests, unmatched messages and attachments remain intact. If a Run fails after
+an unanswered steer was promoted or checkpointed and recovery cannot preserve
+it, the next attempt rebuilds from host history to retain the message. Stop
+notifies the Cursor Run and saves recoverable state; the next turn preserves the checkpoint
 when safe and otherwise rebuilds from host history. See [2.0 incident lessons](../tasks/lessons/opencode-2.md#early-steers-stop-and-restart)
 and [acceptance checks](host-compat-acceptance.md#opencode-2-early-steers-and-stop).
 

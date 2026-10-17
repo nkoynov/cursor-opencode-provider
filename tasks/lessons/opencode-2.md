@@ -48,6 +48,11 @@ Operator setup: [OpenCode 2.0](../../docs/opencode-2.md).
 - **2.0 calls its patch tool `patch`.** Its parser strips CRLF carriage returns;
   native conversions and direct dynamic calls must refuse lossy content before
   mutation (`test/apply-patch.test.ts`).
+- **Read truncation has several forms.** The host removes bytes after 50 KB,
+  stops after 2,000 lines and shortens individual lines after 2,000 characters.
+  Strip the `Read file`/line-number envelope but retain every actual truncation
+  notice; an explicitly bounded page alone is not incomplete
+  (`test/read-cap-repro.test.ts`).
 - **Host prompt changes do not justify reminting.** Agent switches keep the
   sticky conversation; the changed instruction rides after the frozen baseline
   (`test/context-epoch.test.ts`).
@@ -92,3 +97,8 @@ Operator setup: [OpenCode 2.0](../../docs/opencode-2.md).
 - **Stop must reach Cursor and preserve provenance.** A cancelled consumer could
   leave a remote Run generating; terminal checkpoints and partial emission
   ownership govern the next turn (`test/host-interrupt.test.ts`).
+- **An unanswered promoted steer can outlive its recoverable Run.** A failed
+  recovery kept a checkpoint that lacked the host's promoted message. Rebuild
+  from host history when that unanswered steer was promoted or checkpointed;
+  a clean finish must settle receipts so the following turn still warm-reuses
+  (`test/early-steer.test.ts`).

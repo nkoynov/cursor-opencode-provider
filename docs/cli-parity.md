@@ -18,7 +18,7 @@ Parity target is interactive `cursor-agent` (`Run` client: TUI and `--print`). `
 | ConversationActions | 15 oneof actions + 3 metadata fields (`triggering_auth_id`, `triggering_user_info`, `request_context_parts`): user_message, resume, cancel, summarize, shell_command, start/execute_plan, async_ask_question_completion, cancel_subagent, background_task/shell/subagent, subscription_notification, goal_continuation, inject_context | Schema encodes 5: user_message, resume, cancel, async_ask_question_completion, inject_context (`user_context` payload for host notes and early steers) — summarize emulated via compaction marker | 🔶 |
 | Sparse protobuf decode w/ full schema | Native protobuf | Hand-rolled `struct.ts` sparse decoder + full schema table (`messages.ts`) | ✅ |
 | Checksums / framing / device id / client-version | Yes | Yes (`checksum.ts`, `framing.ts`, `device-id.ts`, `client-version.ts`) | ✅ |
-| Response-required write backpressure + heartbeat | Yes (blocks on heartbeats) | Yes (drain-await per stream, heartbeat replies) | ✅ |
+| Response-required write backpressure + heartbeat | Yes (blocks on heartbeats) | Yes (serialized drain-await without an upload deadline; terminal/cancellation settlement and heartbeat replies) | ✅ |
 
 ## Tools (exec requests) — `src/protocol/exec-variants.ts`
 
@@ -64,7 +64,7 @@ Parity target is interactive `cursor-agent` (`Run` client: TUI and `--print`). `
 
 | Feature | Cursor CLI | This provider | Match |
 |---|---|---|---|
-| Tool-call display variants (read/write/edit/shell/mcp/web-search/image/ask/switch/plan/todos/…) | Full UI | Mirrors only finalized todo/plan state; other displays supply diagnostics/correlation, not a second execution ([bridge](../src/protocol/tool-call-bridge.ts)) | 🔶 |
+| Tool-call display variants (read/write/edit/shell/mcp/web-search/image/ask/switch/plan/todos/…) | Full UI | Mirrors finalized todo/plan state and opens edit tool rows while arguments stream; unbound rows close without host execution ([bridge](../src/protocol/tool-call-bridge.ts), [early rows](../src/early-tool-rows.ts)) | 🔶 |
 | Thinking blocks (`thinking_delta`) | Yes (--show-thinking) | Yes (`thinking.ts`) | ✅ |
 | Compaction (`summarize_action` / checkpoint reset) | Native | Emulated via `compaction-marker.ts` + conversation rotation | 🔶 |
 
@@ -74,9 +74,9 @@ Parity target is interactive `cursor-agent` (`Run` client: TUI and `--print`). `
 |---|---|---|---|
 | Checkpoint handling | Full read/write (agent-kv); soft-reuse incomplete/large | Decode + reachable-blob export graph; warn on >100 MiB / incomplete, never remint | ✅ |
 | KV blobs | sqlite blob store + AES-GCM encryption + merkle tree | In-memory blobs plus gzip protobuf restart snapshots; reachability and backpressured writes, without CLI storage encryption | 🔶 |
-| Conversation restart/resume | store.db, resume.tsx, fork-chat-session, export | `conversation-persistence.ts` (atomic pb.gz snapshot, 24h expiry, compaction rotation) | 🔶 |
+| Conversation restart/resume | store.db, resume.tsx, fork-chat-session, export | `conversation-persistence.ts` (atomic pb.gz snapshot, 24h expiry, compaction rotation); uncheckpointed request carryover and steer receipts survive restart | 🔶 |
 | Token details (used/max/category breakdown) | `ConversationStateStructure.tokenDetails` → UI tray | `token-details.ts` → `providerMetadata.cursor.context`; AI SDK usage = authoritative total | ✅ |
-| Session lifecycle (superseded, cap) | Managed by CLI | `maxOpenSessions` backstop, superseded-by-new-run | ✅ |
+| Session lifecycle (superseded, cap) | Managed by CLI | Held-Run KV/control reader, pending-exec heartbeats, activity-renewed leases and `maxOpenSessions` backstop; idle HTTP/2 sessions unref, direct/proxy session memory is 256 MB ([transport](../src/transport/connect.ts), [sessions](../src/session.ts)) | ✅ |
 
 ## Context & discovery
 

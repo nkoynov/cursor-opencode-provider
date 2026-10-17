@@ -76,6 +76,10 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Every inbound request needs a typed answer.** Ignoring an interaction
   deadlocked both peers. Known unsupported variants need a correlated refusal;
   unknown fields remain protocol drift (`test/interactions.test.ts`).
+- **AskQuestion is not an exec request.** Refusing its interaction made the model
+  narrate unavailability while host `question` remained unused. Preserve CLI
+  catch-all/freeform mapping; async completion must echo the original argument
+  bytes, while synchronous questions wait for the host (`test/ask-question.test.ts`).
 - **HTTP 200 and EOF are not completion.** Require Cursor's terminal event and
   retain trailer/GOAWAY evidence (`test/run-interruption.test.ts`).
 - **Keep one iterator and dispatch serially.** Concurrent reads crossed handoff
@@ -92,18 +96,27 @@ These are failure lessons shared by both hosts, not a replacement for
   exec leaves that exec's abort behind it, so re-check the queue whenever the
   Run is held again (`test/held-run-run.test.ts`).
 - **Backpressure belongs to every response-required write.** KV replies filled
-  the stream before an awaited heartbeat exposed it. Serialize writes, label the
-  failing operation, and do not replay ambiguous buffered delivery. Without an
-  upload deadline, transport-only abort tests missed the actual provider: an
-  initial or replacement Run had no registered cancellation owner, and a
-  continuation still had the previous step's signal. Cover cancellation through
-  `doStream` during each upload, including a protocol reply inside the pump, and
-  keep a completed tool step's abort separate. Replacement callbacks also held
-  the first step's aborted signal; pass the current pump's signal explicitly
-  (`test/stream-write.test.ts`, `test/write-drain.test.ts`). Rejecting a drain
-  alone does not release its stream: `end()` left buffered bytes live, and
-  `destroy()` then skipped the reset because it was already locally closed
+  the stream before a heartbeat exposed it; serialize and label every write,
+  with no replay after ambiguous delivery. A five-second drain timer capped a
+  healthy upload because drain waits for the whole message. Terminal settlement
+  must also handle response-end without close, after the idle watchdog stops
+  (`test/stream-write.test.ts`, `test/write-drain.test.ts`).
+- **Cancellation needs an owner before registration.** Transport-only tests
+  missed initial/replacement uploads, continuation delivery and a blocked pump
+  reply. Cover each through `doStream`, including an already-aborted signal;
+  pass the current step's signal and detach temporary listeners before the
+  ordinary tool-step abort (`test/write-drain.test.ts`).
+- **Rejecting a drain does not release its resources.** Plain stream close left
+  buffered bytes live; `end()` then made `destroy()` skip its reset. CANCEL must
+  close the actual stream so its session ref is released. Test child-process
+  exit with idle and blocked requests, including end then destroy
   (`test/session-exit.test.ts`, `test/node-http2-drain.mjs`).
+- **The shared session can reject an otherwise valid Run.** Unsent sibling DATA
+  exceeded the runtime's default 10 MB memory accounting and refused new Runs
+  with `ENHANCE_YOUR_CALM`; Node could also reject one large upload. Verify the
+  higher limit on both connection paths and runtimes, beside sibling backlogs
+  and through a slow relay (`test/run-session-memory.test.ts`,
+  `test/node-http2-session-memory.mjs`).
 - **A checkpoint is not permission to replay side effects.** Resume the newest
   eligible checkpoint only behind the replay barrier; a late tool result needs
   history recovery because `resume_action` re-requests that tool
@@ -141,9 +154,13 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Predict the tool the remap will produce.** An announced edit on a new file
   becomes `write`; predicting `edit` showed a failed row beside every created
   file (`hostToolForCursorEdit`, `test/early-tool-rows.test.ts`).
-- **A renewal source may extend a lease, never shorten it.** A running tool near
-  its 4 h ceiling cut an activity-renewed lease (`refreshHardDeadline`,
-  `test/session.test.ts`).
+- **Silence of model text is not inactivity.** A large tool input arrived as
+  heartbeats/token counts for minutes; renew semantic liveness on every inbound
+  frame. Pending real execs also need the CLI's three-second client heartbeats,
+  stopping on abort/result delivery. Running host tools and open prompts renew
+  held leases through descendant activity; a four-hour running-tool ceiling
+  must never shorten an existing lease (`test/run-liveness.test.ts`,
+  `test/activity.test.ts`, `test/session.test.ts`).
 
 ## Planning and file mutations
 
@@ -176,9 +193,12 @@ These are failure lessons shared by both hosts, not a replacement for
   behavior where a boolean did not. Parse markers by position; block destructive
   marker echoes, allow source quoting them in targeted edits, and do not label
   ordinary pagination truncated (`test/read-cap-repro.test.ts`).
-- **Content fields are not transport metadata.** Filtering `file_bytes` removed
-  legitimate writes. Binary images need staged bytes, not a display-preview
-  write or media attachment that starts another turn (`test/generate-image.test.ts`).
+- **Content fields are not transport metadata.** Filtering `file_bytes` or
+  `encoding_hint` removed legitimate content. GenerateImage's display data is a
+  preview; only its binary write exec commits bytes. Some remote generations
+  omit the approval query entirely, so the save tool's edit gate and containment
+  remain essential. Default project assets intentionally stay outside the git
+  worktree (`test/generate-image.test.ts`, `src/image-save.ts`).
 
 ## Context, caching and accounting
 
@@ -190,15 +210,21 @@ These are failure lessons shared by both hosts, not a replacement for
   Compaction rotates state but transfers workspace context
   (`test/context-epoch.test.ts`, `test/prompt-history.test.ts`).
 - **Do not seed Cursor's rendered root prompt.** Client entries suppressed rules
-  and subagents. Rebuilt history belongs in the user transcript; checkpoint
-  category drops expose lost context (`test/prompt-history.test.ts`).
+  and subagents. Rebuilt history belongs in the user transcript; host instructions
+  need the typed `global` rule, not a seeded system message, untyped rule or
+  `system_prompt_override`. Checkpoint category drops expose lost context
+  (`test/prompt-history.test.ts`, `src/context/build.ts`).
 - **Host instructions are host-owned.** Skill changes arrive through host
   updates, not per-turn relevance guesses. Restart tests must check the latest
   effective instruction, not merely the first frozen rule
   (`test/context-epoch.test.ts`).
 - **Instructions need an instruction carrier.** Models refused host rules buried
-  in tool output. Inject them as user context and retain acknowledgements;
-  reserve hook context for notices about one result (`test/host-notes-run.test.ts`).
+  in tool output; `system_context` injection was rejected as unallowlisted.
+  Use `user_context`, unwrap host updates and retain delivery acknowledgements.
+  Queued/rejected/unacknowledged notes follow recovery or the next user turn;
+  do not reinject results already delivered or notes already in seeded history.
+  Reserve hook context for notices about one result
+  (`test/host-notes-run.test.ts`, `test/host-notes.test.ts`).
 - **Empty tools are not compaction evidence.** Waiting for a sibling catalog
   stalled standalone titles. Tool-less Runs advertise empty tools; explicit
   compaction metadata controls reset (`resolveTurnToolState`).
@@ -270,8 +296,11 @@ These are failure lessons shared by both hosts, not a replacement for
 ## Auth, models and delivery process
 
 - **Use the client with the actual credential flow.** CLI inspection missed IDE
-  browser renewal; HTTP 200 with `shouldLogout` was rejection. Session and API-key
-  renewal must stay separate (`test/auth-renewal.test.ts`).
+  browser renewal; HTTP 200 with `shouldLogout` was rejection. `/oauth/token`
+  returns no refresh token, so store its access token in both session slots.
+  The IDE's 1272-hour renewal threshold applies to browser sessions; raw keys
+  use their own exchange and never stand in for that refresh. An idle expired
+  session requires login again (`src/auth.ts`, `test/auth-renewal.test.ts`).
 - **Keep secrets out of serializable SDK options.** OpenCode exposes provider
   options. Resolve credentials on demand, persist only unchanged credentials,
   and hash secrets only for private lookup keys (`test/plugin.test.ts`).
@@ -299,5 +328,7 @@ These are failure lessons shared by both hosts, not a replacement for
   include Bun editor types (`scripts/strip-copied-coverage.ts`).
 - **Keep one current policy across docs and prompts.** A rebase can add review
   rules; reviewer patches still need whole-path validation. Changelog fixes
-  compare with the release, not an intermediate PR state. Acceptance checklists
-  stay reusable; dated counts and logs stay in run reports.
+  compare with the release, not an intermediate PR state. Keep AGENTS.md to
+  current invariants and source pointers; merge incident rationale here or in
+  the owning host lesson instead of growing implementation transcripts.
+  Acceptance checklists stay reusable; dated counts and logs stay in run reports.

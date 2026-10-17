@@ -36,8 +36,14 @@ Operator setup: [OpenCode 1.x](../../docs/opencode-1.md).
   directory, and never inject primary turns into helpers
   (`test/switch-mode.test.ts`, `src/host-plan-file.ts`).
 - **Read envelopes carry notices outside the file.** Lift the trailing host
-  reminder out of `<content>` without losing a truncation notice
+  reminder out of `<content>` without losing the 50 KB cap's meaning. The native
+  `truncated` flag alone did not stop models treating a page as a complete file
   (`test/read-cap-repro.test.ts`, `test/host-notes.test.ts`).
+- **Image-save attachments can break continuation.** Classic OpenCode extracts
+  third-party tool media into a user message. A save-tool attachment opened a
+  new Run and stranded the pending binary write. Return only the commit result;
+  correlate detached images from real reads/MCP results separately
+  (`test/generate-image.test.ts`, `test/image-input.test.ts`).
 
 ## Shell outcomes and billing
 

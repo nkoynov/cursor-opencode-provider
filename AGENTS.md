@@ -1,314 +1,346 @@
 # cursor-opencode-provider
 
-OpenCode plugin + AI SDK provider that runs Cursor subscription models by speaking Cursor’s Connect-RPC agent protocol (not a generic chat-completions API).
+OpenCode plugin and AI SDK `LanguageModelV3` provider for Cursor's Connect-RPC
+agent protocol. TypeScript ESM; Bun installs/tests; `tsc` builds `dist/`.
 
-**Stack:** TypeScript (ESM), Bun for install/test, `tsc` for build. Optional peer: `@opencode-ai/plugin@^1.17.13` (devDependency pinned to `^1.18.16`). Deps: `@ai-sdk/provider@3.0.15`, `protobufjs@^7.6.5`.
+## Working conventions
+
+- Read the target and its callers before editing. Use independent wire evidence
+  for protocol changes; distinguish fixture results from live host validation.
+- Keep fixes targeted and preserve prompt-cache continuity. Consider both OpenCode
+  majors unless the behavior belongs to one entrypoint. Do not commit unless asked.
+- Before changing behavior, read the [lessons index](tasks/lessons.md), the general
+  lessons, and the relevant host lessons. Merge incident lessons by cause; keep
+  current requirements here and dated validation in private run reports.
+- Keep operator behavior in [README.md](README.md) and the matching
+  [host guide](docs/README.md). Follow [CONTRIBUTING.md](CONTRIBUTING.md) and the
+  [review rules](docs/review-rules.md), including every Greptile finding and
+  applicable Codecov issue. User-facing changes need an Unreleased changelog line.
 
 ## Non-negotiable provider / compatibility-layer boundary
 
-This provider knows **only OpenCode 1.x and OpenCode 2.0**. The dependency direction is one-way: compatibility layers may know and adapt this provider, but this provider must not know, import, detect, or depend on any compatibility-layer package.
+This provider knows only OpenCode 1.x and 2.0. Compatibility layers adapt it;
+this package never imports, detects, or depends on them.
 
-- **No compatibility-layer dependency:** executable code, types, package metadata, tests, and built output must not import or declare `@opencode-compat/*` (or any future compatibility package). Do not dynamically import a detector as an “optional” fallback.
-- **No fork identity:** executable code and provider tests must not detect, name, or branch on MiMo, Kilo, Pi, OMP, or another host/fork; their binaries, environment variables, paths, tool names, schemas, and quirks belong in the compatibility layer.
-- **Generic contracts only:** the provider may consume structural capabilities installed before load (currently `Symbol.for("opencode.host.path-bridge")`, `Symbol.for("opencode.host.event-bridge")`, and `Symbol.for("opencode.host.skills")`), explicit OpenCode host API values, advertised canonical tool schemas, and `createCursor({ cacheDir })`. Contract names and shapes must be host-neutral and must not expose who installed them.
-- **Canonical OpenCode vocabulary:** provider executable code sees OpenCode names (`task`, `todowrite`, `question`, `plan_enter`, `plan_exit`, etc.). Alternate host vocabulary and payloads are translated before reaching it. Capability gating uses the advertised canonical catalog, never a host or model id.
-- **Absolute host ignorance:** `src/`, provider tests, package metadata, and published `dist/` must never name or parse another host's tools, schemas, result envelopes, plan lifecycle, approval wording, session events, environment variables, or package identities. This explicitly includes DSH/DeepSeek Harness, Pi/OMP, MiMo/Kilo, and other consumer providers such as Devin. Receiving an arbitrary advertised tool name as opaque catalog data is allowed; recognizing `exit_plan_mode`, `ask_user_question`, host JSON answer envelopes, or another provider's success strings is not. OCP must normalize those into canonical OpenCode contracts first.
-- **No compatibility aliases:** do not export another provider's factory/plugin names or retain aliases that make this package appear to be a different provider. Backward compatibility does not override the provider boundary.
-- **Standalone invariant:** without any compatibility layer or injected bridge, the package must remain fully functional and use native OpenCode cache/data/config paths.
-- **Testing ownership:** provider tests cover OpenCode behavior and neutral structural contracts only. Fork-specific paths, schemas, call/result translations, and live-host assertions live in OCP.
-- **Documentation exception:** README/comments may explain that OCP provides external compatibility and may cite host behavior as rationale, but instructions must never turn those references into provider executable branches.
-- **Tool-contract order:** advertise canonical schemas → normalize Cursor arguments → validate → execute/replay. Required fields must be complete before validation; downstream repairs are too late. Before boundary changes, consult OCP’s [current tool vocabulary](https://github.com/oakimov/opencode-plugin-compat/blob/main/docs/tool-vocabulary.md), validate every host family, and verify the loaded runtime. OCP owns host-specific definitions and their upkeep.
-- **Change gate:** before accepting a provider change, build and scan `src/`, tests, `package.json`, lockfile, and published `dist/` for compatibility-package imports, alternate-host vocabulary/result shapes, and other-provider identities. `test/architecture.test.ts` must fail on every known host family, including DSH, and on Devin identities. A compatibility fix that requires any of these belongs in OCP, not here.
-
-OCP lives at `https://github.com/oakimov/opencode-plugin-compat`; it loads only on the hosts that need it and adapts the unchanged published provider. OpenCode is native: point it at this package's `dist/` (or a published install). Do not wrap live OpenCode with ocp-dev.
+- `src/`, provider tests, package metadata, lockfile and published `dist/` must not
+  import/declare `@opencode-compat/*`, detect other hosts, or parse their tools,
+  schemas, results, plan lifecycle, approvals, events, paths or environment.
+  This includes MiMo/Kilo, Pi/OMP, DSH/DeepSeek Harness and Devin identities.
+  No optional detector imports or other-provider factory/plugin aliases.
+- Unknown advertised names may pass through as opaque data. Host-specific
+  translation belongs in [OCP](https://github.com/oakimov/opencode-plugin-compat),
+  including alternate tool vocabulary such as `exit_plan_mode` or
+  `ask_user_question`. Documentation may explain that boundary.
+- Consume canonical OpenCode schemas, explicit host APIs, `createCursor({ cacheDir })`
+  and neutral structural contracts installed before load:
+  `opencode.host.path-bridge`, `opencode.host.event-bridge`, `opencode.host.skills`
+  (all through `Symbol.for`). Their shapes must not identify the installer.
+- Advertise canonical schemas → normalize Cursor arguments → validate →
+  execute/replay. Required fields must be complete before validation. Gate on
+  the current advertised/permitted capabilities, never a host or model id.
+- Without a bridge, use native OpenCode cache/data/config paths and remain fully
+  functional. Load native OpenCode directly; do not wrap it with `ocp-dev`.
+- Build and run `test/architecture.test.ts` after boundary changes. Its scans
+  cover source, tests, metadata and built output; retain guards for every host
+  family and other-provider identities. Before changing a shared contract,
+  consult OCP's [tool vocabulary](https://github.com/oakimov/opencode-plugin-compat/blob/main/docs/tool-vocabulary.md)
+  and verify affected host families and the loaded runtime in OCP.
 
 ## Commands
 
 ```bash
 bun install
-bun run build        # tsc → dist/
-bun run typecheck
+bun run typecheck          # source and test projects
+bun run build              # tsc → dist/
 bun test
-bun run test:watch
-bun run generate:pricing   # refresh src/pricing-data.ts from Cursor docs
-bun run check:pricing      # fixture coverage for known model ids
+bun run test:node-http2     # build + Node transport regressions
+bun run check:pricing      # fixture coverage, not live regeneration
+bun run generate:pricing   # live Cursor pricing/context/capability metadata
 ```
 
-Publish surface is `dist/` only (`files` in `package.json`). Always rebuild before testing a local `file://` OpenCode install.
+The executable publish surface is `dist/`; rebuild before testing a local
+`file://` install. Use `sessionFixture` in tests instead of casting to
+`CursorSession`. Protocol tests need independent bytes or vendor definitions.
+
+## Architecture and entrypoints
+
+| Owner | Source |
+|-------|--------|
+| Public factory + classic plugin | `src/index.ts`, `src/plugin.ts` |
+| Separate host plugin APIs | `src/plugin-v2.ts`, `src/plugin-opencode2.ts`, `src/opencode2/` |
+| Run lifecycle, continuations, recovery | `src/language-model.ts`, `src/session.ts`, `src/activity.ts` |
+| Context, native paths, frozen epochs | `src/context/`, `src/context/epoch.ts` |
+| Wire schemas, tools, persistence | `src/protocol/` |
+| Auth, renewal, discovery, catalog | `src/auth.ts`, `src/auth-renewal.ts`, `src/agent-url.ts`, `src/models.ts`, `src/model-config.ts` |
+| Pricing, billing, shared plain data | `src/pricing.ts`, `src/pricing-data.ts`, `src/billing.ts`, `src/process-shared.ts` |
+| HTTP/2, proxy, ordered writes | `src/transport/`, `src/stream-write.ts` |
+| Planning, image staging/save | `src/host-agent-mode.ts`, `src/host-plan-file.ts`, `src/image-staging.ts`, `src/image-save.ts` |
+
+Package exports are defined in `package.json`. Root exports `createCursor` and
+classic `CursorPlugin`; `CursorPluginV2` stays off the root. Auxiliary APIs stay
+on their subpaths. `/server` resolves the 2.0 module and also exports classic
+`server: CursorPlugin` for the 1.18 loader.
+
+The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
+
+- **1.x:** classic `/plugin` owns auth/tools. `/plugin/v2` uses
+  `@opencode-ai/plugin/v2/promise`, `ctx.aisdk.sdk` and `ctx.aisdk.language`;
+  load it alongside classic because it has no tool domain.
+- **2.0:** load only `/plugin/opencode2`. Export plain `{ id, setup }`, use
+  local structural types, and import neither host plugin SDK. Inventory is
+  in-memory through `ctx.provider.transform`, not written to config. Compile
+  usages against `test/opencode2-host-contract.ts` and
+  `test/opencode2-conformance.types.ts`.
+- 2.0 direct plugin tools need `codemode: false` and an output schema. Todo
+  fallbacks are off unless `CURSOR_OPENCODE2_TODOS=1`/`true` and the catalog lacks
+  them. MCP placement changes tool options, preserves explicit server opt-ins,
+  and never rewrites server config or delays startup. Web search uses the native
+  permission-gated backend; the public 2.0 `ToolContext` cannot request approval.
+- Keep host hook/permission order intact: 1.x `shell.env` follows permission;
+  2.0 `shell.create.before` preserves the command and shell basename through an
+  executable adapter. Compaction/agent state comes from explicit host hooks.
+
+## Auth and transport invariants
+
+- Keep browser-session renewal (`POST /oauth/token`) separate from raw API-key
+  exchange (`/auth/exchange_user_api_key`). Renew on demand, never by timer or
+  after assuming an expired session can be recovered. Inspect `shouldLogout`
+  even on HTTP 200; latch final rejection, back off transient errors while the
+  credential is valid, and persist only if the stored credential is unchanged.
+- Plugins pass `getAccessToken`, not serializable tokens/keys. A raw `crsr_`
+  key is never a Bearer token. Preserve stable OS-derived device identity.
+- `apiBaseURL` owns auth/models/GetServerConfig; `agentBaseURL` owns Run.
+  Legacy `baseURL` aliases only the latter. Resolve `agentUrlConfig.agentnUrl`
+  once per process in memory, validate HTTPS `*.cursor.sh`, and fail closed;
+  no disk memo or legacy-host fallback. GetServerConfig telemetry defaults off.
+- Serialize every response-required write and await drain. A buffered failure
+  is ambiguous delivery and cannot be replayed. There is no upload deadline;
+  errors, Run termination and the 120 s inbound read-idle watchdog settle waits.
+- Initial and replacement uploads own temporary abort/host-Stop listeners;
+  continuation delivery and the active pump use their current call's signal.
+  Detach temporary listeners after upload so an ordinary tool-step abort keeps
+  the held Run alive. Replacement callbacks must not capture the first signal.
+- Local cancellation resets buffered streams with `NGHTTP2_CANCEL`; `destroy()`
+  must work after `end()`. Retiring a cached connection must let siblings drain,
+  never destroy them. Direct and proxy connections use `maxSessionMemory: 256`.
+  Idle sessions are unref'd; live streams and health-check pings hold a ref.
+- Fork: Run connections advertise an 8 MiB stream / 16 MiB connection receive
+  window. A cached connection that received data in the last 10 s is reused
+  without its ping, as Cursor CLI does; if it dies before Cursor answers, the
+  Run goes once more on a new connection and a pending drain follows it there.
+  Each stream holds its own session until it closes, a resent one too.
+- Fork: Run frames over 1 KiB go gzip-compressed (`connect-content-encoding`).
+  A gzip Run Cursor refuses is sent once more uncompressed, outside the retry
+  budget, and the origin stays uncompressed; a refusal during the upload is
+  resent by `sendRunRequest` inside `openRunWithRequest`, under its listeners.
+  Frame arrival numbers (`frameArrival`) belong to the parsed frame readers gunzip.
+- Decode Cursor's error title/detail and retry verdict. A non-retryable server
+  error reaches the host as `APICallError` with its status and
+  `x-should-retry: false` (`src/errors.ts`), including on OpenCode 2.
+
+## Context, identity and persistence
+
+- Forward the host system prompt plus provider guidance as one `global`
+  system-instructions rule. Never read instruction/skill bodies yourself,
+  seed `root_prompt_messages_json`, or use `system_prompt_override` as a carrier.
+  History for an uncheckpointed Run goes in `seedHistoryUserText`.
+- Fork: that `<conversation_history>` transcript keeps every tool call input
+  and result whole; only past 80% of the context are the oldest shortened, with
+  a note in place, and a seed that still does not fit fails with 413 so the host
+  compacts. Size replays at 1.75 characters per token (`REPLAY_CHARS_PER_TOKEN`).
+- Fork: a zero-tool Run (title, plugin `generate`) opens its user turn with that
+  prompt as the task and the host message as `<input>`; as a rule alone it
+  loses to Cursor's agent prompt.
+- Freeze the workspace base and baseline rule per conversation. Later agent,
+  skill, MCP or prompt changes ride chronological user-context updates; they
+  must not remint the conversation or rewrite its baseline. Recover the saved
+  baseline after restart. Deduplicate concurrent builds and reuse equal bytes.
+- Rediscover tools, subagents and plugin metadata, then retain epoch order and
+  append new ids. Advertisement is separate from current execution permission:
+  a shrinking nonempty catalog keeps frozen advertisement but restricts exec;
+  a host-empty lifecycle call advertises `[]` and never waits for a sibling.
+  Explicit compaction can retain advertisement while refusing execution.
+- RequestContext tools are names-only; full definitions come from the current
+  session catalog on exec #36. Omit `RequestContext.tools`, fs MCP descriptors
+  and `AgentRunRequest.mcp_tools`. Skill paths/descriptions require advertised
+  `skill` and a usable location; never send their content or freeze the list.
+- Prefer `x-opencode-session-id` over affinity fallbacks. A daemon's session
+  workspace comes from host request context, not its process cwd. Persisted
+  host-agent/prompt markers must not remint a conversation. Title/summary helpers
+  cannot supersede a held tool Run.
+- Fork: `x-opencode-session` is never a session key. OpenCode 2's stateless
+  `generate.text` sends only a freshly minted one, so keying on it made that
+  no-tool call wait forever for a sibling catalog.
+- Compaction/rebase discards old checkpoints/blobs, transfers stable workspace
+  context/comparison state and admits a new baseline. Direct Cursor model
+  switches keep the conversation. Foreign-provider history rebuilds with every
+  tool result; oversized foreign seeds fail before opening so the host compacts.
+- Persist atomic per-session gzip protobuf snapshots under the native/bridged
+  host cache: checkpoint, reachable blobs, baseline, catalogs, provenance, notes,
+  lost requests and steer receipts. Keep all blobs if reachability is uncertain.
+  A >100 MiB or incomplete transfer graph warns and warm-reuses; it never remints.
+- Fork: a Run still in progress (held on a host tool for a second, shutdown, a
+  cancel without `turn_ended`) saves its latest checkpoint and the blobs it
+  reaches without pruning the live store: the Run may still need blobs only its
+  next checkpoint references. Snapshot field 15 is the lost request; the fork's
+  model-fallback stop is field 101, and an older fork field 15 that is not a
+  lost-request record is read as that stop, never as a lost request.
+- Skip a history image only when the checkpoint being sent is known to hold it
+  (`sent-history-images.ts`; hashes per conversation id + checkpoint SHA-256,
+  snapshot fields 16/17). A Run's own images count once its turn ends with
+  `turn_ended` on a checkpoint that arrived after them; a failed or stopped
+  turn, or a snapshot without the set, sends them again. Arrival is when the
+  transport received the frame (`frameArrival`), not when a pump read it: the
+  checkpoint after a tool step holds none of that tool result's images.
+- Retention uses persisted application metadata, not filesystem timestamps.
+  Hydrate on demand, expire after 24 h, avoid blocking startup/full-cache decode,
+  preserve concurrent replacement files, and keep soft-evicted state reusable.
+
+## Run lifecycle and recovery
+
+- One reader owns frame dispatch. Every inbound frame renews semantic liveness.
+  Pending real host execs receive CLI-shaped heartbeats every 3 s until result
+  delivery or abort. Open prompts and descendant activity renew held leases;
+  running tools extend them up to four hours from their own start, never shorten
+  a lease. Shared cross-copy state must be versioned plain data.
+- While tools run, `readHeldRun` answers KV/exec control and queues other frames
+  in order for the pump. Recheck queued aborts after registering their exec.
+  Preserve iterator ownership across timeouts and handoffs.
+- Fork: execs the tool-call ordering holds back get heartbeats too, and an abort
+  for one drops it. A KV write the held reader answers counts for model-switch
+  detection. An exec Cursor aborted is not held by a running host tool. OpenCode 2
+  never publishes `session.idle`, so `session.execution.*` ends running tools.
+  Frames queue as `heldFrames` → `queuedFrame` → stream; `putBackFrame` requeues.
+- Respect `tool_requests_listed` when emitting parallel calls. Early edit rows
+  predict the remapped host tool, close if no exec arrives, and retain routing
+  after Run closure/restart so a late result can rebuild from history.
+- Fork: `pump` keeps the AI SDK step open after a host tool-call until every
+  listed call has reached it (its exec, or its display completion when no exec
+  claimed it; an edit's private read does not count).
+- Fork tool-call order (`src/tool-call-order.ts`, Claude Code's rule): reads,
+  searches, subagents and read-only shell run together; an edit, write, other
+  shell or MCP call waits for the calls written before it, and later calls wait
+  for it. A held-back exec stays with the provider until its turn.
+- Fork early rows: an empty existing file predicts `write`, as the edit remap
+  leaves it. A row opens only while no other call of the step is announced or
+  started and unfinished and no exec is held back; otherwise the earlier call's
+  exec would close it as failed.
+- Drain a held Run before a fresh user turn. Rebuild late tool results from
+  host history; checkpoint resume would request the tool again. Never replay
+  side effects after the replay barrier or treat EOF as successful `stop`.
+  Missing-blob recovery is limited to the initial control-only checkpoint path
+  (`isSoleControlFrame`); unknown/mixed frames keep the normal replay barrier.
+- Carry an uncheckpointed request only on its unchanged checkpoint; persist it
+  on failure. Retry equality uses the previous attempt's own live text. New
+  checkpoints, host Stop and history rebuild drop it; unseeded history must not
+  duplicate it. Session caps close only idle Runs, never pumping or held-pending
+  Runs.
+- Fork lost request: carry it only into a Run whose prompt still holds its live
+  text (first text part), so a helper Run or a reverted message does not get it.
+  A Stop drops it also with no open Run (OpenCode's retry wait). A steer Cursor
+  did not take, sent as a follow-up Run, and a model-fallback reply are recorded
+  too; an override reply is not carried.
+- Host notes and detached media beside tool results continue that Run. Inject
+  instructions as `user_context`, keep acknowledgements and ordered fallback,
+  and reserve hook context for notices about a result. Never use `system_context`.
+  Attribute images only to proven pending owners under one 20 MiB continuation
+  budget; remember hashes after delivery and preserve cancellation.
+- OpenCode 2 early-steer receipts persist with checkpoints. Deduplicate exact
+  promoted copies at their host boundary, preserve later identical requests and
+  attachments, rebuild an unanswered promoted/checkpointed steer after failed
+  recovery, and deliver all pending user messages in order.
+- Fork (CP-10): a message promoted after tool results with no early copy is
+  injected into the held Run after the results when that Run waits on exactly
+  them (`heldRunTakesSteers`); otherwise it goes to a follow-up Run. In a steer
+  step the step's notes go first, then the messages as early-steer records. A
+  host note promoted beside an answered steer's copy still gets its own Run.
+- Fork: a note already in the turn's own text (`liveUserTurn` sends every user
+  message since the model's last output) is not added again as a reminder.
+  Field 14 from older fork builds (answered-steer texts) is ignored on restore.
+
+## Tools, planning and images
+
+- Remap from the current permitted catalog, preserving native tools when
+  available: 1.x `apply_patch`, 2.0 `patch`, `task`/`subagent`, and `shell`/`bash`.
+  2.0 `execute` is JavaScript. Refuse lossy patches before mutation, including
+  2.0 CRLF. Keep the correlated Task display title over a prompt fragment.
+- Strip read envelopes while retaining `[Partial read: …]` meaning. Explicit
+  pagination alone is not truncation. Reject whole-file writes/overwriting Add
+  File patches that echo incomplete content; allow targeted source edits.
+  Resolve relative result paths against the workspace without rewriting prose.
+- Fork: shell output reaches Cursor verbatim, as Cursor CLI sends it; never
+  rewrite it, because a `cd` in the command changes what its paths mean and most
+  path-shaped lines (`S=/tmp/x`, `#!/bin/sh`, diff lines) are not paths.
+- Fork: Cursor reads each `TaskToolArgs.attachments` file through a `read_args`
+  carrying the Task's `tool_call_id` before `SubagentArgs`, and refuses the Task
+  unless it gets `data`. `answerTaskAttachmentRead` answers with a placeholder
+  image without reading the file, and the paths go into the subagent prompt.
+- `WriteArgs.file_bytes` and `encoding_hint` are content. Private legacy-edit
+  reads need complete correlated content; external/symlink-escaped files require
+  the exact host-authorized read first. Final mutation remains a host edit/patch.
+- AskQuestion is an interaction query, not an exec. Preserve CLI option/freeform,
+  rejection and synchronous/async behavior; async completion echoes the original
+  argument bytes. Bridge only through an advertised permitted `question`.
+- Write plans as plain markdown in host-native locations, never Cursor's plan
+  store. Display records do not execute tools. Writing a plan does not ask;
+  leaving approved plan mode to execute does. Show the plan in the transcript
+  before asking, and treat refinement/dismissal/failure as unapproved. Use the
+  advertised host review channel; without one the user switches agents.
+- SwitchMode never spawns a subagent. Apply native primary-agent switches only
+  after the owning Run is terminal; lifecycle turns soft-ack without mutating
+  mode. Same-mode switches auto-approve. Entering plan needs no execution gate.
+- Generated images arrive through binary write execs; display image data is
+  preview only. Gate GenerateImage approval on advertised `cursor_image_save`.
+  Stage bytes behind a single-use opaque `cursor_image_save` id,
+  never a model-supplied path/content writer. Recheck symlink-aware containment.
+  Classic asks `external_directory` then `edit`; 2.0 uses catalog `edit` gating
+  plus containment when public `ask` is absent. Refusal is `permission_denied`.
+  Do not return save-tool attachments or change the default project-assets
+  location outside the worktree. Explicit workspace targets remain supported.
+
+## Usage and billing
+
+Use checkpoint `token_details` for occupancy, with source/staleness metadata;
+never reinterpret aggregate TurnEnded counters as context. Emit occupancy per
+step (not deltas), reserving one output token for host display. Preserve raw
+counters separately. Keep displayed occupancy separate from retry checkpoints.
+
+`src/billing.ts` estimates tool steps and reconciles aggregate catalog-priced
+cost at turn end. Book only delivered finishes; bound cache counters and retain
+unsettled balances. In the fork, a steer Cursor did not take, sent as a follow-up
+Run, settles through the same ledger. 1.x supports `copilot.totalNanoAiu`; 2.0 prices tokens, so
+both projections must agree without host detection. Do not invent per-call tier
+attribution or bill unpriced Auto. Use the [log runbook](docs/cache-log-runbook.md)
+for cache, token and billing claims.
 
 ## HARD STOP — release / version bump / tag gate (non-optional)
 
-**Do not edit `package.json` `"version"`, create a `v*` tag, push a `v*` tag, or run `npm publish` until the pricing gate below has succeeded in *this* turn, any mapping/`pricing-data.ts` updates are committed, and `CHANGELOG.md` is finalized.** Skipping either is a process failure, not an acceptable shortcut. CI regenerating pricing later is **not** a substitute: unmapped Cursor display names fail publish after the tag already exists, forcing retags and wasted release cycles (this happened on `v0.6.4`).
+**Do not edit the package version, create/push a `v*` tag, or publish until all
+steps 1–4 below succeed in this turn.** CI or a previous run cannot replace them.
 
-**Forbidden until the gate passes:**
-- bumping `"version"` in `package.json`
-- `git commit` of a version bump
-- `git tag v…` / retag / `git push --tags` / `git push origin v…`
-- `npm publish` / asking the user to publish
+1. Run `bun run generate:pricing` against live Cursor docs.
+2. Resolve every unmapped display name in `DISPLAY_NAME_TO_MODEL_ID` or
+   `SKIP_DISPLAY_NAMES` (`scripts/generate-cursor-pricing.ts`); add wire ids to
+   `test/fixtures/cursor-pricing-models.txt` and regenerate until exit 0.
+3. Run `bun run check:pricing` successfully. Commit mapping/fixture/generated
+   `src/pricing-data.ts` changes **before** the version bump commit.
+4. Finalize `CHANGELOG.md`: cover every user-facing change since the release,
+   rename Unreleased to `[X.Y.Z] - YYYY-MM-DD` using the UTC release date, and
+   insert a fresh empty Unreleased section.
+5. Only then bump the version, commit with the finalized changelog, tag and push.
 
-**Required order (no exceptions, no “I’ll fix pricing after the tag”):**
-1. `bun run generate:pricing` — must exit 0 against **live** Cursor docs in this session (do not assume a prior run is still valid).
-2. On any `Unmapped pricing/context/capability display name`, update `DISPLAY_NAME_TO_MODEL_ID` or `SKIP_DISPLAY_NAMES` in `scripts/generate-cursor-pricing.ts`, add any new wire id to `test/fixtures/cursor-pricing-models.txt`, regenerate, and **commit that fix first**.
-3. `bun run check:pricing` — must exit 0.
-4. Commit mapping / fixture / `src/pricing-data.ts` changes **before** the version bump commit.
-5. Finalize `CHANGELOG.md`: every user-facing change since the last release must be under `## [Unreleased]`; rename that section to `## [X.Y.Z] - YYYY-MM-DD` (**UTC** calendar date of the release), then insert a fresh empty `## [Unreleased]` at the top. See [Changelog](#changelog).
-6. Only then bump version, commit (include the changelog finalization), tag, and push.
-
-If the user asks only to “bump / tag / publish”, still run steps 1–5 first and report the pricing result and changelog finalization before touching the version.
-
-## Architecture
-
-```
-OpenCode
-  └── CursorPlugin (auth, model cache, config hook)
-        └── createCursor() → LanguageModelV3
-              ├── session.ts     held-open Run stream + exec bridge
-              ├── context/       RequestContext from OpenCode discovery
-              ├── protocol/      protobuf encode/decode, tools, thinking
-              └── transport/     Connect-RPC over HTTP/2
-```
-
-| Area | Path | Notes |
-|------|------|--------|
-| Package entry | `src/index.ts` | `createCursor`; default export = classic `CursorPlugin` |
-| Classic plugin | `src/plugin.ts` | Auth, OAuth, model cache, provider registration |
-| V2 plugin (1.18) | `src/plugin-v2.ts` | Effect/Promise API via `ctx.aisdk.*` — load as `./plugin/v2` **with** classic `plugin` (no `tool` domain; image-save/websearch need classic) |
-| OpenCode 2.0 plugin | `src/plugin-opencode2.ts` | Load **only** as `./plugin/opencode2` (`ctx.provider.transform` inventory; registers `todowrite`/`todoread` only when `CURSOR_OPENCODE2_TODOS=1`/`true` and the host catalog lacks them — off by default; publishes an Exa `websearch` provider for the host's native permission-gated tool. Sets `options.codemode: false` on tools from MCP servers that did not set `codemode: true`, via `ctx.tool.transform`, so Cursor can call them by name. MCP server config is not written. Plugin-owned tools are `codemode: false` with an `output` schema so they sit in the direct catalog, not Code Mode. Registers handle-only `cursor_image_save` (`permission: "edit"`) so generated images can land; it does not add a direct web-search fallback because the public 2.0 `ToolContext` cannot request permissions for that path.) |
-| 2.0 support modules | `src/opencode2/` | Provider inventory mapping, integration/auth, local 2.0 API types, catalog-gated `todowrite`/`todoread`, handle-only `cursor_image_save`, direct MCP tool placement |
-| Session todo store | `src/todo-store.ts` | In-memory per-session list backing plugin-owned `todowrite`/`todoread` |
-| Host-neutral core | `src/plugin-core.ts`, `src/model-config.ts` | Shared by every plugin surface; must not import a host plugin API |
-| Model pricing | `src/pricing.ts`, `src/pricing-data.ts` | Cursor docs → classic `cost` + OpenCode 2.0 cost tiers; regenerate via `bun run generate:pricing` |
-| Language model | `src/language-model.ts` | AI SDK `LanguageModelV3` (`doStream` / `doGenerate`) |
-| Session | `src/session.ts` | Held-open agent Run + pending exec correlation |
-| Auth / models | `src/auth.ts`, `src/models.ts` | PKCE/API key exchange, session refresh (`/oauth/token`), `cursor-models.json` cache |
-| Credential renewal | `src/auth-renewal.ts` | Separate session / API-key renewal, backoff + final-failure latch, on-demand renewal, Bearer resolution (`getAccessToken` → `accessToken` → `apiKey`) |
-| Process-wide state | `src/process-shared.ts` | `Symbol.for` registry shared by every copy of the package in one process (OpenCode 2 imports one copy per location); per-account renewal, agent-host memo, client version. Plain data only, versioned keys |
-| Agent host | `src/agent-url.ts` | `GetServerConfig` → region-specific Run host (in-memory memo) |
-| Request context | `src/context/` | Env, git, layout; names-only tool overlay + live exec #36; `loadMergedConfig` / `collectPlugins` |
-| Host paths | `src/context/paths.ts` | Native OpenCode cache/data defaults with optional structural host path bridge; project metadata under `<host-cache>/projects/<slug>/` |
-| Wire protocol | `src/protocol/` | Framing, messages, tools, thinking, checksums, device id |
-| Patch synthesis | `src/protocol/apply-patch.ts` | `apply_patch` (1.x) / `patch` (2.0) envelopes when the current turn withholds `edit`/`write` |
-| AskQuestion bridge | `src/protocol/ask-question.ts` | Cursor AskQuestion interaction ⇄ OpenCode `question` tool (CLI parity) |
-| SwitchMode bridge | `src/protocol/switch-mode.ts` | Cursor SwitchMode (#4) ⇄ OpenCode `plan_enter` / `plan_exit` when advertised |
-| CreatePlan bridge | `src/protocol/create-plan.ts`, `src/host-plan-file.ts`, `hostPlanFilePath` / `hostPlansDir` in `src/context/paths.ts` | Cursor CreatePlan (#7) → plain markdown where the host keeps plans (OpenCode 1.x `Session.plan`, OpenCode 2.0 Plan directory, or the path bridge); optional advertised host stage remains capability-gated; without `plan_exit`, Yes/No via advertised `question` |
-| Host agent mode sync | `src/host-agent-mode.ts` | Structural callback/terminal queue: approved Cursor plan/spec → native `plan`, other modes (including CreatePlan Yes) → `build`; installed on OpenCode 1.x (`promptAsync`) and OpenCode 2.0 (`switchAgent` + continue) |
-| Image generation | `src/protocol/generate-image.ts`, `src/image-staging.ts`, `src/image-save.ts` | Cursor GenerateImage approval + permission-gated byte write |
-| Transport | `src/transport/connect.ts` | HTTP/2 bidi + unary RPC |
-| HTTPS proxy | `src/transport/https-proxy.ts` | CONNECT tunnel for Run when `HTTPS_PROXY` applies |
-
-Package exports:
-
-- `cursor-opencode-provider` → `createCursor` + classic plugin
-- `cursor-opencode-provider/plugin` → classic Hooks (auth)
-- `cursor-opencode-provider/plugin/v2` → 1.18 v2 plugin only (`CursorPluginV2` is **not** on the root export)
-- `cursor-opencode-provider/plugin/opencode2` → OpenCode 2.0 plugin only
-- `cursor-opencode-provider/server` → the same 2.0 module; also exports `server: CursorPlugin` for classic package resolution
-- `cursor-opencode-provider/errors`, `/models`, `/pricing`, `/auth` → auxiliary APIs on subpaths only
-- `cursor-opencode-provider/image-save` → host-neutral `executeCursorImageSave` (pi-bridge / non-plugin hosts; not on the package root)
-
-## OpenCode 2.0 vs the 1.18 "v2" plugin API
-
-These are **source-incompatible APIs, not versions of one API**. Keep them in separate
-entrypoints; never try to unify them.
-
-| | 1.18 (`@opencode-ai/plugin@^1.17.13`, `/v2/promise`) | 2.0 (`plugin/opencode2`) |
-|---|---|---|
-| Import | `define` from `.../v2/promise` | plain `{ id, setup }` (host `define` is identity) |
-| Hook shape | `ctx.aisdk.sdk(cb)` | `ctx.aisdk.hook("sdk", cb)` |
-| OAuth registration | Effect-valued | Promise-valued |
-| Model registration | classic `config` hook | `ctx.provider.transform` + `editor.add` + `reload()` |
-| Provider schema | `api: { type: "aisdk", package }` | flat `package: "aisdk:…"` |
-
-`src/plugin-opencode2.ts` does **not** import `@opencode-ai/plugin` or
-`@opencode/plugin`. It exports a plain `{ id, setup }` object and duck-types a
-subset of the 2.0 context from `src/opencode2/types.ts`, so an OpenCode 2.0
-patch release does not require a plugin dependency bump.
-
-Compile-time usage checks against the documented OpenCode 2.0 host contract live
-in `test/opencode2-conformance.types.ts` (contract: `test/opencode2-host-contract.ts`).
-They are checked by `tsc -p tsconfig.test.json`, which `bun run typecheck` runs
-over all of `src/` and `test/`. Build pre-registration Run fixtures with
-`sessionFixture` (`test/session-fixture.ts`) rather than casting to `CursorSession`.
-
-Two 1.x hooks have no 2.0 equivalent and are emulated:
-- **`shell.env`** — replaced by `ctx.shell.hook("create.before")`. The plugin
-  installs a same-basename executable adapter while keeping the original command
-  for the host's later permission scan. When that public hook is absent, the
-  fallback uses `prepareCursorShellArgs(..., { preferWrapperCommand: true })`.
-- **`chat.params`** — replaced by session `context` / `compaction` hooks. They
-  record the owning agent, explicit compaction option and session marker read by
-  `doStream`; tool-list emptiness alone must not identify compaction.
-
-## Working conventions
-
-- Prefer minimal, targeted changes. Fix root causes; no temporary workarounds.
-- Do not commit unless the user (or an explicit implementation task) asks.
-- Keep README accurate when behavior users care about changes (auth, env vars, architecture, limitations). Host-specific OpenCode install/auth belongs in `docs/opencode-1.md` and `docs/opencode-2.md`, not back in the README.
-- For user-facing changes, update `CHANGELOG.md` under `## [Unreleased]` in the same change set. Follow [Changelog](#changelog).
-- Tests live in `test/` (Bun test). Mirror protocol/context behavior with unit tests when changing encode/decode or discovery.
-- Read the [lessons index](tasks/lessons.md), then the general and relevant host file. Keep incident rationale there and current requirements here; merge lessons that share a cause.
-- **Release gate:** any version bump / `v*` tag / publish request must obey the HARD STOP pricing + changelog section above. Do not “bump first, check pricing if CI fails.”
-
-## Context this provider sends to Cursor
-
-`src/context/build.ts` builds Cursor `RequestContext` from host input and
-host-neutral workspace facts:
-
-- **System instructions:** one `rules` entry, `CursorRule{full_path: "OpenCode
-  system instructions", type.global}`, carrying the Context Epoch baseline:
-  OpenCode's system prompt (its `AGENTS.md` / `instructions`, skill list, MCP
-  server instructions, env) plus this provider's interaction guidance.
-- Env, git, repository, and project layout
-- Host `task` / `subagent` names and descriptions as `custom_subagents`
-- Host skills with a usable location as RequestContext `agent_skills`
-  (path + description only, `agent_skills_info_complete: true`) when the host
-  advertises `skill`: catalog order and descriptions from the frozen
-  system-instructions rule; locations from `opencode.host.skills`, else
-  OpenCode 2 `skill.list()` files remembered by the plugin, else OpenCode 1
-  catalog `<location>`. Built-ins stay on the `skill` tool. Never content;
-  never kept on the frozen base
-- Advertised host tools as names-only `mcp_meta_tool_options` (full definitions
-  only on exec #36)
-- Plugin lines in `hooks_additional_context` via `collectPlugins`
-
-The rule is the only way the host system context reaches the model. Verified
-live (composer-2.5, glm-5p3; OpenCode 1.18 and 2.0): a client-seeded `system`
-entry in `root_prompt_messages_json` is not followed, an untyped `CursorRule`
-is not applied (the Cursor CLI types AGENTS.md as `alwaysApply` → `global`;
-untyped falls to `manuallyAttached`), and `RequestContext.system_prompt_override`
-(#53) is ignored; the `global` rule is followed and costs the tokens of its
-text. So no `system` entry is seeded (`system` history entries are dropped
-too), and the provider does not read instruction or skill file bodies itself.
-Prior turns are not seeded there either: with any client-seeded root message
-Cursor skips building its root prompt, so the rule, `custom_subagents` and MCP
-instructions are gone for the rest of the conversation. A Run without a
-checkpoint sends an empty `ConversationStateStructure` and opens its user
-message with a `<conversation_history>` transcript (`renderHistoryTranscript`).
-The transcript keeps every tool call input and result whole, as a resumed
-Claude Code session resends its whole transcript; only when it would pass 80%
-of the context are the oldest ones shortened (with a note in place), and when
-even that does not fit the Run fails with a 413 so the host compacts. The
-replay is sized at 1.75 characters per token (`REPLAY_CHARS_PER_TOKEN`, the
-1st percentile of how Cursor counts coding sessions; the median is 2.1), not
-with `estimateTokens`' four.
-Merged `opencode.json` (`loadMergedConfig`) is still read for MCP server ids,
-plugin lists, and interaction guidance.
-
-**Never write `root_prompt_messages_json`.** Cursor checkpoints fill it with
-references to the conversation's own rendered root prompt; any client entry
-stands in for that prompt, and Cursor then stops rendering RequestContext rules,
-skills and subagents, the system-instructions rule included. Verified live
-2026-10-09 (claude-sonnet-5-5, gpt-5.4-mini): two seeded history messages there
-gave checkpoint categories `rules:0, subagents:0` and a reply that ignored the
-rule; the same history inlined in the user text kept both. A Run without a
-checkpoint (compaction, rebase, reseed, a first turn with prior history)
-therefore sends an empty seed state and carries the history as a
-`<conversation_history>` transcript ahead of the live user text
-(`seedHistoryUserText`, `src/protocol/request.ts`). With the root prompt left to
-Cursor, a conversation rebuilt in the same process also kept the cached prompt
-prefix (97% cache read on the first rebuilt Run, against 0% in the incident it
-replaced).
-
-## Critical behavioral constraints
-
-- **Release / pricing gate:** before any version bump, `v*` tag, tag push, or publish, run `bun run generate:pricing` and `bun run check:pricing` successfully in this turn, commit mapping/`pricing-data.ts` updates first, and finalize `CHANGELOG.md` (`[Unreleased]` → dated version + new empty `[Unreleased]`). See HARD STOP and [Changelog](#changelog). CI re-running pricing is validation, not permission to skip the local gate.
-- **Agent host:** resolve via `GetServerConfig` (`agentUrlConfig.agentnUrl`). Memoize once per process in memory (`processShared`, so every module copy the host loads shares it); never write to disk; never silently fall back to a legacy global host on failure.
-- **Auth renewal:** a browser login and an API key are different credentials, renewed by separate paths that never stand in for each other. There is no `/auth/token` route (Cursor answers 404). The browser-login session (`type:"session"` JWT, 60-day life) renews exactly as Cursor's IDE does (`_performAccessTokenRefresh` in the app's `workbench.desktop.main.js`): `POST /oauth/token` `{grant_type:"refresh_token", client_id: CURSOR_OAUTH_CLIENT_ID, refresh_token}`; the response has no refresh token, so the new access token is stored as both. A rejected session is **HTTP 200** `{access_token:"", shouldLogout:true}` (`error:"sign_in_policy_violation"` for a policy block); read the body, not the status. Renewal is due 1272 h before expiry (IDE `hir`) and happens only on demand, when a request needs a token (Run open, model discovery, endpoint warmup) — no timer, matching OpenCode's own OAuth providers. Never depend on renewing an expired session. An API-key login renews only by re-exchanging the raw key (`/auth/exchange_user_api_key`), as Cursor CLI does; its refresh token is unused and not stored. Transient failures keep the current token while valid and back off; `shouldLogout`, policy blocks, and rejected keys latch per credential. Plugins hand the provider a `getAccessToken` function and put no token or key in serializable options, exactly as OpenCode's own OAuth providers do (codex/xai/copilot loaders return a dummy `apiKey` plus a `fetch` that calls `getAuth()` per request); OpenCode returns provider options unredacted from `/provider`, and functions drop out of that JSON. A raw `crsr_` key is never sent as Bearer. Renewals are persisted only if the stored credential is unchanged (compare-and-set). OpenCode 2.0 stores the JWT expiry as `expires` (as its built-in OAuth integrations do) and calls `refresh` within five minutes of it; in between, the plugin renews in memory when due and `refresh` hands that renewal to the host to persist.
-- **URL options:** `apiBaseURL` (auth/models/GetServerConfig) vs `agentBaseURL` (Run stream) are separate. Legacy `baseURL` aliases `agentBaseURL` only.
-- **Host validation:** explicit agent overrides and GetServerConfig results must be HTTPS `*.cursor.sh`; reject others.
-- **Telemetry:** `GetServerConfig` sends `telem_enabled: false` by default; opt in via `telemetryEnabled` or `CURSOR_GET_SERVER_CONFIG_TELEMETRY`.
-- **Tool results:** strip OpenCode’s read envelope before returning content to Cursor so the model cannot echo wrappers into writes. OpenCode 1.x uses `<path>` / `<content>` plus `(Output capped at 50 KB…)`. OpenCode 2 uses `Read file <path>, lines <start>-<end>`, `N: ` prefixes, and `[Output truncated. Continue reading with offset: N]`. Stripping must not also drop the truncation footer's *meaning*: both hosts cap reads at 50 KB, and OpenCode 2 also stops at 2,000 lines and shortens individual lines after 2,000 characters, so re-state every partial result or the model treats it as the whole file. Relative grep, glob, and directory entries are resolved against the workspace root before Cursor sees them. Shell stdout reaches Cursor verbatim, as Cursor CLI sends it: never rewrite it, because a `cd` in the command changes what its relative paths mean and most path-shaped lines (`S=/tmp/x`, `#!/bin/sh`, branch names, diff lines) are not paths. Checkpointed Runs also get the same workspace-root reminder appended to that turn's user text. Native `read_args` → `read_result` is the path models actually use (verified live for `gpt-5.4-mini` and `grok-4.5`); its structured `truncated` flag is **not** sufficient on its own, so the content also carries a `[Partial read: …]` marker. `mcp_result` gets a separate notice item and Pi reads get structured `truncation`. Whole-file writes / overwriting Add File patches that echo the marker are rejected; targeted edits are not, because warning text can legitimately occur in source. Never mark ordinary pagination merely because the caller bounded the read with `offset`/`limit`; still mark a byte-capped page or character-truncated line.
-- **Write content:** `WriteArgs` has six fields. `file_bytes` (#5) carries the content whenever Cursor sends bytes instead of `file_text`, decoded per `encoding_hint` (#6); Cursor's own executor prefers bytes when non-empty. Never re-add those two to `CURSOR_INTERNAL_KEYS` — they are content, not transport metadata.
-- **Edit-tool substitution:** OpenCode 1.x substitutes `apply_patch`, and 2.0 substitutes `patch`, for `edit`/`write` on API model ids containing `gpt-` but not `oss` or `gpt-4`. `remapEditToolsForCatalog` translates native text writes/edits from the current turn's permitted catalog, never from a model id or version check. Preserve native tools when permitted; refuse lossy conversions before mutation (including CRLF on 2.0 `patch`). Rationale and upstream citations live in `src/protocol/apply-patch.ts`. The same catalog-gated pattern remaps Cursor Task onto OpenCode 2 `subagent` (`agent` / `sessionID`) when `task` is absent. OpenCode 2 `execute` is Code Mode JavaScript (`code`), not a shell; OS commands stay on `shell`/`bash`.
-- **Subagent task title:** Cursor's display `task_tool_call` carries the short description OpenCode shows, but exec `#28` `SubagentArgs` has no description field — only `tool_call_id` + prompt. Prefer the correlated display description via `preferCorrelatedTaskDescription`; the first-five-words prompt slice is fallback only and looks cut off in the TUI.
-- **Subagent attachments:** `TaskToolArgs.attachments` (#7) lists files; before `SubagentArgs` Cursor reads each one through a `read_args` exec carrying the Task's `tool_call_id`, and refuses the Task ("Attachment is not binary data") unless the read returns `data`. The bytes only fill `SubagentArgs.selected_context`, which OpenCode's subagent tool cannot take, so `answerTaskAttachmentRead` answers with a placeholder image without reading the file, and the paths go into the subagent prompt. A host `read` there would end the step and claim the display call its title comes from.
-- **AskQuestion bridge:** Cursor's native AskQuestion is an inbound `InteractionQuery` (#3), not an exec request, so it is translated into the host `question` tool when permitted. Refusing it made models narrate "the AskQuestion tool is unavailable" and answer in prose while `question` sat advertised and never once called. `src/protocol/ask-question.ts` mirrors Cursor CLI (`src/utils/interaction-utils.ts` `Q7`/`iX`/`N$`, `chunk-7076/dist/ui.js`): strip a *trailing* catch-all option because OpenCode's `custom` adds its own, map answer labels back to option ids with anything unmatched becoming `freeform_text` (empty freeform → the literal `"Other"`), and keep the CLI's reason strings verbatim. `run_async` replies `async{}` at once and delivers answers later through `ConversationAction.async_ask_question_completion_action` echoing the server's own `AskQuestionArgs` **bytes**; a synchronous query stays open until the host tool returns, exactly as the CLI blocks on user input. Only unbridgeable turns (no advertised `question`, or `allowTools=false`) reject, and the reason must name the real cause.
-- **SwitchMode bridge:** Cursor's native SwitchMode is an inbound `InteractionQuery` (#4) with `SwitchModeArgs{target_mode_id, explanation?, tool_call_id}`; the CLI blocks until `approved{}` or `rejected{reason}` (`"Mode switch rejected by user"` on decline) — there is no async variant. OpenCode 1.x uses advertised `plan_enter` (→ plan) / `plan_exit` (→ build). OpenCode 2 removed those model-callable tools in favor of vendor-maintained primary `plan` / `build` agents, so `plugin-opencode2.ts` installs the structural `host-agent-mode.ts` callback and applies an approved Cursor switch through public `session.switchAgent` only after the owning Run is terminal, then continues under that agent with `session.synthetic` (or `session.prompt` if synthetic is absent); `plan`/`spec` select `plan`, every other non-empty target selects `build`. After approval, the provider also records the Cursor unified mode per OpenCode session; CLI-shaped reminders remain the fallback when no native host agent owns the mode. Do not spawn `task`/subagents for SwitchMode itself. A missing plan tool is not a refusal: entering plan can be approved directly, while leaving it uses the advertised `question` fallback so execution remains user-gated. A lifecycle turn (`allowTools=false`) soft-acks with `approved{}` and does not mutate session mode — a hard reject entered the transcript and made the real turn narrate that mode switches were blocked. OCP may translate fork tool vocabulary before the provider sees it. Display `switch_mode_tool_call` (#25) is a separate non-replayed transcript record.
-- **CreatePlan bridge:** Cursor's `create_plan_request_query` (#7) writes plain markdown and returns a `file://` `plan_uri`; never into Cursor's own `~/.cursor` — host-native locations only. On OpenCode 1.x it is the session's own `Session.plan` file (`hostPlanFilePath`: `<worktree>/.opencode/plans/<created>-<slug>.md` in a VCS project, else `<data>/plans/`), resolved once per session from the classic client. On OpenCode 2.0 it is a new file in the Plan directory (`~/.opencode/plan`, `opencode2PlanDir`). An installed structural path bridge owns both (`planFile`, else `<globalDataDir>/plans`). Body is plain markdown (`# title`, overview, plan, optional `## Todos`). Empty / missing args keep the CLI empty-`plan_uri` success ack. Display `create_plan_tool_call` still mirrors into `todowrite` separately and does not write the file.
-- **Plan execution approval:** **writing a plan never asks; executing one always does**, and canonical OpenCode reports that through one contract — `success` means the user approved execution, `error` means the plan was written but not accepted, so the model keeps planning. Do not let a refinement request return success: Cursor then implements the plan the user just asked to change. `resolveCreatePlanBridge` picks the channel from the advertised catalog alone: an advertised plan-stage tool writes the artifact and its tool result **is** the outcome (success = approved, error = not approved; the result may name the host's own follow-up approval call, which this provider does not invent), else the OpenCode `question` tool carrying upstream `PlanExitTool`'s own prompt after the provider has already written the file, else a plain ack when nothing can ask. **The user must be able to read the plan before approving it.** Cursor routes the plan body through the interaction query, never the text stream, so nothing has displayed it by the time the prompt appears; on the emulated path the provider emits the plan into the assistant message (`renderPlanReviewMessage`) before the question. It must go there and not into the question text: OpenCode renders the question dock outside its scrollbox in a `flexShrink={0}` box (`tui/src/routes/session/index.tsx:1296-1304`), so a full plan in the prompt would push the conversation off screen. An OpenCode plan-stage tool already receives `content` and shows it in its own review UI. Only an explicit "Yes" approves — an unanswered, dismissed, or failed prompt keeps the model in plan mode. The gate gates the transition *out of* planning, so it is armed only while the provider records an approved Cursor plan/spec mode (`isCursorPlanModeActive`) and never on a lifecycle turn. On approval the session moves to `agent` so the next Run carries the agent reminder. The same native host-agent switch used for SwitchMode then selects the host `build` agent (`queueHostAgentModeSwitch`) so OpenCode 1.x and 2.0 start implementing without waiting for the model to ask. Relying on the model to raise SwitchMode back to `agent` after writing is **not** a gate: observed live, the model wrote the plan and ended the turn, so nothing ever asked. A SwitchMode whose target is the mode already in effect auto-approves (as Cursor's own IDE handler does), which also keeps that path from prompting a second time.
-- **Image generation:** Cursor approves via `InteractionQuery` #12, generates server-side, then writes the image with an **ordinary write exec** — `WriteArgs{path, file_bytes, return_file_content_after_write:false}` to `<artifactsFolder|projectFolder>/assets/<basename>`, reading the client's `WriteResult` back and branching on `permission_denied` (`agent-cli-local/src/index.ts:84752-84776`). The display `generate_image_tool_call.result.image_data` is **preview only** — Cursor CLI feeds it to its terminal image cache, which falls back to reading the path off disk. Never write from that frame; the bytes would land twice. So the client work is: approve, then honour a binary write. `decodeWriteBytes` returns undefined for bytes that are not text (fatal decode; NUL outside UTF-16/32), those bytes never reach OpenCode's `write` (string content, BOM split, diff, `Format.file()`), and are staged (`src/image-staging.ts`) for the classic `cursor_image_save` plugin tool, which mirrors OpenCode's own `write` gate in the same order: `external_directory` for a target outside the project (the by-design default, so this fires on every ordinary generation), then `edit` with a worktree-relative pattern. Roots are realpath-resolved on both sides or a symlinked project root reads as external. Then the bytes are written verbatim. A refusal returns Cursor's own `WriteResult.permission_denied` (#3), not a generic error. **The commit tool must not return `attachments`:** OpenCode gates media-in-tool-result on an allowlist of `model.api.npm` values no third-party provider can join (`message-v2.ts:299-305`), so media is always extracted into a trailing user message — which stops the next turn from looking like a tool continuation, opens a fresh Run, and strands the pending write result (observed live: session superseded with `pending=1` plus a 1.7 MB rebase). Continuations now look past that `Attached media from tool result:` message (see **Host notes after tool results**), but the rule stands: a `write_result` has no image field, so returned media would only reach Cursor later as history. **The tool takes only a single-use opaque id** — never a path or content — so its presence in the catalog gives no model a way to write arbitrary files; keep it that way. `remapCursorImageWritePath` maps Cursor's target onto a real host location: the advertised `project_folder` and the workspace pass through, anything else is rebased to `<projectDir>/assets/<basename>` rather than refused. **Landing in `<projectDir>/assets/` — outside the worktree — is the intended default, not a shortcoming.** Generated images are agent artifacts and stay out of the git tree unless asked for; a user who wants one in the repo asks for a path, Cursor sends that path, and it is honoured verbatim. Do not "fix" the default to write into the workspace, and do not re-raise it as a caveat. Containment is re-checked symlink-aware at commit time against both roots. Approve #12 only when `cursor_image_save` is advertised, otherwise generation spends Cursor quota on an image with nowhere to go. OpenCode 2.0's public plugin `ToolContext` has no permission-request method, so `plugin-opencode2.ts` still registers handle-only `cursor_image_save` (`codemode: false`, `permission: "edit"`, output schema) and commits after containment when `ask` is absent; classic 1.x keeps raising `external_directory` then `edit`. Do not advertise a general file writer. Approach adapted from [`jkalasas/opencode-antigravity-image`](https://github.com/jkalasas/opencode-antigravity-image) (MIT) — prior art for writing image bytes from inside a plugin tool; no code copied. Verified live 2026-08-15 (`sample-balloon.png`, 1203133 B, 1024x1024 PNG written byte-exact). **Cursor's remote path did not raise #12 at all** — zero interaction queries in that session; it emitted the display `generate_image_tool_call` and then the binary write exec directly. The #12 handler therefore stays as correct-if-raised, but the effective gate is the `edit` permission on the write. Reference images (`reference_image_paths`) are read back through a read exec; a held-Run read of an image returns its bytes in `ReadSuccess.data` (#5), as Cursor's own read executor does (decoded under the existing 20 MiB attachment budget without CLI-style resize).
-- **Legacy edit reads:** `edit_tool_call` uses a private `read_args` → whole-file `write_args` transaction. For the exact correlated regular file inside the real workspace, answer the private read directly with complete content up to Cursor's 50 MB edit limit; OpenCode's ordinary 50 KB read cap is unsuitable for this transaction. External paths and symlink escapes must first pass through OpenCode's permission-aware read; only after that exact read succeeds may its private result be upgraded to complete content. The final write must still be remapped to a targeted host edit/patch.
-- **Prompt-cache context:** freeze and persist the stable `RequestContext` base (env, repository, git, layout) per Cursor `conversation_id`; git and layout discovery for one workspace serves every build within 30 s (`collectWorkspaceFacts`), so OpenCode's title request and the turn it names do not each pay for `git status`, and a failed or timed-out `git status` is sent as `git_status_info_complete: false`, never as a clean tree; rediscover tools/MCP, host-advertised subagents, and plugin metadata every Run then epoch-hold them (equal ids keep frozen bytes; new ids append) and overlay them deterministically. Reuse the prior materialized object when its protobuf bytes are unchanged. Persist the current host primary agent and Context Epoch baseline hash with the checkpoint for diagnostics only — they must never remint a sticky conversation (Cursor CLI keeps the same agentId across mode flips; system-prompt remint is forbidden). V2-style Context Epoch: the first normal seed freezes Baseline System Context (host system + interaction guidance) per `conversation_id`, and that baseline is the system-instructions rule frozen into the persisted RequestContext base, sent on every Run (checkpoint Runs included) and in the exec #10 reply; later host/agent/guidance/mode/kickoff changes are Mid-Conversation System Messages on the user turn and never rewrite the rule. A new epoch baseline (compaction rebase, binding reset) replaces the rule; a recovered epoch (restart past a checkpoint, no baseline bytes) keeps the persisted rule and fills it from live host text only when none was persisted. Lifecycle/compaction Runs carry their own ephemeral prompt as the rule under their own `conversation_id`. A zero-tool Run (title, plugin `generate`) opens its user turn with that prompt as the task, the host message following as `<input>`: as a rule alone it loses to Cursor's agent prompt. Compaction remint ends the epoch; RequestContext workspace base still transfers. Title/generate lifecycle prompts are ephemeral and must not replace that primary identity. **Advertisement and permission are independent.** Equal name-sets on nonempty host catalogs keep frozen descriptors and their order; new names append at the tail (UTF-16 only among the newcomers); the encoder emits advertised order. A varying nonempty tool set changes the RequestContext shape and costs the whole prompt cache. A host-empty tool list is a lifecycle turn (OpenCode 1.x/2.0 title, OpenCode 1.x compaction/summary) — advertise `[]` to Cursor to match the host instead of inventing a sticky tools prefix on that ephemeral `conversation_id`. OpenCode 2.0 compaction still sends a nonempty catalog; keep epoch advertisement there and refuse execution via `isCompaction`. A host-empty Run needs no sibling catalog and must proceed on cold start too; waiting can deadlock a standalone no-tool call or serialized title generation. Never invent or filter an enabled nonempty set. Permission is computed separately from what actually arrived (`allowTools`), so lifecycle turns refuse execution and cannot duplicate the real turn's side effects — which is why bridged interactions (SwitchMode, CreatePlan) must gate on `allowTools`, not on advertisement: before that gate existed, the title turn flipped plan mode and wrote its own duplicate plan file. When the host shrinks a non-empty catalog (OpenCode plan denies edit), keep the epoch advertisement for RequestContext stability and refuse exec outside the host-permitted set for that turn; grow the epoch catalog when new tool names appear (MCP). When a held Run's catalog grows, rematerialize that conversation overlay without rewriting the already-sent RequestContext so the next user-turn Run reuses those bytes. Held-Run continuation re-runs `resolveTurnToolState` and writes advertised + permitted sets onto the live session; exec #36 answers from that catalog's session descriptors (full definitions, after web-tool aliasing, so names match what RequestContext advertises), not from the frozen `RequestContext`. MCP server ids come from the Run's one merged-config load, compaction included, so RequestContext names, session descriptors and #36 agree on server identity. Overlay is names plus live #36 — not full skill/rule bodies. The wire omits `RequestContext.tools` (#7) and fs `mcp_descriptors`; `mcp_meta_tool_options` is `tool_name` only (schema-only edits do not change overlay bytes); `AgentRunRequest.mcp_tools` is empty. Session `toolDescriptors` stay full for exec remap and bridges. Deduplicate concurrent first builds. Compaction/rebase discards old checkpoints/blobs but transfers the stable workspace base and comparison seed; the new epoch supplies its own system baseline. Agent/prompt changes alone do not reset, and binding soft-eviction retains warm state.
-- **Persisted KV blobs:** a Cursor checkpoint contains content-addressed references and is not independently replayable. At successful `TurnEnded`, persist only blobs reachable from the latest checkpoint using Cursor CLI's export graph (turn/user/step/image, summary/todo/prompt, and recursive subagent refs). If decoding fails or a referenced hash is absent, retain the complete set rather than write an incomplete restart snapshot. A Run still in progress is also saved (held on a host tool for a second, OpenCode 2 shutdown, a cancel that ends without `turn_ended`), with its latest checkpoint and the blobs that checkpoint reaches, without pruning the live store, because the Run may still need blobs that only its next checkpoint references. Do not mistake these private blobs for OpenCode's own session cache.
-- **History images a checkpoint holds (`src/protocol/sent-history-images.ts`):** a Run skips a history image only when the checkpoint it sends is known to hold it, so every set of content hashes belongs to one checkpoint (conversation id + SHA-256 of the bytes). Each checkpoint a Run receives holds what the Run's starting checkpoint held; the images the Run sent (its request, explicit attachments included, and tool-result images) count only once its turn ends on a checkpoint of its own that arrived after them. Arrival is when the transport received the frame (`frameArrival`), not when a pump read it: the checkpoint Cursor sends right after a tool step is read only after the host tool's result is written, and holds none of its images. A turn that fails, is stopped (even when Cursor ends the cancelled Run on a checkpoint) or ends without a checkpoint confirms nothing it sent, so the next Run sends those images again. The restart snapshot keeps the set only beside the checkpoint it belongs to (fields 16/17); a snapshot without them, a reset, compaction or rebase sends every image.
-- **Checkpoint transport budget:** inspect the checkpoint-reachable KV graph before opening the next Run for diagnostics. A graph above 100 MiB (Cursor CLI export/transfer budget only) or an incomplete reachability proof must **not** remint — warm-reuse the sticky conversation and warn (`action=warm-reuse`), matching CLI soft-reuse. Report checkpoint-envelope bytes, reachable blob bytes, and seed/wire estimates separately; blob bytes are not tokens.
-- **Run write backpressure:** response-required protocol writes must be serialized per stream and await HTTP/2 drain. In particular, never queue successive KV `get_blob` replies after `write()` returns false, and never let a heartbeat race or misattribute an already-pending response write. Continuation exec results use that same writer and stay claimed until the drain boundary; a drain failure after a buffered write is an ambiguous partial delivery and is not replayed. A drain has no deadline, as in Cursor CLI's transport (`@connectrpc/connect-node` 1.6.1 awaits `drain` with no timer): Node and Bun emit `drain` only once the whole buffered message is out, so a timeout caps the upload instead of detecting a stall (a 5 s one failed an 18 MB Run request that drains in about 8 s from a home uplink, [#75](https://github.com/oakimov/cursor-opencode-provider/issues/75)). A stream error or close settles it, and so does every terminal event of the Run: a local abort, `destroy()` or `end()` at once, because Node holds back a stream's `close` while a write is buffered, and a response that ends while the request is still blocked, because the read-idle watchdog stops with the response (Bun keeps that stream open). The read-idle watchdog bounds a stream that stops answering. Opening Runs (initial and replacement requests) own a temporary abort/host-Stop listener until their upload finishes, before session registration or replacement; continuation uploads follow that call's current signal only during delivery. The active pump owns its signal too, so a blocked protocol reply cannot hide an abort; it resets only its own Run with no pending host exec. Replacement callbacks receive the current pump's signal, never the signal of the first step. These listeners must detach before a tool step's ordinary abort, which keeps the held Run alive. A local abort, `destroy()`, or `end()` with a buffered write resets the stream with `NGHTTP2_CANCEL`, as connect-node does for an aborted call: a plain `close()` never closes a stream whose request write is still buffered, on Node or Bun, so the stream would stay open and keep its HTTP/2 session held and the process alive. Two fork paths send an opening Run again, and a pending drain follows them: a Run on a session reused without its ping goes out once more on a new connection if that session dies before Cursor answers (the drain moves to the new stream instead of failing), and a gzip Run Cursor refuses goes out once more uncompressed (`sendRunRequest`, inside `openRunWithRequest`, so the resend keeps the same abort/host-Stop listener).
-- **Shared Run session memory:** every Run shares one HTTP/2 session per origin, and Node and Bun count its unsent bytes against `maxSessionMemory` (10 MB by default). Over it, every new stream fails with `ENHANCE_YOUR_CALM` (Bun inside `request()` before sending it, Node by refusing its response headers; [#76](https://github.com/oakimov/cursor-opencode-provider/issues/76)), and on Node a single write over it fails its own stream while a slow uplink holds the bytes back. Cursor gives each stream a 512 KiB window and reads a Run's request at its own pace, so a few multi-megabyte requests or KV replies pass the default. Run sessions therefore open with `maxSessionMemory: 256` (MB), direct and through `HTTPS_PROXY`: the provider holds those bytes in memory anyway, and 256 MB clears the 100 MiB checkpoint transfer budget. Cursor CLI's transport sets no such option and keeps the default.
-- **Cursor-authoritative token totals:** Cursor's checkpoint `ConversationStateStructure.token_details` (#5) is the authoritative context snapshot. Decode it without re-encoding the opaque checkpoint; expose `used_tokens`, `max_tokens`, prompt-category breakdown, source, and staleness under `providerMetadata.cursor.context`, and make AI SDK input + output equal `used_tokens`. OpenCode TUI/GUI **replace** each assistant message's tokens (they do not sum occupancy) and the TUI footer only accepts a message with `tokens.output > 0`; session cost **adds** every step-finish. Held-Run tool boundaries therefore emit the last-known occupancy snapshot (`output=1` so the footer updates, remaining occupancy on input/cache), and at `TurnEnded`/`stop` the same snapshot shape once more, so host tok/s — which divides generated tokens by this step's wall time — is not inflated by the held-Run aggregate. **Billing (`src/billing.ts`):** OpenCode 1.x prices a step from `providerMetadata.copilot.totalNanoAiu` (USD × 1e11) when present, OpenCode 2 always from the step's tokens at the catalog rates (no override exists there), and both add every step. Each step's input/cache split is therefore chosen so the token-priced cost is the amount billed, and `totalNanoAiu` carries the same amount, so both hosts bill identically without host detection. A tool step bills an estimate shaped like one model call (the previous step's occupancy as cache read, the rest new input). Every `TurnEnded` (pump, fresh-turn drain, progress-only continuation, a steer Cursor did not take sent as a follow-up Run) adds the catalog-priced aggregate cost — its counters at the catalog rates of the Run's price entry (`cursorPricingId`: `<wire>-fast` for a Fast variant with its own rate, else the wire id), cache categories without their own rate billed as input — to a per-OpenCode-session ledger; the turn-end step's split is chosen to bill what is outstanding (confirmed real cost + unconfirmed Run estimates − billed), clamped to what its occupancy can carry, and the remainder carries to later priced turn-ends. Whole-token rounding and a nonzero minimum price can leave a balance; negative balances cannot refund prior charges. The aggregate counters do not identify per-call tiers, so mixed-tier Runs cannot be priced exactly; the final context tier estimate is capped at aggregate input so output alone cannot trigger a higher tier. Ephemeral Runs settle under their own Run id. Unpriced models (`default`/Auto) bill nothing. The ledger is shared as plain data across module copies in one process, bounds cache counters to input before pricing, and records a charge/prefix only after the finish is accepted by the consumer. It retains at most 1,024 recently written sessions and resets on process restart. Preserve exact request counters under `providerMetadata.cursor.*Raw` (input/output/cache/reasoning); a compatibility layer may use the neutral event bridge to reconcile a host's separate aggregate-usage record without changing the assistant-message occupancy. If the current Run supplies no token details, retain the prior checkpoint snapshot as `checkpoint-previous-turn` / `stale: true`; if no snapshot has ever existed, emit zero standard usage and leave context metadata absent. Never reinterpret `TurnEnded` as context occupancy. Keep this last-known snapshot separate from `resumeCheckpoint`, because display state must not make stale transport state retry-eligible. Compaction replaces the snapshot with a lower authoritative total. Do not emit per-step occupancy *deltas*: the TUI would then show only the increment.
-- **Device identity:** stable OS-derived device ids (CLI-shaped); inventing new fingerprints risks “too many devices” errors.
-- **Parallel tool calls:** one Cursor model step can request several tool calls. Cursor dispatches each exec as soon as its call is generated and sends `tool_requests_listed` (InteractionUpdate #27, `call_count`) once the model has finished the step: live, the first execs of a three-call step arrive before it and the last one right after. `pump` therefore keeps the AI SDK step open after a host tool-call until every listed call has reached it (its exec request or, for a call no exec claimed, its display completion; an edit's private prerequisite read does not count, and completions Cursor sends for the previous step's calls are ignored), then finishes with `tool-calls`, so OpenCode starts the calls together and returns every result in one continuation. Until Cursor has sent a count in this process, each host call ends its step (the pre-count behaviour). Model output or `turn_ended` while a step is held closes it and puts that frame read back on `session.queuedFrame` for the next pass. The Run's end or a read failure closes it too and becomes the session's deferred terminal, so the session closes when the pump ends and the continuation rebases from the step's results instead of replaying it. A held step whose count is never met closes once the Run has been quiet for 1.5 s. Every frame reader (`takeFrame`, `nextFrameWithin`) consumes `queuedFrame` before calling `frames.next()`, so no frame is skipped.
-- **Tool call order** (`src/tool-call-order.ts`): Claude Code's rule. `tool_call_started` records each call in model order with whether it can change state (`displayToolCallMutates`; a shell display without a command is provisional until its exec). An exec whose call must wait (it changes state and an earlier call is unfinished, or an earlier unfinished call changes state) is kept on `session.toolCallOrder.deferred` instead of being handled; if the step already emitted host calls it closes, so OpenCode runs them. A call finishes when its result is delivered (`deliverContinuationResults`; not an edit's prerequisite read) or Cursor sends `tool_call_completed`. Each pump pass first handles held execs that may now run. A step split this way keeps Cursor's listed count in `session.carriedToolStep` for the next pass. Cursor's `abort{id}` drops a held exec; held execs get exec heartbeats; a fresh-turn drain is busy while any is held. If nothing but heartbeats arrives for 15 s while an exec is held, nothing is pending and no Cursor wait runs, the first held exec is released anyway.
-- **Host-facing errors:** a Connect error's `message` is often just `"Error"`; the reason is `aiserver.v1.ErrorDetails.details` (title #1, detail #2, `is_retryable` #4). Show `${title} ${detail}` and obey an explicit `is_retryable` for the provider's own recovery, as Cursor CLI does (`NonRetriableError`). A request Cursor declared not retryable leaves `doStream` as an AI SDK `APICallError` with the Connect code's HTTP status (unknown codes as `unknown`/500), `isRetryable: false` and response header `x-should-retry: false` (`hostFacingError`): OpenCode 2 classifies an `APICallError` by status and retries 408/409/429/5xx regardless of `isRetryable`, but the header overrides that (`packages/ai/src/provider-error.ts` `isRetryable`, v2.0.31); OpenCode 2 retries any failure without a status or recognized code (`UnknownProvider`), which sent an Anthropic-policy-blocked request 11 times (verified live 2026-10-16, OpenCode 2.0.31).
-- **Session lifecycle:** `SessionManager` holds a Cursor Run open past `doStream` returning whenever a tool exec is still pending, so a later continuation can resume it. A Cursor generation that lists several tool calls (`InteractionUpdate.tool_requests_listed` field 27) finishes one AI SDK step with all of them (see **Parallel tool calls**). As in Cursor CLI, every inbound Run frame (heartbeats and undeclared fields included) renews the semantic idle deadline in the pump and the fresh-turn drain: a model composing a large tool input sends only heartbeats/token counts for minutes (#66). Each exec this client still owes (not bridged, not an AskQuestion/SwitchMode/CreatePlan result, not aborted) gets `ExecClientControlMessage.heartbeat{id}` every 3 s through the serialized writer until its result is written, and so does each exec the tool-call ordering still holds back. The hard cap (`hardCapMs`, 10 min) on a held tool is renewed by OpenCode session activity, and a permission or question prompt the host has open counts as activity for its session and every ancestor until it is answered (`permission.asked`/`.replied`, `question.asked`/`.replied`/`.rejected`, OpenCode 2 `form.created`/`.replied`/`.cancelled`; `applyHostPromptEvent`, `src/activity.ts`): a Run waiting on the user is not stalled. A host tool that is actually running (OpenCode 1 tool part `running` without `providerExecuted`, OpenCode 2 `session.tool.called` when `executed` is not true; `applyHostToolEvent`) renews every pending of that Run until the tool finishes, and not past four hours from that tool's own start (`RUNNING_TOOL_CAP_MS`), including a tool running in a descendant session; an exec Cursor aborted is not held by it. OpenCode 2 never publishes `session.idle`, so `session.execution.*` ends the session's running tools there. The tracker's whole state (parent links, activity, open prompts, running tools) is process-wide plain data (`session-activity.v1`), because the plugin copy that receives host events need not be the copy holding the Run; a running tool extends a lease but never shortens one activity already gave. A `partial_tool_call` whose edit path predicts a host tool opens a tool row without `providerExecuted` (`src/early-tool-rows.ts`, `hostToolForCursorEdit`): an existing non-empty file predicts `edit`, else the patch tool; a missing or empty file predicts `write` (the edit remap leaves a write to an empty file as `write`), else the patch tool's Add File, matching `remapCorrelatedEditWriteForCatalog` / `remapEditToolsForCatalog`. A row opens only while no other call of the step is announced or started and unfinished and no exec is held back: the tool-call ordering never holds a step open for a later call the way a parallel step does, so the earlier call's exec would close it as failed. The exec binds that row when the remapped name still matches; otherwise the row is closed with `providerExecuted` before the step can execute it. Its id is `cursor-early_<session>_<12-hex digest of Cursor's call id>`: Cursor's call id can hold a newline and run to ~90 characters, and the host keeps this id in history for every provider. A bound row's route outlives its Run (bounded like tombstones), and an unrouted `cursor-early_` id after a restart is still recognized, so a late result rebuilds from host history instead of being dropped. A fresh user turn records the checkpoint it was sent on and its text (`src/lost-request.ts`, snapshot field 15; the fork's model-fallback stop is field 101, and an older fork snapshot's field 15 that is not a lost-request record is read as that stop, never as a lost request). So does a steer Cursor did not take, sent as a follow-up Run (on the checkpoint it was sent on), and the reply to a model-fallback stop (an override reply is not carried and records the stop's request unless the checkpoint holds the turn). The next fresh turn on that same checkpoint prepends the text, but only if its prompt still holds the record's live text (first text part: claude-compat moves its reminder to the newest message), so a helper Run on the same session or a reverted message does not get it. The record also keeps the attempt's own live text: a retry is that same text again and sends what the previous attempt sent, because OpenCode 2 sends the same synthetic "The previous response was interrupted…" user message before every retry (`session/runner/llm.ts`) and failed retries on one checkpoint must not stack copies of it. Any other text is appended, even when it repeats an older part (red, blue, then red again must reach Cursor in that order). A turn without a checkpoint seeds host history, which already holds the text, so it neither records nor prepends. A Run that fails while a record is pending saves the snapshot first, since no later save would carry the record past a restart. OpenCode 1.x drops an errored assistant message, so its next prompt already carries the request as part of the live turn and the record leaves it unchanged; OpenCode 2 keeps that message, so the record is what reaches Cursor. A newer checkpoint, a host Stop (also one with no open Run, during OpenCode's retry wait), or a rebuild from host history drops it. A result that arrives after its held Run closed rebuilds from host history; resuming the last checkpoint cannot take it, because Cursor checkpoints only after tool results and `resume_action` re-runs the model step, which re-requests the tool under a new call id (verified live 2026-10-09). While a Run is held for host tools and nothing pumps it, `readHeldRun` keeps reading it as Cursor CLI's single reader does, which handles KV and exec control on their own channels: it answers KV requests at once (a KV write also counts for model-switch detection, as in the pump), applies an abort for an exec still waiting on the host (its exec heartbeats stop and the late result is dropped) or still held back by the tool-call ordering, and skips server heartbeats. Every other frame is queued in `heldFrames`, in arrival order, for the next pump (`readSessionFrame` returns that queue, then `queuedFrame`, then unread frames; `putBackFrame` returns a frame a pump took to the queue's front); an abort whose exec request is still queued stays queued behind it, and is applied (and removed from the queue) as soon as a pump has registered that exec and the Run is held again, even if that pump ended its step before reaching the abort. Verified live 2026-10-17 (grok-4.7, OpenCode 1.19.3 and 2.0.31): right after a step Cursor sends `tool_requests_listed` or a checkpoint, then KV writes, which waited for the whole tool before. The reader parks its read in `queuedFrame`, so a pump that starts meanwhile reads the same frame and the reader backs off; it stops at the end of the stream or at 1,000 queued frames. An exec Cursor aborted no longer holds the Run against the open-session cap; the Run stays open so Cursor's later output reaches the host on the continuation. A tool-less, non-compaction call for the same session (title, summary) that carries no result for the held Run's pending exec is isolated onto its own ephemeral Run and never cancels that Run: OpenCode 2 sends one while a host tool is still running. Registering a *new* Run for the same `openCodeSessionId` closes any still-open prior Run for that id (`superseded-by-new-run`) — callers that abandon a Run and retry with a fresh one instead of delivering the continuation must not leak the old Run's stream. Before a host *fresh user turn* opens that new Run, finish the prior held Run on the same conversation: settle display-only bridged pendings, cancel any still-open real execs with an error result, and drain for `turn_ended` so the checkpoint/prefix is preserved instead of aborting mid-tool. `maxOpenSessions` (default 24) is a hard backstop: exceeding it force-closes the oldest *idle* session (`open-session-cap-exceeded`) — never a pumping or held-pending Run — rather than accumulating streams until Cursor's server closes the whole shared HTTP/2 connection. A failed reuse ping on the shared HTTP/2 session retires it with `close()` (matching age rotation; GOAWAY also removes it from reuse) so sibling Runs can drain; it must not `destroy()` that session. As in Cursor CLI's transport (connect-node 1.6.1 `Http2SessionManager`), a cached session is unref'd once connected and ref'd only while a Run stream (held Runs included; each stream a Run opens, a resend on a new connection too, holds its own session until it closes) or a reuse ping is live on it, so an idle session never keeps a headless host from exiting. Active binding LRU soft-evicts without wiping checkpoint/blobs/frozen; disk hydrate (`hydrateConversationState`) restores after process restart.
-- **Cache diagnostics:** Cursor exposes read/write counters only once at `TurnEnded`, aggregated across its held Run; it does not expose per-model-call cache splits. Debug traces must distinguish warm checkpoint continuity and stable RequestContext hashes from the aggregate read ratio, preserve prior/current token categories for comparison, and label unavailable per-call accounting rather than manufacturing it. Start every cache/token investigation with [`docs/cache-log-runbook.md`](docs/cache-log-runbook.md); it defines the reading order, field semantics, comparison math, common patterns, and handoff checklist.
-- **Compaction cache stability:** compaction and its following normal rebase must rotate `conversation_id` and discard checkpoints/blobs, but they transfer the frozen workspace context base and prior materialized-byte comparison seed to the new id. Live tools, MCP, host-advertised subagents, and plugin metadata are still rediscovered then epoch-held; reuse the complete RequestContext only when the refreshed encoding is byte-identical.
-- **Session key:** derive the OpenCode session key from `x-opencode-session-id` first, then fall back to `x-session-id` / `X-Session-Id` / `x-session-affinity`. OpenCode 2.x sends those fallbacks as its provider-cache affinity id (`parentID ?? fork.sessionID ?? id`, `core/src/session/affinity.ts`), so keying on them makes every subagent take over its parent's Cursor conversation and supersede its held Run. OpenCode 1.x sends the same value in both. `x-opencode-session` is never a key: OpenCode 2's stateless `generate.text` (`core/src/generate.ts`, since 2.0.19) sends only a freshly minted one, so keying on it made that no-tool call wait forever for a sibling catalog that never comes.
-- **Foreign history:** a sticky Cursor conversation contains only what Cursor produced. `src/protocol/turn-provenance.ts` records, per OpenCode session, what this provider emitted in its latest non-empty step (first 64 tool-call ids, first 4 KiB of whitespace-free text, and first 4 KiB of reasoning plus text in emission order; LRU-bounded and persisted in the restart snapshot). The second fingerprint exists because OpenCode 1.x replays a previous model's reasoning as `text` parts after any model change (`session/message-v2.ts` `differentModel`), and OpenCode 2 does the same for an assistant message that ended in error; matching text parts alone would flag our own turn after a Cursor→Cursor switch on 1.x. Before a fresh Run, a host latest assistant turn that matches none of them rotates the conversation (`foreign-history:foreign-assistant`) and seeds the full host history with every tool result; if that seed is estimated above 80% of the model context, throw a 413 "prompt is too long" `APICallError` before opening the Run so the host compacts. No record, or an assistant turn with no text and no tool calls, means no opinion and never forces a reseed. A step that did not finish (still streaming, stopped by the host, or saved at shutdown) also matches a prefix of its own text (the host keeps only what it read) and the step before it (the host drops an aborted message that holds nothing); a finished step matches only itself. A direct Cursor→Cursor model switch is **not** foreign history: Cursor CLI sends the next Run with the same `conversationId` and checkpoint and only the new model details (CLI 2026.09.28 `src/ui.tsx`, `src/acp/agent-session.ts`, `src/models/index.ts`). Do not reintroduce a model-switch remint.
-- **Unrestorable checkpoint:** only on the first pump pass of a fresh Run resumed from a stored checkpoint: if Cursor requested a 32-byte blob hash this client cannot serve (echoed content-as-id reads do not count) and the Run then fails transiently while every frame so far was a sole raw control field (one KV request, checkpoint update, or heartbeat-only interaction update — `isSoleControlFrame`), mark the failure `checkpointUnusable` and replay-safe and rebase onto a new conversation seeded with the full history and the real user message (`checkpoint-unusable`). Any other frame, including undecodable frames and unknown top-level fields, keeps the normal replay barrier.
-- **Host notes after tool results:** OpenCode 2.x lowers a mid-turn system update (skills or MCP instructions changed) to a user message wrapping `<system-update>…</system-update>`, the plan agent injects `<system-reminder>…</system-reminder>` after a step, OpenCode 2 loads a nested AGENTS.md during a step as a synthetic user message made of `Instructions from: <absolute path>\n<content>` blocks (no wrapper or marker reaches the provider; observed on 2.0.25), and OpenCode re-sends tool-result media as a user message captioned `Attached media from tool result:`. Those follow a step's tool results and are not a new user turn: skip them when locating the live tool-result tail (`liveTail`) and keep note bodies off tool `output`. Deliver each step's notes once, after its results, the way Cursor SDK `Run.steer` adds text to a running turn: `ConversationAction.inject_context_action{injection_id, expected_run_id, user_context{user_message{message_id, text}}}` with plain text (OC `<system-update>` unwrapped and XML-unescaped; no `<system_reminder>` or other wrapper). Read, MCP, shell and error results reach Cursor exactly as the tool returned them. Verified live 2026-10-08 with a realistic nested-AGENTS.md rule (claude-sonnet-5-5, claude-opus-5-5, grok-4.7): the injected rule was used in the same and the next turn 8/8, while postToolUse hook context on the result was refused by Sonnet 3/3 as tool-result content; an 11-model A/B agreed. Prompt cache and `RequestContext` bytes are unaffected (Claude/GPT warm reads unchanged; Grok's warm-read collapses also occur with no note). Do **not** use `system_context` (#4): Cursor rejects it (`producer_not_allowlisted`). Track each injection until `InteractionUpdate.context_injection_state` (#23) reports it, in the pump and in the fresh-turn drain: `delivered` clears it; `queued_for_next_turn`, `cancelled`, `rejected`, or a turn that ends unacknowledged keeps the notes for the session's next checkpointed user turn as `<system_reminder>` text (persisted with the restart snapshot), matching the SDK's revert-to-follow-up. Notes of a Run that closed without acknowledging them are released only once that Run is closed, never while it can still deliver them. When `pumpWithRecovery` replaces a failed Run, its unacknowledged notes move with the turn: re-injected into a `resume` Run (same turn, tracked anew so its turn-end snapshot keeps them), dropped for a `rebase` (the seeded host history holds them), and kept for the next user turn if recovery itself fails. In a steer step (user messages OpenCode promoted after the step's results; `continuationAfterEarlySteers`) the step's notes are injected after the results through this tracking, then the new messages as promoted early-steer records (see **Early steers**). A step whose results were all delivered already is not injected again, and a Run seeded from host history already holds its notes. Notes OpenCode places between the previous reply and the next user message (OpenCode 2 sends MCP-instruction `<system-update>` there) exist only in host history, which a checkpointed Run does not resend; they are part of that user turn's text, since `liveUserTurn` sends every user message since the model's last output (see **The user turn of a fresh Run**), and a deferred note that text already holds is not added again as a reminder. `context_injection_state` is status only and is not a replay barrier. Hook context (`ExecClientMessage.hook_additional_contexts` #45, `ShellStream.hook_context` #8) is kept for provider notices about one result. OpenCode 1 read output that appends a `<system-reminder>` after `</content>` is lifted out the same way and does not stay in the file body. Do not append plan-mode reminders (they would keep Cursor planning after a Yes). Detached media includes every tool result, including host-owned calls without Cursor correlation. Attribute only uniquely determined slices using result order and OpenCode's read/placeholder markers; opaque text-plus-media tools do not prove an owner, so ambiguous images remain in history. Decode only image-bearing pending execs, under one continuation-wide 20 MiB budget; skip failed/bridged/foreign results, preserve cancellation, and report unreadable or oversized images (a read that kept an image is encoded from its bytes, so its omission notice rides as hook context on that read). Fresh/rebased Runs use the same attachment normalization. Attributed media rides on the exec result where its shape has an image field (`ReadSuccess.data` for a native read; `McpImageContent` items on `McpToolResultContentItem` #2 for `mcp_result`, matching Cursor CLI's read and MCP executors). Delivered images are recorded with the session's sent history-image hashes so the next fresh Run does not attach them again. Treating them as a fresh turn cancelled CreatePlan as a fake No, superseded the held Run, or ran an unpersisted isolated helper. A genuine new user message that still carries the approval result in history must deliver that result rather than invent a rejection.
-- **Early steers (OpenCode 2):** OpenCode 2 accepts a mid-turn message into the session inbox at once (`session.inbox.enqueued` with `delivery: "steer"`, or `session.inbox.delivery.changed` to `steer`) but adds it to the prompt only at the next step boundary, which a Cursor-side wait (AwaitShell, a long answer) does not reach. `src/host-steer.ts` (process-global) hands a plain-text steer to the Run being pumped for its session, which injects it like a host note (`inject_context_action`, backpressured write, re-checked just before it is written); compaction Runs, ending turns and Runs not pumping are skipped. OpenCode's own copy still comes later and is matched exactly (ignoring `<system-reminder>`): a copy of an answered steer needs no Run (a host note beside it still gets a Run, without the copy, so a background shell or subagent report wakes the model), a copy after tool results while the held Run has the steer continues that Run without it (a follow-up Run if Cursor never took it), and a steer Cursor never took is left to that copy. A message promoted after tool results with no early copy (sent while the host ran the step's tools, so no Run was pumping) is recorded the same way and injected into the held Run after the results when that Run waits on exactly them, for the session's own user step and model (`heldRunTakesSteers`; fork, CP-10); otherwise it goes to a follow-up Run (beside a matched copy) or the step stays a fresh turn. Recovery moves checkpointed steers to a resumed Run; a Run that ended without answering a steer that its checkpoint and host history disagree on (a Stop, a failed recovery) makes the next turn rebuild from host history. Delivery receipts are saved with the conversation checkpoint (snapshot field 14, as upstream; older fork builds wrote answered-steer texts there, so a field-14 value is used only when it is the one occurrence and parses as receipts, and otherwise ignored while the snapshot still restores) and restored before matching a promoted copy, including a copy that needs no Run. Keep answered receipts through failed steps and scope consumed copies to their host prompt boundary at both fresh-turn and tool-result promotion paths (including queued follow-ups), so a later identical user message is still new. Match plain-text copies individually and preserve attachment-bearing neighbors with every part intact. A fresh user Run sends every pending user message in order and excludes that live range from seeded history; lifecycle helpers and recovery resumes keep their dedicated behavior.
-- **Personal use:** private Cursor agent protocol; account you own; API can change without notice.
-
-## Env / paths (quick)
-
-| Variable / path | Role |
-|-----------------|------|
-| `CURSOR_API_BASE_URL` | Auth, models, GetServerConfig (default `https://api2.cursor.sh`) |
-| `CURSOR_WEBSITE_URL` | OAuth login base |
-| `CURSOR_PROVIDER_DEBUG` | Wire debug log (`CURSOR_PROVIDER_DEBUG_FILE`; default under `$TMPDIR/cursor-provider-logs-<uid>/debug-<pid>.log`) |
-| `CURSOR_GET_SERVER_CONFIG_TELEMETRY` | Opt in GetServerConfig telemetry |
-| `CURSOR_AGENT_TRANSCRIPTS_FOLDER` | Optional existing transcript directory; advertised only at conversation-base creation, never created or written by the provider |
-| `CURSOR_OPENCODE2_DEV_ENTRY` | Local dev only: absolute path to a built entry file (e.g. `dist/index.js`). Points the 2.0 `aisdk:` package spec at `file://…` so OpenCode 2.0's built-in fallback imports it directly instead of `npm install`-ing the published package into `<host-cache>/packages/cursor-opencode-provider/`. Unset in production. |
-| `CURSOR_OPENCODE2_TODOS` | OpenCode 2.0 only. `1` or `true` force-enables plugin-owned `todowrite`/`todoread`. Off by default. 1.x host builtin is not gated. |
-| `createCursor({ cacheDir })` | Explicit host cache root (also Effect v2 `Path.cache` when the plugin passes it) |
-| `XDG_CACHE_HOME` | Native OpenCode cache base (`$XDG_CACHE_HOME/opencode`, otherwise `~/.cache/opencode`); an optional structural host path bridge may provide the host cache root |
-| `XDG_DATA_HOME` | Native OpenCode data base (`$XDG_DATA_HOME/opencode`, otherwise `~/.local/share/opencode`); an optional structural host path bridge may provide the host data root |
-| `<host-cache>/cursor-models.json` | Model cache under the resolved OpenCode/host cache root |
-| `<host-cache>/cursor-conversations/*.pb.gz` | One atomic gzip-compressed protobuf restart snapshot per stable host session (checkpoint, reachable blobs, stable context base, compaction tool fallback, compaction marker, turn provenance), updated at successful `TurnEnded` and for a Run in progress the host holds on a tool, stops or shuts down; records expire after 24h |
-| `<host-cache>/projects/<slug>/` | Cursor project metadata root (`project_folder` / `workspace_project_dir`; keeps `agent-tools` out of the git workspace) |
-| `<worktree>/.opencode/plans/` | OpenCode 1.x session plan files (`Session.plan`) in a VCS project; a path bridge's `planFile` overrides |
-| `<data>/plans/` | OpenCode 1.x session plan files without VCS, and plans when the session file is unknown; a path bridge uses `<globalDataDir>/plans` |
-| `~/.opencode/plan/` | OpenCode 2.0 Plan directory (`OPENCODE_TEST_HOME` replaces home, as in the host) |
-| OpenCode auth | `~/.local/share/opencode/auth.json` (`$XDG_DATA_HOME`) |
+A request only to bump/tag/publish still requires steps 1–4 first; report their
+results before touching the version. The failed-release rationale belongs in
+[general lessons](tasks/lessons/opencode.md#auth-models-and-delivery-process).
 
 ## Changelog
 
-Location: `CHANGELOG.md` (repo root; this is a single-package repo).
+Use `CHANGELOG.md` → `## [Unreleased]`, with applicable `### Breaking Changes`
+(first), `Added`, `Changed`, `Fixed`, `Removed` sections. Entries are brief,
+user-facing, and link issues/PRs with public contributor attribution. Leave
+released sections immutable. Pure docs/test/CI changes need no entry unless
+operator or integrator behavior changes. Normalize formatting at release time.
 
-**Format** — sections under `## [Unreleased]`:
-
-- `### Breaking Changes` (first if present)
-- `### Added`
-- `### Changed`
-- `### Fixed`
-- `### Removed`
-
-**Rules:**
-
-- New user-facing entries always go under `## [Unreleased]` in the same PR/commit as the change.
-- Entries are one line, brief, and user-facing: lead with what the user will see or can now do. Root-cause narration and implementation detail belong in the commit/PR, not the changelog.
-- Skip pure chore/docs/test/CI-only work unless it changes something operators or integrators must know (for example a publish-breaking pricing map fix that ships in a release).
-- Never modify already-released sections (e.g. `## [0.8.0]`) — they are immutable after the tag exists.
-- On release, rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` (UTC date of the release), then insert a fresh empty `## [Unreleased]` above it. Do not leave an empty dated version section.
-- Do not bikeshed changelog section order or bullet formatting in reviews or PRs — keep entries accurate and user-facing; normalize order when finalizing a release.
-
-**Attribution:**
-
-- Internal (from issues): `Fixed foo bar ([#123](https://github.com/oakimov/cursor-opencode-provider/issues/123))`.
-- External contributions: `Added feature X ([#456](https://github.com/oakimov/cursor-opencode-provider/pull/456) by [@username](https://github.com/username))`.
-- For external PRs, add the PR link and contributor credit after GitHub assigns the number, then push the entry before considering the changelog done.
-
-## Docs map
-
-| File | Purpose |
-|------|---------|
-| `README.md` | User-facing overview, shared model catalog, troubleshooting |
-| `CHANGELOG.md` | User-facing release notes (`[Unreleased]` + dated versions) |
-| `docs/opencode-1.md` | OpenCode 1.x install (classic `plugin` + optional 1.18 `plugin/v2`) |
-| `docs/opencode-2.md` | OpenCode 2.0 install (`plugin/opencode2`) and migration off `ctx.catalog` / the `opencode.json` catalog dump |
-| `AGENTS.md` | Canonical agent/project context (this file) |
-| `docs/README.md` | Documentation navigation and ownership |
-| `tasks/lessons.md` | Lessons index; links to general, 1.x and 2.0 incident lessons |
-| `.claude/CLAUDE.md` | Pointer to `AGENTS.md` for Claude Code |
-| `docs/cache-log-runbook.md` | Maintainer runbook for capturing, reading, comparing, and handing off cache/token debug logs |
-| `docs/host-compat-acceptance.md` | Pre-release stock-host TTY checklist for CreatePlan, mode switching, generic Pi isolation, and cache stability |
+Documentation ownership and environment/setup references:
+[docs index](docs/README.md), [README](README.md), [1.x guide](docs/opencode-1.md),
+[2.0 guide](docs/opencode-2.md), [lessons index](tasks/lessons.md).
