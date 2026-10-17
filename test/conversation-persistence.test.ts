@@ -270,6 +270,57 @@ describe("conversation restart persistence", () => {
     expect(snapshotHeldHistoryImagesForTests(sessionKey)).toEqual([])
   })
 
+  it("saves history image hashes on field 16 and their checkpoint on field 17", async () => {
+    const root = await cacheRoot()
+    const sessionKey = "ses_image_fields"
+    const hashes = ["a".repeat(64), "b".repeat(64)]
+    const checkpoint = "c".repeat(64)
+    const text = (value: string) => {
+      const bytes = Buffer.from(value)
+      return [...(bytes.length < 0x80 ? [bytes.length] : [(bytes.length & 0x7f) | 0x80, bytes.length >> 7]), ...bytes]
+    }
+    const fields = Buffer.from([
+      0x82, 0x01, ...text(hashes[0]!), // sent_image_hashes #16
+      0x82, 0x01, ...text(hashes[1]!), // sent_image_hashes #16
+      0x8a, 0x01, ...text(checkpoint), // sent_images_checkpoint_sha256 #17
+    ])
+    const earlySteers = JSON.stringify({ version: 1, records: [] })
+    const lostRequest = JSON.stringify({ conversationId: "conversation-image-fields", checkpointKey: "k", text: "lost" })
+    const modelFallbackStop = "model-fallback-stop"
+    const snapshot = {
+      sessionKey,
+      conversationId: "conversation-image-fields",
+      checkpoint: Uint8Array.from([1]),
+      blobs: [],
+      requestContext: { rules_info_complete: true },
+      toolCatalog: [],
+      postCompactionRebase: false,
+      earlySteers,
+      lostRequest,
+      modelFallbackStop,
+    }
+    const filePath = conversationCacheFilePath(root, sessionKey)
+
+    await persistConversation(root, { ...snapshot, sentImageHashes: hashes, sentImagesCheckpoint: checkpoint })
+    const saved16and17 = gunzipSync(await readFile(filePath))
+    expect(saved16and17.includes(fields)).toBe(true)
+    expect(saved16and17.includes(Buffer.from([0x72, ...text(earlySteers)]))).toBe(true) // early_steers_json #14
+    expect(saved16and17.includes(Buffer.from([0x7a, ...text(lostRequest)]))).toBe(true) // lost_request_json #15
+    expect(saved16and17.includes(Buffer.from([0xaa, 0x06, ...text(modelFallbackStop)]))).toBe(true) // #101
+
+    await persistConversation(root, snapshot)
+    const withoutImages = gunzipSync(await readFile(filePath))
+    expect(withoutImages.includes(fields)).toBe(false)
+    await writeFile(filePath, gzipSync(Buffer.concat([withoutImages, fields])))
+    await clearMemory()
+    const saved = await getPersistedConversation(root, sessionKey)
+    expect(saved?.sentImageHashes).toEqual(hashes)
+    expect(saved?.sentImagesCheckpoint).toBe(checkpoint)
+    expect(saved?.earlySteers).toBe(earlySteers)
+    expect(saved?.lostRequest).toBe(lostRequest)
+    expect(saved?.modelFallbackStop).toBe(modelFallbackStop)
+  })
+
   it("keeps the older checkpoint's images when a turn ends without a checkpoint of its own", async () => {
     const root = await cacheRoot()
     const older = Uint8Array.from([4, 5])

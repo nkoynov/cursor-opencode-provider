@@ -13,7 +13,12 @@ import {
   normalizeAgentRunOrigin,
   type BidiStream,
 } from "./transport/connect.js"
-import { StreamWriteDrainError, waitForStreamWrites, writeStreamMessage as writeWithBackpressure } from "./stream-write.js"
+import {
+  isStreamWriteBlocked,
+  StreamWriteDrainError,
+  waitForStreamWrites,
+  writeStreamMessage as writeWithBackpressure,
+} from "./stream-write.js"
 import {
   clearUnansweredEarlySteers,
   forgetEarlySteerRecords,
@@ -1364,12 +1369,20 @@ export async function pumpWithRecovery(input: {
     const pumpedSession = session
     const pumpOwner = Symbol("cursor-pump")
     sessionManager.beginPump(pumpedSession, pumpOwner)
-    const cancelPumpUpload = () => {
+    // OpenCode 1.x stops a turn by aborting the signal, before the AI SDK cancels
+    // the stream. Cancel at Cursor, as the stream's cancel() does, so Cursor ends
+    // the Run on a checkpoint; a reply still waiting for drain would hold the
+    // cancel back, so then reset the Run at once.
+    const stopPumpedRun = () => {
       if (!sessionManager.isPumpOwner(pumpedSession, pumpOwner) || pumpedSession.pending.size > 0 || pumpedSession.hostInterrupted) return
+      if (!isStreamWriteBlocked(pumpedSession.stream)) {
+        cancelForHostInterrupt(pumpedSession, "aborted")
+        return
+      }
       dropLostRequest(pumpedSession.openCodeSessionId)
       sessionManager.close(pumpedSession, "host-interrupted", new CursorLocalCancellationError("Cursor Run cancelled locally"))
     }
-    input.abortSignal?.addEventListener("abort", cancelPumpUpload, { once: true })
+    input.abortSignal?.addEventListener("abort", stopPumpedRun, { once: true })
     // A compaction Run keeps the session id, but a steer is for the agent, not the summarizer.
     const stopSteers = pumpedSession.openCodeSessionId && !pumpedSession.postCompactionRebase
       ? listenForHostSteers(pumpedSession.openCodeSessionId, (steer) => injectHostSteer(pumpedSession, steer))
@@ -1455,7 +1468,7 @@ export async function pumpWithRecovery(input: {
       await sleepForRetry(delayMs, input.abortSignal)
       session = await reopen(pumpedSession, failure, checkpoint)
     } finally {
-      input.abortSignal?.removeEventListener("abort", cancelPumpUpload)
+      input.abortSignal?.removeEventListener("abort", stopPumpedRun)
       stopSteers?.()
       // Cancellation cleanup inside pump() must keep an active owner alive.
       // Retry after releasing this owner so a stopped consumer with no pending

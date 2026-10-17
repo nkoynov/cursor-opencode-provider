@@ -333,6 +333,62 @@ describe("a turn stopped mid-step, continued by the next process", () => {
     }
   }, 30_000)
 
+  it("cancels at Cursor on an OpenCode 1.x Stop, which aborts the call before it cancels the stream", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-interrupt-abort-"))
+    cacheHttp2SessionForTests(ORIGIN, client)
+    try {
+      const sessionKey = "ses_restart_aborted"
+      const model = () =>
+        createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      onRun = (run, message) => {
+        const index = runs.indexOf(run)
+        if (message.run_request && index === 0) {
+          run.send({ interaction_update: { text_delta: { text: "Partial " } } })
+          run.send({ conversation_checkpoint_update: checkpoint("mid-answer") })
+        } else if (message.conversation_action?.cancel_action && index === 0) {
+          run.send({ conversation_checkpoint_update: checkpoint("cancelled") })
+          run.send({ interaction_update: { turn_ended: { input_tokens: 10, output_tokens: 2 } } })
+        } else if (message.run_request) {
+          run.send({ interaction_update: { text_delta: { text: "Going on." } } })
+          run.send({ interaction_update: { turn_ended: { input_tokens: 10, output_tokens: 2 } } })
+        }
+      }
+      const turn1: Prompt = [{ role: "user", content: [{ type: "text", text: "Explain it." }] }]
+      const stop = new AbortController()
+      const { stream } = await model().doStream({
+        prompt: turn1,
+        tools: [{ type: "function", name: "read", description: "Read a file.", inputSchema: { type: "object", properties: {} } }],
+        headers: { "x-opencode-session-id": sessionKey },
+        abortSignal: stop.signal,
+      } as LanguageModelV3CallOptions)
+      const reader = stream.getReader()
+      for (;;) {
+        const { value } = await reader.read()
+        if (value?.type === "text-delta") break
+      }
+      // AI SDK streamText sees the aborted signal on its next read, then cancels the provider stream.
+      stop.abort()
+      await reader.cancel()
+      await until(() => !sessionManager.findOpenByOpenCodeSessionId(sessionKey))
+      await notifyHostInterrupt(undefined, "shutdown")
+      restartProcess()
+
+      await collect(model(), [
+        ...turn1,
+        { role: "assistant", content: [{ type: "text", text: "Partial " }] },
+        { role: "user", content: [{ type: "text", text: "go on" }] },
+      ], sessionKey)
+      const stopped = runRequest(runs[0]!)
+      const next = runRequest(runs[runs.length - 1]!)
+      const state = decodeMessage<Record<string, any>>("ConversationStateStructure", next.conversation_state)
+      expect(runs[0]!.received.filter((message) => message.conversation_action?.cancel_action)).toHaveLength(1)
+      expect(next.conversation_id).toBe(stopped.conversation_id)
+      expect(state.root_prompt_messages_json).toEqual(["cancelled"])
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
   it("keeps the conversation after a Stop while Cursor's turn end is being saved, when the host kept less than was sent", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-interrupt-turn-end-"))
     cacheHttp2SessionForTests(ORIGIN, client)

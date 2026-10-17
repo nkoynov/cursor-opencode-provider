@@ -105,7 +105,11 @@ These are failure lessons shared by both hosts, not a replacement for
   missed initial/replacement uploads, continuation delivery and a blocked pump
   reply. Cover each through `doStream`, including an already-aborted signal;
   pass the current step's signal and detach temporary listeners before the
-  ordinary tool-step abort (`test/write-drain.test.ts`).
+  ordinary tool-step abort (`test/write-drain.test.ts`). A pump listener that
+  reset the Run on every abort also pre-empted the OpenCode 1.x Stop, which
+  aborts before the AI SDK cancels the stream, so Cursor never got
+  `cancel_action`; reset only a write blocked on drain, and test Stop in the
+  host's own order (`test/interrupt-restart.test.ts`).
 - **Rejecting a drain does not release its resources.** Plain stream close left
   buffered bytes live; `end()` then made `destroy()` skip its reset. CANCEL must
   close the actual stream so its session ref is released. Test child-process

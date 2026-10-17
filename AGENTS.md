@@ -120,6 +120,9 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   continuation delivery and the active pump use their current call's signal.
   Detach temporary listeners after upload so an ordinary tool-step abort keeps
   the held Run alive. Replacement callbacks must not capture the first signal.
+  An abort of the pumping step with nothing owed (OpenCode 1.x Stop aborts
+  before the stream is cancelled) sends `cancel_action` like any Stop; only a
+  write still waiting for drain resets the Run at once.
 - Local cancellation resets buffered streams with `NGHTTP2_CANCEL`; `destroy()`
   must work after `end()`. Retiring a cached connection must let siblings drain,
   never destroy them. Direct and proxy connections use `maxSessionMemory: 256`.

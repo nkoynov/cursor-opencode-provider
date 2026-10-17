@@ -202,9 +202,10 @@ function cloneConversation(value: PersistedConversation): PersistedConversation 
  * updated_at=4, checkpoint=5, blobs=6, request_context=7, tool_catalog=8,
  * post_compaction_rebase=9, host_agent=10, system_prompt_hash=11,
  * turn_provenance_json=12, host_note=13, early_steers_json=14,
- * model_fallback_stop_json=15, sent_image_hashes=16 (repeated),
- * sent_images_checkpoint_sha256=17. Older fork builds wrote field 14 as
- * repeated answered-steer strings; those are ignored on read.
+ * lost_request_json=15, sent_image_hashes=16 (repeated), sent_images_checkpoint_sha256=17,
+ * model_fallback_stop_json=101 (fork). Older fork builds wrote field 14 as
+ * repeated answered-steer strings, ignored on read, and the model-fallback stop
+ * as field 15, read as that stop when it is not a lost-request record.
  * Blob: id=1, data=2. Tool: name=1, description=2,
  * input_schema_json=3, source_name=4.
  *

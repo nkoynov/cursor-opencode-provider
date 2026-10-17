@@ -7,7 +7,7 @@ import { createHash } from "node:crypto"
 /** Mirrors MAX_TURN_STATE_SESSIONS. */
 const MAX_SESSIONS = 256
 const MAX_IMAGES_PER_SESSION = 256
-/** A model-switch stop rolls back to a checkpoint from earlier in its turn. */
+/** A stopped or failed turn, or a model-switch stop, leaves the next Run on an earlier checkpoint. */
 const MAX_CHECKPOINTS_PER_SESSION = 32
 
 /** `hashes` is shared between entries and never mutated. */

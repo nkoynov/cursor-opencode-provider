@@ -100,13 +100,19 @@ describe("history images a checkpoint holds", () => {
     expect(held(C1)).toEqual([])
   })
 
-  it("follows a rekey to the same checkpoint bytes and drops on forget", () => {
+  it("keeps a set to its conversation id and drops it on forget", () => {
+    turn(undefined, ["a"], C1)
+    expect(held(C1, "other-conversation")).toEqual([])
+    expect(held(C1)).toEqual(["a"])
+    forgetHeldHistoryImages(SESSION)
+    expect(held(C1)).toEqual([])
+  })
+
+  it("follows a rekey to the same checkpoint bytes", () => {
     turn(undefined, ["a"], C1)
     rebindHeldHistoryImages(SESSION, CONVERSATION, "rekeyed")
     expect(held(C1)).toEqual([])
     expect(held(C1, "rekeyed")).toEqual(["a"])
-    forgetHeldHistoryImages(SESSION)
-    expect(held(C1, "rekeyed")).toEqual([])
   })
 
   it("keeps the newest 256 hashes", () => {

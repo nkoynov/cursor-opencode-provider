@@ -21,6 +21,13 @@ export class StreamWriteDrainError extends CursorTransportError {
 }
 
 const streamWriteChains = new WeakMap<BidiStream, Promise<unknown>>()
+/** Streams whose current write is buffered and waiting for `drain`. */
+const drainingStreams = new WeakSet<BidiStream>()
+
+/** True while a write on `stream` waits for `drain`; anything written next queues behind it. */
+export function isStreamWriteBlocked(stream: BidiStream): boolean {
+  return drainingStreams.has(stream)
+}
 
 export async function waitForStreamWrites(stream: BidiStream): Promise<void> {
   const pending = streamWriteChains.get(stream)
@@ -77,6 +84,7 @@ async function writeStreamMessageNow(
   // out, so a timeout here would cap the upload, not detect a stall. Cursor CLI
   // (connect-node) waits the same way; a closed or idle stream settles it.
   const startedAt = Date.now()
+  drainingStreams.add(stream)
   try {
     await stream.waitForDrain()
     trace(`stream write drained: operation=${operation} bytes=${message.length} ms=${Date.now() - startedAt}`)
@@ -85,5 +93,7 @@ async function writeStreamMessageNow(
       `Cursor ${operation} backpressure drain failed`,
       cause,
     )
+  } finally {
+    drainingStreams.delete(stream)
   }
 }
