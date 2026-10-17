@@ -497,7 +497,7 @@ describe("deliverContinuationResults", () => {
     const result = decodeMessage<any>("AgentClientMessage", writes[0]).exec_client_message
     expect(Uint8Array.from(result.read_result.success.data)).toEqual(data)
     expect(result.read_result.success.content).toBeUndefined()
-    expect(live.historyImages.sent).toEqual(["hash"])
+    expect(live.historyImages.sent.map((image) => image.hash)).toEqual(["hash"])
   })
 
   it("injects a host update after an image read and leaves the bytes unchanged", async () => {

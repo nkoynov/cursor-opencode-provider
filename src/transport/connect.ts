@@ -754,6 +754,18 @@ function acquireSession(
   return promise.then((session) => ({ session, verified: true }))
 }
 
+/** Process-wide order in which Run frames came off the network, before any reader takes them. */
+const frameArrivals = new WeakMap<object, number>()
+let lastArrival = 0
+
+export function frameArrival(frame: object): number | undefined {
+  return frameArrivals.get(frame)
+}
+
+export function lastFrameArrival(): number {
+  return lastArrival
+}
+
 export async function bidiRunStream(
   token: string,
   options: {
@@ -1092,7 +1104,10 @@ export async function bidiRunStream(
     const consumed = parsed.reduce((sum, frame) => sum + 5 + frame.payload.length, 0)
     pendingChunks.length = 0
     if (consumed < merged.length) pendingChunks.push(merged.subarray(consumed))
-    for (const frame of parsed) enqueueFrame(frame)
+    for (const frame of parsed) {
+      frameArrivals.set(frame, ++lastArrival)
+      enqueueFrame(frame)
+    }
   }
   const startInboundReader = () => {
     if (inboundReaderStarted || locallyClosed || remotelyClosed || streamFailure) return

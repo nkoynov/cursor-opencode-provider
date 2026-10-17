@@ -307,6 +307,48 @@ describe("history images through a full provider Run", () => {
     expect(sentImages(2)).toEqual([IMAGE_B])
   }), 30_000)
 
+  it.each([
+    ["sends it again when the turn's last checkpoint arrived before it, queued while the tool ran", 100, undefined, checkpoint(40), [IMAGE_B]],
+    ["sends it again when the turn's last checkpoint arrived before it, unread when the result was written", 0, undefined, checkpoint(40), [IMAGE_B]],
+    ["counts it as held when the turn ends on a checkpoint sent after it", 100, checkpoint(41), checkpoint(41), []],
+  ] as const)("after a restart, a tool-result image: %s", (_, toolMs, afterResult, resumed, resent) => withRoot(async (root) => {
+    const sessionKey = `ses_images_tool_result_${toolMs}_${afterResult?.[2] ?? "none"}`
+    const file = path.join(root, "shot.png")
+    fs.writeFileSync(file, Buffer.from(IMAGE_B, "base64"))
+    onRun = (run, message) => {
+      const index = runs.indexOf(run)
+      if (message.run_request && index === 1) {
+        run.send({ exec_server_message: { id: 1, read_args: { path: file } } })
+        run.send({ conversation_checkpoint_update: checkpoint(40) })
+      } else if (message.exec_client_message?.read_result) {
+        endTurnOn(run, afterResult)
+      } else if (message.run_request) {
+        endTurnOn(run, checkpoint(index + 1))
+      }
+    }
+    const turn1: Prompt = [user("First screenshot.", IMAGE_A)]
+    await collect(model(root), turn1, sessionKey)
+    const turn2: Prompt = [...turn1, assistant("Done."), user("Read shot.png.")]
+    const call = (await collect(model(root), turn2, sessionKey)).find((part) => part.type === "tool-call")
+    if (call?.type !== "tool-call") throw new Error("Expected read")
+    await Bun.sleep(toolMs)
+    const turn3: Prompt = [
+      ...turn2,
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: call.toolCallId, toolName: "read", input: JSON.parse(call.input) }] },
+      { role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: "read",
+        output: { type: "content", value: [{ type: "text", text: "Image read successfully" },
+          { type: "image-data", mediaType: "image/png", data: IMAGE_B }] } }] },
+    ] as Prompt
+    await collect(model(root), turn3, sessionKey)
+    restartProcess()
+    await collect(model(root), [...turn3, assistant("Done."), user("What was in it?")], sessionKey)
+
+    const result = runs[1]!.received.find((message) => message.exec_client_message?.read_result)!
+    expect(Buffer.from(result.exec_client_message.read_result.success.data).toString("base64")).toBe(IMAGE_B)
+    expect(sentCheckpoint(2)).toEqual(resumed)
+    expect(sentImages(2)).toEqual([...resent])
+  }), 30_000)
+
   it("sends again the image of a turn whose Run failed after a checkpoint", () => withRoot(async (root) => {
     const sessionKey = "ses_images_failed"
     onRun = (run, message) => {

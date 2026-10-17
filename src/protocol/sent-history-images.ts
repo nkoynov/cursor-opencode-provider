@@ -18,10 +18,15 @@ const heldBySession = new Map<string, HeldImages[]>()
 
 /**
  * One Run's view: `held` by the checkpoint it last stood on, `checkpointed` sent
- * before Cursor's latest checkpoint, `sent` since. Only a turn that ends on a
- * checkpoint of its own moves `checkpointed` into `held`.
+ * before Cursor's latest checkpoint arrived, `sent` since, each with the last
+ * frame arrival at its send. Only a turn that ends on a checkpoint of its own
+ * moves `checkpointed` into `held`.
  */
-export type RunHistoryImages = { held: readonly string[]; checkpointed: string[]; sent: string[] }
+export type RunHistoryImages = {
+  held: readonly string[]
+  checkpointed: string[]
+  sent: Array<{ hash: string; afterArrival: number }>
+}
 
 export function checkpointFingerprint(checkpoint: Uint8Array): string {
   return createHash("sha256").update(checkpoint).digest("hex")
@@ -79,19 +84,26 @@ export function runHistoryImages(held?: ReadonlySet<string>): RunHistoryImages {
   return { held: [...(held ?? [])], checkpointed: [], sent: [] }
 }
 
-export function noteHistoryImagesSent(run: RunHistoryImages, hashes: readonly string[]): void {
-  run.sent.push(...hashes)
+/** `lastArrival`: the last frame arrival once the images are written. */
+export function noteHistoryImagesSent(run: RunHistoryImages, hashes: readonly string[], lastArrival = 0): void {
+  run.sent.push(...hashes.map((hash) => ({ hash, afterArrival: lastArrival })))
 }
 
-/** Cursor's checkpoints extend the one the Run started on, so each holds at least what that one held. */
+/**
+ * Cursor's checkpoints extend the one the Run started on, so each holds at least what that one held.
+ * A checkpoint that arrived before images were written (read only after a host tool's result) holds none of them.
+ */
 export function noteHistoryImageCheckpoint(
   run: RunHistoryImages,
   sessionKey: string,
   conversationId: string,
   checkpoint: Uint8Array,
+  arrival = Infinity,
 ): void {
-  run.checkpointed.push(...run.sent)
-  run.sent = []
+  const later = run.sent.findIndex((image) => image.afterArrival >= arrival)
+  const earlier = later < 0 ? run.sent.length : later
+  run.checkpointed.push(...run.sent.slice(0, earlier).map((image) => image.hash))
+  run.sent = run.sent.slice(earlier)
   recordHeldHistoryImages(sessionKey, conversationId, checkpoint, run.held)
 }
 

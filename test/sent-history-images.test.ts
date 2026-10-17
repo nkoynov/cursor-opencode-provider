@@ -68,6 +68,23 @@ describe("history images a checkpoint holds", () => {
     expect(run).toEqual({ held: ["a"], checkpointed: [], sent: [] })
   })
 
+  it("gives a checkpoint only the images written before its frame arrived", () => {
+    const run = runHistoryImages()
+    noteHistoryImagesSent(run, ["a"], 10)
+    noteHistoryImagesSent(run, ["tool-image"], 12)
+    noteHistoryImageCheckpoint(run, SESSION, CONVERSATION, C1, 12)
+    confirmHistoryImagesAtTurnEnd(run, SESSION, CONVERSATION, C1)
+    expect(held(C1)).toEqual(["a"])
+
+    const next = runHistoryImages(heldHistoryImageHashes(SESSION, CONVERSATION, C1))
+    noteHistoryImagesSent(next, ["b"], 20)
+    noteHistoryImageCheckpoint(next, SESSION, CONVERSATION, C2, 21)
+    noteHistoryImagesSent(next, ["c"], 25)
+    noteHistoryImageCheckpoint(next, SESSION, CONVERSATION, C3, 26)
+    confirmHistoryImagesAtTurnEnd(next, SESSION, CONVERSATION, C3)
+    expect(held(C3)).toEqual(["a", "b", "c"])
+  })
+
   it("carries what a turn confirmed into a follow-up Run on the same Cursor session", () => {
     const run = turn(undefined, ["a"], C1)
     noteHistoryImageCheckpoint(run, SESSION, CONVERSATION, C2)
