@@ -10,6 +10,7 @@ import {
   bidiRunStream,
   cacheHttp2SessionForTests,
   closeCachedHttp2SessionsForTests,
+  resetRunCompressionForTests,
 } from "../dist/transport/connect.js"
 import { encodeFrame } from "../dist/protocol/framing.js"
 import { writeStreamMessage } from "../dist/stream-write.js"
@@ -25,6 +26,8 @@ import { encodeMessage } from "../dist/protocol/messages.js"
 // Bun. Adapted from the relay tests in #77 (by @nkoynov).
 process.env.CURSOR_CLIENT_VERSION = "cli-node-drain-test-1"
 const ORIGIN = "https://agentn.node-drain-test.cursor.sh"
+// Gzip would shrink these filled payloads below the stream's buffers, so nothing would backpressure.
+resetRunCompressionForTests(ORIGIN)
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const failureOf = (promise) => promise.then(() => undefined, (error) => error)
 const waitUntil = async (condition, ms = 5_000) => {
@@ -244,7 +247,9 @@ for (const [name, bytes, close] of [
 ]) {
   const script = `
 import http2 from "node:http2"
-import { bidiRunStream, cacheHttp2SessionForTests } from ${JSON.stringify(CONNECT_MODULE)}
+import { bidiRunStream, cacheHttp2SessionForTests, resetRunCompressionForTests } from ${JSON.stringify(CONNECT_MODULE)}
+// Gzip would shrink the filled request below the stream's buffers, so it would never block.
+resetRunCompressionForTests("https://agentn.node-exit-test.cursor.sh")
 const server = http2.createServer()
 server.on("session", (session) => session.unref())
 const arrived = new Promise((resolve) => server.on("stream", (stream) => {
