@@ -13,6 +13,8 @@ export type CursorErrorDiagnostics = {
   rstCode?: number
   code?: string
   retryAfterMs?: number
+  /** The message Cursor's error carried (Connect error envelope or `grpc-message`). */
+  serverMessage?: string
 }
 
 export type CursorProviderErrorOptions = CursorErrorDiagnostics & {
@@ -43,6 +45,7 @@ export class CursorProviderError extends Error {
   readonly retryAfterMs?: number
   /** Cursor's own verdict (`ErrorDetails.details.isRetryable`), when it gave one. */
   readonly retryable?: boolean
+  readonly serverMessage?: string
 
   constructor(message: string, options: CursorProviderErrorOptions) {
     super(message, options.cause === undefined ? undefined : { cause: options.cause })
@@ -56,6 +59,7 @@ export class CursorProviderError extends Error {
     this.code = options.code
     this.retryAfterMs = options.retryAfterMs
     this.retryable = options.retryable
+    this.serverMessage = options.serverMessage
   }
 }
 
@@ -266,6 +270,26 @@ export function isCapacityFailure(error: CursorProviderError): boolean {
   if (error.statusCode === 429 || error.statusCode === 503) return true
   return [error.code, error.grpcStatus].some((value) =>
     value !== undefined && CAPACITY_CODES.has(String(value).toLowerCase().replaceAll("-", "_")))
+}
+
+const normalizedStatus = (value: number | string) => String(value).toLowerCase().replaceAll("-", "_")
+const COMPRESSION_UNSUPPORTED_CODES = new Set(["unimplemented", "12"])
+const COMPRESSION_DECODE_CODES = new Set(["invalid_argument", "internal", "3", "13"])
+
+/**
+ * Cursor could not take a gzip-compressed message: HTTP 415, `unimplemented` (Connect's answer to an
+ * unsupported `connect-content-encoding`), or `invalid_argument`/`internal` whose message names the compression.
+ */
+export function isCompressionRejection(
+  error: Pick<CursorErrorDiagnostics, "statusCode" | "code" | "grpcStatus" | "serverMessage">,
+): boolean {
+  if (error.statusCode === 415) return true
+  const codes = [error.code, error.grpcStatus]
+    .filter((value): value is number | string => value !== undefined)
+    .map(normalizedStatus)
+  if (codes.some((code) => COMPRESSION_UNSUPPORTED_CODES.has(code))) return true
+  return codes.some((code) => COMPRESSION_DECODE_CODES.has(code))
+    && /compress|gzip|encoding/i.test(error.serverMessage ?? "")
 }
 
 export function isAuthGrpcStatus(status: number | string): boolean {

@@ -2179,6 +2179,16 @@ export function createMessageTypes(): protobuf.Root {
 
   // ── AgentServerMessage ──
 
+  addType(root, "TtftBreakdown", [
+    { id: 1, name: "server_first_token_ms", type: "double" },
+    { id: 2, name: "pre_stream_setup_ms", type: "double" },
+    { id: 3, name: "wait_for_first_event_ms", type: "double" },
+    { id: 4, name: "provider_ttft_ms", type: "double" },
+    { id: 5, name: "slow_pool_wait_ms", type: "double" },
+    { id: 6, name: "client_prep_ms", type: "double" },
+    { id: 7, name: "client_clock", type: "bool" },
+  ])
+
   addType(
     root,
     "AgentServerMessage",
@@ -2189,6 +2199,8 @@ export function createMessageTypes(): protobuf.Root {
       { id: 4, name: "kv_server_message", type: "KvServerMessage" },
       { id: 5, name: "exec_server_control_message", type: "ExecServerControlMessage" },
       { id: 7, name: "interaction_query", type: "InteractionQuery" },
+      // Beside the oneof member, on the frame that carries the Run's first token.
+      { id: 8, name: "ttft_breakdown", type: "TtftBreakdown" },
     ],
     [{ name: "message", fields: ["interaction_update", "exec_server_message", "conversation_checkpoint_update", "kv_server_message", "exec_server_control_message", "interaction_query"] }],
   )

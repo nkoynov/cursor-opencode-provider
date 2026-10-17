@@ -191,6 +191,7 @@ import {
   type CursorContextUsageSource,
   type CursorConversationTokenDetails,
 } from "./protocol/token-details.js"
+import { describeTtftBreakdown, type TtftBreakdown } from "./protocol/ttft.js"
 import {
   conversationBlobCount,
   inspectConversationBlobGraph,
@@ -680,9 +681,11 @@ export function connectFrameError(payload: string): CursorProviderError {
     if (envelope.error?.message !== undefined || envelope.error?.details !== undefined) {
       trace(`connect error: code=${code} message=${JSON.stringify(envelope.error.message)?.slice(0, 2_000)} details=${JSON.stringify(envelope.error.details)?.slice(0, 4_000)}`)
     }
+    const serverMessage = typeof envelope.error?.message === "string" ? envelope.error.message : undefined
     if (code === "unauthenticated" || code === "permission_denied") {
       return new CursorAuthError(`Cursor authentication failed (${code}); reauthenticate with Cursor`, {
         code,
+        serverMessage,
         replaySafe: code === "unauthenticated",
       })
     }
@@ -714,7 +717,7 @@ export function connectFrameError(payload: string): CursorProviderError {
       // requests, and OpenCode retries any text saying "try again".
       const refusal = new CursorServerError(
         `Cursor refused the request: ${sanitizeHostTerminalMessage(customMessage).replace(/\btry again\b/gi, "retry")}`,
-        { transient: false, replaySafe: false, code },
+        { transient: false, replaySafe: false, code, serverMessage },
       )
       refusal.hostRetryUseless = true
       return refusal
@@ -726,6 +729,7 @@ export function connectFrameError(payload: string): CursorProviderError {
       retryable: cursorDetails?.isRetryable,
       replaySafe: true,
       code,
+      serverMessage,
       retryAfterMs: retryAfterMs === undefined
         ? undefined
         : Math.min(MAX_RETRY_DELAY_MS, retryAfterMs),
@@ -1249,6 +1253,7 @@ export async function pumpWithRecovery(input: {
   const capacityMaxRecoveries = (retryPolicy.capacityMaxAttempts ?? retryPolicy.maxAttempts) - 1
   const startedAt = Date.now()
   let credentialRenewed = false
+  let compressionFallbackUsed = false
   input.onSession?.(session)
 
   const resumableCheckpoint = (pumpedSession: CursorSession) =>
@@ -1375,6 +1380,17 @@ export async function pumpWithRecovery(input: {
         attempt--
         continue
       }
+      if (!compressionFallbackUsed && pumpedSession.stream.compressionRejected?.()) {
+        compressionFallbackUsed = true
+        const checkpoint = resumableCheckpoint(pumpedSession)
+        if (failure.replaySafe || checkpoint) {
+          trace(`Run compression rejected: sessionId=${pumpedSession.sessionId} — reopening once uncompressed`)
+          sessionManager.close(pumpedSession, "remote-error", failure)
+          session = await reopen(pumpedSession, failure, checkpoint)
+          attempt--
+          continue
+        }
+      }
       if (!failure.transient) throw failure
       // A replay-safe failure keeps the rebase path, in case the carried checkpoint is what failed.
       const carried = !pumpedSession.resumeCheckpoint && !pumpedSession.resultsAfterCheckpoint && !failure.replaySafe
@@ -1418,6 +1434,34 @@ export async function pumpWithRecovery(input: {
         if (!sessionManager.closeUnlessPending(pumpedSession)) readHeldRun(pumpedSession)
       }
     }
+  }
+}
+
+/**
+ * Send a new Run's request. Cursor may refuse a gzip Run before the upload finishes; the same request then goes
+ * once more on a new stream, which the transport opens uncompressed.
+ */
+export async function sendRunRequest(
+  stream: BidiStream,
+  request: Uint8Array,
+  operation: string,
+  reopen: () => Promise<BidiStream>,
+): Promise<BidiStream> {
+  try {
+    await writeWithBackpressure(stream, request, operation)
+    return stream
+  } catch (error) {
+    if (!stream.compressionRejected?.()) throw error
+  }
+  try { stream.destroy() } catch { /* already closed */ }
+  trace(`Run compression: ${operation} refused while uploading — sending it once more uncompressed`)
+  const next = await reopen()
+  try {
+    await writeWithBackpressure(next, request, operation)
+    return next
+  } catch (error) {
+    try { next.destroy() } catch { /* already closed */ }
+    throw error
   }
 }
 
@@ -2089,7 +2133,7 @@ async function startSession(
   // Do NOT pass callOptions.abortSignal into the h2 Run stream. OpenCode aborts
   // that signal when a turn ends with tool-calls; the Cursor stream must stay
   // open until we write the exec results on the next doStream.
-  const stream = await bidiRunStream(token, {
+  let stream = await bidiRunStream(token, {
     baseURL: agentBaseUrl,
     headers: options.headers,
   })
@@ -2204,7 +2248,8 @@ async function startSession(
   if (conversationState) trace(`hash checkpoint sha256=${sha(conversationState)}`)
 
   try {
-    await writeWithBackpressure(stream, reqBytes, "initial Run request")
+    stream = await sendRunRequest(stream, reqBytes, "initial Run request",
+      () => bidiRunStream(token, { baseURL: agentBaseUrl, headers: options.headers }))
     userTurnHostNotes.sent()
     if (sessionKey && fallbackReply) forgetModelFallbackStop(sessionKey, fallbackReply.stop)
   } catch (error) {
@@ -2345,8 +2390,12 @@ async function startSession(
     abortIfNeeded()
     // Do not pass OpenCode's abortSignal into the h2 stream: a tool-calls abort
     // must not tear down a Run we still need to pump. Check abort around open.
-    const next = await bidiRunStream(freshToken, { baseURL: agentBaseUrl, headers: options.headers })
-    abortIfNeeded(next)
+    const openNext = async () => {
+      const opened = await bidiRunStream(freshToken, { baseURL: agentBaseUrl, headers: options.headers })
+      abortIfNeeded(opened)
+      return opened
+    }
+    let next = await openNext()
     const conversationState = session.resumeCheckpoint ?? getCheckpoint(session.conversationId)
     const nextRunId = crypto.randomUUID()
     const reqBytes = buildRunRequest({
@@ -2364,7 +2413,7 @@ async function startSession(
       mode: cursorAgentModeWireValue(getActiveCursorMode(session.openCodeSessionId)),
     })
     try {
-      await writeWithBackpressure(next, reqBytes, "progress-only continuation Run")
+      next = await sendRunRequest(next, reqBytes, "progress-only continuation Run", openNext)
     } catch (error) {
       try { next.destroy() } catch {}
       throw error
@@ -5263,6 +5312,8 @@ export async function pump(
     // carried output or stateful activity.
     if (!isSoleControlFrame(payload)) onlyControlFrames = false
 
+    const ttft = describeTtftBreakdown(asm.ttft_breakdown as TtftBreakdown | null | undefined)
+    if (ttft) trace(`ttft: sessionId=${session.sessionId} ${ttft}`)
     {
       const iuKind = iu ? Object.keys(iu).find((k) => iu[k]) : undefined
       trace(

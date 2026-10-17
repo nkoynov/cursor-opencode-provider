@@ -6,6 +6,7 @@ import {
   closeCachedHttp2SessionsForTests,
   getSession,
   HTTP2_SESSION_LIVE_WINDOW_MS,
+  resetRunCompressionForTests,
   routeHttp2ConnectionsForTests,
 } from "../dist/transport/connect.js"
 import { encodeFrame } from "../dist/protocol/framing.js"
@@ -14,6 +15,8 @@ import { encodeFrame } from "../dist/protocol/framing.js"
 // until the socket takes the data, so the resend of a Run reused without a ping is checked here too.
 process.env.CURSOR_CLIENT_VERSION = "cli-node-resend-test-1"
 const ORIGIN = "https://agentn.node-resend-test.cursor.sh"
+// Uncompressed, so a large request stays larger than the socket buffers on the wire.
+resetRunCompressionForTests(ORIGIN)
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 async function startFakeCursor() {

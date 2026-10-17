@@ -6,6 +6,7 @@ import os from "node:os"
 import path from "node:path"
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
+import { decodeFramePayload } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
 import { sessionManager } from "../src/session.js"
@@ -44,7 +45,7 @@ beforeAll(async () => {
       while (pending.length >= 5) {
         const length = pending.readUInt32BE(1)
         if (pending.length < 5 + length) break
-        const message = decodeMessage<Record<string, unknown>>("AgentClientMessage", pending.subarray(5, 5 + length))
+        const message = decodeMessage<Record<string, unknown>>("AgentClientMessage", decodeFramePayload({ flags: pending[0]!, payload: pending.subarray(5, 5 + length) }))
         pending = pending.subarray(5 + length)
         if (!message.run_request) continue
         // Cursor announces an edit, then answers in text without ever running it.

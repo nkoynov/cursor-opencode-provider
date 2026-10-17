@@ -7,6 +7,7 @@ import {
   bidiRunStream,
   closeCachedHttp2SessionsForTests,
   getSession,
+  resetRunCompressionForTests,
   routeHttp2ConnectionsForTests,
   type BidiStream,
 } from "../src/transport/connect.js"
@@ -59,10 +60,13 @@ const savedClientVersion = process.env.CURSOR_CLIENT_VERSION
 beforeEach(async () => {
   process.env.CURSOR_CLIENT_VERSION = "cli-session-memory-test-1"
   resetClientVersionCache()
+  // The pending requests must stay megabytes on the wire, which gzip would shrink to almost nothing.
+  resetRunCompressionForTests(ORIGIN)
   cursor = await startBusyCursor()
 })
 
 afterEach(async () => {
+  resetRunCompressionForTests()
   closeCachedHttp2SessionsForTests()
   routeHttp2ConnectionsForTests()
   await cursor.close()

@@ -6,7 +6,7 @@ import os from "node:os"
 import path from "node:path"
 import { APICallError, type LanguageModelV3CallOptions, type LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
-import { encodeFrame } from "../src/protocol/framing.js"
+import { decodeFramePayload, encodeFrame } from "../src/protocol/framing.js"
 import { decodeMessage } from "../src/protocol/messages.js"
 import { closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
 import {
@@ -213,7 +213,7 @@ describe("final failures OpenCode must not retry", () => {
             destroyed: false,
             rstCode: 0,
             write(data: Uint8Array) {
-              if (decodeMessage<any>("AgentClientMessage", data.subarray(5)).run_request) {
+              if (decodeMessage<any>("AgentClientMessage", decodeFramePayload({ flags: data[0]!, payload: data.subarray(5) })).run_request) {
                 runs++
                 setImmediate(() => {
                   stream.emit("response", { ":status": 200 })

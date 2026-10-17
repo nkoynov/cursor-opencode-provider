@@ -13,7 +13,8 @@ Parity target is interactive `cursor-agent` (`Run` client: TUI and `--print`). `
 | Connect-RPC `Run` bidi stream over HTTP/2 | Yes (`createAgentService`, Run) | Yes (`src/transport/connect.ts`) | ✅ |
 | `RunSSE` / `RunPoll` transports | Yes | No (HTTP/2 bidi only) | ❌ |
 | Client msgs: run_request, exec, kv, conversation_action, exec_control, interaction_response, client_heartbeat, prewarm | All 8 | All except `prewarm_request` (RunRequest.mcp_tools is prewarm-only, empty on real turns) | 🔶 |
-| Server msgs: interaction_update, exec, checkpoint_update, kv, exec_control, interaction_query, ttft_breakdown | All | All except `ttft_breakdown` (not decoded) | 🔶 |
+| Server msgs: interaction_update, exec, checkpoint_update, kv, exec_control, interaction_query, ttft_breakdown | All | All (`ttft_breakdown` only in the debug log) | ✅ |
+| Run message compression | gzip over 1 KiB (connect-es `sendCompression`) | gzip over 1 KiB; one uncompressed retry and uncompressed later Runs if Cursor refuses it | ✅ |
 | ConversationActions | 15 oneof actions + 3 metadata fields (`triggering_auth_id`, `triggering_user_info`, `request_context_parts`): user_message, resume, cancel, summarize, shell_command, start/execute_plan, async_ask_question_completion, cancel_subagent, background_task/shell/subagent, subscription_notification, goal_continuation, inject_context | Schema encodes 5: user_message, resume, cancel, async_ask_question_completion, inject_context (`user_context` payload for host notes and early steers) — summarize emulated via compaction marker | 🔶 |
 | Sparse protobuf decode w/ full schema | Native protobuf | Hand-rolled `struct.ts` sparse decoder + full schema table (`messages.ts`) | ✅ |
 | Checksums / framing / device id / client-version | Yes | Yes (`checksum.ts`, `framing.ts`, `device-id.ts`, `client-version.ts`) | ✅ |
