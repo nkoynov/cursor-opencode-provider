@@ -133,7 +133,7 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   A gzip Run Cursor refuses is sent once more uncompressed, outside the retry
   budget, and the origin stays uncompressed; a refusal during the upload is
   resent by `sendRunRequest` inside `openRunWithRequest`, under its listeners.
-  Frame arrival numbers (`frameArrival`) belong to the parsed frame readers gunzip.
+  Frame arrival numbers (`frameArrival`) go on the parsed frame readers gunzip.
 - Decode Cursor's error title/detail and retry verdict. A non-retryable server
   error reaches the host as `APICallError` with its status and
   `x-should-retry: false` (`src/errors.ts`), including on OpenCode 2.
@@ -216,11 +216,15 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   after Run closure/restart so a late result can rebuild from history.
 - Fork: `pump` keeps the AI SDK step open after a host tool-call until every
   listed call has reached it (its exec, or its display completion when no exec
-  claimed it; an edit's private read does not count).
+  claimed it; an edit's private read does not count). Model output,
+  `turn_ended`, a Run failure or 1.5 s without frames
+  (`HELD_TOOL_STEP_QUIET_MS`) close it early.
 - Fork tool-call order (`src/tool-call-order.ts`, Claude Code's rule): reads,
   searches, subagents and read-only shell run together; an edit, write, other
   shell or MCP call waits for the calls written before it, and later calls wait
-  for it. A held-back exec stays with the provider until its turn.
+  for it. A held-back exec is released anyway after 15 s without progress
+  (`toolCallOrderTiming.releaseQuietMs`), so a call Cursor never closes cannot
+  stall the Run.
 - Fork early rows: an empty existing file predicts `write`, as the edit remap
   leaves it. A row opens only while no other call of the step is announced or
   started and unfinished and no exec is held back; otherwise the earlier call's
@@ -307,9 +311,10 @@ counters separately. Keep displayed occupancy separate from retry checkpoints.
 
 `src/billing.ts` estimates tool steps and reconciles aggregate catalog-priced
 cost at turn end. Book only delivered finishes; bound cache counters and retain
-unsettled balances. In the fork, a steer Cursor did not take, sent as a follow-up
-Run, settles through the same ledger. 1.x supports `copilot.totalNanoAiu`; 2.0 prices tokens, so
-both projections must agree without host detection. Do not invent per-call tier
+unsettled balances. In the fork, a steer Cursor did not take, sent as a
+follow-up Run, settles through the same ledger. 1.x supports
+`copilot.totalNanoAiu`; 2.0 prices tokens, so both projections must agree
+without host detection. Do not invent per-call tier
 attribution or bill unpriced Auto. Use the [log runbook](docs/cache-log-runbook.md)
 for cache, token and billing claims.
 
