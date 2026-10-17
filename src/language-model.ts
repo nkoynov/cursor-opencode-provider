@@ -241,8 +241,8 @@ import {
   CursorRetryExhaustedError,
   CursorServerError,
   CursorTransportError,
+  failedOnCompression,
   isCapacityFailure,
-  isCompressionRejection,
   isRejectedCredentialError,
   isTransientGrpcStatus,
   retrySuppressedError,
@@ -899,9 +899,12 @@ async function doStreamImpl(
     || (!options.accessToken && options.apiKey !== undefined && isExchangeableApiKey(options.apiKey))
   let prefetchedToken: string | undefined
   const requestedAt = Date.now()
+  let compressionRetried = false
   // pumpWithRecovery owns the complete per-turn attempt budget.  Opening a
   // replacement session here must be a single attempt; otherwise setup retry
   // loops nest inside recovery and `maxAttempts` no longer caps total Runs.
+  // The one exception is a Run request Cursor refused for its compression,
+  // sent once more uncompressed.
   const openSession = async (startOptions?: { recovery?: CursorRunRecovery; isolate?: boolean }) => {
     const forceRefresh = forceCredentialRefresh
     forceCredentialRefresh = false
@@ -910,10 +913,19 @@ async function doStreamImpl(
     const token = prefetched !== undefined && !forceRefresh
       ? prefetched
       : await resolveRunBearerToken(options, forceRefresh)
-    const opened = await startSession(modelId, token, callOptions, options, {
+    const start = () => startSession(modelId, token, callOptions, options, {
       ...startOptions,
       requestedAt,
     })
+    let opened: CursorSession
+    try {
+      opened = await start()
+    } catch (error) {
+      if (compressionRetried || !failedOnCompression(error)) throw error
+      compressionRetried = true
+      trace("Run compression rejected while the Run request was uploading — opening the Run once more uncompressed")
+      opened = await start()
+    }
     cancelIfHostStoppedSince(opened)
     return opened
   }
@@ -1308,11 +1320,8 @@ export async function pumpWithRecovery(input: {
         attempt--
         continue
       }
-      if (!compressionFallbackUsed && pumpedSession.stream.usesCompression?.() && isCompressionRejection(failure)) {
+      if (!compressionFallbackUsed && (pumpedSession.stream.compressionRejected?.() || failedOnCompression(failure))) {
         compressionFallbackUsed = true
-        pumpedSession.stream.disableCompression?.(
-          failure.serverMessage ? `${failure.message}: ${failure.serverMessage}` : failure.message,
-        )
         const checkpoint = resumableCheckpoint(pumpedSession)
         if (failure.replaySafe || checkpoint) {
           trace(`Run compression rejected: sessionId=${pumpedSession.sessionId} — reopening once uncompressed`)
@@ -1368,6 +1377,12 @@ export async function pumpWithRecovery(input: {
       if (!pumpedSession.closed && pumpedSession.pending.size > 0) void watchHeldRun(pumpedSession)
     }
   }
+}
+
+/** A Run request write that failed because Cursor refused the Run's compression may be sent again uncompressed. */
+function markCompressionRejection(error: unknown, stream: BidiStream): unknown {
+  if (stream.compressionRejected?.() && error instanceof CursorProviderError) error.compressionRejected = true
+  return error
 }
 
 const EARLY_ROW_RUN_REPLACED = "Cursor's stream was interrupted before this call was sent; the model continues on a new stream."
@@ -2130,7 +2145,7 @@ async function startSession(
     if (sessionKey && fallbackReply) forgetModelFallbackStop(sessionKey, fallbackReply.stop)
   } catch (error) {
     stream.destroy()
-    throw error
+    throw markCompressionRejection(error, stream)
   }
   const historyImages = sessionKey && !ephemeralRun ? runHistoryImages(heldImages) : undefined
   if (historyImages) noteHistoryImagesSent(historyImages, imageExtraction.hashes)
@@ -2300,7 +2315,7 @@ async function startSession(
       await writeWithBackpressure(next, reqBytes, "progress-only continuation Run")
     } catch (error) {
       try { next.destroy() } catch {}
-      throw error
+      throw markCompressionRejection(error, next)
     }
     abortIfNeeded(next)
     session.heartbeatCancel?.()

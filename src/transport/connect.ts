@@ -1,5 +1,5 @@
 import { CURSOR_API_HOST, CONNECT_PROTOCOL_VERSION, SERVER_CONFIG_PATH } from "../shared.js"
-import { encodeFrame, FLAG_GZIP, streamFrames } from "../protocol/framing.js"
+import { decodeFramePayload, encodeFrame, FLAG_END_STREAM, FLAG_GZIP, streamFrames } from "../protocol/framing.js"
 import { createCursorChecksumHeader } from "../protocol/checksum.js"
 import { getDeviceIds } from "../protocol/device-id.js"
 import { resolveClientVersion } from "../protocol/client-version.js"
@@ -12,8 +12,10 @@ import {
   cursorHttpError,
   errorCode,
   CursorProviderError,
+  isCompressionRejection,
 } from "../errors.js"
 import { withAbortDeadline } from "../deadline.js"
+import { processShared } from "../process-shared.js"
 import http2 from "node:http2"
 import type { Duplex } from "node:stream"
 import type { TLSSocket } from "node:tls"
@@ -257,7 +259,23 @@ export async function fetchAgentUrl(
 // Cursor CLI sends Run messages with connect-es `sendCompression: gzip` and its default `compressMinBytes`.
 export const RUN_COMPRESS_MIN_BYTES = 1024
 // The connection a rejection came on is dropped with the failed stream, so the fallback holds per origin.
-const _uncompressedRunOrigins = new Set<string>()
+const _uncompressedRunOrigins = processShared("connect.uncompressed-run-origins.v1", () => new Set<string>())
+
+/** The Connect error an end-stream frame carries, if any. */
+function endStreamError(frame: { flags: number; payload: Uint8Array }): { code?: string; serverMessage?: string } | undefined {
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(decodeFramePayload(frame))) as {
+      error?: { code?: unknown; message?: unknown }
+    }
+    if (!parsed.error) return undefined
+    return {
+      ...(typeof parsed.error.code === "string" ? { code: parsed.error.code } : {}),
+      ...(typeof parsed.error.message === "string" ? { serverMessage: parsed.error.message } : {}),
+    }
+  } catch {
+    return undefined
+  }
+}
 
 /** Encode one outbound Run message, gzip-compressed when it is over `RUN_COMPRESS_MIN_BYTES`. */
 export function encodeRunFrame(msg: Uint8Array, compress: boolean): Uint8Array {
@@ -271,10 +289,8 @@ export function resetRunCompressionForTests(...uncompressedOrigins: string[]): v
 
 export type BidiStream = {
   write(msg: Uint8Array): boolean | void
-  /** Whether this Run announced gzip (`connect-content-encoding`), which a server may reject before any frame. */
-  usesCompression?(): boolean
-  /** Send this origin's later Runs uncompressed, after Cursor rejected a compressed one. */
-  disableCompression?(reason: string): void
+  /** Cursor refused this Run for its gzip compression; the origin's later Runs already go out uncompressed. */
+  compressionRejected?(): boolean
   /** Fails once the stream has taken nothing more for `stallTimeoutMs`; no deadline for the whole write. */
   waitForDrain?(stallTimeoutMs: number): Promise<void>
   end(): void
@@ -796,6 +812,17 @@ export async function bidiRunStream(
   ])
   const compress = !_uncompressedRunOrigins.has(origin)
   const encodeOutbound = (msg: Uint8Array): Uint8Array => encodeRunFrame(msg, compress)
+  let compressionRejected = false
+  const noteCompressionRejection = (status: Parameters<typeof isCompressionRejection>[0], where: string) => {
+    if (!compress || compressionRejected || !isCompressionRejection(status)) return
+    compressionRejected = true
+    if (_uncompressedRunOrigins.has(origin)) return
+    _uncompressedRunOrigins.add(origin)
+    trace(
+      `Run compression: Cursor refused a gzip Run (${where} ${JSON.stringify(status)}) — ` +
+        `sending uncompressed to ${origin} from now on`,
+    )
+  }
   const headers = {
     ...buildBaseHeaders(token, clientVersion, options.headers),
     ":method": "POST",
@@ -1114,7 +1141,22 @@ export async function bidiRunStream(
     const consumed = parsed.reduce((sum, frame) => sum + 5 + frame.payload.length, 0)
     pendingChunks.length = 0
     if (consumed < merged.length) pendingChunks.push(merged.subarray(consumed))
-    for (const frame of parsed) enqueueFrame(frame)
+    for (const frame of parsed) {
+      if (compress && frame.flags & FLAG_END_STREAM) {
+        const error = endStreamError(frame)
+        if (error) noteCompressionRejection(error, "end-stream")
+      }
+      enqueueFrame(frame)
+    }
+  }
+  const noteGrpcCompressionRejection = (h: Record<string, unknown>) => {
+    const grpcStatus = h["grpc-status"]
+    if (grpcStatus === undefined || String(grpcStatus) === "0") return
+    const message = h["grpc-message"]
+    noteCompressionRejection(
+      { grpcStatus: String(grpcStatus), ...(message === undefined ? {} : { serverMessage: String(message) }) },
+      "gRPC",
+    )
   }
   const startInboundReader = () => {
     if (inboundReaderStarted || locallyClosed || remotelyClosed || streamFailure) return
@@ -1143,12 +1185,15 @@ export async function bidiRunStream(
       responseHeaders = h
       responseStatus = h[":status"] !== undefined ? Number(h[":status"]) : 0
       trace(`h2 response: status=${responseStatus} headers=${JSON.stringify(stripPseudo(h))}`)
+      noteCompressionRejection({ statusCode: responseStatus }, "HTTP")
+      noteGrpcCompressionRejection(h)
     })
     target.on("trailers", (h: Record<string, unknown>) => {
       if (replaced()) return
       noteSessionInbound(owner)
       responseTrailers = h
       trace(`h2 trailers: ${JSON.stringify(stripPseudo(h))}`)
+      noteGrpcCompressionRejection(h)
     })
     target.on("error", (err: Error) => {
       if (replaced()) return
@@ -1249,12 +1294,7 @@ export async function bidiRunStream(
         throw streamFailure
       }
     },
-    usesCompression: () => compress,
-    disableCompression(reason: string) {
-      if (_uncompressedRunOrigins.has(origin)) return
-      _uncompressedRunOrigins.add(origin)
-      trace(`Run compression: Cursor rejected a gzip frame (${reason}) — sending uncompressed to ${origin} from now on`)
-    },
+    compressionRejected: () => compressionRejected,
     waitForDrain(stallTimeout) {
       if (!backpressured) return Promise.resolve()
       const stallTimeoutMs = timeoutMs("Cursor write drain stall timeout", stallTimeout, stallTimeout)

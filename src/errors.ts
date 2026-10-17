@@ -33,6 +33,8 @@ export class CursorProviderError extends Error {
    * Recovery must reseed a new conversation instead of resuming that checkpoint.
    */
   checkpointUnusable?: boolean
+  /** The Run announced gzip and Cursor refused it for that; it can be sent again uncompressed. */
+  compressionRejected?: boolean
   /** Another attempt by the host cannot succeed soon (account refusal, capacity after our own backoff). */
   hostRetryUseless?: boolean
   readonly statusCode?: number
@@ -230,7 +232,9 @@ const COMPRESSION_DECODE_CODES = new Set(["invalid_argument", "internal", "3", "
  * Cursor could not take a gzip-compressed message: HTTP 415, `unimplemented` (Connect's answer to an
  * unsupported `connect-content-encoding`), or `invalid_argument`/`internal` whose message names the compression.
  */
-export function isCompressionRejection(error: CursorProviderError): boolean {
+export function isCompressionRejection(
+  error: Pick<CursorErrorDiagnostics, "statusCode" | "code" | "grpcStatus" | "serverMessage">,
+): boolean {
   if (error.statusCode === 415) return true
   const codes = [error.code, error.grpcStatus]
     .filter((value): value is number | string => value !== undefined)
@@ -238,6 +242,15 @@ export function isCompressionRejection(error: CursorProviderError): boolean {
   if (codes.some((code) => COMPRESSION_UNSUPPORTED_CODES.has(code))) return true
   return codes.some((code) => COMPRESSION_DECODE_CODES.has(code))
     && /compress|gzip|encoding/i.test(error.serverMessage ?? "")
+}
+
+/** Whether this failure, or one it wraps, ended a Run that Cursor refused for its compression. */
+export function failedOnCompression(error: unknown): boolean {
+  for (let current = error, depth = 0; current && typeof current === "object" && depth < 8; depth++) {
+    if ((current as CursorProviderError).compressionRejected) return true
+    current = (current as { cause?: unknown }).cause
+  }
+  return false
 }
 
 export function isAuthGrpcStatus(status: number | string): boolean {

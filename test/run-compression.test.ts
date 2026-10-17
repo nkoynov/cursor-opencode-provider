@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import http2 from "node:http2"
 import net from "node:net"
 import { gunzipSync } from "node:zlib"
-import { CursorProviderError, CursorServerError, isCompressionRejection } from "../src/errors.js"
+import { CursorProviderError, CursorServerError, CursorTransportError, failedOnCompression, isCompressionRejection } from "../src/errors.js"
 import { connectFrameError, pumpWithRecovery } from "../src/language-model.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
 import { encodeFrame, FLAG_GZIP, streamFrames } from "../src/protocol/framing.js"
@@ -46,9 +46,11 @@ describe("encodeRunFrame", () => {
 })
 
 type ReceivedStream = { headers: http2.IncomingHttpHeaders; frames: Frame[] }
+type Answer = "answer" | "end-stream-unimplemented" | "end-stream-internal" | "http-415" | "grpc-12"
 
 async function startFakeCursor() {
   const streams: ReceivedStream[] = []
+  const answers: Answer[] = []
   const server = http2.createServer()
   server.on("stream", (stream, headers) => {
     const record: ReceivedStream = { headers, frames: [] }
@@ -59,16 +61,43 @@ async function startFakeCursor() {
       record.frames = [...streamFrames(new Uint8Array(Buffer.concat(chunks)))]
     })
     stream.on("error", () => {})
-    stream.respond({ ":status": 200, "content-type": "application/connect+proto" })
-    stream.write(encodeFrame(0x00, new Uint8Array([1])))
+    const endStream = (error: Record<string, string>) =>
+      stream.end(encodeFrame(0x02, new TextEncoder().encode(JSON.stringify({ error }))))
+    switch (answers.shift() ?? "answer") {
+      case "answer":
+        stream.respond({ ":status": 200, "content-type": "application/connect+proto" })
+        stream.write(encodeFrame(0x00, new Uint8Array([1])))
+        break
+      case "end-stream-unimplemented":
+        stream.respond({ ":status": 200, "content-type": "application/connect+proto" })
+        endStream({ code: "unimplemented", message: "unknown compression \"gzip\": supported encodings are identity" })
+        break
+      case "end-stream-internal":
+        stream.respond({ ":status": 200, "content-type": "application/connect+proto" })
+        endStream({ code: "internal", message: "upstream model error" })
+        break
+      case "http-415":
+        stream.respond({ ":status": 415 }, { endStream: true })
+        break
+      case "grpc-12":
+        stream.respond({ ":status": 200, "content-type": "application/grpc", "grpc-status": "12" }, { endStream: true })
+        break
+    }
   })
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
   const port = (server.address() as net.AddressInfo).port
   routeHttp2ConnectionsForTests(() => net.connect(port, "127.0.0.1"))
   return {
     streams,
+    answers,
     close: () => new Promise((resolve) => server.close(resolve)),
   }
+}
+
+async function drain(run: { frames(): AsyncIterable<unknown> }): Promise<void> {
+  try {
+    for await (const _ of run.frames()) { /* until the Run ends */ }
+  } catch { /* a refused Run ends with its error */ }
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -111,26 +140,45 @@ describe("Run stream compression", () => {
     expect(stream!.frames.map((frame) => frame.flags)).toEqual([0x00, FLAG_GZIP])
     expect(stream!.frames[0]!.payload).toEqual(new Uint8Array([9, 9, 9]))
     expect(new Uint8Array(gunzipSync(stream!.frames[1]!.payload))).toEqual(large)
-    expect(run.usesCompression?.()).toBe(true)
+    expect(run.compressionRejected?.()).toBe(false)
     run.end()
   })
 
-  it("sends the origin's later Runs uncompressed once compression is disabled", async () => {
-    const large = new Uint8Array(8 * 1024).fill(3)
+  it.each(["end-stream-unimplemented", "http-415", "grpc-12"] as const)(
+    "sends the origin's later Runs uncompressed after Cursor refuses a gzip Run (%s)",
+    async (refusal) => {
+      fake.answers.push(refusal)
+      const large = new Uint8Array(8 * 1024).fill(3)
+      const first = await bidiRunStream("token", { baseURL: ORIGIN })
+      first.write(large)
+      await drain(first)
+      expect(first.compressionRejected?.()).toBe(true)
+
+      const second = await bidiRunStream("token", { baseURL: ORIGIN })
+      second.write(large)
+      await until(() => fake.streams[1]?.frames.length === 1)
+
+      expect(fake.streams[0]!.headers["connect-content-encoding"]).toBe("gzip")
+      expect(fake.streams[1]!.headers["connect-content-encoding"]).toBeUndefined()
+      expect(fake.streams[1]!.frames[0]!.flags).toBe(0x00)
+      expect(fake.streams[1]!.frames[0]!.payload).toEqual(large)
+      expect(second.compressionRejected?.()).toBe(false)
+      second.end()
+    },
+  )
+
+  it("keeps compressing after a failure unrelated to compression", async () => {
+    fake.answers.push("end-stream-internal")
     const first = await bidiRunStream("token", { baseURL: ORIGIN })
-    first.write(large)
-    await until(() => fake.streams[0]?.frames.length === 1)
-    first.disableCompression?.("test rejection")
-    first.end()
+    first.write(new Uint8Array(8 * 1024).fill(3))
+    await drain(first)
+    expect(first.compressionRejected?.()).toBe(false)
 
     const second = await bidiRunStream("token", { baseURL: ORIGIN })
-    second.write(large)
+    second.write(new Uint8Array(8 * 1024).fill(3))
     await until(() => fake.streams[1]?.frames.length === 1)
-
-    expect(fake.streams[1]!.headers["connect-content-encoding"]).toBeUndefined()
-    expect(fake.streams[1]!.frames[0]!.flags).toBe(0x00)
-    expect(fake.streams[1]!.frames[0]!.payload).toEqual(large)
-    expect(second.usesCompression?.()).toBe(false)
+    expect(fake.streams[1]!.headers["connect-content-encoding"]).toBe("gzip")
+    expect(fake.streams[1]!.frames[0]!.flags).toBe(FLAG_GZIP)
     second.end()
   })
 })
@@ -190,15 +238,14 @@ const textDelta = (text: string): Frame => ({
   payload: encodeMessage("AgentServerMessage", { interaction_update: { text_delta: { text } } }),
 })
 
-function fakeSession(id: string, frames: Frame[], compressed: boolean, disabled: string[]): CursorSession {
+function fakeSession(id: string, frames: Frame[], refused = false): CursorSession {
   let index = 0
   return sessionFixture({
     sessionId: id,
     conversationId: `conv-${id}`,
     stream: {
       write() {},
-      usesCompression: () => compressed,
-      disableCompression: (reason: string) => { disabled.push(reason) },
+      compressionRejected: () => refused,
       end() {},
       frames: () => ({ async *[Symbol.asyncIterator]() { yield* frames } }),
       destroy() {},
@@ -234,87 +281,87 @@ function controller(parts: unknown[] = []) {
 const unsupported = { code: "unimplemented", message: "unknown compression \"gzip\"" }
 
 describe("compression fallback", () => {
-  it("reopens a rejected compressed Run once, uncompressed, outside the retry budget", async () => {
-    const disabled: string[] = []
+  it("reopens a refused gzip Run once, outside the retry budget", async () => {
     const recoveries: unknown[] = []
     const final = await pumpWithRecovery({
-      initialSession: fakeSession("gzip-rejected", [endStreamError(unsupported)], true, disabled),
+      initialSession: fakeSession("gzip-refused", [endStreamError(unsupported)], true),
       controller: controller(),
       retryPolicy: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0 },
       recover: async (recovery) => {
         recoveries.push(recovery)
-        return fakeSession("uncompressed", [turnEnded()], false, disabled)
+        return fakeSession("uncompressed", [turnEnded()])
       },
     })
     expect(final.sessionId).toBe("uncompressed")
-    expect(disabled).toHaveLength(1)
     expect(recoveries).toEqual([{ kind: "rebase" }])
   })
 
-  it("falls back only once per turn", async () => {
-    const disabled: string[] = []
+  it("reopens a Run whose own write failed on the refusal", async () => {
+    const failure = new CursorTransportError("Cursor Run stream closed before drain", { transient: false, replaySafe: true })
+    failure.compressionRejected = true
+    const wrapped = new CursorTransportError("initial Run request backpressure drain failed", {
+      transient: false, replaySafe: true, cause: failure,
+    })
+    expect(failedOnCompression(wrapped)).toBe(true)
+    expect(failedOnCompression(new CursorTransportError("other", { transient: false, replaySafe: true }))).toBe(false)
     let recoveries = 0
-    const failure = await pumpWithRecovery({
-      initialSession: fakeSession("gzip-1", [endStreamError(unsupported)], true, disabled),
+    const session = fakeSession("write-refused", [])
+    session.frames = { next: async () => { throw wrapped } }
+    const final = await pumpWithRecovery({
+      initialSession: session,
       controller: controller(),
       retryPolicy: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0 },
       recover: async () => {
         recoveries++
-        return fakeSession("gzip-2", [endStreamError(unsupported)], true, disabled)
+        return fakeSession("uncompressed", [turnEnded()])
+      },
+    })
+    expect(final.sessionId).toBe("uncompressed")
+    expect(recoveries).toBe(1)
+  })
+
+  it("falls back only once per turn", async () => {
+    let recoveries = 0
+    const failure = await pumpWithRecovery({
+      initialSession: fakeSession("gzip-1", [endStreamError(unsupported)], true),
+      controller: controller(),
+      retryPolicy: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async () => {
+        recoveries++
+        return fakeSession("gzip-2", [endStreamError(unsupported)], true)
       },
     }).catch((error: unknown) => error)
     expect(failure).toBeInstanceOf(CursorProviderError)
     expect((failure as CursorProviderError).code).toBe("unimplemented")
     expect(recoveries).toBe(1)
-    expect(disabled).toHaveLength(1)
   })
 
-  it("does not fall back for a Run that did not announce gzip", async () => {
-    const disabled: string[] = []
+  it("does not fall back when the transport saw no refusal of gzip", async () => {
     let recoveries = 0
     const failure = await pumpWithRecovery({
-      initialSession: fakeSession("raw", [endStreamError(unsupported)], false, disabled),
+      initialSession: fakeSession("raw", [endStreamError(unsupported)]),
       controller: controller(),
       recover: async () => {
         recoveries++
-        return fakeSession("unexpected", [turnEnded()], false, disabled)
+        return fakeSession("unexpected", [turnEnded()])
       },
     }).catch((error: unknown) => error)
     expect((failure as CursorProviderError).code).toBe("unimplemented")
     expect(recoveries).toBe(0)
-    expect(disabled).toHaveLength(0)
   })
 
-  it("does not fall back for a failure unrelated to compression", async () => {
-    const disabled: string[] = []
+  it("does not replay a refusal after visible output", async () => {
     let recoveries = 0
     const failure = await pumpWithRecovery({
-      initialSession: fakeSession("other", [endStreamError({ code: "invalid_argument", message: "bad request" })], true, disabled),
+      initialSession: fakeSession("after-output", [textDelta("partial"), endStreamError(unsupported)], true),
       controller: controller(),
       recover: async () => {
         recoveries++
-        return fakeSession("unexpected", [turnEnded()], false, disabled)
-      },
-    }).catch((error: unknown) => error)
-    expect((failure as CursorProviderError).code).toBe("invalid_argument")
-    expect(recoveries).toBe(0)
-    expect(disabled).toHaveLength(0)
-  })
-
-  it("stops compressing but does not replay a rejection after visible output", async () => {
-    const disabled: string[] = []
-    let recoveries = 0
-    const failure = await pumpWithRecovery({
-      initialSession: fakeSession("after-output", [textDelta("partial"), endStreamError(unsupported)], true, disabled),
-      controller: controller(),
-      recover: async () => {
-        recoveries++
-        return fakeSession("unexpected", [turnEnded()], false, disabled)
+        return fakeSession("unexpected", [turnEnded()])
       },
     }).catch((error: unknown) => error)
     expect((failure as CursorProviderError).code).toBe("unimplemented")
     expect(recoveries).toBe(0)
-    expect(disabled).toHaveLength(1)
   })
 })
 
