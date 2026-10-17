@@ -18,7 +18,7 @@ import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { sessionManager, type CursorSession } from "../src/session.js"
 import { resetTurnProvenanceForTests } from "../src/protocol/turn-provenance.js"
 import { resetConversationBlobsForTests } from "../src/protocol/blob-store.js"
-import { resetTurnStateForTests } from "../src/language-model.js"
+import { resetTurnStateForTests, settleTerminalCheckpointSavesForTests } from "../src/language-model.js"
 import { resetConversationBindingsForTests } from "../src/protocol/conversation-bind.js"
 import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { getPersistedConversation, resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
@@ -351,7 +351,7 @@ describe("Greptile receipt matching regressions", () => {
           const answer = textOf(await collect(model, step, sessionKey))
           const countBefore = runs.length
           if (restart) {
-            coldMemory()
+            await coldMemory()
             cacheHttp2SessionForTests(ORIGIN, client)
             model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir }).languageModel("composer-2.5")
           }
@@ -389,7 +389,7 @@ describe("Greptile receipt matching regressions", () => {
             }
             const tail = copyFirst ? [user(early.text), attached] : [attached, user(early.text)]
             if (restart) {
-              coldMemory()
+              await coldMemory()
               cacheHttp2SessionForTests(ORIGIN, client)
               model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir }).languageModel("composer-2.5")
             }
@@ -1008,7 +1008,8 @@ describe("a steer sent while Cursor waits inside a step", () => {
   }, 30_000)
 })
 
-function coldMemory(): void {
+async function coldMemory(): Promise<void> {
+  await settleTerminalCheckpointSavesForTests()
   sessionManager.dispose()
   resetTurnStateForTests()
   resetTurnProvenanceForTests()
@@ -1028,7 +1029,7 @@ describe("steer restart and mixed-message regressions", () => {
         const answer = textOf(await first)
         const promoted = [ask, assistant(answer), user(message.text)]
         expect(textOf(await collect(model, promoted, sessionKey))).toBe("")
-        coldMemory()
+        await coldMemory()
         cacheHttp2SessionForTests(ORIGIN, client)
         const restarted = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir }).languageModel("composer-2.5")
         onRun = (run, next) => { if (next.run_request) endTurn(run, "NEW_ANSWER") }
@@ -1069,14 +1070,14 @@ describe("steer restart and mixed-message regressions", () => {
     }, 30_000)
   }
 
-  it("validates restart receipts and round-trips their scope", () => {
+  it("validates restart receipts and round-trips their scope", async () => {
     const record: EarlySteer = {
       ...steer("ses_receipt_validation", "RECEIPT"), injectionId: "injection", run: "run",
       delivered: true, checkpointed: true, answered: true, hostTurn: "a".repeat(64),
     }
     expect(recordEarlySteer(record)).toBe(true)
     const encoded = serializeEarlySteers(record.sessionID)
-    coldMemory()
+    await coldMemory()
     for (const invalid of ["{", "null", JSON.stringify({ version: 2, records: [record] }), JSON.stringify({ version: 1, records: [record, {}] })]) {
       restoreEarlySteers(record.sessionID, invalid)
       expect(matchEarlySteers(record.sessionID, [record.text], () => true)).toEqual([])
@@ -1096,7 +1097,7 @@ describe("steer restart and mixed-message regressions", () => {
       const persisted = await getPersistedConversation(cacheDir, sessionKey)
       expect(persisted?.conversationId).toBeTruthy()
       expect(JSON.parse(persisted!.earlySteers!).records[0].answered).toBe(true)
-      coldMemory()
+      await coldMemory()
       cacheHttp2SessionForTests(ORIGIN, client)
       const restarted = createCursor({
         name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir,
@@ -1201,7 +1202,7 @@ describe("steer restart and mixed-message regressions", () => {
         expect(error).toBeInstanceOf(Error)
         rejectRenewal = false
         if (restart) {
-          coldMemory()
+          await coldMemory()
           cacheHttp2SessionForTests(ORIGIN, client)
           model = createCursor({
             name: "cursor", agentBaseURL: ORIGIN, cacheDir,

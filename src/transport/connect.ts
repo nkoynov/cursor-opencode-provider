@@ -415,7 +415,13 @@ export const HTTP2_SESSION_LIVE_WINDOW_MS = 10_000
 // the provider holds those bytes anyway, so the limit only adds a failure.
 // 256 MB clears the 100 MiB checkpoint transfer budget with room to spare.
 // Cursor CLI's transport sets no maxSessionMemory, so it keeps the default (#76).
-const RUN_SESSION_OPTIONS = { maxSessionMemory: 256 } satisfies http2.ClientSessionOptions
+// Node and Bun default to 64 KiB receive windows: Cursor's MB-sized set_blob frames then arrive at one window per RTT.
+export const RUN_STREAM_WINDOW_BYTES = 8 * 1024 * 1024
+export const RUN_SESSION_WINDOW_BYTES = 16 * 1024 * 1024
+const RUN_SESSION_OPTIONS = {
+  maxSessionMemory: 256,
+  settings: { initialWindowSize: RUN_STREAM_WINDOW_BYTES },
+} satisfies http2.ClientSessionOptions
 
 export function shouldReuseHttp2Session(
   state: { destroyed: boolean; closed: boolean },
@@ -651,6 +657,14 @@ function validateCachedSession(
   })
 }
 
+function raiseSessionWindow(session: http2.ClientHttp2Session): void {
+  try {
+    session.setLocalWindowSize(RUN_SESSION_WINDOW_BYTES)
+  } catch (error) {
+    trace(`h2 session window not raised: ${errorMessage(error)}`)
+  }
+}
+
 function connectSession(origin: string): Promise<http2.ClientHttp2Session> {
   return new Promise((resolve, reject) => {
     let settled = false
@@ -703,7 +717,8 @@ function connectSession(origin: string): Promise<http2.ClientHttp2Session> {
       tunnelSocket = undefined
       cacheReadySession(origin, session)
       noteSessionInbound(session)
-      trace(`h2 session connected: origin=${origin}`)
+      raiseSessionWindow(session)
+      trace(`h2 session connected: origin=${origin} localWindow=${session.state?.localWindowSize ?? "?"}`)
       resolve(session)
     }
     const timer = setTimeout(() => {

@@ -1236,6 +1236,15 @@ async function doStreamImpl(
           cancelForHostInterrupt(activeSession, "stream-cancelled")
           return
         }
+        // A stream the host read to its end is closed and never cancelled, so the
+        // host kept only part of a turn that ended here.
+        const keepStopped = pumpingThisStream ? undefined : stopAfterTurnEnd.get(activeSession)
+        if (keepStopped) {
+          stopAfterTurnEnd.delete(activeSession)
+          trace("ReadableStream cancel() after turn_ended with parts unread → keeping the step as stopped")
+          keepStopped()
+          return
+        }
         trace("ReadableStream cancel() → closeUnlessPending")
         if (!activeSession.hostInterrupted) sessionManager.closeUnlessPending(activeSession)
       },
@@ -2587,6 +2596,30 @@ async function persistTerminalCheckpoint(session: Pick<CursorSession,
   })
 }
 
+/** Turn-end saves still writing; a shutdown waits for them. */
+const terminalSavesInFlight = new Set<Promise<void>>()
+/** For a Run whose turn ended: keep its step as stopped and save again, when the host stops before reading it all. */
+const stopAfterTurnEnd = new WeakMap<CursorSession, () => void>()
+
+function trackTerminalSave(save: Promise<void>): void {
+  terminalSavesInFlight.add(save)
+  void save.finally(() => terminalSavesInFlight.delete(save))
+}
+
+/**
+ * Start the turn-end save without holding the turn's `finish` for it: the
+ * checkpoint and blobs are captured before the first await, and the per-session
+ * write queue keeps saves in order (about 0.1 s of gzip and write at 700k tokens).
+ */
+function startTerminalCheckpointSave(session: Parameters<typeof persistTerminalCheckpoint>[0]): void {
+  trackTerminalSave(persistTerminalCheckpoint(session))
+}
+
+/** Test hook: wait for turn-end saves started so far. */
+export async function settleTerminalCheckpointSavesForTests(): Promise<void> {
+  await Promise.all([...terminalSavesInFlight])
+}
+
 /**
  * Before opening a new user-turn Run, settle the held Run's pending results
  * and drain its terminal checkpoint. The unseen follow-up to results settled
@@ -3035,6 +3068,7 @@ onHostInterrupt(async (openCodeSessionId, reason, at) => {
     await Promise.all([
       ...open.map((session) => persistRunInProgress(session, "shutdown")),
       ...cancelsInFlight.values(),
+      ...terminalSavesInFlight,
     ])
     return
   }
@@ -5506,7 +5540,7 @@ export async function pump(
       }
       confirmRunImagesAtTurnEnd(session)
       if (session.openCodeSessionId) finishEmittedStep(session.openCodeSessionId, session.conversationId)
-      await persistTerminalCheckpoint(session)
+      startTerminalCheckpointSave(session)
       const checkpoint = session.resumeCheckpoint ?? getCheckpoint(session.conversationId)
       if (steers.undelivered.length > 0 && typeof session.reopenWithUserMessage === "function") {
         // OpenCode will not send these again: they were left out of this turn's continuation.
@@ -5588,7 +5622,7 @@ export async function pump(
         const previousId = session.conversationId
         const conversationId = rekeyConversation(sessionKey, previousId, checkpoint)
         trace(`model switch: accepted turn ended served=${session.servedBySwitch} conversation ${previousId} → ${conversationId}`)
-        await persistConversationState(session.cacheDir ?? opencodeGlobalCacheDir(), {
+        const saveAccepted = () => persistConversationState(session.cacheDir ?? opencodeGlobalCacheDir(), {
           sessionKey,
           conversationId,
           requestContext: session.requestContext,
@@ -5599,6 +5633,17 @@ export async function pump(
           hostNote: encodePersistedHostNotes(undeliveredHostNotes(sessionKey)),
         }).catch((error) => {
           trace(`conversation persistence: accepted switch save failed sessionKey=${sessionKey}: ${String(error)}`)
+        })
+        trackTerminalSave(saveAccepted())
+        stopAfterTurnEnd.set(session, () => {
+          resumeEmittedStep(sessionKey, conversationId)
+          trackTerminalSave(saveAccepted())
+        })
+      } else if (session.openCodeSessionId) {
+        const sessionKey = session.openCodeSessionId
+        stopAfterTurnEnd.set(session, () => {
+          resumeEmittedStep(sessionKey, session.conversationId)
+          startTerminalCheckpointSave(session)
         })
       }
       emitFinish(

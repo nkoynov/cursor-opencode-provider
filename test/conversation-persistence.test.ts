@@ -10,8 +10,10 @@ import {
   loadPersistedConversation,
   persistConversation,
   resetConversationPersistenceForTests,
+  setConversationPersistenceHookForTests,
   waitForConversationMaintenanceForTests,
 } from "../src/protocol/conversation-persistence.js"
+import { notifyHostInterrupt } from "../src/host-interrupt.js"
 import {
   hydrateConversationState,
   persistConversationState,
@@ -52,6 +54,7 @@ import {
   resetTurnStateForTests,
   resolveTurnToolState,
   restoreTurnToolCatalog,
+  settleTerminalCheckpointSavesForTests,
 } from "../src/language-model.js"
 import type { CursorSession, Frame } from "../src/session.js"
 import { forgetEarlySteers, recordEarlySteer, serializeEarlySteers } from "../src/host-steer.js"
@@ -77,7 +80,8 @@ async function cacheRoot(): Promise<string> {
   return root
 }
 
-function clearMemory(): void {
+async function clearMemory(): Promise<void> {
+  await settleTerminalCheckpointSavesForTests()
   resetConversationPersistenceForTests()
   resetConversationBindingsForTests()
   resetCheckpointsForTests()
@@ -174,7 +178,7 @@ describe("conversation restart persistence", () => {
       systemPromptHash: "stable-prompt-hash",
     })
 
-    clearMemory()
+    await clearMemory()
     const hydrated = await hydrateConversationState(root, sessionKey)
     expect(hydrated?.conversationId).toBe(conversationId)
     expect(hydrated?.toolCatalog).toEqual(toolCatalog)
@@ -210,7 +214,7 @@ describe("conversation restart persistence", () => {
     confirmHistoryImagesAtTurnEnd(run, sessionKey, conversationId, checkpoint)
     await persistConversationState(root, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
 
-    clearMemory()
+    await clearMemory()
     expect(snapshotHeldHistoryImagesForTests(sessionKey)).toEqual([])
     await hydrateConversationState(root, sessionKey)
     expect([...heldHistoryImageHashes(sessionKey, conversationId, getCheckpoint(conversationId)!) ?? []]).toEqual(["a", "b"])
@@ -232,7 +236,7 @@ describe("conversation restart persistence", () => {
     const saved = await getPersistedConversation(root, sessionKey)
     expect(saved?.sentImageHashes).toBeUndefined()
     expect(saved?.sentImagesCheckpoint).toBeUndefined()
-    clearMemory()
+    await clearMemory()
     await hydrateConversationState(root, sessionKey)
     expect(snapshotHeldHistoryImagesForTests(sessionKey)).toEqual([])
   })
@@ -250,7 +254,7 @@ describe("conversation restart persistence", () => {
       toolCatalog: [],
       postCompactionRebase: false,
     })
-    clearMemory()
+    await clearMemory()
     await hydrateConversationState(root, sessionKey)
     expect(snapshotHeldHistoryImagesForTests(sessionKey)).toEqual([])
 
@@ -259,9 +263,9 @@ describe("conversation restart persistence", () => {
     const hash = Buffer.from("a".repeat(64))
     const field16 = Buffer.concat([Buffer.from([0x82, 0x01, hash.length]), hash])
     await writeFile(filePath, gzipSync(Buffer.concat([gunzipSync(await readFile(filePath)), field16])))
-    clearMemory()
+    await clearMemory()
     expect((await getPersistedConversation(root, sessionKey))?.sentImageHashes).toBeUndefined()
-    clearMemory()
+    await clearMemory()
     await hydrateConversationState(root, sessionKey)
     expect(snapshotHeldHistoryImagesForTests(sessionKey)).toEqual([])
   })
@@ -283,11 +287,12 @@ describe("conversation restart persistence", () => {
       enqueue() {},
       error(error: unknown) { throw error },
     } as unknown as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
+    await settleTerminalCheckpointSavesForTests()
 
     const saved = await getPersistedConversation(root, sessionKey)
     expect(saved?.checkpoint).toEqual(older)
     expect(saved?.sentImageHashes).toEqual(["a"])
-    clearMemory()
+    await clearMemory()
     await hydrateConversationState(root, sessionKey)
     expect([...heldHistoryImageHashes(sessionKey, session.conversationId, older) ?? []]).toEqual(["a"])
   })
@@ -307,7 +312,7 @@ describe("conversation restart persistence", () => {
       error(error: unknown) { throw error },
     } as unknown as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
 
-    clearMemory()
+    await clearMemory()
     const restored = await getPersistedConversation(root, "ses_turn_ended")
     expect(restored?.conversationId).toBe("turn-ended-conversation")
     expect(restored?.checkpoint).toEqual(checkpoint)
@@ -316,6 +321,43 @@ describe("conversation restart persistence", () => {
     expect(restored?.hostAgent).toBe("build")
     expect(restored?.systemPromptHash).toBe("build-prompt-hash")
     expect(parts.some((part: any) => part.type === "finish")).toBe(true)
+  })
+
+  it("hands the turn's finish to the host before its snapshot is written, and a shutdown waits for the write", async () => {
+    const root = await cacheRoot()
+    const checkpoint = Uint8Array.from([3, 1, 4])
+    const session = turnEndedSession(root, checkpoint)
+    restoreConversationBinding(session.openCodeSessionId!, session.conversationId)
+    let releaseWrite!: () => void
+    const writeHeld = new Promise<void>((resolve) => { releaseWrite = resolve })
+    let writeStarted = false
+    setConversationPersistenceHookForTests(async (phase) => {
+      if (phase !== "before-write") return
+      writeStarted = true
+      await writeHeld
+    })
+    try {
+      const parts: Array<{ type: string }> = []
+      await pump(session, {
+        enqueue(part: { type: string }) { parts.push(part) },
+        error(error: unknown) { throw error },
+      } as unknown as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
+      expect(parts.some((part) => part.type === "finish")).toBe(true)
+      for (let i = 0; i < 100 && !writeStarted; i++) await new Promise((resolve) => setTimeout(resolve, 5))
+      expect(writeStarted).toBe(true)
+      expect(await getPersistedConversation(root, session.openCodeSessionId!)).toBeUndefined()
+
+      let shutdownDone = false
+      const shutdown = notifyHostInterrupt(undefined, "shutdown").then(() => { shutdownDone = true })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(shutdownDone).toBe(false)
+      releaseWrite()
+      await shutdown
+    } finally {
+      setConversationPersistenceHookForTests(undefined)
+    }
+    await clearMemory()
+    expect((await getPersistedConversation(root, "ses_turn_ended"))?.checkpoint).toEqual(checkpoint)
   })
 
   it("keeps the early steers a turn answered in its TurnEnded snapshot", async () => {
@@ -341,7 +383,7 @@ describe("conversation restart persistence", () => {
         error(error: unknown) { throw error },
       } as unknown as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
 
-      clearMemory()
+      await clearMemory()
       const saved = await getPersistedConversation(root, sessionKey)
       expect(JSON.parse(saved!.earlySteers!).records).toMatchObject([{ text: "Also check the README", answered: true }])
       const filePath = conversationCacheFilePath(root, sessionKey)
@@ -385,7 +427,7 @@ describe("conversation restart persistence", () => {
     expect(loaded.value?.modelFallbackStop).toBe(fallbackStop)
     expect(loaded.value?.earlySteers).toBeUndefined()
 
-    clearMemory()
+    await clearMemory()
     const hydrated = await hydrateConversationState(root, sessionKey)
     expect(hydrated).toMatchObject({ conversationId, modelFallbackStop: fallbackStop })
     expect(getCheckpoint(conversationId)).toEqual(Uint8Array.from([0x0a, 0x02, 0x08, 0x01]))
@@ -407,7 +449,7 @@ describe("conversation restart persistence", () => {
     const filePath = conversationCacheFilePath(root, sessionKey)
     const text = Buffer.from("{not json")
     await writeFile(filePath, gzipSync(Buffer.concat([gunzipSync(await readFile(filePath)), Buffer.from([0x72, text.length]), text])))
-    clearMemory()
+    await clearMemory()
 
     const loaded = await loadPersistedConversation(root, sessionKey)
     expect(loaded.status).toBe("restored")
@@ -585,7 +627,7 @@ describe("conversation restart persistence", () => {
       conversationId,
       requestContext: { rules_info_complete: true },
     })
-    clearMemory()
+    await clearMemory()
     const restored = await hydrateConversationState(root, sessionKey)
     expect(restored?.conversationId).toBe(conversationId)
     expect(getCheckpoint(conversationId)).toEqual(checkpoint)
@@ -612,7 +654,7 @@ describe("conversation restart persistence", () => {
     const fileBytes = await readFile(conversationCacheFilePath(root, "ses_same"))
     expect([...fileBytes.subarray(0, 2)]).toEqual([0x1f, 0x8b])
     expect(gunzipSync(fileBytes)[0]).not.toBe("{".charCodeAt(0))
-    clearMemory()
+    await clearMemory()
     expect(await getPersistedConversation(root, "ses_same")).toMatchObject({
       conversationId: "new-conversation",
       updatedAt: now + 1,
@@ -632,13 +674,13 @@ describe("conversation restart persistence", () => {
     await persistConversation(staleRoot, value, writtenAt)
     await persistConversation(boundaryRoot, value, writtenAt)
 
-    clearMemory()
+    await clearMemory()
     await waitForConversationMaintenanceForTests(staleRoot, writtenAt + CONVERSATION_CACHE_TTL_MS + 1)
     expect((await loadPersistedConversation(staleRoot, value.sessionKey)).status).toBe("expired")
     await expect(stat(conversationCacheFilePath(staleRoot, value.sessionKey)))
       .rejects.toMatchObject({ code: "ENOENT" })
 
-    clearMemory()
+    await clearMemory()
     await waitForConversationMaintenanceForTests(boundaryRoot, writtenAt + CONVERSATION_CACHE_TTL_MS)
     expect((await getPersistedConversation(boundaryRoot, value.sessionKey))?.conversationId)
       .toBe(value.conversationId)
@@ -663,7 +705,7 @@ describe("conversation restart persistence", () => {
       }),
     ])
 
-    clearMemory()
+    await clearMemory()
     expect((await getPersistedConversation(root, "ses_a"))?.conversationId).toBe("conversation-a")
     expect((await getPersistedConversation(root, "ses_b"))?.conversationId).toBe("conversation-b")
     const files = (await readdir(conversationCacheDirectoryPath(root)))
@@ -708,7 +750,7 @@ describe("conversation restart persistence", () => {
     child.stdin.end()
     expect(await child.exited).toBe(0)
 
-    clearMemory()
+    await clearMemory()
     expect((await getPersistedConversation(root, "ses_parent"))?.conversationId)
       .toBe("conversation-parent")
     expect((await getPersistedConversation(root, "ses_child"))?.conversationId)

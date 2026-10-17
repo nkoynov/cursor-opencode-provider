@@ -23,6 +23,7 @@ import {
   HELD_RUN_SAVE_DELAY_MS,
   pump,
   resetTurnStateForTests,
+  settleTerminalCheckpointSavesForTests,
 } from "../src/language-model.js"
 import { createCursor } from "../src/index.js"
 import { notifyHostInterrupt } from "../src/host-interrupt.js"
@@ -507,6 +508,7 @@ describe("provenance through a Cursor Run", () => {
 
     expect(detect(promptEndingWith(assistantText("Cursor wrote this")))).toBeUndefined()
     expect(detect(promptEndingWith(assistantText("Somebody else")))).toBe("foreign-assistant")
+    await settleTerminalCheckpointSavesForTests()
     expect((await getPersistedConversation(root, SESSION))?.turnProvenance).toBeDefined()
 
     // Simulate a host restart: drop all in-memory state, then hydrate.
