@@ -169,6 +169,7 @@ import {
   type CursorContextUsageSource,
   type CursorConversationTokenDetails,
 } from "./protocol/token-details.js"
+import { describeTtftBreakdown, type TtftBreakdown } from "./protocol/ttft.js"
 import {
   conversationBlobCount,
   inspectConversationBlobGraph,
@@ -241,6 +242,7 @@ import {
   CursorServerError,
   CursorTransportError,
   isCapacityFailure,
+  isCompressionRejection,
   isRejectedCredentialError,
   isTransientGrpcStatus,
   retrySuppressedError,
@@ -631,12 +633,14 @@ function cursorCustomErrorMessage(record: Record<string, unknown>): string | und
 export function connectFrameError(payload: string): CursorProviderError {
   try {
     const envelope = JSON.parse(payload) as {
-      error?: { code?: unknown; details?: unknown; retryAfter?: unknown; retry_after?: unknown }
+      error?: { code?: unknown; message?: unknown; details?: unknown; retryAfter?: unknown; retry_after?: unknown }
     }
     const code = typeof envelope.error?.code === "string" ? envelope.error.code : "unknown"
+    const serverMessage = typeof envelope.error?.message === "string" ? envelope.error.message : undefined
     if (code === "unauthenticated" || code === "permission_denied") {
       return new CursorAuthError(`Cursor authentication failed (${code}); reauthenticate with Cursor`, {
         code,
+        serverMessage,
         replaySafe: code === "unauthenticated",
       })
     }
@@ -664,7 +668,7 @@ export function connectFrameError(payload: string): CursorProviderError {
       // requests, and OpenCode retries any text saying "try again".
       const refusal = new CursorServerError(
         `Cursor refused the request: ${sanitizeHostTerminalMessage(customMessage).replace(/\btry again\b/gi, "retry")}`,
-        { transient: false, replaySafe: false, code },
+        { transient: false, replaySafe: false, code, serverMessage },
       )
       refusal.hostRetryUseless = true
       return refusal
@@ -673,6 +677,7 @@ export function connectFrameError(payload: string): CursorProviderError {
       transient: isTransientGrpcStatus(code) || hasRetryInfo,
       replaySafe: true,
       code,
+      serverMessage,
       retryAfterMs: retryAfterMs === undefined
         ? undefined
         : Math.min(MAX_RETRY_DELAY_MS, retryAfterMs),
@@ -1175,6 +1180,7 @@ export async function pumpWithRecovery(input: {
   const capacityMaxRecoveries = (retryPolicy.capacityMaxAttempts ?? retryPolicy.maxAttempts) - 1
   const startedAt = Date.now()
   let credentialRenewed = false
+  let compressionFallbackUsed = false
   input.onSession?.(session)
 
   const resumableCheckpoint = (pumpedSession: CursorSession) =>
@@ -1301,6 +1307,21 @@ export async function pumpWithRecovery(input: {
         session = await reopen(pumpedSession, failure)
         attempt--
         continue
+      }
+      if (!compressionFallbackUsed && pumpedSession.stream.usesCompression?.() && isCompressionRejection(failure)) {
+        compressionFallbackUsed = true
+        pumpedSession.stream.disableCompression?.(
+          failure.serverMessage ? `${failure.message}: ${failure.serverMessage}` : failure.message,
+        )
+        const checkpoint = resumableCheckpoint(pumpedSession)
+        if (failure.replaySafe || checkpoint) {
+          trace(`Run compression rejected: sessionId=${pumpedSession.sessionId} — reopening once uncompressed`)
+          sessionManager.close(pumpedSession, "remote-error", failure)
+          closeEarlyToolRows(pumpedSession, input.controller, EARLY_ROW_RUN_REPLACED)
+          session = await reopen(pumpedSession, failure, checkpoint)
+          attempt--
+          continue
+        }
       }
       if (!failure.transient) throw failure
       // A replay-safe failure keeps the rebase path, in case the carried checkpoint is what failed.
@@ -5165,6 +5186,8 @@ export async function pump(
     // carried output or stateful activity.
     if (!isSoleControlFrame(payload)) onlyControlFrames = false
 
+    const ttft = describeTtftBreakdown(asm.ttft_breakdown as TtftBreakdown | null | undefined)
+    if (ttft) trace(`ttft: sessionId=${session.sessionId} ${ttft}`)
     {
       const iuKind = iu ? Object.keys(iu).find((k) => iu[k]) : undefined
       trace(

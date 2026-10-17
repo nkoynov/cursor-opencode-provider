@@ -13,6 +13,7 @@ import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-
 import { createCursor } from "../src/index.js"
 import { notifyHostInterrupt } from "../src/host-interrupt.js"
 import { HELD_RUN_SAVE_DELAY_MS, resetTurnStateForTests } from "../src/language-model.js"
+import { decodeFramePayload } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
@@ -70,7 +71,10 @@ beforeAll(async () => {
       while (pending.length >= 5) {
         const length = pending.readUInt32BE(1)
         if (pending.length < 5 + length) break
-        const message = decodeMessage<ClientMessage>("AgentClientMessage", pending.subarray(5, 5 + length))
+        const message = decodeMessage<ClientMessage>(
+          "AgentClientMessage",
+          decodeFramePayload({ flags: pending[0]!, payload: pending.subarray(5, 5 + length) }),
+        )
         pending = pending.subarray(5 + length)
         run.received.push(message)
         onRun(run, message)

@@ -10,6 +10,7 @@ import { sessionManager, type Frame } from "../src/session.js"
 import {
   bidiRunStream,
   closeCachedHttp2SessionsForTests,
+  resetRunCompressionForTests,
   routeHttp2ConnectionsForTests,
 } from "../src/transport/connect.js"
 import { sessionFixture } from "./session-fixture.js"
@@ -100,11 +101,14 @@ const savedClientVersion = process.env.CURSOR_CLIENT_VERSION
 beforeEach(() => {
   process.env.CURSOR_CLIENT_VERSION = "cli-drain-test-1"
   resetClientVersionCache()
+  // Pacing is measured in wire bytes, which gzip would shrink to almost nothing for these payloads.
+  resetRunCompressionForTests(ORIGIN)
 })
 
 afterEach(async () => {
   sessionManager.dispose()
   resetTurnStateForTests()
+  resetRunCompressionForTests()
   closeCachedHttp2SessionsForTests()
   routeHttp2ConnectionsForTests()
   await fake?.close()

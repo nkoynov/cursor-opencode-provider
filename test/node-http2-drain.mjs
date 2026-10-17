@@ -4,6 +4,7 @@ import net from "node:net"
 import {
   bidiRunStream,
   closeCachedHttp2SessionsForTests,
+  resetRunCompressionForTests,
   routeHttp2ConnectionsForTests,
 } from "../dist/transport/connect.js"
 import { encodeFrame } from "../dist/protocol/framing.js"
@@ -12,6 +13,8 @@ import { encodeFrame } from "../dist/protocol/framing.js"
 // write drain's stall window is checked on Node too.
 process.env.CURSOR_CLIENT_VERSION = "cli-node-drain-test-1"
 const ORIGIN = "https://agentn.node-drain-test.cursor.sh"
+// Pacing is measured in wire bytes, which gzip would shrink to almost nothing for these payloads.
+resetRunCompressionForTests(ORIGIN)
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const failureOf = (promise) => promise.then(() => undefined, (error) => error)
 const waitUntil = async (condition, ms = 5_000) => {

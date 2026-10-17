@@ -1,5 +1,5 @@
 import { CURSOR_API_HOST, CONNECT_PROTOCOL_VERSION, SERVER_CONFIG_PATH } from "../shared.js"
-import { encodeFrame, streamFrames } from "../protocol/framing.js"
+import { encodeFrame, FLAG_GZIP, streamFrames } from "../protocol/framing.js"
 import { createCursorChecksumHeader } from "../protocol/checksum.js"
 import { getDeviceIds } from "../protocol/device-id.js"
 import { resolveClientVersion } from "../protocol/client-version.js"
@@ -254,8 +254,27 @@ export async function fetchAgentUrl(
 
 // ── Bidi (Run stream) ──
 
+// Cursor CLI sends Run messages with connect-es `sendCompression: gzip` and its default `compressMinBytes`.
+export const RUN_COMPRESS_MIN_BYTES = 1024
+// The connection a rejection came on is dropped with the failed stream, so the fallback holds per origin.
+const _uncompressedRunOrigins = new Set<string>()
+
+/** Encode one outbound Run message, gzip-compressed when it is over `RUN_COMPRESS_MIN_BYTES`. */
+export function encodeRunFrame(msg: Uint8Array, compress: boolean): Uint8Array {
+  return encodeFrame(compress && msg.length > RUN_COMPRESS_MIN_BYTES ? FLAG_GZIP : 0x00, msg)
+}
+
+export function resetRunCompressionForTests(...uncompressedOrigins: string[]): void {
+  _uncompressedRunOrigins.clear()
+  for (const origin of uncompressedOrigins) _uncompressedRunOrigins.add(origin)
+}
+
 export type BidiStream = {
   write(msg: Uint8Array): boolean | void
+  /** Whether this Run announced gzip (`connect-content-encoding`), which a server may reject before any frame. */
+  usesCompression?(): boolean
+  /** Send this origin's later Runs uncompressed, after Cursor rejected a compressed one. */
+  disableCompression?(reason: string): void
   /** Fails once the stream has taken nothing more for `stallTimeoutMs`; no deadline for the whole write. */
   waitForDrain?(stallTimeoutMs: number): Promise<void>
   end(): void
@@ -335,7 +354,9 @@ function cursorRunGrpcError(
 ): CursorProviderError {
   const message = trailers["grpc-message"] ?? headers["grpc-message"]
   return withErrorMessageSuffix(
-    cursorGrpcError("Cursor Run failed by remote:", grpcStatus),
+    cursorGrpcError("Cursor Run failed by remote:", grpcStatus, {
+      ...(message === undefined ? {} : { serverMessage: String(message) }),
+    }),
     message === undefined ? "" : `: ${message}`,
   )
 }
@@ -773,12 +794,15 @@ export async function bidiRunStream(
     acquireSession(options.baseURL, sessionOptions),
     resolveClientVersion(),
   ])
+  const compress = !_uncompressedRunOrigins.has(origin)
+  const encodeOutbound = (msg: Uint8Array): Uint8Array => encodeRunFrame(msg, compress)
   const headers = {
     ...buildBaseHeaders(token, clientVersion, options.headers),
     ":method": "POST",
     ":path": "/agent.v1.AgentService/Run",
     "content-type": "application/connect+proto",
     "connect-accept-encoding": "gzip,br",
+    ...(compress ? { "connect-content-encoding": "gzip" } : {}),
     // The CLI's streaming interceptor sets this on the bidi Run stream
     // (decompiled client.ts:1190). Without it Cursor may treat the stream as
     // non-streaming.
@@ -1201,7 +1225,7 @@ export async function bidiRunStream(
       const resendQueue = resending ?? (failing ? unanswered : undefined)
       if (resendQueue && !locallyClosed && !terminalEvent) {
         // Goes out with the rest of the Run if it is sent again, and is dropped with it otherwise.
-        resendQueue.push(encodeFrame(0x00, msg))
+        resendQueue.push(encodeOutbound(msg))
         return true
       }
       if (failing) {
@@ -1210,7 +1234,7 @@ export async function bidiRunStream(
         }
         throw observedFailure() ?? new CursorRunInterruptedError("Cursor Run stream is no longer writable")
       }
-      const frame = encodeFrame(0x00, msg)
+      const frame = encodeOutbound(msg)
       try {
         const accepted = send(frame)
         unanswered?.push(frame)
@@ -1224,6 +1248,12 @@ export async function bidiRunStream(
         scheduleTerminalSettlement()
         throw streamFailure
       }
+    },
+    usesCompression: () => compress,
+    disableCompression(reason: string) {
+      if (_uncompressedRunOrigins.has(origin)) return
+      _uncompressedRunOrigins.add(origin)
+      trace(`Run compression: Cursor rejected a gzip frame (${reason}) — sending uncompressed to ${origin} from now on`)
     },
     waitForDrain(stallTimeout) {
       if (!backpressured) return Promise.resolve()

@@ -10,7 +10,7 @@ import { createCursor } from "../src/index.js"
 import { resetTurnStateForTests } from "../src/language-model.js"
 import { lostRequestsFor, noteFailedTurn, resetLostTurnsForTests, withLostRequests } from "../src/lost-turns.js"
 import { sessionManager, type CursorSession } from "../src/session.js"
-import { encodeFrame } from "../src/protocol/framing.js"
+import { decodeFramePayload, encodeFrame } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { resetCheckpointsForTests, setCheckpoint } from "../src/protocol/checkpoint.js"
 import { resetConversationBindingsForTests, restoreConversationBinding } from "../src/protocol/conversation-bind.js"
@@ -41,7 +41,7 @@ function fakeCursorRuns(script: ScriptedFrame[][], refused = { requests: 0 }): {
           destroyed: false,
           rstCode: 0,
           write(data: Uint8Array) {
-            const message = decodeMessage<any>("AgentClientMessage", data.subarray(5))
+            const message = decodeMessage<any>("AgentClientMessage", decodeFramePayload({ flags: data[0]!, payload: data.subarray(5) }))
             if (message.run_request) {
               runs.push(message.run_request)
               const frames = script.shift() ?? [{ interaction_update: { turn_ended: { input_tokens: 1, output_tokens: 1 } } }]

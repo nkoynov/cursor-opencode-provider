@@ -10,6 +10,7 @@ import {
   getSession,
   HTTP2_SESSION_LIVE_WINDOW_MS,
   receivedRecently,
+  resetRunCompressionForTests,
   routeHttp2ConnectionsForTests,
   type BidiStream,
 } from "../src/transport/connect.js"
@@ -181,6 +182,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   setSystemTime()
+  resetRunCompressionForTests()
   closeCachedHttp2SessionsForTests()
   routeHttp2ConnectionsForTests()
   await fake.close()
@@ -265,6 +267,8 @@ describe("Run connection reuse", () => {
   )
 
   it("follows the new connection when the dead one held a request still draining", async () => {
+    // Uncompressed, so the request stays larger than the socket buffers on the wire.
+    resetRunCompressionForTests(ORIGIN)
     await completedRun()
     fake.dropNextRequest(200)
 

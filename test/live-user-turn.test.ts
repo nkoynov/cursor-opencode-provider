@@ -9,7 +9,7 @@ import { createCursor } from "../src/index.js"
 import { resetTurnStateForTests, restoreTurnToolCatalog } from "../src/language-model.js"
 import { sessionManager } from "../src/session.js"
 import { forgetEarlySteers, recordEarlySteer } from "../src/host-steer.js"
-import { encodeFrame } from "../src/protocol/framing.js"
+import { decodeFramePayload, encodeFrame } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { resetCheckpointsForTests, setCheckpoint } from "../src/protocol/checkpoint.js"
 import { resetConversationBindingsForTests, restoreConversationBinding } from "../src/protocol/conversation-bind.js"
@@ -55,7 +55,7 @@ function fakeCursorRuns(): { runs: any[]; restore: () => void } {
             if (written.length < 5 || written.length < 5 + written.readUInt32BE(1)) return true
             const frame = written.subarray(0, 5 + written.readUInt32BE(1))
             written = written.subarray(frame.length)
-            const message = decodeMessage<any>("AgentClientMessage", frame.subarray(5))
+            const message = decodeMessage<any>("AgentClientMessage", decodeFramePayload({ flags: frame[0]!, payload: frame.subarray(5) }))
             if (message.run_request) {
               runs.push(message.run_request)
               setImmediate(() => {

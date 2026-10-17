@@ -26,7 +26,7 @@ import {
 } from "../src/model-fallback.js"
 import { pump, resetTurnStateForTests } from "../src/language-model.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
-import { encodeFrame } from "../src/protocol/framing.js"
+import { decodeFramePayload, encodeFrame } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { OPENCODE_2_TOOL_DIALECT, toolsToDescriptors } from "../src/protocol/tools.js"
 import { getCheckpoint, resetCheckpointsForTests, setCheckpoint } from "../src/protocol/checkpoint.js"
@@ -595,7 +595,7 @@ function fakeCursorRuns(script: Array<Array<Record<string, unknown>>>): { runs: 
           destroyed: false,
           rstCode: 0,
           write(data: Uint8Array) {
-            const message = decodeMessage<any>("AgentClientMessage", data.subarray(5))
+            const message = decodeMessage<any>("AgentClientMessage", decodeFramePayload({ flags: data[0]!, payload: data.subarray(5) }))
             if (message.run_request) {
               runs.push(message.run_request)
               const frames = script.shift() ?? [{ interaction_update: { turn_ended: { input_tokens: 1, output_tokens: 1 } } }]
