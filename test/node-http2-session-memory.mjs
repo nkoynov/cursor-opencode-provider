@@ -5,6 +5,7 @@ import {
   bidiRunStream,
   closeCachedHttp2SessionsForTests,
   getSession,
+  resetRunCompressionForTests,
   routeHttp2ConnectionsForTests,
 } from "../dist/transport/connect.js"
 import { encodeFrame } from "../dist/protocol/framing.js"
@@ -12,6 +13,8 @@ import { encodeFrame } from "../dist/protocol/framing.js"
 // Node counts a session's unsent request bytes against maxSessionMemory too, so new Runs are checked here as well.
 process.env.CURSOR_CLIENT_VERSION = "cli-node-session-memory-test-1"
 const ORIGIN = "https://agentn.node-session-memory-test.cursor.sh"
+// The pending requests must stay megabytes on the wire, which gzip would shrink to almost nothing.
+resetRunCompressionForTests(ORIGIN)
 const MiB = 1024 * 1024
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
