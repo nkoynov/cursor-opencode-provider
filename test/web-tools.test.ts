@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test"
 import {
   executeOpenCodeWebSearch,
+  fetchOpenCodeWebSearchText,
   parseOpenCodeWebSearchResponse,
   parseExaWebSearchResults,
 } from "../src/web-tools.js"
@@ -69,6 +70,80 @@ describe("OpenCode-backed websearch tool", () => {
       output: "search output",
       metadata: { provider: "exa" },
     })
+  })
+})
+
+describe("Exa rate limits", () => {
+  const ok = () => new Response(JSON.stringify({ result: { content: [{ type: "text", text: "found" }] } }))
+  const limited = (retryAfter: string | null = "1") =>
+    new Response(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "You've hit Exa's free MCP rate limit." } }), {
+      status: 429,
+      headers: retryAfter === null ? {} : { "retry-after": retryAfter },
+    })
+  function scripted(responses: Array<() => Response>) {
+    let calls = 0
+    const fetchImpl = (async () => responses[Math.min(calls++, responses.length - 1)]!()) as unknown as typeof fetch
+    return { fetchImpl, calls: () => calls }
+  }
+  function clock() {
+    let t = 1_000_000
+    const waits: number[] = []
+    return {
+      waits,
+      options: {
+        now: () => t,
+        random: () => 0.5,
+        sleep: async (ms: number) => { waits.push(ms); t += ms },
+      },
+    }
+  }
+
+  it("waits out a 429 as Retry-After asks, with jitter, then returns the results", async () => {
+    const { fetchImpl, calls } = scripted([() => limited("1"), () => limited("2"), ok])
+    const c = clock()
+    await expect(fetchOpenCodeWebSearchText({ query: "q" }, undefined, fetchImpl, c.options)).resolves.toBe("found")
+    expect(calls()).toBe(3)
+    expect(c.waits).toEqual([1_500, 2_500])
+  })
+
+  it("assumes one second when a 429 has no usable Retry-After and caps long ones", async () => {
+    const { fetchImpl } = scripted([() => limited(null), () => limited("120"), ok])
+    const c = clock()
+    await fetchOpenCodeWebSearchText({ query: "q" }, undefined, fetchImpl, c.options)
+    expect(c.waits).toEqual([1_500, 5_500])
+  })
+
+  it("reports the 429 after six attempts", async () => {
+    const { fetchImpl, calls } = scripted([() => limited("1")])
+    const c = clock()
+    await expect(fetchOpenCodeWebSearchText({ query: "q" }, undefined, fetchImpl, c.options))
+      .rejects.toThrow("Web search failed (429)")
+    expect(calls()).toBe(6)
+  })
+
+  it("stops retrying when the next wait would pass the 25 s budget", async () => {
+    const { fetchImpl, calls } = scripted([() => limited("5")])
+    const c = clock()
+    await expect(fetchOpenCodeWebSearchText({ query: "q" }, undefined, fetchImpl, c.options))
+      .rejects.toThrow("Web search failed (429)")
+    expect(calls()).toBe(5)
+    expect(c.waits.reduce((a, b) => a + b, 0)).toBeLessThan(25_000)
+  })
+
+  it("does not retry other failures", async () => {
+    const { fetchImpl, calls } = scripted([() => new Response("boom", { status: 500 }), ok])
+    await expect(fetchOpenCodeWebSearchText({ query: "q" }, undefined, fetchImpl, clock().options))
+      .rejects.toThrow("Web search failed (500): boom")
+    expect(calls()).toBe(1)
+  })
+
+  it("ends a rate-limit wait when the call is aborted", async () => {
+    const { fetchImpl, calls } = scripted([() => limited("1"), ok])
+    const controller = new AbortController()
+    const pending = fetchOpenCodeWebSearchText({ query: "q" }, controller.signal, fetchImpl)
+    setTimeout(() => controller.abort(new Error("stopped")), 20)
+    await expect(pending).rejects.toThrow("stopped")
+    expect(calls()).toBe(1)
   })
 })
 
