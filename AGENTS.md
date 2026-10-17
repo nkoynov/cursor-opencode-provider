@@ -214,15 +214,18 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
 - Respect `tool_requests_listed` when emitting parallel calls. Early edit rows
   predict the remapped host tool, close if no exec arrives, and retain routing
   after Run closure/restart so a late result can rebuild from history.
-- Fork: `pump` keeps the AI SDK step open after a host tool-call until every
-  listed call has reached it (its exec, or its display completion when no exec
-  claimed it; an edit's private read does not count). Model output,
-  `turn_ended`, a Run failure or 1.5 s without frames
-  (`HELD_TOOL_STEP_QUIET_MS`) close it early.
+- Fork: until this process has seen `tool_requests_listed`, every host call
+  ends its own AI SDK step. After that, `pump` keeps the step open after a host
+  tool-call until every listed call has reached it (its exec, or its display
+  completion when no exec claimed it; an edit's private read does not count).
+  Model output, `turn_ended`, a Run failure or 1.5 s without frames
+  (`HELD_TOOL_STEP_QUIET_MS`) close it early, and so does the ordering below.
 - Fork tool-call order (`src/tool-call-order.ts`, Claude Code's rule): reads,
-  searches, subagents and read-only shell run together; an edit, write, other
-  shell or MCP call waits for the calls written before it, and later calls wait
-  for it. A held-back exec is released anyway after 15 s without progress
+  searches, subagents, read-only shell and MCP tools with read-only names run
+  together; an edit, write, other shell or other MCP call waits for the calls
+  written before it, and later calls wait for it. A state-changing call ends its
+  step, and a call that must wait closes the step so OpenCode runs the earlier
+  ones. A held-back exec is released anyway after 15 s without progress
   (`toolCallOrderTiming.releaseQuietMs`), so a call Cursor never closes cannot
   stall the Run.
 - Fork early rows: an empty existing file predicts `write`, as the edit remap
