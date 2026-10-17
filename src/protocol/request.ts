@@ -182,10 +182,15 @@ export function buildHeartbeat(): Uint8Array {
   })
 }
 
-/** Exec control heartbeat for an exec still running, which Cursor CLI sends every 3 s. */
+/**
+ * ACM #5 `exec_client_control_message.heartbeat{id}`: Cursor CLI sends it every
+ * 3 s for each exec it is still running, keyed by the exec message id. The CLI
+ * leaves a zero id out, as proto3 does for a default scalar; protobufjs would
+ * write it explicitly, so it is omitted here to send the CLI's exact bytes.
+ */
 export function buildExecHeartbeat(execId: number): Uint8Array {
   return encodeMessage("AgentClientMessage", {
-    exec_client_control_message: { heartbeat: { id: execId } },
+    exec_client_control_message: { heartbeat: execId === 0 ? {} : { id: execId } },
   })
 }
 

@@ -14,7 +14,6 @@ import {
   CursorTransportError,
   isCapacityFailure,
 } from "../src/errors.js"
-import { MAX_TOOL_INPUT_MS, semanticDeadlineAt } from "../src/cursor-waits.js"
 import { sessionFixture } from "./session-fixture.js"
 
 type TimedFrame = { frame: Frame; afterMs?: number }
@@ -93,11 +92,13 @@ const ids = { textId: "t", reasoningId: "r" }
 const noDelay = { maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 0 }
 
 describe("Cursor-side waits and the stall watchdog", () => {
-  it("lets a Run stay silent through an AwaitShell sleep", async () => {
+  it("keeps a Run through an AwaitShell sleep on Cursor's heartbeats", async () => {
     const session = fakeSession("await-sleep", [
       { frame: awaitStarted("w1", 150) },
-      { frame: heartbeat(), afterMs: 100 },
-      { frame: awaitCompleted("w1"), afterMs: 80 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: heartbeat(), afterMs: 40 },
+      { frame: awaitCompleted("w1"), afterMs: 40 },
       { frame: turnEnded() },
     ])
     const parts: any[] = []
@@ -105,7 +106,7 @@ describe("Cursor-side waits and the stall watchdog", () => {
     expect(parts.filter((part) => part.type === "finish")).toHaveLength(1)
   })
 
-  it("still times out the same silence without a Cursor-side wait", async () => {
+  it("still times out silence without a Cursor-side wait", async () => {
     const session = fakeSession("plain-silence", [
       { frame: heartbeat(), afterMs: 100 },
       { frame: turnEnded() },
@@ -113,10 +114,10 @@ describe("Cursor-side waits and the stall watchdog", () => {
     await expect(pump(session, controller(), ids)).rejects.toMatchObject({ code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
   })
 
-  it("times out a wait that outlives block_until_ms plus the idle window", async () => {
-    const session = fakeSession("wait-overrun", [
-      { frame: awaitStarted("w1", 40) },
-      { frame: turnEnded(), afterMs: 40 + IDLE_MS + 80 },
+  it("times out a fully silent stream during an AwaitShell sleep after the idle window", async () => {
+    const session = fakeSession("wait-silent", [
+      { frame: awaitStarted("w1", 10_000) },
+      { frame: turnEnded(), afterMs: IDLE_MS + 80 },
     ])
     await expect(pump(session, controller(), ids)).rejects.toMatchObject({ code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
   })
@@ -137,7 +138,6 @@ describe("Cursor-side waits and the stall watchdog", () => {
     ])
     await expect(pump(session, controller(), ids)).rejects.toMatchObject({ code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
     expect(session.cursorWaits?.size ?? 0).toBe(0)
-    expect(semanticDeadlineAt(session)).toBe(session.semanticDeadlineAt)
   })
 })
 
@@ -285,29 +285,6 @@ describe("a tool input Cursor holds until the model has written it", () => {
     const parts: any[] = []
     await pump(session, controller(parts), ids)
     expect(parts.filter((part) => part.type === "finish")).toHaveLength(1)
-  })
-
-  it("gives heartbeats alone at most MAX_TOOL_INPUT_MS after the last other frame", () => {
-    const now = Date.now()
-    const lastOther = now - MAX_TOOL_INPUT_MS + 10
-    const session = fakeSession("input-cap", [], {
-      semanticDeadlineAt: lastOther + IDLE_MS,
-      lastNonHeartbeatAt: lastOther,
-      lastFrameAt: now,
-    })
-    expect(semanticDeadlineAt(session)).toBe(now + 10)
-    session.lastNonHeartbeatAt = now - 1_000
-    expect(semanticDeadlineAt(session)).toBe(now + IDLE_MS)
-  })
-
-  it("measures the heartbeat stretch from the Run's last progress when that is later", () => {
-    const now = Date.now()
-    const session = fakeSession("input-cap-progress", [], {
-      semanticDeadlineAt: now - 1_000 + IDLE_MS,
-      lastNonHeartbeatAt: now - MAX_TOOL_INPUT_MS - 60_000,
-      lastFrameAt: now,
-    })
-    expect(semanticDeadlineAt(session)).toBe(now + IDLE_MS)
   })
 })
 

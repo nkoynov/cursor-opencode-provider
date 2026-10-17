@@ -41,6 +41,29 @@
   any resend must preserve replay safety and must not treat missing response
   headers as proof that a stateful Run was never processed.
 
+- [ ] Investigate the system prompt resent after a restart, and decide only
+  from A/B results. The frozen system-instructions rule already goes out with
+  every Run and keeps the prompt cache. Separately, the first turn after a
+  process restart (`context epoch: recovered`) also puts the whole live host
+  system prompt into the user text as "Current host system instructions after
+  session recovery" (`admitContextEpoch`, `src/context/epoch.ts`). Seen live
+  2026-10-17 on OpenCode 1.19.3 with grok-4.7: about 43 KB of user text against
+  27 characters on the session's first turn. A process per turn (`opencode
+  run`) pays it on every turn. The reminder exists because a checkpoint may
+  hold instruction changes made after the frozen rule. It is documented
+  behavior, not a known bug, so do not remove or narrow it from reading code.
+  - [ ] Measure first: uncached input and cache reads on the first turn after a
+    restart, with and without the reminder, on both hosts and on several models
+    (Claude, GPT, Grok, composer).
+  - [ ] A/B the behavior: after a restart, does the model still follow the host
+    instructions without the reminder? Cover unchanged instructions, an
+    AGENTS.md or MCP instruction change before the restart, an agent switch
+    (build/plan) before the restart, and a restart right after compaction.
+  - [ ] Only then choose: keep it, skip it when provably redundant (persist the
+    epoch snapshot the checkpoint actually reflects, including in-progress
+    saves of a held Run), or send only what changed. Record the results and
+    the reason for the choice in `tasks/lessons/` and AGENTS.md.
+
 - [x] Design how Cursor metadata spills (`write_args` to
   `<project_folder>/agent-tools/<uuid>.txt`) are written, to match Cursor CLI
   behavior instead of routing them through the host `write` tool. Implemented

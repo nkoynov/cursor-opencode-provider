@@ -15,9 +15,9 @@ import {
   remapCorrelatedEditWriteForCatalog,
   remapEditToolsForCatalog,
   buildTypedExecResult,
+  hostToolForCursorEdit,
   type ParsedExecRequest,
 } from "../src/protocol/tools.js"
-import { predictEarlyToolName } from "../src/early-tool-rows.js"
 import {
   parseDisplayToolCall,
   resolveBridgedOpenCodeToolCall,
@@ -683,13 +683,12 @@ describe.each([
   it("predicts the patch tool's row for a GPT edit_tool_call and keeps Opus on write/edit", () => {
     const existing = path.join(workspace, "row.txt")
     fs.writeFileSync(existing, "body\n")
-    const call = (target: string) => ({ variant: "edit_tool_call", args: { path: target } })
-    const gpt = { advertised: new Set<string>(gptCatalog), workspaceRoot: workspace }
-    const opus = { advertised: new Set<string>(opusCatalog), workspaceRoot: workspace }
-    expect(predictEarlyToolName(call(path.join(workspace, "absent.txt")), gpt)).toBe(patchTool)
-    expect(predictEarlyToolName(call(existing), gpt)).toBe(patchTool)
-    expect(predictEarlyToolName(call(path.join(workspace, "absent.txt")), opus)).toBe("write")
-    expect(predictEarlyToolName(call(existing), opus)).toBe("edit")
+    const gpt = new Set<string>(gptCatalog)
+    const opus = new Set<string>(opusCatalog)
+    expect(hostToolForCursorEdit(path.join(workspace, "absent.txt"), gpt, workspace)).toBe(patchTool)
+    expect(hostToolForCursorEdit(existing, gpt, workspace)).toBe(patchTool)
+    expect(hostToolForCursorEdit(path.join(workspace, "absent.txt"), opus, workspace)).toBe("write")
+    expect(hostToolForCursorEdit(existing, opus, workspace)).toBe("edit")
   })
 })
 

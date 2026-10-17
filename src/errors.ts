@@ -1,3 +1,5 @@
+import { APICallError } from "@ai-sdk/provider"
+
 export type CursorErrorOrigin =
   | "local-cancel"
   | "transport"
@@ -17,6 +19,7 @@ export type CursorProviderErrorOptions = CursorErrorDiagnostics & {
   origin: CursorErrorOrigin
   transient: boolean
   replaySafe: boolean
+  retryable?: boolean
   cause?: unknown
 }
 
@@ -38,6 +41,8 @@ export class CursorProviderError extends Error {
   readonly rstCode?: number
   readonly code?: string
   readonly retryAfterMs?: number
+  /** Cursor's own verdict (`ErrorDetails.details.isRetryable`), when it gave one. */
+  readonly retryable?: boolean
 
   constructor(message: string, options: CursorProviderErrorOptions) {
     super(message, options.cause === undefined ? undefined : { cause: options.cause })
@@ -50,7 +55,52 @@ export class CursorProviderError extends Error {
     this.rstCode = options.rstCode
     this.code = options.code
     this.retryAfterMs = options.retryAfterMs
+    this.retryable = options.retryable
   }
+}
+
+/** Connect error code → HTTP status, per https://connectrpc.com/docs/protocol/#error-codes. */
+const CONNECT_CODE_HTTP_STATUS: Readonly<Record<string, number>> = {
+  canceled: 499,
+  unknown: 500,
+  invalid_argument: 400,
+  deadline_exceeded: 504,
+  not_found: 404,
+  already_exists: 409,
+  permission_denied: 403,
+  resource_exhausted: 429,
+  failed_precondition: 400,
+  aborted: 409,
+  out_of_range: 400,
+  unimplemented: 501,
+  internal: 500,
+  unavailable: 503,
+  data_loss: 500,
+  unauthenticated: 401,
+}
+
+/**
+ * The error the host receives. A request Cursor declared not retryable becomes
+ * an AI SDK `APICallError` with the Connect code's HTTP status (an unrecognized
+ * code is Connect `unknown`): OpenCode 2 retries any failure that has no status
+ * or recognized code. A host may classify by status alone, and 408/409/429/5xx
+ * read as retryable, so the verdict also travels as the conventional
+ * `x-should-retry: false` response header, which overrides the status.
+ */
+export function hostFacingError(error: unknown): Error {
+  if (!(error instanceof Error)) return new Error(String(error))
+  if (!(error instanceof CursorServerError) || error.retryable !== false) return error
+  return new APICallError({
+    message: error.message,
+    url: "cursor://agent.v1.AgentService/Run",
+    requestBodyValues: {},
+    statusCode: error.code !== undefined && Object.hasOwn(CONNECT_CODE_HTTP_STATUS, error.code)
+      ? CONNECT_CODE_HTTP_STATUS[error.code]
+      : CONNECT_CODE_HTTP_STATUS.unknown,
+    responseHeaders: { "x-should-retry": "false" },
+    isRetryable: false,
+    cause: error,
+  })
 }
 
 export class CursorLocalCancellationError extends CursorProviderError {

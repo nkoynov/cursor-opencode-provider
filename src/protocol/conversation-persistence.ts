@@ -36,7 +36,7 @@ export type PersistedConversation = {
    * via encodePersistedHostNotes). The Cursor checkpoint does not hold them.
    */
   hostNote?: string
-  /** JSON-encoded ModelFallbackStop: the last turn stopped on a model switch and awaits the user's reply. */
+  /** JSON-encoded ModelFallbackStop (field 101): the last turn stopped on a model switch and awaits the user's reply. */
   modelFallbackStop?: string
   /** Content hashes of the history images `sentImagesCheckpoint` holds. */
   sentImageHashes?: string[]
@@ -44,6 +44,8 @@ export type PersistedConversation = {
   sentImagesCheckpoint?: string
   /** Bounded early-steer delivery receipts for the saved checkpoint. */
   earlySteers?: string
+  /** JSON lost-request record: user text sent on a checkpoint Cursor never advanced. */
+  lostRequest?: string
 }
 
 /** Small per-session facts kept for the process; full snapshots stay on disk. */
@@ -213,6 +215,9 @@ function fieldTag(field: number, wireType: number): number {
   return (field << 3) | wireType
 }
 
+/** Fork-only fields sit far above upstream's sequence so a new upstream field cannot collide. */
+const MODEL_FALLBACK_STOP_FIELD = 101
+
 function bytesToHex(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString("hex")
 }
@@ -327,11 +332,12 @@ function encodeCacheFile(value: PersistedConversation): {
   if (value.turnProvenance) writer.uint32(fieldTag(12, 2)).string(value.turnProvenance)
   if (value.hostNote) writer.uint32(fieldTag(13, 2)).string(value.hostNote)
   if (value.earlySteers) writer.uint32(fieldTag(14, 2)).string(value.earlySteers)
-  if (value.modelFallbackStop) writer.uint32(fieldTag(15, 2)).string(value.modelFallbackStop)
+  if (value.lostRequest) writer.uint32(fieldTag(15, 2)).string(value.lostRequest)
   if (value.sentImagesCheckpoint && value.sentImageHashes?.length) {
     for (const hash of value.sentImageHashes) writer.uint32(fieldTag(16, 2)).string(hash)
     writer.uint32(fieldTag(17, 2)).string(value.sentImagesCheckpoint)
   }
+  if (value.modelFallbackStop) writer.uint32(fieldTag(MODEL_FALLBACK_STOP_FIELD, 2)).string(value.modelFallbackStop)
   return { protobufBytes: writer.finish(), requestContextBytes: requestContext.length }
 }
 
@@ -351,6 +357,7 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
   let turnProvenance: string | undefined
   let hostNote: string | undefined
   let modelFallbackStop: string | undefined
+  let field15: string | undefined
   const sentImageHashes: string[] = []
   let sentImagesCheckpoint: string | undefined
   const earlySteerValues: string[] = []
@@ -415,8 +422,8 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
         earlySteerValues.push(reader.string())
         break
       case 15:
-        if (wireType !== 2) throw new Error("invalid model fallback stop")
-        modelFallbackStop = reader.string()
+        if (wireType !== 2) throw new Error("invalid lost request")
+        field15 = reader.string()
         break
       case 16:
         if (wireType !== 2) throw new Error("invalid sent image hash")
@@ -425,6 +432,10 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
       case 17:
         if (wireType !== 2) throw new Error("invalid sent images checkpoint")
         sentImagesCheckpoint = reader.string()
+        break
+      case MODEL_FALLBACK_STOP_FIELD:
+        if (wireType !== 2) throw new Error("invalid model fallback stop")
+        modelFallbackStop = reader.string()
         break
       default:
         reader.skipType(wireType)
@@ -435,6 +446,9 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
     !sessionKey || !conversationId || updatedAt === undefined ||
     !requestContextBytes || requestContextBytes.length === 0
   ) throw new Error("incomplete conversation cache")
+  // Fork builds before field 101 wrote the model-fallback stop as field 15.
+  const lostRequest = field15 !== undefined && isLostRequestJson(field15) ? field15 : undefined
+  if (field15 !== undefined && !lostRequest) modelFallbackStop ??= field15
   const requestContext = decodeMessageSparse<Record<string, unknown>>(
     "RequestContext",
     requestContextBytes,
@@ -455,6 +469,7 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
     ...(modelFallbackStop ? { modelFallbackStop } : {}),
     ...(sentImagesCheckpoint && sentImageHashes.length > 0 ? { sentImageHashes, sentImagesCheckpoint } : {}),
     ...(earlySteerValues.length === 1 && isEarlySteersJson(earlySteerValues[0]!) ? { earlySteers: earlySteerValues[0] } : {}),
+    ...(lostRequest ? { lostRequest } : {}),
   }
 }
 
@@ -463,6 +478,18 @@ function isEarlySteersJson(value: string): boolean {
   try {
     const parsed = JSON.parse(value) as { version?: unknown; records?: unknown } | null
     return !!parsed && typeof parsed === "object" && parsed.version === 1 && Array.isArray(parsed.records)
+  } catch {
+    return false
+  }
+}
+
+function isLostRequestJson(value: string): boolean {
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown> | null
+    return !!parsed && typeof parsed === "object"
+      && typeof parsed.conversationId === "string"
+      && typeof parsed.checkpointKey === "string"
+      && typeof parsed.text === "string"
   } catch {
     return false
   }

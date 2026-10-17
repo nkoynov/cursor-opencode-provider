@@ -8,7 +8,7 @@ import { createSdk, cursorApiBaseURL, cursorGetServerConfigTelemetryEnabled, isC
 import { opencode2PlanDir, opencodeGlobalCacheDir, setNativePlansDir } from "./context/paths.js"
 import { discoverModels, isCacheFresh, readCache, type ModelInfo } from "./models.js"
 import { resolveAgentUrl } from "./agent-url.js"
-import { applyHostPromptEvent, sessionActivity } from "./activity.js"
+import { applyHostPromptEvent, applyHostToolEvent, sessionActivity } from "./activity.js"
 import { notifyHostInterrupt } from "./host-interrupt.js"
 import { takeFinalFailure } from "./host-retry.js"
 import {
@@ -767,6 +767,7 @@ function applySessionActivity(event: any, onCredentialSwitch?: () => void): void
   const payload = eventPayload(event)
   const info = payload?.info
   applyHostPromptEvent(sessionActivity, event?.type, payload)
+  applyHostToolEvent(sessionActivity, event?.type, payload)
   switch (event?.type) {
     case "credential.switched":
     case "credential.updated": {
@@ -814,18 +815,6 @@ function applySessionActivity(event: any, onCredentialSwitch?: () => void): void
       if (id) sessionActivity.recordActivity(id)
       break
     }
-    case "session.tool.called":
-    case "session.tool.success":
-    case "session.tool.failed": {
-      const id = payload?.sessionID
-      const callID = typeof payload?.id === "string" ? payload.id : undefined
-      if (id) sessionActivity.recordActivity(id)
-      if (id && callID) {
-        if (event.type === "session.tool.called") sessionActivity.toolStarted(id, callID)
-        else sessionActivity.toolEnded(callID)
-      }
-      break
-    }
     case "session.inbox.enqueued": {
       const id = payload?.sessionID
       if (id) sessionActivity.recordActivity(id)
@@ -858,7 +847,8 @@ function applySessionActivity(event: any, onCredentialSwitch?: () => void): void
       const id = payload?.sessionID
       if (id) {
         sessionActivity.recordActivity(id)
-        sessionActivity.endSessionTools(id)
+        // OpenCode 2 never publishes session.idle, where the tracker otherwise drops a tool whose end it missed.
+        sessionActivity.endRunningTools(id)
         if (event.type === "session.execution.interrupted") {
           void notifyHostInterrupt(
             id,

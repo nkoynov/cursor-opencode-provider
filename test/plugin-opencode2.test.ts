@@ -33,7 +33,7 @@ import { consumeCursorShellResult, registerCursorShellCall, resetCursorShellCall
 import { createManagedTerminal } from "../src/terminal-runner.js"
 import { listenForHostSteers, matchEarlySteers, recordEarlySteer, resetHostSteersForTests } from "../src/host-steer.js"
 import { toolResultFailure } from "../src/opencode2/tool-results.js"
-import { sessionActivity } from "../src/activity.js"
+import { RUNNING_TOOL_CAP_MS, sessionActivity } from "../src/activity.js"
 import { onHostInterrupt } from "../src/host-interrupt.js"
 import { stageCursorImage } from "../src/image-staging.js"
 import { hostPlansDir, opencode2PlanDir, setHostCacheDirOverride, setNativePlansDir } from "../src/context/paths.js"
@@ -2050,26 +2050,28 @@ describe("opencode2 running tool tracking", () => {
     data: { sessionID: "ses_tools", assistantMessageID: "msg_1", id, executed: false },
   })
 
-  test("a tool runs from tool.called until its success, failure or the end of the execution", async () => {
+  test("a tool runs from tool.called until its success or failure, and none survives the end of the execution", async () => {
     sessionActivity.clear()
+    const running = () => sessionActivity.runningToolDeadline("ses_tools", Date.now(), RUNNING_TOOL_CAP_MS) !== undefined
     try {
       await withPluginEvents([
         toolEvent("session.tool.called", "cursor_run_1"),
+        toolEvent("session.tool.success", "cursor_run_1"),
+      ], () => sessionActivity.lastActivityAt("ses_tools") !== undefined && !running())
+      expect(running()).toBe(false)
+
+      await withPluginEvents([
         toolEvent("session.tool.called", "cursor_run_2"),
         toolEvent("session.tool.called", "cursor_run_3"),
-        toolEvent("session.tool.success", "cursor_run_1"),
         toolEvent("session.tool.failed", "cursor_run_2"),
-      ], () => sessionActivity.isToolRunning("cursor_run_3") && !sessionActivity.isToolRunning("cursor_run_2"))
-      expect(sessionActivity.isToolRunning("cursor_run_1")).toBe(false)
-      expect(sessionActivity.isToolRunning("cursor_run_2")).toBe(false)
-      expect(sessionActivity.isToolRunning("cursor_run_3")).toBe(true)
-      expect(sessionActivity.lastActivityAt("ses_tools")).toBeNumber()
+      ], running)
+      expect(running()).toBe(true)
 
       await withPluginEvents(
         [{ type: "session.execution.interrupted", data: { sessionID: "ses_tools" } }],
-        () => !sessionActivity.isToolRunning("cursor_run_3"),
+        () => !running(),
       )
-      expect(sessionActivity.isToolRunning("cursor_run_3")).toBe(false)
+      expect(running()).toBe(false)
     } finally {
       sessionActivity.clear()
     }

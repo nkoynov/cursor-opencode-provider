@@ -2,564 +2,428 @@ import { afterEach, describe, expect, it } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
-import { OPENCODE_1_TOOL_DIALECT, OPENCODE_2_TOOL_DIALECT, toolsToDescriptors } from "../src/protocol/tools.js"
+import { encodeMessage } from "../src/protocol/messages.js"
+import { hostToolForCursorEdit, toolsToDescriptors } from "../src/protocol/tools.js"
 import {
-  deliverContinuationResults,
-  extractTrailingToolResults,
-  foldStreamParts,
-  pump,
-  pumpWithRecovery,
-  resetTurnStateForTests,
-} from "../src/language-model.js"
-import { SessionManager, sessionManager, type CursorSession, type Frame } from "../src/session.js"
+  UNBOUND_EXEC_ID,
+  cursorEditAnnouncement,
+  earlyRowToolCallId,
+  parseEarlyRowToolCallId,
+  shouldOpenEarlyRow,
+} from "../src/early-tool-rows.js"
+import { extractTrailingToolResults, findContinuationSession, pump } from "../src/language-model.js"
+import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
+import { sessionFixture } from "./session-fixture.js"
 
-const frame = (message: Record<string, unknown>, flags = 0): Frame => ({
-  flags,
-  payload: encodeMessage("AgentServerMessage", message),
+const tempDirs: string[] = []
+
+afterEach(() => {
+  sessionManager.dispose()
+  for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true })
 })
-const update = (value: Record<string, unknown>) => frame({ interaction_update: value })
-const partial = (callId: string, toolCall: Record<string, unknown>) =>
-  update({ partial_tool_call: { call_id: callId, tool_call: toolCall } })
-const started = (callId: string, toolCall: Record<string, unknown>) =>
-  update({ tool_call_started: { call_id: callId, tool_call: toolCall } })
-const completed = (callId: string, toolCall: Record<string, unknown>) =>
-  update({ tool_call_completed: { call_id: callId, tool_call: toolCall } })
-const thinking = (text: string) => update({ thinking_delta: { text } })
-const heartbeat = () => update({ heartbeat: {} })
-const turnEnded = () => update({ turn_ended: {} })
-const checkpoint = () => frame({ conversation_checkpoint_update: Uint8Array.from([9, 9, 9]) })
 
-const editAnnounced = (callId: string, target?: string) => [
-  partial(callId, { edit_tool_call: {} }),
-  ...(target ? [partial(callId, { edit_tool_call: { args: { path: target } } })] : []),
-]
-const editCall = (callId: string, target: string, content: string) =>
-  ({ edit_tool_call: { args: { path: target, stream_content: content } } })
-const editDone = (readId: number, writeId: number, callId: string, target: string, content: string) => [
-  started(callId, editCall(callId, target, content)),
-  frame({ exec_server_message: { id: readId, read_args: { path: target, tool_call_id: callId } } }),
-  frame({ exec_server_message: { id: writeId, write_args: { path: target, file_text: content, tool_call_id: callId } } }),
-]
-const taskDone = (id: number, callId: string, subagentType = "generalPurpose") => [
-  started(callId, { task_tool_call: { args: { description: "Count lines", prompt: "Count the lines of data/app.log." } } }),
-  frame({
-    exec_server_message: {
-      id,
-      subagent_args: { tool_call_id: callId, prompt: "Count the lines of data/app.log.", subagent_type: subagentType },
-    },
-  }),
-]
-const shellStarted = (callId: string, command: string) =>
-  started(callId, { shell_tool_call: { args: { command, tool_call_id: callId } } })
-const shellExec = (id: number, callId: string, command: string) =>
-  frame({ exec_server_message: { id, shell_stream_args: { command, tool_call_id: callId } } })
-
-function scriptedFrames(initial: Frame[] = []) {
-  const queue = [...initial]
-  let waiting: ((result: IteratorResult<Frame>) => void) | undefined
-  let ended = false
-  const frames: AsyncIterator<Frame> = {
-    next: () => {
-      const next = queue.shift()
-      if (next) return Promise.resolve({ done: false, value: next })
-      if (ended) return Promise.resolve({ done: true, value: undefined })
-      return new Promise((resolve) => { waiting = resolve })
-    },
-  }
-  return {
-    frames,
-    push(...next: Frame[]) {
-      for (const item of next) {
-        if (waiting) {
-          const resolve = waiting
-          waiting = undefined
-          resolve({ done: false, value: item })
-        } else queue.push(item)
-      }
-    },
-    end() {
-      ended = true
-      if (waiting) {
-        const resolve = waiting
-        waiting = undefined
-        resolve({ done: true, value: undefined })
-      }
-    },
-  }
+function tempDir(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-early-row-"))
+  tempDirs.push(dir)
+  return dir
 }
 
-const roots: string[] = []
-let seq = 0
-function fakeSession(frames: AsyncIterator<Frame>, tools = ["read", "write", "edit", "shell", "subagent"]): CursorSession {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "early-rows-"))
-  roots.push(root)
-  const definitions = tools.map((name) => ({ name, description: name }))
-  const descriptors = toolsToDescriptors(definitions, "opencode", [])
-  return {
-    sessionId: `early${++seq}`,
-    conversationId: "early-conversation",
+function existingFile(): string {
+  const file = path.join(tempDir(), "existing.txt")
+  fs.writeFileSync(file, "one\n")
+  return file
+}
+
+function partial(callId: string, filePath: string): Uint8Array {
+  return encodeMessage("AgentServerMessage", {
+    interaction_update: {
+      partial_tool_call: {
+        call_id: callId,
+        tool_call: { edit_tool_call: { args: { path: filePath } } },
+      },
+    },
+  })
+}
+
+function turnEnded(): Uint8Array {
+  return encodeMessage("AgentServerMessage", {
+    interaction_update: { turn_ended: { input_tokens: 1, output_tokens: 1 } },
+  })
+}
+
+function pumpSession(
+  payloads: Uint8Array[],
+  tools: Array<{ name: string; description: string }>,
+): { session: CursorSession; parts: any[] } {
+  let index = 0
+  const frames: AsyncIterator<Frame> = {
+    next: async () => index < payloads.length
+      ? { done: false, value: { flags: 0, payload: payloads[index++]! } }
+      : { done: true, value: undefined },
+  }
+  const descriptors = toolsToDescriptors(tools, "opencode", [])
+  const session = sessionFixture({
+    sessionId: `early-${Math.random().toString(16).slice(2)}`,
+    conversationId: `conv-early-${Math.random().toString(16).slice(2)}`,
     stream: {
       write() {},
       end() {},
       destroy() {},
       isClosed: () => false,
       frames: () => ({ [Symbol.asyncIterator]: () => frames }),
-    } as any,
+    } as never,
     frames,
     pending: new Map(),
     displayToolCalls: new Map(),
     nextBridgedExecId: 900_000,
     blobs: new Map(),
-    toolCatalog: definitions,
-    knownMcpServers: [],
+    toolCatalog: tools,
     toolDescriptors: descriptors,
-    hostToolDialect: OPENCODE_2_TOOL_DIALECT,
-    subagentCatalog: { executor: "subagent", agents: [{ name: "general" }, { name: "explore" }], complete: true },
-    requestContext: { tools: descriptors, env: { workspace_paths: [root] } },
+    requestContext: {},
     usageEstimate: { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 },
-    billing: { key: "run:test", prefixTokens: 0 },
     allowTools: true,
-    pumpActive: true,
+    pumpActive: false,
     heartbeat: null,
-    expiresAt: Date.now() + 10_000,
-  } as unknown as CursorSession
-}
-const rootOf = (session: CursorSession) => (session.requestContext.env as { workspace_paths: string[] }).workspace_paths[0]!
-
-function collector() {
+    heartbeatCancel: null,
+    closed: false,
+  })
   const parts: any[] = []
+  return {
+    session,
+    parts,
+  }
+}
+
+async function run(session: CursorSession, parts: any[]): Promise<void> {
   const controller = {
     enqueue(part: unknown) { parts.push(part) },
-    error(error: Error) { throw error },
+    close() {},
+    error(error: unknown) { throw error },
   } as unknown as ReadableStreamDefaultController<any>
-  return { parts, controller }
-}
-
-async function pumpOnce(session: CursorSession) {
-  const { parts, controller } = collector()
   await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
-  return parts
 }
 
-const until = async (check: () => boolean) => {
-  for (let i = 0; i < 200 && !check(); i++) await Bun.sleep(5)
-  expect(check()).toBe(true)
-}
-const rowStarts = (parts: any[]) => parts.filter((p) => p.type === "tool-input-start")
-const hostCalls = (parts: any[]) => parts.filter((p) => p.type === "tool-call" && !p.providerExecuted)
-const closedRows = (parts: any[]) => parts.filter((p) => p.type === "tool-result" && p.isError)
-const kinds = (parts: any[]) => parts
-  .filter((p) => ["tool-input-start", "tool-input-end", "tool-call", "tool-result", "finish"].includes(p.type))
-  .map((p) => p.type === "tool-call" && p.providerExecuted ? "tool-call(provider)" : p.type)
+describe("hostToolForCursorEdit", () => {
+  it("predicts edit for an existing file, write for a new one, and withholds a patch that would change CRLF", () => {
+    const dir = tempDir()
+    const crlf = path.join(dir, "crlf.txt")
+    const lf = path.join(dir, "lf.txt")
+    fs.writeFileSync(crlf, "a\r\nb\r\n")
+    fs.writeFileSync(lf, "a\nb\n")
+    // A missing file is a creation: it stays a write, else becomes the patch tool's Add File.
+    expect(hostToolForCursorEdit(path.join(dir, "missing.txt"), new Set(["edit", "write"]))).toBe("write")
+    expect(hostToolForCursorEdit(path.join(dir, "missing.txt"), new Set(["edit"]))).toBeUndefined()
+    expect(hostToolForCursorEdit(path.join(dir, "missing.txt"), new Set(["write", "patch"]))).toBe("write")
+    expect(hostToolForCursorEdit(lf, new Set(["edit", "write"]))).toBe("edit")
+    expect(hostToolForCursorEdit(crlf, new Set(["edit", "patch"]))).toBe("edit")
+    expect(hostToolForCursorEdit(path.join(dir, "missing.txt"), new Set(["patch"]))).toBe("patch")
+    expect(hostToolForCursorEdit(path.join(dir, "missing.txt"), new Set(["apply_patch"]))).toBe("apply_patch")
+    expect(hostToolForCursorEdit(crlf, new Set(["patch"]))).toBeUndefined()
+    expect(hostToolForCursorEdit(crlf, new Set(["apply_patch"]))).toBe("apply_patch")
+    expect(hostToolForCursorEdit(lf, new Set(["patch"]))).toBe("patch")
+    expect(hostToolForCursorEdit(dir, new Set(["patch"]))).toBeUndefined()
+    expect(hostToolForCursorEdit("relative.txt", new Set(["patch"]))).toBeUndefined()
+    expect(hostToolForCursorEdit(lf, new Set(["write"]))).toBeUndefined()
+  })
+})
 
-async function deliverAll(session: CursorSession) {
-  const results = [...session.pending.entries()].map(([execId, pending]) => ({
-    toolCallId: pending.toolCallId ?? `cursor_${session.sessionId}_${execId}`,
-    sessionId: session.sessionId,
-    execId,
-    toolName: pending.toolName ?? "write",
-    output: "ok",
-  }))
-  expect(await deliverContinuationResults(session, results)).toBe(session)
-}
-
-describe("early tool rows", () => {
-  afterEach(() => {
-    sessionManager.dispose()
-    resetTurnStateForTests()
-    for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true })
+describe("early edit rows", () => {
+  it("opens only while the step can wait for the exec", () => {
+    expect(shouldOpenEarlyRow({
+      allowTools: true,
+      hostInterrupted: false,
+      holdingParallelStep: false,
+      emittedHostTools: 0,
+      owedPending: 0,
+    })).toBe(true)
+    expect(shouldOpenEarlyRow({
+      allowTools: true,
+      hostInterrupted: false,
+      holdingParallelStep: true,
+      emittedHostTools: 2,
+      owedPending: 1,
+    })).toBe(true)
+    expect(shouldOpenEarlyRow({
+      allowTools: false,
+      hostInterrupted: false,
+      holdingParallelStep: false,
+      emittedHostTools: 0,
+      owedPending: 0,
+    })).toBe(false)
+    expect(shouldOpenEarlyRow({
+      allowTools: true,
+      hostInterrupted: true,
+      holdingParallelStep: false,
+      emittedHostTools: 0,
+      owedPending: 0,
+    })).toBe(false)
+    expect(shouldOpenEarlyRow({
+      allowTools: true,
+      hostInterrupted: false,
+      holdingParallelStep: false,
+      emittedHostTools: 1,
+      owedPending: 0,
+    })).toBe(false)
+    expect(cursorEditAnnouncement({
+      call_id: "task-1",
+      tool_call: { task_tool_call: { args: { description: "look" } } },
+    })).toBeUndefined()
+    // Cursor call ids can hold a newline (seen live with grok-4.7); the row id stays opaque and bounded.
+    const liveCallId = "call-4e1f2d3b-b444-4c6f-8ee9-02b61bd2da60-0\nfc_05d8d1a5-117d-961c-95f3-ed00349cd3e3_0"
+    const id = earlyRowToolCallId("2e64e80f-746e-413e-a3f2-27a0b7645ad8", liveCallId)
+    expect(id).toMatch(/^cursor-early_2e64e80f-746e-413e-a3f2-27a0b7645ad8_[0-9a-f]{12}$/)
+    expect(id.length).toBeLessThanOrEqual(64)
+    expect(earlyRowToolCallId("2e64e80f-746e-413e-a3f2-27a0b7645ad8", liveCallId)).toBe(id)
+    expect(earlyRowToolCallId("2e64e80f-746e-413e-a3f2-27a0b7645ad8", "other")).not.toBe(id)
+    expect(parseEarlyRowToolCallId(earlyRowToolCallId("sess", "toolu_01_x")))
+      .toEqual({ sessionId: "sess", execId: UNBOUND_EXEC_ID })
+    expect(parseEarlyRowToolCallId("cursor_sess_4")).toBeUndefined()
+    expect(parseEarlyRowToolCallId("cursor-early_sess")).toBeUndefined()
+    expect(parseEarlyRowToolCallId("cursor-early_sess_")).toBeUndefined()
   })
 
-  it("shows a write row while Cursor still composes a new file, and runs the write under its id", async () => {
-    const script = scriptedFrames()
-    const session = fakeSession(script.frames)
-    const target = path.join(rootOf(session), "NEW.md")
-    const { parts, controller } = collector()
-    const pumping = pump(session, controller, { textId: "text", reasoningId: "reasoning" })
-    script.push(thinking("Writing the notes."), ...editAnnounced("w", target), heartbeat())
-
-    await until(() => rowStarts(parts).length === 1)
-    const [row] = rowStarts(parts)
-    expect(row).toEqual({ type: "tool-input-start", id: `cursor_${session.sessionId}_900000`, toolName: "write", providerExecuted: true })
-    expect(parts.findIndex((p) => p.type === "reasoning-end")).toBeLessThan(parts.indexOf(row))
-
-    script.push(...editDone(1, 2, "w", target, "# notes\n"))
-    await pumping
-    expect(kinds(parts)).toEqual(["tool-input-start", "tool-input-end", "tool-call", "finish"])
-    const [call] = hostCalls(parts)
-    expect(call).toMatchObject({ toolCallId: row.id, toolName: "write" })
-    expect(session.pending.get(2)?.toolCallId).toBe(row.id)
-  })
-
-  it("routes the host's result for a row id back to Cursor's exec", async () => {
-    const script = scriptedFrames()
-    const session = fakeSession(script.frames)
-    const target = path.join(rootOf(session), "NEW.md")
-    script.push(...editAnnounced("w", target), ...editDone(1, 2, "w", target, "x\n"))
-    const parts = await pumpOnce(session)
-    const id = hostCalls(parts)[0].toolCallId
-    expect(id).toBe(rowStarts(parts)[0].id)
-
-    const results = extractTrailingToolResults([
-      { role: "assistant", content: [{ type: "tool-call", toolCallId: id, toolName: "write", input: {} }] },
-      { role: "tool", content: [{ type: "tool-result", toolCallId: id, toolName: "write", output: { type: "error-text", value: "denied" } }] },
-    ] as any)
-    expect(results).toMatchObject([{ toolCallId: id, sessionId: session.sessionId, execId: 2, error: "denied" }])
-    expect(await deliverContinuationResults(session, results)).toBe(session)
-    expect(session.pending.size).toBe(0)
-  })
-
-  it("names the row edit for a file that already has content, and write for an empty one", async () => {
-    for (const [content, expected] of [["old\n", "edit"], ["", "write"]] as const) {
-      const script = scriptedFrames()
-      const session = fakeSession(script.frames)
-      const target = path.join(rootOf(session), "EXISTING.md")
-      fs.writeFileSync(target, content)
-      script.push(...editAnnounced("e", target), ...editDone(1, 2, "e", target, "new\n"))
-      const parts = await pumpOnce(session)
-      expect(rowStarts(parts).map((p) => p.toolName)).toEqual([expected])
-      expect(hostCalls(parts)).toMatchObject([{ toolCallId: rowStarts(parts)[0].id, toolName: expected }])
-      sessionManager.dispose()
-    }
-  })
-
-  it("opens no row for an edit outside the workspace, whose read goes through the host", async () => {
-    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "early-outside-"))
-    roots.push(outside)
-    const script = scriptedFrames()
-    const session = fakeSession(script.frames)
-    const external = path.join(outside, "memory.md")
-    const inside = path.join(rootOf(session), "memory.md")
-    for (const target of [external, inside]) fs.writeFileSync(target, "old\n")
-
-    script.push(...editAnnounced("e", external), ...editDone(1, 2, "e", external, "new\n"))
-    const first = await pumpOnce(session)
-    expect(rowStarts(first)).toEqual([])
-    expect(hostCalls(first).map((p) => p.toolName)).toEqual(["read"])
-    sessionManager.dispose()
-
-    const again = scriptedFrames()
-    const local = fakeSession(again.frames)
-    const localTarget = path.join(rootOf(local), "memory.md")
-    fs.writeFileSync(localTarget, "old\n")
-    again.push(...editAnnounced("e", localTarget), ...editDone(1, 2, "e", localTarget, "new\n"))
-    expect(rowStarts(await pumpOnce(local)).map((p) => p.toolName)).toEqual(["edit"])
-  })
-
-  it("shows a subagent row from Cursor's first announcement", async () => {
-    const script = scriptedFrames()
-    const session = fakeSession(script.frames)
-    const { parts, controller } = collector()
-    const pumping = pump(session, controller, { textId: "text", reasoningId: "reasoning" })
-    script.push(partial("t", { task_tool_call: {} }), heartbeat())
-    await until(() => rowStarts(parts).length === 1)
-    expect(rowStarts(parts)[0].toolName).toBe("subagent")
-
-    script.push(...taskDone(1, "t"))
-    await pumping
-    expect(hostCalls(parts)).toMatchObject([{ toolCallId: rowStarts(parts)[0].id, toolName: "subagent" }])
-    expect(JSON.parse(hostCalls(parts)[0].input)).toMatchObject({ agent: "general" })
-  })
-
-  it("keeps a subagent row through Cursor's attachment read and hands the subagent the paths", async () => {
-    const script = scriptedFrames()
-    const session = fakeSession(script.frames)
-    const written: Uint8Array[] = []
-    session.stream.write = ((message: Uint8Array) => { written.push(message); return true }) as any
-    fs.writeFileSync(path.join(rootOf(session), "shot.png"), "png bytes")
-    const args = { description: "Describe the shot", prompt: "Describe the attached image.", attachments: ["shot.png"] }
-    script.push(
-      partial("t", { task_tool_call: {} }),
-      started("t", { task_tool_call: { args } }),
-      frame({ exec_server_message: { id: 1, read_args: { path: "shot.png", tool_call_id: "t" } } }),
-      frame({
-        exec_server_message: {
-          id: 2,
-          subagent_args: { tool_call_id: "t", prompt: args.prompt, subagent_type: "generalPurpose" },
+  it("binds the announced row to the exec and routes its result", async () => {
+    const dir = tempDir()
+    const target = path.join(dir, "notes.txt")
+    fs.writeFileSync(target, "line one\nline two\n")
+    const callId = "edit-1"
+    const { session, parts } = pumpSession([
+      partial(callId, target),
+      encodeMessage("AgentServerMessage", {
+        interaction_update: {
+          tool_call_started: {
+            call_id: callId,
+            tool_call: { edit_tool_call: { args: { path: target } } },
+          },
         },
       }),
-    )
-    const parts = await pumpOnce(session)
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: { id: 17, read_args: { path: target, tool_call_id: callId } },
+      }),
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: {
+          id: 18,
+          write_args: {
+            path: target,
+            file_text: "edited one\nline two\n",
+            tool_call_id: callId,
+          },
+        },
+      }),
+    ], [
+      { name: "read", description: "Read" },
+      { name: "edit", description: "Edit" },
+      { name: "write", description: "Write" },
+    ])
+    session.requestContext.env = { workspace_paths: [dir] }
+    await run(session, parts)
 
-    expect(closedRows(parts)).toEqual([])
-    const [call] = hostCalls(parts)
-    expect(call).toMatchObject({ toolCallId: rowStarts(parts)[0].id, toolName: "subagent" })
-    expect(JSON.parse(call.input)).toEqual({
-      agent: "general",
-      description: "Describe the shot",
-      prompt: `Describe the attached image.\n\nAttached files (open them with your file tools):\n- ${path.join(rootOf(session), "shot.png")}`,
-    })
-    expect([...session.pending.keys()]).toEqual([2])
-    const read = written
-      .map((message) => decodeMessage("AgentClientMessage", message) as any)
-      .find((message) => message.exec_client_message?.id === 1)
-    const success = read.exec_client_message.read_result.success
-    expect(success.path).toBe("shot.png")
-    expect(success.data.length).toBeGreaterThan(0)
-    expect(Buffer.from(success.data).toString()).not.toContain("png bytes")
-  })
-
-  it("does not run a Task Cursor refuses after its attachment reads", async () => {
-    const script = scriptedFrames()
-    const session = fakeSession(script.frames, ["read", "task"])
-    const written: Uint8Array[] = []
-    session.stream.write = ((message: Uint8Array) => { written.push(message); return true }) as any
-    const args = {
-      description: "Describe the shot",
-      prompt: "Describe the attached image.",
-      subagent_type: { explore: {} },
-      attachments: ["gone.png"],
-    }
-    script.push(
-      started("t", { task_tool_call: { args } }),
-      frame({ exec_server_message: { id: 1, read_args: { path: "gone.png", tool_call_id: "t" } } }),
-      completed("t", { task_tool_call: { args } }),
-      turnEnded(),
-    )
-    const parts = await pumpOnce(session)
-    expect(hostCalls(parts)).toEqual([])
-    expect(session.taskAttachmentCalls?.size ?? 0).toBe(0)
-    const read = written
-      .map((message) => decodeMessage("AgentClientMessage", message) as any)
-      .find((message) => message.exec_client_message?.id === 1)
-    expect(read.exec_client_message.read_result).toEqual({ file_not_found: { path: "gone.png" } })
-  })
-
-  it("closes the row with Cursor's refusal when the call cannot run", async () => {
-    const script = scriptedFrames()
-    const session = fakeSession(script.frames)
-    session.subagentCatalog = { executor: "subagent", agents: [{ name: "explore" }], complete: true }
-    script.push(partial("t", { task_tool_call: {} }), ...taskDone(1, "t", "generalPurpose"), turnEnded())
-    const parts = await pumpOnce(session)
-    expect(kinds(parts)).toEqual(["tool-input-start", "tool-input-end", "tool-call(provider)", "tool-result", "finish"])
-    const [closed] = closedRows(parts)
-    expect(closed.toolCallId).toBe(rowStarts(parts)[0].id)
-    expect(closed.result).toContain("no compatible host agent")
-    expect(hostCalls(parts)).toEqual([])
-  })
-
-  it("closes the row and runs the call under its own id when it becomes another tool", async () => {
-    const script = scriptedFrames()
-    const session = fakeSession(script.frames)
-    const target = path.join(rootOf(session), "RACE.md")
-    const { parts, controller } = collector()
-    const pumping = pump(session, controller, { textId: "text", reasoningId: "reasoning" })
-    script.push(...editAnnounced("e", target), heartbeat())
-    await until(() => rowStarts(parts).length === 1)
-    expect(rowStarts(parts)[0].toolName).toBe("write")
-
-    fs.writeFileSync(target, "created meanwhile\n")
-    script.push(...editDone(1, 2, "e", target, "new\n"))
-    await pumping
-    const [call] = hostCalls(parts)
-    expect(call.toolName).toBe("edit")
-    expect(call.toolCallId).toBe(`cursor_${session.sessionId}_2`)
-    expect(closedRows(parts).map((p) => p.toolCallId)).toEqual([rowStarts(parts)[0].id])
-    expect(parts.indexOf(closedRows(parts)[0])).toBeLessThan(parts.findIndex((p) => p.type === "finish"))
-  })
-
-  it("leaves a row out while an earlier call of the step may still end the host step", async () => {
-    const script = scriptedFrames()
-    const session = fakeSession(script.frames)
-    const target = path.join(rootOf(session), "AFTER.md")
-    script.push(
-      shellStarted("s", "touch a"),
-      ...editAnnounced("e", target),
-      shellExec(1, "s", "touch a"),
-    )
-    const parts = await pumpOnce(session)
-    expect(rowStarts(parts)).toEqual([])
-    expect(hostCalls(parts).map((p) => p.toolName)).toEqual(["shell"])
-
-    await deliverAll(session)
-    script.push(heartbeat(), ...editDone(2, 3, "e", target, "x\n"))
-    const next = await pumpOnce(session)
-    expect(hostCalls(next)).toMatchObject([{ toolCallId: rowStarts(next)[0]?.id, toolName: "write" }])
-  })
-
-  it("lets a call Cursor announces without a row hold back the rows after it", async () => {
-    const script = scriptedFrames()
-    const session = fakeSession(script.frames)
-    const target = path.join(rootOf(session), "AFTER.md")
-    script.push(
-      partial("s", { shell_tool_call: {} }),
-      ...editAnnounced("e", target),
-      heartbeat(),
-      shellStarted("s", "touch a"),
-      shellExec(1, "s", "touch a"),
-    )
-    const parts = await pumpOnce(session)
-    expect(rowStarts(parts)).toEqual([])
-
-    await deliverAll(session)
-    script.push(completed("s", { shell_tool_call: { args: { command: "touch a" } } }), heartbeat())
-    script.push(...editDone(2, 3, "e", target, "x\n"))
-    const next = await pumpOnce(session)
-    expect(rowStarts(next).map((p) => p.toolName)).toEqual(["write"])
-  })
-
-  it("shows the second of two parallel edits in the next step, not in the step the first edit ends", async () => {
-    // Live order (p-claude-md recording): the second edit is announced before the first one's write.
-    const script = scriptedFrames()
-    const session = fakeSession(script.frames)
-    const root = rootOf(session)
-    const first = path.join(root, "retry.py")
-    const second = path.join(root, "test_retry.py")
-    script.push(
-      ...editAnnounced("e1", first),
-      started("e1", editCall("e1", first, "a\n")),
-      ...editAnnounced("e2"),
-      frame({ exec_server_message: { id: 1, read_args: { path: first, tool_call_id: "e1" } } }),
-      partial("e2", { edit_tool_call: { args: { path: second } } }),
-      frame({ exec_server_message: { id: 2, write_args: { path: first, file_text: "a\n", tool_call_id: "e1" } } }),
-    )
-    const pass1 = await pumpOnce(session)
-    expect(rowStarts(pass1).map((p) => p.toolName)).toEqual(["write"])
-    expect(hostCalls(pass1)).toMatchObject([{ toolCallId: rowStarts(pass1)[0].id }])
-    expect(closedRows(pass1)).toEqual([])
-
-    await deliverAll(session)
-    const { parts, controller } = collector()
-    const pumping = pump(session, controller, { textId: "text", reasoningId: "reasoning" })
-    script.push(heartbeat())
-    await until(() => rowStarts(parts).length === 1)
-    expect(hostCalls(parts)).toEqual([])
-
-    script.push(...editDone(3, 4, "e2", second, "b\n"))
-    await pumping
-    expect(hostCalls(parts)).toMatchObject([{ toolCallId: rowStarts(parts)[0].id, toolName: "write" }])
-    expect(closedRows(parts)).toEqual([])
-  })
-
-  it("closes an open row when the turn ends without the call", async () => {
-    const script = scriptedFrames()
-    const session = fakeSession(script.frames)
-    script.push(partial("t", { task_tool_call: {} }), turnEnded())
-    const parts = await pumpOnce(session)
-    expect(kinds(parts)).toEqual(["tool-input-start", "tool-input-end", "tool-call(provider)", "tool-result", "finish"])
-    expect(closedRows(parts)[0].result).toContain("ended the turn")
-  })
-
-  it("keeps the row when Cursor delivers thinking between a call's announcements", async () => {
-    // Live order (vm3c2, 2026-10-08): kind, thinking, path, more thinking, then the call.
-    const script = scriptedFrames()
-    const session = fakeSession(script.frames)
-    const target = path.join(rootOf(session), "NEW.md")
-    script.push(
-      partial("w", { edit_tool_call: {} }),
-      thinking("I'll write the file."),
-      partial("w", { edit_tool_call: { args: { path: target } } }),
-      thinking(" Done planning."),
-      heartbeat(),
-      ...editDone(1, 2, "w", target, "x\n"),
-    )
-    const parts = await pumpOnce(session)
-    expect(closedRows(parts)).toEqual([])
-    expect(hostCalls(parts)).toMatchObject([{ toolCallId: rowStarts(parts)[0]?.id, toolName: "write" }])
-  })
-
-  it("closes the row of a call Cursor completes without an exec", async () => {
-    const script = scriptedFrames()
-    const session = fakeSession(script.frames)
-    script.push(
-      partial("t", { task_tool_call: {} }),
-      started("t", { task_tool_call: { args: { description: "", prompt: "" } } }),
-      completed("t", { task_tool_call: { args: { description: "", prompt: "" } } }),
-      turnEnded(),
-    )
-    const parts = await pumpOnce(session)
-    expect(closedRows(parts).map((p) => p.result)).toEqual(["Cursor finished this call without asking OpenCode to run it."])
-  })
-
-  it("closes the rows of a Run that is replaced, and opens new ones for the new Run's calls", async () => {
-    const first = scriptedFrames([checkpoint(), partial("t1", { task_tool_call: {} })])
-    const session = fakeSession(first.frames)
-    session.openCodeSessionId = "ses_early_recover"
-    const second = scriptedFrames([partial("t2", { task_tool_call: {} }), ...taskDone(1, "t2")])
-    let replacement: CursorSession | undefined
-    const { parts, controller } = collector()
-    const pumping = pumpWithRecovery({
-      initialSession: session,
-      controller,
-      maxRecoveries: 1,
-      retryPolicy: { maxAttempts: 2, baseDelayMs: 0, maxDelayMs: 0 },
-      recover: async () => {
-        replacement = fakeSession(second.frames)
-        replacement.sessionId = session.sessionId + "r"
-        return replacement
+    const start = parts.find((part) => part.type === "tool-input-start")
+    const call = parts.find((part) => part.type === "tool-call" && !part.providerExecuted)
+    expect(start?.toolName).toBe("edit")
+    expect(call?.toolCallId).toBe(start?.id)
+    expect(call?.toolCallId.startsWith("cursor-early_")).toBe(true)
+    expect(parts.filter((part) => part.type === "tool-call" && !part.providerExecuted)).toHaveLength(1)
+    expect(parts.findIndex((part) => part.type === "tool-input-start"))
+      .toBeLessThan(parts.findIndex((part) => part.type === "tool-input-end"))
+    const prompt = [
+      { role: "assistant", content: [{ type: "text", text: "editing" }] },
+      {
+        role: "tool",
+        content: [{
+          type: "tool-result",
+          toolCallId: call.toolCallId,
+          toolName: "edit",
+          output: { type: "text", value: "ok" },
+        }],
       },
-    })
-    await until(() => rowStarts(parts).length === 1)
-    first.end()
-    await pumping
-    const [old, fresh] = rowStarts(parts)
-    expect(closedRows(parts).map((p) => p.toolCallId)).toEqual([old.id])
-    expect(closedRows(parts)[0].result).toContain("new stream")
-    expect(hostCalls(parts)).toMatchObject([{ toolCallId: fresh.id, toolName: "subagent" }])
-    expect(fresh.id).not.toBe(old.id)
-    sessionManager.close(replacement!)
+    ] as never
+    const continued = extractTrailingToolResults(prompt)
+    expect(continued).toMatchObject([{ sessionId: session.sessionId, execId: 18 }])
+
+    // A result that arrives after the Run closed still names its exec, so the
+    // turn rebuilds from host history instead of dropping the completed edit.
+    sessionManager.close(session, "hard-cap-expired")
+    const late = extractTrailingToolResults(prompt)
+    expect(late).toMatchObject([{ sessionId: session.sessionId, execId: 18 }])
+    expect(findContinuationSession(late)).toBeUndefined()
+    expect(sessionManager.classify(session.sessionId, 18)).toEqual({ kind: "terminal", reason: "hard-cap-expired" })
+
+    // After a restart the route is gone; the id is still recognized as this provider's.
+    sessionManager.dispose()
+    expect(extractTrailingToolResults(prompt)).toMatchObject([{ sessionId: session.sessionId, execId: UNBOUND_EXEC_ID }])
   })
 
-  it("leaves a row to OpenCode when the host stops the turn", async () => {
-    const script = scriptedFrames()
-    const session = fakeSession(script.frames)
-    const { parts, controller } = collector()
-    const pumping = pump(session, controller, { textId: "text", reasoningId: "reasoning" })
-    script.push(partial("t", { task_tool_call: {} }), heartbeat())
-    await until(() => rowStarts(parts).length === 1)
-    session.hostInterrupted = "user"
-    script.push(heartbeat())
-    await expect(pumping).rejects.toThrow("host stopped the turn")
-    expect(kinds(parts)).toEqual(["tool-input-start"])
+  it("binds a new file's announced row to its write instead of showing a failed edit", async () => {
+    const dir = tempDir()
+    const target = path.join(dir, "big.txt")
+    const callId = "edit-new"
+    const { session, parts } = pumpSession([
+      partial(callId, target),
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: {
+          id: 5,
+          write_args: { path: target, file_text: "line 1\n", tool_call_id: callId },
+        },
+      }),
+    ], [
+      { name: "edit", description: "Edit" },
+      { name: "write", description: "Write" },
+    ])
+    session.requestContext.env = { workspace_paths: [dir] }
+    await run(session, parts)
+
+    const start = parts.find((part) => part.type === "tool-input-start")
+    const calls = parts.filter((part) => part.type === "tool-call")
+    expect(start?.toolName).toBe("write")
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ toolCallId: start?.id, toolName: "write" })
+    expect(calls[0].providerExecuted).toBeUndefined()
+    sessionManager.resolve(session.sessionId, 5)
   })
 
-  it("opens no rows for an OpenCode 1 host, a tool-less request, or a tool this turn does not permit", async () => {
-    const cases: Array<[(session: CursorSession) => void, number]> = [
-      [() => {}, 1],
-      [(session) => { session.hostToolDialect = OPENCODE_1_TOOL_DIALECT }, 0],
-      [(session) => { session.allowTools = false }, 0],
-      [(session) => { session.permittedToolNames = new Set(["read", "edit"]) }, 0],
-    ]
-    for (const [configure, rows] of cases) {
-      const script = scriptedFrames()
-      const session = fakeSession(script.frames)
-      configure(session)
-      const target = path.join(rootOf(session), "NEW.md")
-      script.push(...editAnnounced("w", target), turnEnded())
-      const parts = await pumpOnce(session)
-      expect(rowStarts(parts).length).toBe(rows)
-      sessionManager.dispose()
-    }
+  it("binds an empty file's announced row to its write, which the edit remap leaves a write", async () => {
+    const dir = tempDir()
+    const target = path.join(dir, "empty.txt")
+    fs.writeFileSync(target, "")
+    const callId = "edit-empty"
+    const { session, parts } = pumpSession([
+      partial(callId, target),
+      encodeMessage("AgentServerMessage", {
+        interaction_update: { tool_call_started: { call_id: callId, tool_call: { edit_tool_call: { args: { path: target } } } } },
+      }),
+      encodeMessage("AgentServerMessage", { exec_server_message: { id: 7, read_args: { path: target, tool_call_id: callId } } }),
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: { id: 8, write_args: { path: target, file_text: "now filled\n", tool_call_id: callId } },
+      }),
+    ], [
+      { name: "read", description: "Read" },
+      { name: "edit", description: "Edit" },
+      { name: "write", description: "Write" },
+    ])
+    session.requestContext.env = { workspace_paths: [dir] }
+    await run(session, parts)
+
+    const start = parts.find((part) => part.type === "tool-input-start")
+    const calls = parts.filter((part) => part.type === "tool-call")
+    expect(start?.toolName).toBe("write")
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ toolCallId: start?.id, toolName: "write" })
+    sessionManager.resolve(session.sessionId, 8)
   })
 
-  it("leaves a closed row out of a non-streaming answer", async () => {
-    const script = scriptedFrames()
-    const session = fakeSession(script.frames)
-    script.push(partial("t", { task_tool_call: {} }), turnEnded())
-    const parts = await pumpOnce(session)
-    expect(closedRows(parts)).toHaveLength(1)
-    expect(foldStreamParts(parts).content.filter((part) => part.type === "tool-call")).toEqual([])
+  it("opens no row for a call announced behind another whose exec has not come", async () => {
+    const dir = tempDir()
+    const first = path.join(dir, "first.txt")
+    const second = path.join(dir, "second.txt")
+    const { session, parts } = pumpSession([
+      partial("edit-a", first),
+      partial("edit-b", second),
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: { id: 9, write_args: { path: first, file_text: "a\n", tool_call_id: "edit-a" } },
+      }),
+    ], [
+      { name: "edit", description: "Edit" },
+      { name: "write", description: "Write" },
+    ])
+    session.requestContext.env = { workspace_paths: [dir] }
+    await run(session, parts)
+
+    const starts = parts.filter((part) => part.type === "tool-input-start")
+    expect(starts.map((part) => part.id)).toEqual([earlyRowToolCallId(session.sessionId, "edit-a")])
+    expect(parts.filter((part) => part.type === "tool-call" && part.providerExecuted)).toEqual([])
+    sessionManager.resolve(session.sessionId, 9)
   })
 
-  it("asks the running-tool lease about the call under its row id", async () => {
-    const script = scriptedFrames()
-    const session = fakeSession(script.frames)
-    const target = path.join(rootOf(session), "NEW.md")
-    script.push(...editAnnounced("w", target), ...editDone(1, 2, "w", target, "x\n"))
-    const parts = await pumpOnce(session)
-    const id = hostCalls(parts)[0].toolCallId
-    expect(id).toBe(`cursor_${session.sessionId}_900000`)
+  it("closes the row when the announced call's exec becomes another tool", async () => {
+    const workspace = tempDir()
+    const outside = path.join(tempDir(), "outside.txt")
+    fs.writeFileSync(outside, "one\n")
+    const callId = "edit-outside"
+    const { session, parts } = pumpSession([
+      partial(callId, outside),
+      // Outside the workspace, the edit's private read goes through the host's permission-aware read.
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: { id: 3, read_args: { path: outside, tool_call_id: callId } },
+      }),
+    ], [
+      { name: "read", description: "Read" },
+      { name: "edit", description: "Edit" },
+    ])
+    session.requestContext.env = { workspace_paths: [workspace] }
+    await run(session, parts)
 
-    const asked: string[] = []
-    const manager = new SessionManager({
-      activitySource: { lastActivityAt: () => undefined, isToolRunning: (toolCallId: string) => { asked.push(toolCallId); return false } },
-    })
-    manager.registerPending(2, session, "write_result", "write")
-    session.pending.get(2)!.toolCallId = id
-    asked.length = 0
-    manager.classify(session.sessionId, 2)
-    expect(asked).toEqual([id])
-    manager.dispose()
+    const start = parts.find((part) => part.type === "tool-input-start")
+    const closed = parts.find((part) => part.type === "tool-call" && part.providerExecuted)
+    const read = parts.find((part) => part.type === "tool-call" && !part.providerExecuted)
+    expect(start?.toolName).toBe("edit")
+    expect(closed?.toolCallId).toBe(start?.id)
+    expect(read?.toolName).toBe("read")
+    expect(read?.toolCallId.startsWith("cursor_")).toBe(true)
+    sessionManager.resolve(session.sessionId, 3)
+  })
+
+  it("closes the row when the exec is a different tool", async () => {
+    const { session, parts } = pumpSession([
+      partial("edit-1", existingFile()),
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: { id: 4, shell_args: { command: "pwd", tool_call_id: "shell-1" } },
+      }),
+    ], [
+      { name: "edit", description: "Edit" },
+      { name: "bash", description: "Shell" },
+    ])
+    await run(session, parts)
+    const start = parts.find((part) => part.type === "tool-input-start")
+    const closed = parts.find((part) => part.type === "tool-call" && part.providerExecuted)
+    const shell = parts.find((part) => part.type === "tool-call" && part.toolName === "bash")
+    expect(start?.toolName).toBe("edit")
+    expect(closed?.toolCallId).toBe(start?.id)
+    expect(shell?.toolCallId.startsWith("cursor_")).toBe(true)
+    expect(parts.findIndex((part) => part === closed)).toBeLessThan(parts.findIndex((part) => part === shell))
+    expect(parts.at(-1)?.type).toBe("finish")
+    sessionManager.resolve(session.sessionId, 4)
+  })
+
+  it("stays open across later text and closes before the step finishes", async () => {
+    const { session, parts } = pumpSession([
+      partial("edit-1", existingFile()),
+      encodeMessage("AgentServerMessage", { interaction_update: { text_delta: { text: "still writing" } } }),
+      turnEnded(),
+    ], [{ name: "edit", description: "Edit" }])
+    await run(session, parts)
+    const startAt = parts.findIndex((part) => part.type === "tool-input-start")
+    const textAt = parts.findIndex((part) => part.type === "text-delta")
+    const textEndAt = parts.findIndex((part) => part.type === "text-end")
+    const closedAt = parts.findIndex((part) => part.type === "tool-call" && part.providerExecuted)
+    const finishAt = parts.findIndex((part) => part.type === "finish")
+    expect(startAt).toBeGreaterThanOrEqual(0)
+    expect(textAt).toBeGreaterThan(startAt)
+    // Open text ends before the closing tool-call, as at every other tool-call.
+    expect(textEndAt).toBeGreaterThan(textAt)
+    expect(closedAt).toBeGreaterThan(textEndAt)
+    expect(finishAt).toBeGreaterThan(closedAt)
+  })
+
+  it("does not open a row a patch conversion would refuse, or on a tool-less turn", async () => {
+    const dir = tempDir()
+    const crlf = path.join(dir, "crlf.txt")
+    fs.writeFileSync(crlf, "a\r\nb\r\n")
+    const refused = pumpSession([
+      partial("edit-1", crlf),
+      encodeMessage("AgentServerMessage", { interaction_update: { text_delta: { text: "no row" } } }),
+      turnEnded(),
+    ], [{ name: "patch", description: "Patch" }])
+    await run(refused.session, refused.parts)
+    expect(refused.parts.some((part) => part.type === "tool-input-start")).toBe(false)
+
+    const lifecycle = pumpSession([
+      partial("edit-1", crlf),
+      encodeMessage("AgentServerMessage", { interaction_update: { text_delta: { text: "title" } } }),
+      turnEnded(),
+    ], [{ name: "edit", description: "Edit" }])
+    lifecycle.session.allowTools = false
+    await run(lifecycle.session, lifecycle.parts)
+    expect(lifecycle.parts.some((part) => part.type === "tool-input-start")).toBe(false)
   })
 })

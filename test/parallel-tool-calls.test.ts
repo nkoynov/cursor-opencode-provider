@@ -174,8 +174,7 @@ describe("parallel tool calls", () => {
     expect(toolCallIds(parts)).toEqual(["cursor_parallel-session_1"])
     expect(finishes(parts)).toEqual(["tool-calls"])
     expect(parts.some((p) => p.type === "text-delta")).toBe(false)
-    expect(session.queuedFrame).toBeDefined()
-    expect(((await session.queuedFrame!).value as Frame).payload).toEqual(text("Both done.").payload)
+    expect(session.heldFrames?.map((held) => held.payload)).toEqual([text("Both done.").payload])
   })
 
   it("closes a held step once the Run goes quiet, and the next read gets the late frame", async () => {

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test"
+import { APICallError } from "@ai-sdk/provider"
 import {
   CursorAuthError,
   CursorProtocolError,
@@ -7,6 +8,7 @@ import {
   CursorTransportError,
   cursorGrpcError,
   cursorHttpError,
+  hostFacingError,
   retrySuppressedError,
   sanitizeHostTerminalMessage,
   toCursorProviderError,
@@ -107,6 +109,76 @@ describe("Cursor provider errors", () => {
         replaySafe: true,
       })
     }
+  })
+
+  it("shows Cursor's ErrorDetails and hands a non-retryable verdict to the host as a 4xx APICallError", () => {
+    const failure = connectFrameError(JSON.stringify({
+      error: {
+        code: "invalid_argument",
+        message: "Error",
+        details: [{
+          type: "aiserver.v1.ErrorDetails",
+          // ErrorDetails{error:13, details{title, detail, is_retryable:false, analytics}, is_expected:true}
+          value: "CA0SlgEKHFJlcXVlc3QgYmxvY2tlZCBieSBBbnRocm9waWMSXVdlIGFyZSB1bmFibGUgdG8gY29tcGxldGUgdGhpcyByZXF1ZXN0IGJlY2F1c2UgaXQgd2FzIGJsb2NrZWQgdW5kZXIgQW50aHJvcGljJ3MgVXNhZ2UgUG9saWN5LiAAUhUKE2N5YmVyX3BvbGljeV9yZXZpZXcYAQ",
+        }],
+      },
+    }))
+    const message = "Cursor API error (code=invalid_argument): Request blocked by Anthropic " +
+      "We are unable to complete this request because it was blocked under Anthropic's Usage Policy."
+    expect(failure).toMatchObject({ message, code: "invalid_argument", transient: false, retryable: false })
+
+    const host = hostFacingError(failure)
+    expect(APICallError.isInstance(host)).toBe(true)
+    expect(host).toMatchObject({
+      message,
+      statusCode: 400,
+      isRetryable: false,
+      responseHeaders: { "x-should-retry": "false" },
+    })
+    expect((host as APICallError).cause).toBe(failure)
+  })
+
+  it("keeps a non-retryable verdict on codes whose HTTP status reads as retryable", () => {
+    // ErrorDetails{details{title:"Limit", is_retryable:false}}
+    const value = Buffer.from([0x12, 0x09, 0x0a, 0x05, ...Buffer.from("Limit"), 0x20, 0x00]).toString("base64")
+    for (const [code, statusCode] of [["resource_exhausted", 429], ["internal", 500], ["aborted", 409], ["constructor", 500]] as const) {
+      const failure = connectFrameError(JSON.stringify({
+        error: { code, details: [{ type: "aiserver.v1.ErrorDetails", value }] },
+      }))
+      expect(failure).toMatchObject({ transient: false, retryable: false })
+      expect(hostFacingError(failure)).toMatchObject({
+        statusCode,
+        isRetryable: false,
+        responseHeaders: { "x-should-retry": "false" },
+      })
+    }
+  })
+
+  it("obeys an explicit retryable verdict and keeps other errors unchanged for the host", () => {
+    // ErrorDetails{details{title:"Busy", is_retryable:true}}
+    const value = Buffer.from([0x12, 0x08, 0x0a, 0x04, ...Buffer.from("Busy"), 0x20, 0x01]).toString("base64")
+    const failure = connectFrameError(JSON.stringify({
+      error: { code: "failed_precondition", details: [{ type: "aiserver.v1.ErrorDetails", value }] },
+    }))
+    expect(failure).toMatchObject({
+      message: "Cursor API error (code=failed_precondition): Busy",
+      transient: true,
+      retryable: true,
+    })
+    expect(hostFacingError(failure)).toBe(failure)
+
+    const plain = connectFrameError(JSON.stringify({ error: { code: "invalid_argument" } }))
+    expect(plain).toMatchObject({ message: "Cursor API error (code=invalid_argument)", transient: false })
+    expect(plain.retryable).toBeUndefined()
+    expect(hostFacingError(plain)).toBe(plain)
+  })
+
+  it("ignores undecodable ErrorDetails", () => {
+    const failure = connectFrameError(JSON.stringify({
+      error: { code: "internal", details: [{ type: "aiserver.v1.ErrorDetails", value: "EgX/" }] },
+    }))
+    expect(failure).toMatchObject({ message: "Cursor API error (code=internal)", transient: true })
+    expect(failure.retryable).toBeUndefined()
   })
 
   it("preserves structured server diagnostics without exposing a cause message", () => {

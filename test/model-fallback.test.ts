@@ -484,7 +484,7 @@ describe("stopping a Run at the first switched step", () => {
     const parts = await pass(session)
 
     const row = parts.find((p) => p.type === "tool-input-start")
-    expect(row).toMatchObject({ toolName: "write", providerExecuted: true })
+    expect(row).toMatchObject({ toolName: "write" })
     expect(parts.filter((p) => p.type === "tool-result" && p.isError).map((p) => p.toolCallId)).toEqual([row.id])
     expect(finishes(parts)).toEqual(["stop"])
     expect(visibleText(parts)).not.toContain("Already ran")

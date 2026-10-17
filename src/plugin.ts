@@ -35,7 +35,7 @@ import {
   setCursorShellPath,
   resolveCursorShellPath,
 } from "./shell-timeout.js"
-import { applyHostPromptEvent, sessionActivity } from "./activity.js"
+import { applyHostPromptEvent, applyHostToolEvent, sessionActivity } from "./activity.js"
 import { dispatchHostEventBridge } from "./host-event-bridge.js"
 import { createPromptHostAgentModeSwitch, setHostAgentModeSwitch } from "./host-agent-mode.js"
 import { isHostPlanFileResolved, resolveHostPlanFile } from "./host-plan-file.js"
@@ -334,6 +334,7 @@ export async function CursorPlugin(input: PluginInput): Promise<Hooks> {
     async event({ event }) {
       // The SDK's event union predates these prompt events; read them untyped.
       applyHostPromptEvent(sessionActivity, (event as { type: unknown }).type, (event as { properties?: unknown }).properties)
+      applyHostToolEvent(sessionActivity, (event as { type: unknown }).type, (event as { properties?: unknown }).properties)
       switch (event.type) {
         case "session.created":
           sessionActivity.linkSession(event.properties.info.id, event.properties.info.parentID)
@@ -348,20 +349,13 @@ export async function CursorPlugin(input: PluginInput): Promise<Hooks> {
         case "message.updated":
           sessionActivity.recordActivity(event.properties.info.sessionID)
           break
-        case "message.part.updated": {
-          const part = event.properties.part
-          sessionActivity.recordActivity(part.sessionID)
-          if (part.type === "tool") {
-            if (part.state.status === "running") sessionActivity.toolStarted(part.sessionID, part.callID)
-            else if (part.state.status === "completed" || part.state.status === "error") sessionActivity.toolEnded(part.callID)
-            // Rejection/abort can stop the classic host before a continuation or
-            // execute.after. Its persisted tool state is still authoritative.
-            if (part.state.status === "error") releaseCursorShellEnv(part.callID)
+        case "message.part.updated":
+          sessionActivity.recordActivity(event.properties.part.sessionID)
+          // Rejection/abort can stop the classic host before a continuation or
+          // execute.after. Its persisted tool state is still authoritative.
+          if (event.properties.part.type === "tool" && event.properties.part.state.status === "error") {
+            releaseCursorShellEnv(event.properties.part.callID)
           }
-          break
-        }
-        case "session.idle":
-          sessionActivity.endSessionTools(event.properties.sessionID)
           break
       }
       await dispatchHostEventBridge({

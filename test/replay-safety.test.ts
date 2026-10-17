@@ -28,7 +28,7 @@ const kv = { id: 7, get_blob_args: { blob_id: new TextEncoder().encode("blob") }
 
 describe("replay frame analysis", () => {
   it("treats a KV request with its span context as a control frame", () => {
-    expect(analyzeReplayFrame(kvFrame(id, getBlob, span), { kv })).toEqual({ semanticProgress: true, barrier: undefined })
+    expect(analyzeReplayFrame(kvFrame(id, getBlob, span), { kv })).toEqual({ barrier: undefined })
     expect(analyzeReplayFrame(kvFrame(id, getBlob), { kv }).barrier).toBeUndefined()
   })
 
@@ -53,7 +53,7 @@ describe("interaction update analysis", () => {
     // thinking_delta{text, thinking_style} #4.
     const styled = updateFrame(4, [...text, ...varint(2 << 3), 1])
     expect(analyzeReplayFrame(styled, { interactionUpdate: { thinking_delta: { text: "hm" } } }))
-      .toEqual({ semanticProgress: true, barrier: undefined })
+      .toEqual({ barrier: undefined })
   })
 
   it("keeps the barrier for undeclared updates and unknown delta fields", () => {
@@ -110,7 +110,7 @@ describe("Cursor CLI 2026.09.28 frame shapes", () => {
     })
   }
 
-  it("decodes an injection state update as status without progress or a barrier", () => {
+  it("decodes an injection state update as status without a barrier", () => {
     const frame = encodeMessage("AgentServerMessage", {
       interaction_update: {
         context_injection_state: { injection_id: "inj-1", state: { rejected: { reason: "run ended" } } },
@@ -119,7 +119,7 @@ describe("Cursor CLI 2026.09.28 frame shapes", () => {
     const decoded = decodeMessage<any>("AgentServerMessage", frame).interaction_update
     expect(decoded.context_injection_state.injection_id).toBe("inj-1")
     expect(decoded.context_injection_state.state.rejected.reason).toBe("run ended")
-    expect(analyzeReplayFrame(frame, { interactionUpdate: decoded })).toEqual({ semanticProgress: false, barrier: undefined })
+    expect(analyzeReplayFrame(frame, { interactionUpdate: decoded })).toEqual({ barrier: undefined })
   })
 
   it("keeps the barrier for an undeclared member or a repeated timing field", () => {

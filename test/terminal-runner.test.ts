@@ -500,6 +500,13 @@ fs.createReadStream(job + "/pipe").on("data", chunk => fs.writeSync(fd, chunk))
     expect(fs.readFileSync(terminal.file, "utf8")).toContain("status: running")
   })
 
+  it("hands off a command that printed nothing in its window without a head error", async () => {
+    const terminal = job("sleep 3", { timeoutMs: 500 })
+    const { stdout, stderr } = await launch(terminal)
+    expect(stdout).toMatch(/^\n__CURSOR_SHELL_BACKGROUND__\d+:\d+:/)
+    expect(stderr).toBe("")
+  })
+
   it("returns the foreground window's output with a soft handoff", async () => {
     const terminal = job("printf 'front\\n'; sleep 3", { timeoutMs: 500 })
     const { stdout } = await launch(terminal)

@@ -20,7 +20,7 @@ import {
   registerCursorShellCall,
   resetCursorShellCalls,
 } from "../src/shell-timeout.js"
-import { sessionActivity } from "../src/activity.js"
+import { RUNNING_TOOL_CAP_MS, sessionActivity } from "../src/activity.js"
 import * as rootExports from "../src/index.js"
 import { hostPlanFileFor, resetHostPlanFilesForTests } from "../src/host-plan-file.js"
 import { HOST_PATH_BRIDGE } from "../src/context/paths.js"
@@ -263,16 +263,17 @@ describe("session activity hooks", () => {
         properties: { part: { sessionID: "ses_v1", type: "tool", callID, tool: "bash", state: { status } } },
       } as any,
     })
+    const running = () => sessionActivity.runningToolDeadline("ses_v1", Date.now(), RUNNING_TOOL_CAP_MS) !== undefined
     try {
-      for (const callID of ["cursor_v1_1", "cursor_v1_2", "cursor_v1_3"]) await hooks.event?.(toolPart(callID, "running"))
+      for (const callID of ["cursor_v1_1", "cursor_v1_2"]) await hooks.event?.(toolPart(callID, "running"))
       await hooks.event?.(toolPart("cursor_v1_1", "completed"))
       await hooks.event?.(toolPart("cursor_v1_2", "error"))
-      expect(sessionActivity.isToolRunning("cursor_v1_1")).toBe(false)
-      expect(sessionActivity.isToolRunning("cursor_v1_2")).toBe(false)
-      expect(sessionActivity.isToolRunning("cursor_v1_3")).toBe(true)
+      expect(running()).toBe(false)
 
+      await hooks.event?.(toolPart("cursor_v1_3", "running"))
+      expect(running()).toBe(true)
       await hooks.event?.({ event: { type: "session.idle", properties: { sessionID: "ses_v1" } } as any })
-      expect(sessionActivity.isToolRunning("cursor_v1_3")).toBe(false)
+      expect(running()).toBe(false)
     } finally {
       sessionActivity.clear()
     }

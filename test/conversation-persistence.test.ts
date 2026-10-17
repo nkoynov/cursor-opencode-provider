@@ -55,6 +55,8 @@ import {
 } from "../src/language-model.js"
 import type { CursorSession, Frame } from "../src/session.js"
 import { forgetEarlySteers, recordEarlySteer, serializeEarlySteers } from "../src/host-steer.js"
+import { checkpointKey, resetLostRequestsForTests, serializeLostRequest } from "../src/lost-request.js"
+import { parseModelFallbackStop } from "../src/model-fallback.js"
 import { sessionFixture } from "./session-fixture.js"
 
 const roots: string[] = []
@@ -411,6 +413,135 @@ describe("conversation restart persistence", () => {
     expect(loaded.status).toBe("restored")
     expect(loaded.value?.checkpoint).toEqual(Uint8Array.from([1]))
     expect(loaded.value?.earlySteers).toBeUndefined()
+  })
+
+  describe("lost request (field 15) and model-fallback stop (field 101)", () => {
+    const stop = {
+      requestedModel: "claude-opus-5-5",
+      servedModel: "claude-opus-4-8",
+      userText: "Fix the build",
+      checkpointHoldsTurn: false,
+      unrecordedTools: [],
+      message: "**Stopped:** Cursor served this step with claude-opus-4-8.",
+    }
+    const checkpoint = Uint8Array.from([0x0a, 0x02, 0x08, 0x01])
+    const lost = (conversationId: string) => JSON.stringify({
+      conversationId,
+      checkpointKey: checkpointKey(checkpoint),
+      text: "Create catalog.md",
+      latest: "Create catalog.md",
+    })
+    const field = (number: number, value: Uint8Array | string) => {
+      const data = Buffer.from(value)
+      return Buffer.concat([varint((number << 3) | 2), varint(data.length), data])
+    }
+    const snapshot = (sessionKey: string, conversationId: string, ...extra: Buffer[]) => Buffer.concat([
+      varint(1 << 3), varint(CONVERSATION_CACHE_SCHEMA_VERSION),
+      field(2, sessionKey),
+      field(3, conversationId),
+      varint(4 << 3), varint(Date.now()),
+      field(5, checkpoint),
+      field(7, encodeMessage("RequestContext", { rules_info_complete: true })),
+      ...extra,
+    ])
+    const write = async (root: string, sessionKey: string, bytes: Buffer) => {
+      await mkdir(conversationCacheDirectoryPath(root), { recursive: true })
+      await writeFile(conversationCacheFilePath(root, sessionKey), gzipSync(bytes))
+    }
+    beforeEach(() => resetLostRequestsForTests())
+
+    it("moves an older fork build's model-fallback stop out of field 15 and never reads it as a lost request", async () => {
+      const root = await cacheRoot()
+      const sessionKey = "ses_old_fork_fallback"
+      const conversationId = "conversation-old-fork-fallback"
+      // Fork main 7f7ae9e: early_steers_json=14, model_fallback_stop_json=15, sent images 16/17.
+      await write(root, sessionKey, snapshot(sessionKey, conversationId,
+        field(15, JSON.stringify(stop)),
+        field(16, "a".repeat(64)),
+        field(17, "b".repeat(64)),
+      ))
+
+      const loaded = await loadPersistedConversation(root, sessionKey)
+      expect(loaded.status).toBe("restored")
+      expect(loaded.value?.lostRequest).toBeUndefined()
+      expect(parseModelFallbackStop(loaded.value!.modelFallbackStop!)).toEqual(stop)
+      expect(loaded.value?.sentImageHashes).toEqual(["a".repeat(64)])
+
+      clearMemory()
+      await hydrateConversationState(root, sessionKey)
+      expect(serializeLostRequest(sessionKey)).toBeUndefined()
+
+      // Saved again, the stop moves to field 101 and field 15 stays empty.
+      await persistConversation(root, { ...loaded.value!, sessionKey })
+      const bytes = gunzipSync(await readFile(conversationCacheFilePath(root, sessionKey)))
+      expect(bytes.includes(field(101, JSON.stringify(stop)))).toBe(true)
+      expect(bytes.includes(field(15, JSON.stringify(stop)))).toBe(false)
+    })
+
+    it("does not turn any other older field-15 value into a lost request", async () => {
+      const root = await cacheRoot()
+      const sessionKey = "ses_old_fork_garbage"
+      await write(root, sessionKey, snapshot(sessionKey, "conversation-garbage", field(15, "{not json")))
+
+      const loaded = await loadPersistedConversation(root, sessionKey)
+      expect(loaded.status).toBe("restored")
+      expect(loaded.value?.lostRequest).toBeUndefined()
+      expect(parseModelFallbackStop(loaded.value!.modelFallbackStop!)).toBeUndefined()
+      clearMemory()
+      await hydrateConversationState(root, sessionKey)
+      expect(serializeLostRequest(sessionKey)).toBeUndefined()
+    })
+
+    it("restores the lost request of an upstream snapshot", async () => {
+      const root = await cacheRoot()
+      const sessionKey = "ses_upstream_lost"
+      const conversationId = "conversation-upstream-lost"
+      // Upstream a1aa47a: early_steers_json=14, lostRequest=15, nothing above.
+      await write(root, sessionKey, snapshot(sessionKey, conversationId,
+        field(14, "{\"version\":1,\"records\":[]}"),
+        field(15, lost(conversationId)),
+      ))
+
+      const loaded = await loadPersistedConversation(root, sessionKey)
+      expect(loaded.value?.lostRequest).toBe(lost(conversationId))
+      expect(loaded.value?.modelFallbackStop).toBeUndefined()
+      clearMemory()
+      await hydrateConversationState(root, sessionKey)
+      expect(JSON.parse(serializeLostRequest(sessionKey)!)).toEqual(JSON.parse(lost(conversationId)))
+    })
+
+    it("keeps both in a new snapshot, and field 101 over an older field-15 stop", async () => {
+      const root = await cacheRoot()
+      const sessionKey = "ses_new_fork"
+      const conversationId = "conversation-new-fork"
+      await persistConversation(root, {
+        sessionKey,
+        conversationId,
+        checkpoint,
+        blobs: [],
+        requestContext: { rules_info_complete: true },
+        toolCatalog: [],
+        postCompactionRebase: false,
+        lostRequest: lost(conversationId),
+        modelFallbackStop: JSON.stringify(stop),
+      })
+      const bytes = gunzipSync(await readFile(conversationCacheFilePath(root, sessionKey)))
+      expect(bytes.includes(field(15, lost(conversationId)))).toBe(true)
+      expect(bytes.includes(field(101, JSON.stringify(stop)))).toBe(true)
+      clearMemory()
+      const loaded = await loadPersistedConversation(root, sessionKey)
+      expect(loaded.value).toMatchObject({ lostRequest: lost(conversationId), modelFallbackStop: JSON.stringify(stop) })
+
+      const mixedKey = "ses_mixed_fields"
+      const newer = { ...stop, userText: "the newer stop" }
+      await write(root, mixedKey, snapshot(mixedKey, "conversation-mixed",
+        field(15, JSON.stringify(stop)),
+        field(101, JSON.stringify(newer)),
+      ))
+      const mixed = await loadPersistedConversation(root, mixedKey)
+      expect(parseModelFallbackStop(mixed.value!.modelFallbackStop!)).toEqual(newer)
+      expect(mixed.value?.lostRequest).toBeUndefined()
+    })
   })
 
   it("does not migrate legacy JSON snapshots", async () => {

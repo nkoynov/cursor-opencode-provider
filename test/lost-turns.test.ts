@@ -8,8 +8,7 @@ import path from "node:path"
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
 import { resetTurnStateForTests } from "../src/language-model.js"
-import { lostRequestsFor, noteFailedTurn, resetLostTurnsForTests, withLostRequests } from "../src/lost-turns.js"
-import { sessionManager, type CursorSession } from "../src/session.js"
+import { sessionManager } from "../src/session.js"
 import { encodeFrame } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { resetCheckpointsForTests, setCheckpoint } from "../src/protocol/checkpoint.js"
@@ -344,52 +343,5 @@ describe("a turn whose Run failed before Cursor checkpointed the request", () =>
     } finally {
       cursor.restore()
     }
-  })
-})
-
-describe("lost turn records", () => {
-  const base = Uint8Array.from([1, 2, 3])
-  const failed = (init: Partial<CursorSession>): CursorSession => ({
-    openCodeSessionId: "ses_unit",
-    conversationId: "conv-unit",
-    requestBase: base,
-    turnRequests: [REQUEST],
-    ...init,
-  }) as CursorSession
-  afterEach(() => resetLostTurnsForTests())
-
-  it("are found by a Run on the same conversation and checkpoint until the conversation moves on", () => {
-    noteFailedTurn(failed({}))
-    expect(lostRequestsFor("ses_unit", "conv-other", base)).toBeUndefined()
-    expect(lostRequestsFor("ses_unit", "conv-unit", base)).toBeUndefined()
-    noteFailedTurn(failed({}))
-    expect(lostRequestsFor("ses_unit", "conv-unit", Uint8Array.from(base))).toEqual([REQUEST])
-    expect(lostRequestsFor("ses_unit", "conv-unit", base)).toEqual([REQUEST])
-    expect(lostRequestsFor("ses_unit", "conv-unit", Uint8Array.from([1, 2, 4]))).toBeUndefined()
-    expect(lostRequestsFor("ses_unit", "conv-unit", base)).toBeUndefined()
-  })
-
-  it("are kept when the Run's latest checkpoint is still the one its request was sent on", () => {
-    noteFailedTurn(failed({ resumeCheckpoint: Uint8Array.from(base), turnRequests: ["a steer follow-up"] }))
-    expect(lostRequestsFor("ses_unit", "conv-unit", base)).toEqual(["a steer follow-up"])
-  })
-
-  it("are not kept without a request, without its checkpoint, or after a newer checkpoint", () => {
-    noteFailedTurn(failed({ turnRequests: undefined }))
-    expect(lostRequestsFor("ses_unit", "conv-unit", base)).toBeUndefined()
-    noteFailedTurn(failed({ requestBase: undefined }))
-    expect(lostRequestsFor("ses_unit", "conv-unit", undefined)).toBeUndefined()
-    noteFailedTurn(failed({ resumeCheckpoint: Uint8Array.from([9]) }))
-    expect(lostRequestsFor("ses_unit", "conv-unit", base)).toBeUndefined()
-  })
-
-  it("join the live request unless it repeats one of them", () => {
-    expect(withLostRequests([REQUEST], CONTINUE)).toEqual([REQUEST, CONTINUE])
-    expect(withLostRequests([REQUEST, CONTINUE], CONTINUE)).toEqual([REQUEST, CONTINUE])
-    expect(withLostRequests([REQUEST], REQUEST)).toEqual([REQUEST])
-    expect(withLostRequests([REQUEST], ".")).toEqual([REQUEST])
-    expect(withLostRequests([`${REQUEST}\n\nThese tools already ran.`], REQUEST)).toEqual([`${REQUEST}\n\nThese tools already ran.`])
-    expect(withLostRequests([`${REQUEST}\n<system-reminder>x</system-reminder>`], REQUEST)).toHaveLength(1)
-    expect(withLostRequests([REQUEST], `${REQUEST} and more`)).toEqual([REQUEST, `${REQUEST} and more`])
   })
 })

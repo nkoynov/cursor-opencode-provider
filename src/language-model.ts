@@ -2,6 +2,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { createHash } from "node:crypto"
 import { APICallError } from "@ai-sdk/provider"
+import protobuf from "protobufjs"
 import type { LanguageModelV3, LanguageModelV3CallOptions, LanguageModelV3StreamResult, LanguageModelV3GenerateResult, LanguageModelV3StreamPart, LanguageModelV3Usage, LanguageModelV3FinishReason } from "@ai-sdk/provider"
 import type { CreateCursorOptions, CursorRetryOptions } from "./index.js"
 import {
@@ -75,6 +76,7 @@ import {
   appendTaskAttachments,
   remapCorrelatedEditWriteForCatalog,
   remapEditToolsForCatalog,
+  hostToolForCursorEdit,
   buildCompleteEditReadMessages,
   buildTaskAttachmentReadMessages,
   rejectPartialReadMutation,
@@ -163,6 +165,24 @@ import { stageCursorImage } from "./image-staging.js"
 import { IMAGE_PERMISSION_DENIED_PREFIX } from "./image-save.js"
 import { clearCheckpoint, getCheckpoint, setCheckpoint } from "./protocol/checkpoint.js"
 import {
+  EARLY_ROW_CLOSED,
+  EarlyToolRows,
+  cursorEditAnnouncement,
+  earlyRowToolCallId,
+  parseEarlyRowToolCallId,
+  shouldOpenEarlyRow,
+  type EarlyToolRow,
+} from "./early-tool-rows.js"
+import {
+  carryLostRequest,
+  dropLostRequest,
+  hasLostRequest,
+  noteCheckpoint,
+  peekLostRequest,
+  rememberLostRequest,
+  resetLostRequestsForTests,
+} from "./lost-request.js"
+import {
   currentCursorTokenBreakdown,
   cursorContextUsageMetadata,
   decodeConversationTokenDetails,
@@ -225,6 +245,8 @@ import {
 import { assistantBlobShape, noteThinkingKind, takeThinkingKinds } from "./narration.js"
 import { initializeConversationPersistence } from "./protocol/conversation-persistence.js"
 import {
+  putBackFrame,
+  readSessionFrame,
   resolveContinuationPolicy,
   sessionManager,
   stoppedWith,
@@ -240,6 +262,7 @@ import {
   CursorRetryExhaustedError,
   CursorServerError,
   CursorTransportError,
+  hostFacingError,
   isCapacityFailure,
   isRejectedCredentialError,
   isTransientGrpcStatus,
@@ -248,7 +271,6 @@ import {
   toCursorProviderError,
 } from "./errors.js"
 import { recordFinalFailure } from "./host-retry.js"
-import { forgetLostTurn, lostRequestsFor, noteFailedTurn, resetLostTurnsForTests, withLostRequests } from "./lost-turns.js"
 import { readCache, cacheFilePath, resolveVariantParameters, resolveVariantMaxMode, extractCursorVariantParameters, resolveCursorWireModelId, type ModelInfo } from "./models.js"
 import { getFrozenRequestContext, getOrBuildRequestContext, resetFrozenRequestContextsForTests } from "./context/frozen.js"
 import { systemInstructionsRuleText, type SystemInstructions } from "./context/build.js"
@@ -309,19 +331,7 @@ import {
   wrapHostNotesForCursor,
 } from "./protocol/host-notes.js"
 import { analyzeReplayFrame, AttemptReplaySafety, describeFrameLayout } from "./replay-safety.js"
-import {
-  aliasEarlyToolCall,
-  earlyRowCloseParts,
-  earlyRowEndPart,
-  earlyRowStartPart,
-  earlyToolRowState,
-  noteComposingToolCall,
-  predictEarlyToolName,
-  resetEarlyToolRowsForTests,
-  resolveEarlyToolCallId,
-  type EarlyToolRow,
-} from "./early-tool-rows.js"
-import { noteCursorWaitEnded, noteCursorWaitStarted, noteRunFrame, semanticDeadlineAt } from "./cursor-waits.js"
+import { noteCursorWaitEnded, noteCursorWaitStarted } from "./cursor-waits.js"
 import {
   deferToolExec,
   deferredToolExecIds,
@@ -628,12 +638,46 @@ function cursorCustomErrorMessage(record: Record<string, unknown>): string | und
   return parts.length > 0 ? parts.map((part) => part.trim()).join(" ") : undefined
 }
 
+type CursorErrorDetails = { title?: string; detail?: string; isRetryable?: boolean }
+
+/** Decode `aiserver.v1.ErrorDetails.details` (#2): title #1, detail #2, is_retryable #4. */
+function decodeCursorErrorDetails(encoded: string): CursorErrorDetails | undefined {
+  try {
+    const outer = protobuf.Reader.create(Buffer.from(encoded, "base64"))
+    while (outer.pos < outer.len) {
+      const tag = outer.uint32()
+      if (tag !== 0x12) {
+        outer.skipType(tag & 7)
+        continue
+      }
+      const inner = protobuf.Reader.create(outer.bytes())
+      const details: CursorErrorDetails = {}
+      while (inner.pos < inner.len) {
+        const innerTag = inner.uint32()
+        if (innerTag === 0x0a) details.title = inner.string().trim() || undefined
+        else if (innerTag === 0x12) details.detail = inner.string().trim() || undefined
+        else if (innerTag === 0x20) details.isRetryable = inner.bool()
+        else inner.skipType(innerTag & 7)
+      }
+      return details
+    }
+  } catch {
+    return undefined
+  }
+  return undefined
+}
+
 export function connectFrameError(payload: string): CursorProviderError {
   try {
     const envelope = JSON.parse(payload) as {
-      error?: { code?: unknown; details?: unknown; retryAfter?: unknown; retry_after?: unknown }
+      error?: { code?: unknown; message?: unknown; details?: unknown; retryAfter?: unknown; retry_after?: unknown }
     }
     const code = typeof envelope.error?.code === "string" ? envelope.error.code : "unknown"
+    // Hosts classify retries from the error text, so Cursor's own message and
+    // details (the specific reason) stay in the log.
+    if (envelope.error?.message !== undefined || envelope.error?.details !== undefined) {
+      trace(`connect error: code=${code} message=${JSON.stringify(envelope.error.message)?.slice(0, 2_000)} details=${JSON.stringify(envelope.error.details)?.slice(0, 4_000)}`)
+    }
     if (code === "unauthenticated" || code === "permission_denied") {
       return new CursorAuthError(`Cursor authentication failed (${code}); reauthenticate with Cursor`, {
         code,
@@ -645,6 +689,7 @@ export function connectFrameError(payload: string): CursorProviderError {
     )
     let hasRetryInfo = false
     let customMessage: string | undefined
+    let cursorDetails: CursorErrorDetails | undefined
     if (Array.isArray(envelope.error?.details)) {
       for (const detail of envelope.error.details) {
         if (!detail || typeof detail !== "object") continue
@@ -657,6 +702,9 @@ export function connectFrameError(payload: string): CursorProviderError {
           )
         }
         customMessage ??= cursorCustomErrorMessage(record)
+        if (type === "aiserver.v1.ErrorDetails" && typeof record.value === "string") {
+          cursorDetails ??= decodeCursorErrorDetails(record.value)
+        }
       }
     }
     if (customMessage !== undefined) {
@@ -669,8 +717,11 @@ export function connectFrameError(payload: string): CursorProviderError {
       refusal.hostRetryUseless = true
       return refusal
     }
-    return new CursorServerError(`Cursor API error (code=${code})`, {
-      transient: isTransientGrpcStatus(code) || hasRetryInfo,
+    // Cursor CLI shows `${title} ${detail}` and obeys an explicit isRetryable.
+    const explanation = [cursorDetails?.title, cursorDetails?.detail].filter(Boolean).join(" ")
+    return new CursorServerError(`Cursor API error (code=${code})${explanation ? `: ${explanation}` : ""}`, {
+      transient: cursorDetails?.isRetryable ?? (isTransientGrpcStatus(code) || hasRetryInfo),
+      retryable: cursorDetails?.isRetryable,
       replaySafe: true,
       code,
       retryAfterMs: retryAfterMs === undefined
@@ -1010,11 +1061,22 @@ async function doStreamImpl(
       // supersede the held parent Run — that remints (`interrupted-run`) when
       // the trailing tool result returns. Isolate onto an ephemeral conversation.
       const busyPrior = sessionManager.findOpenByOpenCodeSessionId(sessionKey)
+      const incomingTools = extractTools(callOptions)
+      // A tool-less call that is not compaction (title, summary) is a lifecycle
+      // Run: ephemeral and refused execution. Without a result for the parent's
+      // pending call, the host is still running that tool (OpenCode 2 sends one
+      // mid-tool), so the call must not cancel it. With that result, the host
+      // has moved past the tool and the parent Run is finished as usual.
+      const lifecycleCall = !computeAllowTools(incomingTools.length, callOptions.toolChoice)
+        && !isCompactionCall(callOptions, sessionKey)
+        && !historicalResults.some((result) =>
+          result.sessionId === busyPrior?.sessionId && busyPrior.pending.has(result.execId))
       if (
-        busyPrior && shouldIsolateInSessionHelper(sessionKey, extractTools(callOptions), historicalResults)
+        busyPrior
+        && (lifecycleCall || shouldIsolateInSessionHelper(sessionKey, incomingTools, historicalResults))
       ) {
         trace(
-          `fresh turn: isolating in-session helper — incomingTools subset of ` +
+          `fresh turn: isolating in-session ${lifecycleCall ? "tool-less lifecycle call" : "helper — incomingTools subset of"} ` +
             `parentTools=${busyPrior.toolCatalog?.length ?? 0} ` +
             `priorSession=${busyPrior.sessionId} pending=${busyPrior.pending.size}`,
         )
@@ -1115,12 +1177,16 @@ async function doStreamImpl(
           trace(`pull: pump threw (cleaning up): ${(e as Error).message}`)
           // A Run the host stopped is drained and closed by its cancel.
           if (!activeSession.hostInterrupted) {
+            // Only the snapshot carries a request Cursor never checkpointed
+            // past a restart; a failed Run reaches no other save.
+            if (hasLostRequest(activeSession.openCodeSessionId)) {
+              await persistRunInProgress(activeSession, "failed Run")
+            }
             sessionManager.close(activeSession)
-            noteFailedTurn(activeSession)
           }
           recordFinalFailure(opencodeSessionKey(callOptions), e)
           try {
-            controller.error(e instanceof Error ? e : new Error(String(e)))
+            controller.error(hostFacingError(e))
           } catch {
             /* controller already errored/closed */
           }
@@ -1297,7 +1363,6 @@ export async function pumpWithRecovery(input: {
         )
         sessionManager.close(pumpedSession, "remote-error", failure)
         input.renewRejectedCredential()
-        closeEarlyToolRows(pumpedSession, input.controller, EARLY_ROW_RUN_REPLACED)
         session = await reopen(pumpedSession, failure)
         attempt--
         continue
@@ -1332,7 +1397,6 @@ export async function pumpWithRecovery(input: {
       const delayMs = retryDelayMs(failure, attempt + 1, retryPolicy)
       trace(`Run retry backoff: attempt=${attempt + 1}/${recoveries} delayMs=${delayMs}${capacity ? " (capacity)" : ""}`)
       await sleepForRetry(delayMs, input.abortSignal)
-      closeEarlyToolRows(pumpedSession, input.controller, EARLY_ROW_RUN_REPLACED)
       session = await reopen(pumpedSession, failure, checkpoint)
     } finally {
       stopSteers?.()
@@ -1342,33 +1406,11 @@ export async function pumpWithRecovery(input: {
       // a newer pump owner still retain their session, and a host interrupt
       // closes its Run itself after draining Cursor's checkpoint.
       if (sessionManager.endPump(pumpedSession, pumpOwner) && !pumpedSession.hostInterrupted) {
-        sessionManager.closeUnlessPending(pumpedSession)
+        // Held for the host's tools: keep answering what Cursor sends meanwhile.
+        if (!sessionManager.closeUnlessPending(pumpedSession)) readHeldRun(pumpedSession)
       }
-      if (!pumpedSession.closed && pumpedSession.pending.size > 0) void watchHeldRun(pumpedSession)
     }
   }
-}
-
-const EARLY_ROW_RUN_REPLACED = "Cursor's stream was interrupted before this call was sent; the model continues on a new stream."
-
-/** The replacement Run composes its calls again under new ids. */
-function closeEarlyToolRows(
-  session: CursorSession,
-  controller: ReadableStreamDefaultController<V3Part>,
-  reason: string,
-): void {
-  const state = session.earlyToolRows
-  if (!state) return
-  try {
-    for (const row of state.open.values()) {
-      for (const part of earlyRowCloseParts(row, reason)) controller.enqueue(part as V3Part)
-      trace(`early tool row: closed toolCallId=${row.toolCallId} reason=${JSON.stringify(reason)}`)
-    }
-  } catch (error) {
-    trace(`early tool row: close after a failed Run not delivered err=${(error as Error).message}`)
-  }
-  state.open.clear()
-  state.composing.clear()
 }
 
 /** A recovery Run continues the same turn: same request, same tools run so far, same acceptance of a switch. */
@@ -1451,22 +1493,6 @@ function isCurrentHeartbeatGeneration(session: CursorSession, generation: number
   return heartbeatGenerationBySession.get(session) === generation
 }
 
-const INTERACTION_RESULT_FIELDS: ReadonlySet<string> = new Set([
-  ASK_QUESTION_RESULT_FIELD,
-  SWITCH_MODE_RESULT_FIELD,
-  CREATE_PLAN_RESULT_FIELD,
-])
-
-/** Execs Cursor sent that still wait on the host; interaction queries and display bridges are not execs. */
-export function pendingExecIds(session: CursorSession): number[] {
-  const ids: number[] = []
-  for (const [execId, pending] of session.pending) {
-    if (pending.bridged || pending.aborted || pending.state !== "pending" || INTERACTION_RESULT_FIELDS.has(pending.resultField)) continue
-    ids.push(execId)
-  }
-  return ids
-}
-
 /** `ExecServerControlMessage`: Cursor withdrew an exec, e.g. when it stops the Run. */
 export function applyExecControl(session: CursorSession, control: Record<string, unknown>, where: string): void {
   const id = (control.abort as Record<string, unknown> | undefined)?.id
@@ -1479,8 +1505,8 @@ export function applyExecControl(session: CursorSession, control: Record<string,
     return
   }
   const pending = session.pending.get(id)
-  const owed = pending !== undefined && !INTERACTION_RESULT_FIELDS.has(pending.resultField)
-  const marked = owed && sessionManager.markExecAborted(session, id)
+  // Interaction answers share the pending map under their own ids, never an exec's.
+  const marked = pending !== undefined && isOwedCursorExec(pending) && sessionManager.markExecAborted(session, id)
   trace(
     `exec control: Cursor aborted execId=${id} (${where}) sessionId=${session.sessionId} ` +
       `${marked ? "— no result will be written for it" : "— not an exec the host still owes"}`,
@@ -1502,19 +1528,7 @@ export function attachSessionHeartbeat(session: CursorSession): void {
       return
     }
     heartbeatWritePendingBySession.set(session, true)
-    const stream = session.stream
-    const execIds = pendingExecIds(session)
-    const heldExecIds = deferredToolExecIds(session.toolCallOrder)
-    void writeWithBackpressure(stream, buildHeartbeat(), "heartbeat")
-      .then(async () => {
-        for (const execId of [...execIds, ...heldExecIds]) {
-          if (session.closed || !isCurrentHeartbeatGeneration(session, generation)) return
-          const owed = session.pending.get(execId)?.state === "pending"
-            || deferredToolExecIds(session.toolCallOrder).includes(execId)
-          if (!owed) continue
-          await writeWithBackpressure(stream, buildExecHeartbeat(execId), `exec heartbeat id=${execId}`)
-        }
-      })
+    void writeWithBackpressure(session.stream, buildHeartbeat(), "heartbeat")
       .then(() => {
         if (!isCurrentHeartbeatGeneration(session, generation) || session.closed) return
         sessionManager.recordHeartbeatWrite(session)
@@ -1538,10 +1552,70 @@ export function attachSessionHeartbeat(session: CursorSession): void {
   }, session.policy.heartbeatMs)
   interval.unref?.()
   session.heartbeat = interval
+  const execInterval = setInterval(() => {
+    if (session.closed || !isCurrentHeartbeatGeneration(session, generation)) return
+    if (execHeartbeatsPendingBySession.has(session)) return
+    void writeExecHeartbeats(session, generation)
+  }, EXEC_HEARTBEAT_MS)
+  execInterval.unref?.()
   session.heartbeatCancel = () => {
     if (session.heartbeat) clearInterval(session.heartbeat)
     session.heartbeat = null
+    clearInterval(execInterval)
     if (isCurrentHeartbeatGeneration(session, generation)) bumpHeartbeatGeneration(session)
+  }
+}
+
+/** Cursor CLI's per-exec heartbeat period (`agent-exec` handler). */
+const EXEC_HEARTBEAT_MS = 3_000
+const execHeartbeatsPendingBySession = new WeakSet<CursorSession>()
+const execHeartbeatCount = new WeakMap<PendingExec, number>()
+
+/** A Cursor exec the host still runs, as opposed to an interaction answer or a display-only mirror. */
+function isOwedCursorExec(pending: PendingExec): boolean {
+  return !pending.bridged
+    && pending.resultField !== ASK_QUESTION_RESULT_FIELD
+    && pending.resultField !== SWITCH_MODE_RESULT_FIELD
+    && pending.resultField !== CREATE_PLAN_RESULT_FIELD
+}
+
+/**
+ * Tell Cursor each exec the host is still running is alive, as Cursor CLI does
+ * while its exec handler runs. A failed write is left to the session heartbeat,
+ * which owns closing a broken stream; the CLI ignores it too.
+ */
+async function writeExecHeartbeats(session: CursorSession, generation: number): Promise<void> {
+  execHeartbeatsPendingBySession.add(session)
+  const stream = session.stream
+  try {
+    for (const [execId, pending] of [...session.pending]) {
+      if (!isOwedCursorExec(pending)) continue
+      const stillRunning = () => !session.closed
+        && session.stream === stream
+        && isCurrentHeartbeatGeneration(session, generation)
+        && session.pending.get(execId) === pending
+        && pending.state === "pending"
+        && !pending.aborted
+      if (!stillRunning()) continue
+      const written = await writeWithBackpressure(stream, buildExecHeartbeat(execId), `exec heartbeat id=${execId}`, stillRunning)
+      if (!written) continue
+      const count = (execHeartbeatCount.get(pending) ?? 0) + 1
+      execHeartbeatCount.set(pending, count)
+      trace(`exec heartbeat: id=${execId} tool=${pending.toolName ?? "?"} n=${count} sessionId=${session.sessionId}`)
+    }
+    // Execs the tool-call ordering holds back are Cursor's to wait on as much as the running ones.
+    for (const execId of deferredToolExecIds(session.toolCallOrder)) {
+      const stillHeld = () => !session.closed
+        && session.stream === stream
+        && isCurrentHeartbeatGeneration(session, generation)
+        && deferredToolExecIds(session.toolCallOrder).includes(execId)
+      if (!stillHeld()) continue
+      await writeWithBackpressure(stream, buildExecHeartbeat(execId), `exec heartbeat id=${execId} (held)`, stillHeld)
+    }
+  } catch (error) {
+    trace(`exec heartbeat write failed sessionId=${session.sessionId}: ${(error as Error).message}`)
+  } finally {
+    execHeartbeatsPendingBySession.delete(session)
   }
 }
 
@@ -1595,16 +1669,7 @@ async function startSession(
   const cacheDir = opencodeGlobalCacheDir()
   const providerOptions = callOptions.providerOptions?.cursor as Record<string, unknown> | undefined
   const hostAgent = hostAgentFromCallOptions(callOptions)
-  // The classic plugin marks OpenCode's agent="compaction" through chat.params.
-  // OpenCode 2.0 removed that hook, so its plugin writes the same request-local
-  // option from session hooks. The session marker is a fallback only when a
-  // host does not preserve mutable options; explicit false prevents concurrent
-  // title/generate calls from inheriting a compaction marker.
-  // Do not infer this from tools/toolChoice: standalone no-tool calls are valid.
-  const compactionOption = providerOptions?.[CURSOR_COMPACTION_OPTION]
-  const isCompaction = compactionOption === true || (
-    compactionOption === undefined && isCompactionSession(sessionKey)
-  )
+  const isCompaction = isCompactionCall(callOptions, sessionKey)
   const toolState = await resolveTurnToolState({
     sessionKey,
     incomingTools,
@@ -1754,19 +1819,46 @@ async function startSession(
         `conversationId=${bound.conversationId} checkpoint=${conversationState?.length ?? 0}B`,
     )
   }
-  const requestText = userText
-  // A helper on the same session has its own prompt; only the session's own next turn still shows the request.
-  const lostFound = liveTurn && sessionKey && !recovery && !fallbackReply?.override
-    ? lostRequestsFor(sessionKey, conversationId, conversationState)
-    : undefined
-  const lostRequests = lostFound?.length && promptHoldsRequest(prompt, lostFound[0]!) ? lostFound : undefined
-  const turnRequests = lostRequests ? withLostRequests(lostRequests, liveTurn!.text) : undefined
-  if (turnRequests) {
-    userText = turnRequests.join("\n\n") || "."
-    trace(
-      `lost turn: carrying ${lostRequests!.length} request(s) Cursor never checkpointed into this Run ` +
-        `sessionKey=${sessionKey} conversationId=${conversationId}`,
-    )
+  let carriedRequest: string | undefined
+  if (sessionKey && liveTurn && recovery?.kind !== "rebase") {
+    // A Run without a checkpoint seeds the host history, which already holds
+    // the earlier request; only a checkpoint can be missing it.
+    const rebuildFromHistory = !conversationState?.length
+    const lost = peekLostRequest(sessionKey)
+    if (fallbackReply?.override) {
+      // The reply resends the stopped turn's request itself; a checkpoint holding that turn needs nothing resent.
+      if (!rebuildFromHistory && !fallbackReply.stop.checkpointHoldsTurn) {
+        rememberLostRequest({ sessionKey, conversationId, checkpoint: conversationState, text: userText })
+      } else {
+        dropLostRequest(sessionKey)
+      }
+    } else if (!lost || rebuildFromHistory || promptHoldsRequest(prompt, lost.latest)) {
+      const liveText = userText
+      userText = carryLostRequest({
+        sessionKey,
+        conversationId,
+        checkpoint: conversationState,
+        text: userText,
+        rebuildFromHistory,
+      })
+      if (userText !== liveText) {
+        carriedRequest = userText
+        trace(`lost request: carried into this Run sessionKey=${sessionKey} conversationId=${conversationId}`)
+      }
+      if (!rebuildFromHistory) {
+        rememberLostRequest({
+          sessionKey,
+          conversationId,
+          checkpoint: conversationState,
+          text: userText,
+          latest: liveText,
+        })
+      }
+    } else {
+      trace(`lost request: kept out of a Run whose prompt does not hold it sessionKey=${sessionKey}`)
+    }
+  } else if (sessionKey && recovery?.kind === "rebase") {
+    dropLostRequest(sessionKey)
   }
   if (lifecycle) userText = textOnlyTurnText(baseSystemPrompt, userText)
   // After an approved SwitchMode, inject the Cursor CLI-shaped mode reminder
@@ -2209,16 +2301,6 @@ async function startSession(
     closeError: null,
     closed: false,
     requestedModelId: cursorModelId,
-    ...(liveTurn && sessionKey && !recovery && conversationState
-      ? {
-          requestBase: conversationState,
-          turnRequests: turnRequests ?? (
-            !fallbackReply ? [liveTurn.text]
-            : fallbackReply.override && fallbackReply.stop.checkpointHoldsTurn ? []
-            : [requestText]
-          ),
-        }
-      : {}),
     // Every agent Run, including one that rebases a lost Run's tool results.
     ...(sessionKey && allowTools && !isCompaction && !isolateHelper
       ? {
@@ -2230,9 +2312,7 @@ async function startSession(
             toolRuns: [],
             userText: fallbackReply?.override
               ? fallbackReply.stop.userText
-              : turnRequests
-                ? turnRequests.join("\n\n")
-                : (liveTurn?.text ?? (extractUserText(lastUser) || ".")),
+              : carriedRequest ?? liveTurn?.text ?? (extractUserText(lastUser) || "."),
             epochAtTurnStart,
           },
         }
@@ -2286,8 +2366,6 @@ async function startSession(
     await waitForStreamWrites(session.stream)
     abortIfNeeded(next)
     sessionManager.replaceStream(session, next, nextRunId)
-    session.requestBase = conversationState
-    session.turnRequests = undefined
     attachSessionHeartbeat(session)
   }
 
@@ -2544,6 +2622,159 @@ export async function cancelPendingExecsForFreshTurn(session: CursorSession): Pr
   return Math.max(0, before - session.pending.size)
 }
 
+const ASM_EXEC_SERVER_CONTROL_FIELD = 5
+
+type HeldControlFrame =
+  | { kind: "heartbeat" }
+  | { kind: "kv"; kv: Record<string, unknown> }
+  | { kind: "exec-control"; control: Record<string, unknown> }
+
+/** A frame the held reader may take: a server heartbeat, a KV request or exec control, and nothing else. */
+function heldControlFrame(frame: Frame): HeldControlFrame | undefined {
+  if (frame.flags & 0x02) return undefined
+  let payload: Uint8Array
+  try {
+    payload = decodeFramePayload(frame)
+  } catch {
+    return undefined
+  }
+  const fields = readAllFieldsStrict(payload)
+  if (!fields || fields.length !== 1 || fields[0]!.wt !== 2) return undefined
+  const field = fields[0]!
+  if (field.fn === ASM_INTERACTION_UPDATE_FIELD) {
+    const update = field.bytes ? readAllFieldsStrict(field.bytes) : undefined
+    const heartbeat = update?.length === 1
+      && update[0]!.fn === INTERACTION_UPDATE_HEARTBEAT_FIELD
+      && update[0]!.wt === 2
+    return heartbeat ? { kind: "heartbeat" } : undefined
+  }
+  if (field.fn !== ASM_KV_SERVER_MESSAGE_FIELD && field.fn !== ASM_EXEC_SERVER_CONTROL_FIELD) return undefined
+  let asm: Record<string, unknown>
+  try {
+    asm = decodeMessage<Record<string, unknown>>("AgentServerMessage", payload)
+  } catch {
+    return undefined
+  }
+  const kv = asm.kv_server_message as Record<string, unknown> | undefined
+  if (kv) return { kind: "kv", kv }
+  const control = asm.exec_server_control_message as Record<string, unknown> | undefined
+  return control ? { kind: "exec-control", control } : undefined
+}
+
+const heldRunReaders = new WeakSet<CursorSession>()
+/** Unread frames then wait for the pump, under HTTP/2 flow control, as before the reader. */
+const MAX_HELD_FRAMES = 1_000
+
+function isHeldRunIdle(session: CursorSession, frames: CursorSession["frames"]): boolean {
+  return !session.closed
+    && !session.hostInterrupted
+    && !sessionManager.isActivelyPumping(session)
+    && session.pending.size > 0
+    && session.frames === frames
+    && (session.heldFrames?.length ?? 0) < MAX_HELD_FRAMES
+}
+
+/** An abort the reader may apply now: its exec is registered and still waits on the host, or is held back by the ordering. */
+function abortsPendingExec(session: CursorSession, control: Record<string, unknown>): boolean {
+  const id = (control.abort as Record<string, unknown> | undefined)?.id
+  if (typeof id === "number" && deferredToolExecIds(session.toolCallOrder).includes(id)) return true
+  const pending = typeof id === "number" ? session.pending.get(id) : undefined
+  return !!pending && isOwedCursorExec(pending) && pending.state === "pending" && !pending.aborted
+}
+
+/**
+ * While the host runs a step's tools nothing pumps the Run, but Cursor keeps
+ * writing: right after a step it sends `tool_requests_listed` or a checkpoint,
+ * then KV blob writes, and it may abort an exec. Cursor CLI's single reader
+ * handles KV and exec control on their own channels at once; an unanswered KV
+ * write left Cursor waiting until the tool finished (seen live). Answer KV,
+ * apply an abort for an exec still waiting on the host, and skip heartbeats;
+ * queue every other frame in `heldFrames`, in arrival order, for the next pump.
+ * An abort whose exec request is still queued stays queued behind it.
+ *
+ * The reader parks its read in `queuedFrame`: a pump that starts meanwhile
+ * awaits the same read, and the reader leaves that frame to it.
+ */
+export function readHeldRun(session: CursorSession): void {
+  const frames = session.frames
+  if (!isHeldRunIdle(session, frames)) return
+  // A reader from before the last pump may still be waiting on the stream.
+  applyQueuedAborts(session)
+  if (heldRunReaders.has(session)) return
+  heldRunReaders.add(session)
+  void readHeldFrames(session, frames).finally(() => heldRunReaders.delete(session))
+}
+
+/**
+ * An abort queued behind its own exec request waits only until a pump has
+ * registered that exec. If the pump ended its step before reaching the abort,
+ * apply it now, as Cursor CLI does on its control channel; otherwise the exec
+ * runs, keeps its heartbeats and has its late result written.
+ */
+function applyQueuedAborts(session: CursorSession): void {
+  const queued = session.heldFrames
+  if (!queued?.length) return
+  for (let index = 0; index < queued.length;) {
+    const held = heldControlFrame(queued[index]!)
+    if (held?.kind === "exec-control" && abortsPendingExec(session, held.control)) {
+      queued.splice(index, 1)
+      applyExecControl(session, held.control, "held queue")
+    } else {
+      index++
+    }
+  }
+}
+
+async function readHeldFrames(session: CursorSession, frames: CursorSession["frames"]): Promise<void> {
+  while (isHeldRunIdle(session, frames)) {
+    applyQueuedAborts(session)
+    const read = session.queuedFrame ??= frames.next()
+    void read.catch(() => {})
+    let result: IteratorResult<Frame>
+    try {
+      result = await read
+    } catch {
+      return // the next pump reads the same rejection, after the queued frames
+    }
+    // A pump started meanwhile reads this frame itself; an ended stream stays for it too.
+    if (!isHeldRunIdle(session, frames) || session.queuedFrame !== read || result.done) return
+    session.queuedFrame = undefined
+    sessionManager.recordSemanticProgress(session)
+    const frame = result.value
+    const held = heldControlFrame(frame)
+    const kv = held?.kind === "kv" ? held.kv : undefined
+    const kvReply = kv ? handleKvServerMessage(kv, session) : undefined
+    if (held?.kind === "heartbeat") continue
+    if (kvReply) {
+      if (kvReply.kind === "set") noteAssistantBlob(session, kv!)
+      try {
+        await writeWithBackpressure(session.stream, kvReply.reply, `held KV ${kvReply.kind}_blob reply id=${kvReply.id}`)
+        trace(`held Run: answered KV ${kvReply.kind} id=${kvReply.id} sessionId=${session.sessionId}`)
+      } catch (error) {
+        trace(`held Run: KV reply failed sessionId=${session.sessionId}: ${(error as Error).message}`)
+        sessionManager.close(session, "reply-write-failed", toCursorProviderError(error, {
+          replaySafe: false,
+          fallback: "Cursor KV reply failed",
+        }))
+        return
+      }
+      continue
+    }
+    if (held?.kind === "exec-control" && abortsPendingExec(session, held.control)) {
+      applyExecControl(session, held.control, "held")
+      if (![...session.pending.values()].some((pending) => isOwedCursorExec(pending) && !pending.aborted)) {
+        trace(`held Run: Cursor aborted every exec it was waiting on sessionId=${session.sessionId}`)
+      }
+      continue
+    }
+    // Everything else, a KV request this client cannot answer included (the
+    // pump fails the Run on it), waits for the next pump in order.
+    ;(session.heldFrames ??= []).push(frame)
+    trace(`held Run: queued a frame for the next pump queued=${session.heldFrames.length} sessionId=${session.sessionId}`)
+    if (frame.flags & 0x02) return
+  }
+}
+
 /** Save a Run's conversation before Cursor ends its turn, with the latest checkpoint Cursor sent. */
 function persistRunInProgress(session: CursorSession, where: string): Promise<void> {
   const sessionKey = session.openCodeSessionId
@@ -2612,6 +2843,7 @@ export function cancelRunForHostInterrupt(
 
 async function cancelRun(session: CursorSession, reason: string, opts?: { graceMs?: number }): Promise<void> {
   session.hostInterrupted = reason
+  dropLostRequest(session.openCodeSessionId)
   // Stopped while its turn end was being saved, the host may have kept only part of the step.
   if (session.openCodeSessionId && sessionManager.isActivelyPumping(session)) {
     resumeEmittedStep(session.openCodeSessionId, session.conversationId)
@@ -2700,85 +2932,11 @@ onHostInterrupt(async (openCodeSessionId, reason, at) => {
     if (stop.at < at - HOST_INTERRUPT_MEMORY_MS) hostInterrupts.delete(id)
   }
   hostInterrupts.set(openCodeSessionId, { at, reason })
-  forgetLostTurn(openCodeSessionId)
+  dropLostRequest(openCodeSessionId)
   for (const session of sessionManager.openSessionsStoppedWith(openCodeSessionId)) {
     if (requestedBefore(session, at)) cancelForHostInterrupt(session, reason)
   }
 })
-
-const heldRunWatchers = new WeakSet<CursorSession>()
-
-/**
- * While the host runs a step's tools nobody reads the held Run, yet Cursor
- * keeps sending: KV writes, heartbeats, an exec abort. Answer those as they
- * come and leave any other frame queued for the pump that delivers the results.
- */
-async function watchHeldRun(session: CursorSession): Promise<void> {
-  if (heldRunWatchers.has(session)) return
-  heldRunWatchers.add(session)
-  try {
-    while (!session.closed && session.pending.size > 0 && !sessionManager.isActivelyPumping(session)) {
-      const read = takeFrame(session)
-      session.queuedFrame = read
-      let next: IteratorResult<Frame>
-      try {
-        next = await read
-      } catch {
-        return
-      }
-      if (session.queuedFrame !== read || session.closed || sessionManager.isActivelyPumping(session)) return
-      if (next.done || next.value.flags & 0x02) return
-      const frame = heldRunControlFrame(session, next.value)
-      if (!frame) return
-      // Taken before any await, so a pump starting meanwhile reads the next frame instead.
-      session.queuedFrame = undefined
-      sessionManager.recordSemanticProgress(session)
-      if (frame.kind === "exec-control") {
-        applyExecControl(session, frame.control, "held")
-      } else if (frame.kind === "kv") {
-        try {
-          await writeWithBackpressure(session.stream, frame.handled.reply, `held KV ${frame.handled.kind}_blob reply id=${frame.handled.id}`)
-          trace(`held Run: answered KV ${frame.handled.kind} id=${frame.handled.id} sessionId=${session.sessionId}`)
-        } catch (error) {
-          trace(`held Run: KV reply failed sessionId=${session.sessionId} err=${(error as Error).message}`)
-          sessionManager.close(session, "reply-write-failed")
-          return
-        }
-      }
-    }
-  } finally {
-    heldRunWatchers.delete(session)
-  }
-}
-
-type HeldRunControlFrame =
-  | { kind: "heartbeat" }
-  | { kind: "exec-control"; control: Record<string, unknown> }
-  | { kind: "kv"; handled: NonNullable<ReturnType<typeof handleKvServerMessage>> }
-
-/** A frame the held-Run watcher answers itself; anything else is the pump's. */
-function heldRunControlFrame(session: CursorSession, frame: Frame): HeldRunControlFrame | undefined {
-  let payload: Uint8Array
-  let asm: Record<string, unknown>
-  try {
-    payload = decodeFramePayload(frame)
-    asm = decodeMessage<Record<string, unknown>>("AgentServerMessage", payload)
-  } catch {
-    return undefined
-  }
-  const fields = readAllFieldsStrict(payload)
-  if (!fields || fields.length !== 1) return undefined
-  const control = asm.exec_server_control_message as Record<string, unknown> | undefined
-  if (control) return { kind: "exec-control", control }
-  if (!isSoleControlFrame(payload)) return undefined
-  const iu = asm.interaction_update as Record<string, unknown> | undefined
-  if (iu?.heartbeat) return { kind: "heartbeat" }
-  // A get can miss, which only the pump knows how to recover from.
-  const kv = asm.kv_server_message as Record<string, unknown> | undefined
-  const handled = kv?.set_blob_args ? handleKvServerMessage(kv, session) : undefined
-  if (handled) noteAssistantBlob(session, kv!)
-  return handled ? { kind: "kv", handled } : undefined
-}
 
 async function waitUntilNotPumping(
   session: CursorSession,
@@ -2803,13 +2961,6 @@ let cursorListsToolRequests = false
 // Liveness only: closes a held step whose listed calls never all arrive.
 const HELD_TOOL_STEP_QUIET_MS = 1_500
 
-/** The queued frame read, if any, else a new one. */
-function takeFrame(session: CursorSession): Promise<IteratorResult<Frame>> {
-  const queued = session.queuedFrame
-  session.queuedFrame = undefined
-  return queued ?? session.frames.next()
-}
-
 /**
  * The next frame, or undefined when none arrives within `timeoutMs`. A read
  * that times out stays queued on the session, so the next reader gets its frame.
@@ -2818,7 +2969,7 @@ async function nextFrameWithin(
   session: CursorSession,
   timeoutMs: number,
 ): Promise<IteratorResult<Frame> | undefined> {
-  const read = takeFrame(session)
+  const read = readSessionFrame(session)
   let timer: ReturnType<typeof setTimeout> | undefined
   const timedOut = new Promise<undefined>((resolve) => {
     timer = setTimeout(() => resolve(undefined), timeoutMs)
@@ -2897,6 +3048,7 @@ export async function drainSessionUntilTurnEnded(
       }
 
       const frame = next.value as Frame
+      sessionManager.recordSemanticProgress(session)
       if (frame.flags & 0x02) {
         if (cancelling) {
           try {
@@ -2946,6 +3098,7 @@ export async function drainSessionUntilTurnEnded(
           cancellationCheckpoint = true
           if (session.cacheDiagnostics) session.cacheDiagnostics.checkpointUpdates++
           setCheckpoint(session.conversationId, bytes)
+          noteCheckpoint(session.openCodeSessionId, bytes)
           session.resumeCheckpoint = Uint8Array.from(bytes)
           session.carriedCheckpoint = undefined
           noteRunImageCheckpoint(session, bytes)
@@ -3042,7 +3195,6 @@ export async function drainSessionUntilTurnEnded(
           outcome = "interrupted"
           break
         }
-        sessionManager.recordSemanticProgress(session)
         continue
       }
 
@@ -3060,17 +3212,13 @@ export async function drainSessionUntilTurnEnded(
         outcome = "busy"
         break
       }
-      if (iu?.heartbeat || iu?.step_started || iu?.step_completed) {
-        sessionManager.recordSemanticProgress(session)
-        continue
-      }
+      if (iu?.heartbeat || iu?.step_started || iu?.step_completed) continue
       if (iu?.tool_call_completed) {
         // Display close of a call Cursor already has its answer for (the
         // result this drain just delivered, typically). Cursor does not wait
         // on it, and its checkpoint and turn_ended follow; stopping here would
         // supersede the Run and lose that turn. Its display mirror, if any,
         // has no host consumer on this path.
-        sessionManager.recordSemanticProgress(session)
         trace(`fresh turn drain: skipped display tool_call_completed sessionId=${session.sessionId}`)
         continue
       }
@@ -4026,25 +4174,17 @@ function isTruthyEnv(value: string | undefined): boolean {
 async function nextFrameWithSemanticDeadline(
   session: CursorSession,
 ): Promise<IteratorResult<Frame>> {
-  const remainingMs = semanticDeadlineAt(session) - Date.now()
-  if (remainingMs <= 0) {
-    throw new CursorTransportError(
-      `Cursor semantic-progress timeout after ${session.policy.semanticIdleMs}ms`,
-      { transient: true, replaySafe: true, code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" },
-    )
-  }
+  const idleTimeout = () => new CursorTransportError(
+    `Cursor Run sent no frames for ${session.policy.semanticIdleMs}ms`,
+    { transient: true, replaySafe: true, code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" },
+  )
+  const remainingMs = session.semanticDeadlineAt - Date.now()
+  if (remainingMs <= 0) throw idleTimeout()
   let timer: ReturnType<typeof setTimeout> | undefined
   let rejectCancelled: ((error: CursorProviderError) => void) | undefined
   const deadline = new Promise<never>((_, reject) => {
     rejectCancelled = reject
-    timer = setTimeout(() => {
-      reject(
-        new CursorTransportError(
-          `Cursor semantic-progress timeout after ${session.policy.semanticIdleMs}ms`,
-          { transient: true, replaySafe: true, code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" },
-        ),
-      )
-    }, remainingMs)
+    timer = setTimeout(() => reject(idleTimeout()), remainingMs)
     timer.unref?.()
   })
   session.semanticDeadlineCancel = () => {
@@ -4056,7 +4196,7 @@ async function nextFrameWithSemanticDeadline(
     )
   }
   try {
-    return await Promise.race([takeFrame(session), deadline])
+    return await Promise.race([readSessionFrame(session), deadline])
   } finally {
     if (timer) clearTimeout(timer)
     session.semanticDeadlineCancel = null
@@ -4203,6 +4343,9 @@ export async function pump(
   let lifecycleRefusedExec = false
   let progressContinuationAttempts = 0
   let emittedHostTools = 0
+  const earlyRows = new EarlyToolRows()
+  /** Calls Cursor announced in this pass whose exec or completion has not arrived. */
+  const announcedCalls = new Set<string>()
   // The current model step's tool calls: Cursor's listed count, the call ids that
   // reached us (exec request or display completion), and those sent to the host.
   const carried = session.carriedToolStep
@@ -4229,11 +4372,8 @@ export async function pump(
     }
   }
   /** End a held step; `requeue` is a frame read that belongs to the next pump pass. */
-  const closeHeldToolStep = (reason: string, requeue?: Promise<IteratorResult<Frame>>): void => {
-    if (requeue) {
-      requeue.catch(() => {})
-      session.queuedFrame = requeue
-    }
+  const closeHeldToolStep = (reason: string, requeue?: IteratorResult<Frame>): void => {
+    if (requeue) putBackFrame(session, requeue)
     trace(
       `exec: tool step closed (${reason}) hostCalls=${toolStep.hostCalls} ` +
         `listed=${toolStep.listed ?? "-"} resolved=${toolStep.resolved.size}`,
@@ -4349,81 +4489,6 @@ export async function pump(
     streamClosed = true
   }
 
-  const earlyRows = earlyToolRowState(session)
-  /** The Cursor call whose own exec is being handled; a refusal closes its early row with the reason. */
-  let execOwnCallId: string | undefined
-  const enqueueEarlyRowPart = (part: V3Part): void => {
-    if (streamClosed) return
-    try {
-      controller.enqueue(part)
-    } catch (e) {
-      streamClosed = true
-      trace(`pump: enqueue on closed controller (suppressing) err=${(e as Error).message}`)
-    }
-  }
-  const settleEarlyRows = (fallbackReason?: string): void => {
-    for (const [callId, row] of [...earlyRows.open]) {
-      const reason = row.settle ?? fallbackReason
-      if (!reason) continue
-      earlyRows.open.delete(callId)
-      for (const part of earlyRowCloseParts(row, reason)) enqueueEarlyRowPart(part as V3Part)
-      trace(`early tool row: closed toolCallId=${row.toolCallId} callId=${callId} reason=${JSON.stringify(reason)}`)
-    }
-  }
-  /**
-   * Open a row for the first call Cursor is still composing, once nothing
-   * before it in the step can end the host step first: no host call in this
-   * pass (a held exec then closes nothing), no held exec, and every other
-   * unfinished call already handled.
-   */
-  const openEarlyToolRows = (): void => {
-    const first = earlyRows.composing.entries().next().value
-    if (!first || streamClosed || earlyRows.open.size > 0) return
-    const [callId, call] = first
-    if (call.skipped || !session.allowTools || session.hostInterrupted) return
-    if (session.hostToolDialect?.filePathKey !== "path") return
-    if (toolStep.hostCalls > 0 || hasDeferredToolExecs(order)) return
-    if (!order.calls.every((entry) => entry.callId === callId || earlyRows.handled.has(entry.callId))) return
-    if (call.variant === "edit_tool_call" && typeof call.args.path !== "string") return
-    const toolName = predictEarlyToolName(call, {
-      advertised: fileToolNames(),
-      permitted: session.permittedToolNames,
-      workspaceRoot: workspaceRootFromRequestContext(session.requestContext),
-    })
-    if (!toolName) {
-      call.skipped = true
-      return
-    }
-    const bridgedExecId = session.nextBridgedExecId++
-    const row: EarlyToolRow = { toolCallId: `cursor_${session.sessionId}_${bridgedExecId}`, toolName, bridgedExecId }
-    closeOpenSpans()
-    replaySafety.markBarrier("visible-tool-row")
-    earlyRows.open.set(callId, row)
-    enqueueEarlyRowPart(earlyRowStartPart(row) as V3Part)
-    trace(`early tool row: opened toolCallId=${row.toolCallId} toolName=${toolName} callId=${callId} variant=${call.variant}`)
-  }
-  /** The call's own exec arrived: it no longer composes, and its row closes unless the exec becomes its tool call. */
-  const noteEarlyRowExec = (callId: string): void => {
-    earlyRows.handled.add(callId)
-    earlyRows.composing.delete(callId)
-    const row = earlyRows.open.get(callId)
-    if (!row) return
-    row.settle ??= "Cursor sent this call as a different request."
-    execOwnCallId = callId
-  }
-  /** The early row of `callId` when the call runs as `toolName`; another tool closes it. */
-  const bindEarlyRow = (callId: string | undefined, toolName: string): EarlyToolRow | undefined => {
-    const row = callId ? earlyRows.open.get(callId) : undefined
-    if (!row) return undefined
-    if (row.toolName !== toolName) {
-      row.settle = `Cursor sent this call as \`${toolName}\`, which runs as a separate call.`
-      return undefined
-    }
-    earlyRows.open.delete(callId!)
-    trace(`early tool row: bound toolCallId=${row.toolCallId} toolName=${toolName} callId=${callId}`)
-    return row
-  }
-
   /** Reply on Cursor's correlated exec channel without exposing a host tool call. */
   const rejectExec = async (
     parsed: ParsedExecRequest,
@@ -4434,8 +4499,6 @@ export async function pump(
       reason,
       workspaceRootFromRequestContext(session.requestContext),
     )
-    const earlyRow = execOwnCallId ? earlyRows.open.get(execOwnCallId) : undefined
-    if (earlyRow) earlyRow.settle = reason
     const ok = await writeExecFrames(
       buildExecClientMessages({
         execId: parsed.id,
@@ -4454,7 +4517,7 @@ export async function pump(
 
   /**
    * Cursor reads a Task's attachments before its subagent request. A host read
-   * would end the step and close the Task's early row as a failed subagent.
+   * would end the step before the subagent request arrives.
    */
   const answerTaskAttachmentRead = async (parsed: ParsedExecRequest): Promise<boolean> => {
     const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
@@ -4729,15 +4792,43 @@ export async function pump(
     session.usageEstimate.outputTokens += estimateTokens(text.length)
     safeEnqueue({ type: "reasoning-delta", id: reasoningId, delta: text } as V3Part)
   }
+  const owedPendingCount = (): number => {
+    let owed = 0
+    for (const pending of session.pending.values()) if (isOwedCursorExec(pending)) owed++
+    return owed
+  }
+  const closeEarlyRow = (row: EarlyToolRow) => {
+    replaySafety.markBarrier("visible-tool-row")
+    // Text that streamed while the row was open ends before its tool-call.
+    closeOpenSpans()
+    safeEnqueue({ type: "tool-input-end", id: row.toolCallId } as V3Part)
+    safeEnqueue({
+      type: "tool-call",
+      toolCallId: row.toolCallId,
+      toolName: row.toolName,
+      input: "{}",
+      providerExecuted: true,
+    } as V3Part)
+    safeEnqueue({
+      type: "tool-result",
+      toolCallId: row.toolCallId,
+      toolName: row.toolName,
+      result: EARLY_ROW_CLOSED,
+      isError: true,
+    } as V3Part)
+  }
+  const settleOpenEarlyRows = () => {
+    for (const row of earlyRows.drain()) closeEarlyRow(row)
+  }
   const emitFinish = (
     te: Record<string, unknown> | undefined,
     reason: LanguageModelV3FinishReason,
     settledUsage?: LanguageModelV3Usage,
     settledSource?: string,
   ) => {
+    settleOpenEarlyRows()
     flushToollessText()
     closeOpenSpans()
-    settleEarlyRows("Cursor ended the step before sending this call.")
     const est = session.usageEstimate
     // OpenCode TUI/GUI replace each assistant message's tokens (they do not
     // sum occupancy) and the TUI footer requires tokens.output > 0. Cost is
@@ -4875,7 +4966,8 @@ export async function pump(
 
   // The cancel path drains and closes the Run; a frame read here goes back to it.
   const stopForHostInterrupt = (read?: IteratorResult<Frame>): never => {
-    if (read) session.queuedFrame = Promise.resolve(read)
+    if (read) putBackFrame(session, read)
+    settleOpenEarlyRows()
     closeOpenSpans()
     trace(`pump: host interrupted the turn sessionId=${session.sessionId} — leaving the cancelled Run to its drain`)
     throw new CursorLocalCancellationError("Cursor Run cancelled: the host stopped the turn")
@@ -4996,9 +5088,6 @@ export async function pump(
     }
 
     execMutates = false
-    execOwnCallId = undefined
-    settleEarlyRows()
-    openEarlyToolRows()
     let released = takeReadyToolExec(order)
     let waitForOrderMs: number | undefined
     if (!released && hasDeferredToolExecs(order)) {
@@ -5036,7 +5125,7 @@ export async function pump(
       } else {
         next = session.pending.size === 0
           ? await nextFrameWithSemanticDeadline(session)
-          : await takeFrame(session)
+          : await readSessionFrame(session)
       }
     } catch (error) {
       if (session.hostInterrupted) stopForHostInterrupt()
@@ -5053,6 +5142,7 @@ export async function pump(
             `Cursor Run frame stream interrupted: ${(error as Error).message}`,
             { cause: error },
           )
+      settleOpenEarlyRows()
       throw finalizeFailure(failure)
     }
     if (session.hostInterrupted) stopForHostInterrupt(next)
@@ -5061,17 +5151,23 @@ export async function pump(
       return
     }
     if (next.done) {
+      settleOpenEarlyRows()
       closeOpenSpans()
       trace("pump: frames iterator ended before turn_ended")
       const failure = new CursorRunInterruptedError()
       throw finalizeFailure(failure)
     }
     const frame = next.value as Frame
+    // As in Cursor CLI, any inbound frame (heartbeats included) proves the Run is
+    // alive: a model composing a large tool input sends only heartbeats or token
+    // counts until the call arrives.
+    sessionManager.recordSemanticProgress(session)
 
     if (frame.flags & 0x02) {
       // A successful agent turn has an explicit turn_ended update before the
       // Connect envelope closes. Reaching end-stream here means the Run was
       // interrupted, even if the HTTP status itself was 200.
+      settleOpenEarlyRows()
       closeOpenSpans()
       const failure = endStreamFailure(frame)
       if (planHandoffCancellationRequested && failure.origin === "server" && failure.code === "canceled"
@@ -5117,10 +5213,9 @@ export async function pump(
     }
     const iu = asm.interaction_update as Record<string, unknown> | undefined
     if (!iu?.heartbeat) order.progressAt = Date.now()
-    noteRunFrame(session, iu)
     // Output after a step's tool calls belongs to the next step.
     if (toolStep.hostCalls > 0 && (iu?.text_delta || iu?.thinking_delta || iu?.turn_ended)) {
-      closeHeldToolStep("model output", Promise.resolve(next))
+      closeHeldToolStep("model output", next)
       return
     }
     const esm = asm.exec_server_message as Record<string, unknown> | undefined
@@ -5129,7 +5224,6 @@ export async function pump(
     const interactionQuery = asm.interaction_query as Record<string, unknown> | undefined
     const checkpointRaw = asm.conversation_checkpoint_update
     const topField = payload.length > 0 ? payload[0] >> 3 : 0
-    const checkpointProgress = normalizeCheckpointBytes(checkpointRaw)
     const requiredChannel = responseRequiredChannel(payload)
     if (
       requiredChannel === "multiple" ||
@@ -5145,11 +5239,7 @@ export async function pump(
       kv,
       execControl,
       interactionQuery,
-      checkpointBytes: checkpointProgress,
     })
-    if (replayFrame.semanticProgress) {
-      sessionManager.recordSemanticProgress(session)
-    }
     if (replayFrame.barrier === "unknown-or-malformed-frame" && isDebugEnabled()) {
       const layout = describeFrameLayout(payload)
       if (!unknownFrameLayouts.has(layout)) {
@@ -5187,6 +5277,7 @@ export async function pump(
       if (bytes && bytes.length > 0) {
         cacheDiagnostics.checkpointUpdates++
         setCheckpoint(session.conversationId, bytes)
+        noteCheckpoint(session.openCodeSessionId, bytes)
         session.resumeCheckpoint = Uint8Array.from(bytes)
         if (switchGuard) switchGuard.latestCheckpoint = session.resumeCheckpoint
         session.carriedCheckpoint = undefined
@@ -5290,9 +5381,7 @@ export async function pump(
       recordTurnEndedCost(session, turnEnded)
       session.carriedCheckpoint = undefined
       session.toolCallOrder = undefined
-      for (const row of earlyRows.open.values()) row.settle ??= "Cursor ended the turn before sending this call."
-      earlyRows.composing.clear()
-      earlyRows.handled.clear()
+      settleOpenEarlyRows()
       // A checkpoint from before the step's results (or from an earlier Run) would drop the step
       // from any turn that resumed it, so it is neither kept nor saved.
       const checkpointPredatesStep = !!session.resultsAfterCheckpoint
@@ -5322,7 +5411,14 @@ export async function pump(
         const followUp = steers.undelivered.map((steer) => steer.text)
         try {
           await session.reopenWithUserMessage(followUp.join("\n\n"), abortSignal)
-          session.turnRequests = followUp
+          if (session.openCodeSessionId && checkpoint?.length) {
+            rememberLostRequest({
+              sessionKey: session.openCodeSessionId,
+              conversationId: session.conversationId,
+              checkpoint,
+              text: followUp.join("\n\n"),
+            })
+          }
           // Resuming the checkpoint from before the follow-up would send the steer again.
           session.resumeCheckpoint = undefined
           endingTurns.delete(session)
@@ -5401,8 +5497,6 @@ export async function pump(
       trace("steer: Cursor appended a user message to the Run")
       endThinkingRun()
       if (textStarted) textSeparator = "\n\n"
-    } else if (iu?.partial_tool_call) {
-      noteComposingToolCall(earlyRows, iu.partial_tool_call as Record<string, unknown>)
     } else if (iu?.tool_call_started) {
       cacheDiagnostics.displayToolCalls++
       // Stash Cursor display ToolCall until exec claims it, or completed bridges it.
@@ -5459,13 +5553,8 @@ export async function pump(
       if (discoveryError) {
         trace(`display tool_call_completed: ERROR variant=get_mcp_tools_tool_call callId=${JSON.stringify(callId)} error=${JSON.stringify(discoveryError)}`)
       }
-      if (callId) {
-        earlyRows.composing.delete(callId)
-        earlyRows.handled.delete(callId)
-        const earlyRow = earlyRows.open.get(callId)
-        if (earlyRow) earlyRow.settle ??= "Cursor finished this call without asking OpenCode to run it."
-      }
       if (callId) session.editToolCalls?.delete(callId)
+      if (callId) announcedCalls.delete(callId)
       const refusedAttachmentTask = !!callId && session.taskAttachmentCalls?.delete(callId) === true
       if (callId) session.resultsAfterCheckpoint?.awaiting.delete(callId)
       if (callId) noteCursorWaitEnded(session, callId)
@@ -5538,8 +5627,7 @@ export async function pump(
               const snapshot = snapshotMirroredTodos(bridged.args.todos)
               if (snapshot !== undefined) storeMirroredTodos(session, snapshot)
             }
-            const earlyRow = bindEarlyRow(callId, bridged.toolName)
-            const execId = earlyRow?.bridgedExecId ?? session.nextBridgedExecId++
+            const execId = session.nextBridgedExecId++
             sessionManager.registerPending(
               execId,
               session,
@@ -5555,7 +5643,6 @@ export async function pump(
             )
             emittedHostTools++
             closeOpenSpans()
-            if (earlyRow) enqueueEarlyRowPart(earlyRowEndPart(earlyRow) as V3Part)
             safeEnqueue({
               type: "tool-call",
               toolCallId,
@@ -5693,7 +5780,7 @@ export async function pump(
         if (runtimeMessages) {
           if (displayCallId) {
             toolStep.resolved.add(displayCallId)
-            noteEarlyRowExec(displayCallId)
+            announcedCalls.delete(displayCallId)
             noteToolCallFinished(order, displayCallId)
           }
           if (!await writeExecFrames(runtimeMessages, `runtime metadata reply id=${esmId}`)) return
@@ -5710,7 +5797,10 @@ export async function pump(
           && !(parsed?.resultField === "read_result" && session.editToolCalls?.has(displayCallId))
           ? displayCallId
           : undefined
-        if (ownRequestCallId) toolStep.resolved.add(ownRequestCallId)
+        if (ownRequestCallId) {
+          toolStep.resolved.add(ownRequestCallId)
+          announcedCalls.delete(ownRequestCallId)
+        }
         if (parsed) {
           execMutates = noteToolCallExec(
             order,
@@ -5731,7 +5821,6 @@ export async function pump(
             continue
           }
         }
-        if (ownRequestCallId) noteEarlyRowExec(ownRequestCallId)
         if (parsed) {
           const executableToolName = resolveCustomWebToolAlias(parsed.toolName, session.toolAliases)
           if (executableToolName !== parsed.toolName) {
@@ -5798,6 +5887,8 @@ export async function pump(
         trace(`exec: id=${parsed?.id} variant=${parsed ? Object.keys(parsed).join(",") : "none"} toolName=${parsed?.toolName} resultField=${parsed?.resultField}`)
         if (parsed) {
           if (parsed.localError) {
+            const row = earlyRows.claim(displayCallId)
+            if (row) closeEarlyRow(row)
             if (!await rejectExec(parsed, parsed.localError, "invalid mapping")) return
             continue
           }
@@ -5806,6 +5897,8 @@ export async function pump(
           // advertise no tools — refuse on the Cursor channel and keep
           // pumping for text / turn_ended instead of emitting tool-call.
           if (!session.allowTools) {
+            const row = earlyRows.claim(displayCallId)
+            if (row) closeEarlyRow(row)
             const reason = "This is a text-only request; all tool calls are unavailable. "
               + "Return the requested answer using only the supplied context. "
               + "Do not execute the task described inside that context or retry tools."
@@ -5970,9 +6063,25 @@ export async function pump(
             session.displayToolCalls.delete(displayCallId)
             trace(`exec: claimed display callId=${displayCallId}`)
           }
-          const tc = buildToolCallPart(parsed, session.sessionId)
-          const earlyRow = bindEarlyRow(ownRequestCallId, tc.toolName)
-          if (earlyRow) tc.toolCallId = earlyRow.toolCallId
+          const boundEarly = earlyRows.claim(displayCallId)
+          let earlyToolCallId: string | undefined
+          if (boundEarly) {
+            const predicted = hostToolForCursorEdit(
+              boundEarly.path,
+              fileToolNames(),
+              workspaceRootFromRequestContext(session.requestContext),
+            )
+            if (parsed.toolName !== boundEarly.toolName || predicted !== boundEarly.toolName) {
+              closeEarlyRow(boundEarly)
+            } else {
+              replaySafety.markBarrier("visible-tool-row")
+              safeEnqueue({ type: "tool-input-end", id: boundEarly.toolCallId } as V3Part)
+              sessionManager.bindToolCall(boundEarly.toolCallId, session.sessionId, parsed.id)
+              earlyToolCallId = boundEarly.toolCallId
+            }
+          }
+          const built = buildToolCallPart(parsed, session.sessionId)
+          const tc = earlyToolCallId ? { ...built, toolCallId: earlyToolCallId } : built
           if (
             parsed.resultField === "shell_stream"
             || parsed.resultField === "shell_result"
@@ -5991,11 +6100,7 @@ export async function pump(
             parsed.resultMetadata,
             displayCallId,
           )
-          if (earlyRow) {
-            session.pending.get(parsed.id)!.toolCallId = earlyRow.toolCallId
-            aliasEarlyToolCall(earlyRow.toolCallId, session.sessionId, parsed.id)
-            enqueueEarlyRowPart(earlyRowEndPart(earlyRow) as V3Part)
-          }
+          if (earlyToolCallId) session.pending.get(parsed.id)!.toolCallId = earlyToolCallId
           // A direct host `todowrite` is a replace-all snapshot: it is the new
           // truth for later Cursor merge patches, which otherwise apply onto a
           // stale (or empty) mirrored list.
@@ -6008,6 +6113,7 @@ export async function pump(
           }
           // tc.input is already a JSON string (LanguageModelV3ToolCall.input).
           trace(`exec: EMITTED tool-call toolCallId=${tc.toolCallId} toolName=${tc.toolName} inputLen=${tc.input.length}`)
+          settleOpenEarlyRows()
           emittedHostTools++
           // Close open text/reasoning spans before tool-call (required by AI SDK V3).
           closeOpenSpans()
@@ -6350,7 +6456,10 @@ export async function pump(
       }
     }
     } catch (e) {
-      if (e instanceof CursorProviderError) throw e
+      if (e instanceof CursorProviderError) {
+        settleOpenEarlyRows()
+        throw e
+      }
       if (requiredChannel) {
         failRunProtocol(`Cursor ${requiredChannel} request could not be handled`, RUN_REQUEST_UNSUPPORTED)
       }
@@ -6358,9 +6467,51 @@ export async function pump(
       // exec/args decode) must not abort the whole turn — log and skip.
       trace(`frame dispatch FAILED (skipping): topField=${topField}`)
     }
-    // heartbeat / step / partial_tool_call → ignore (partial args are
-    // display-only; the exec channel is authoritative. Checkpoints and
-    // interaction queries are handled above.)
+    const partialCallId = (iu?.partial_tool_call as { call_id?: unknown } | undefined)?.call_id
+    if (typeof partialCallId === "string" && partialCallId) announcedCalls.add(partialCallId)
+    const announced = iu?.partial_tool_call ? cursorEditAnnouncement(iu.partial_tool_call) : undefined
+    if (
+      announced
+      && !earlyRows.seen(announced.callId)
+      // The ordering does not hold a step for a later call the way a parallel step does, so an
+      // earlier call's exec would close the row of a call announced behind it.
+      && [...announcedCalls].every((callId) => callId === announced.callId)
+      && order.calls.every((call) => call.callId === announced.callId)
+      && !hasDeferredToolExecs(order)
+      && shouldOpenEarlyRow({
+        allowTools: session.allowTools,
+        hostInterrupted: !!session.hostInterrupted,
+        holdingParallelStep: false,
+        emittedHostTools,
+        owedPending: owedPendingCount(),
+      })
+    ) {
+      const toolName = hostToolForCursorEdit(
+        announced.path,
+        fileToolNames(),
+        workspaceRootFromRequestContext(session.requestContext),
+      )
+      if (!toolName) earlyRows.skip(announced.callId)
+      else {
+        const row: EarlyToolRow = {
+          cursorCallId: announced.callId,
+          toolCallId: earlyRowToolCallId(session.sessionId, announced.callId),
+          toolName,
+          path: announced.path,
+        }
+        earlyRows.openRow(row)
+        replaySafety.markBarrier("visible-tool-row")
+        safeEnqueue({
+          type: "tool-input-start",
+          id: row.toolCallId,
+          toolName: row.toolName,
+        } as V3Part)
+      }
+    }
+    // heartbeat / step / tool-input deltas stay display-only. An edit
+    // partial with a path may have opened a row above; the exec channel
+    // still decides the call. Checkpoints and interaction queries are
+    // handled above.
   }
 }
 
@@ -6402,7 +6553,9 @@ type ExtractedToolResult = ToolResultContent & { sessionId: string; execId: numb
 
 function correlateToolResults(results: ToolResultContent[]): ExtractedToolResult[] {
   return results.flatMap(result => {
-    const parsed = resolveEarlyToolCallId(result.toolCallId) ?? parseExecIdFromToolCallId(result.toolCallId)
+    const parsed = parseExecIdFromToolCallId(result.toolCallId)
+      ?? sessionManager.toolCallExec(result.toolCallId)
+      ?? parseEarlyRowToolCallId(result.toolCallId)
     return parsed ? [{ ...result, ...parsed }] : []
   })
 }
@@ -7555,11 +7708,7 @@ export async function refreshHeldSessionToolCatalog(
   const sessionKey = session.openCodeSessionId
   const previousAdvertised = session.toolCatalog?.length ?? 0
   const incomingTools = extractTools(callOptions)
-  const providerOptions = callOptions.providerOptions?.cursor as Record<string, unknown> | undefined
-  const compactionOption = providerOptions?.[CURSOR_COMPACTION_OPTION]
-  const isCompaction = compactionOption === true || (
-    compactionOption === undefined && !!sessionKey && isCompactionSession(sessionKey)
-  )
+  const isCompaction = isCompactionCall(callOptions, sessionKey)
   const toolState = await resolveTurnToolState({
     sessionKey,
     incomingTools,
@@ -7688,6 +7837,22 @@ function toolsInFixedOrder<T extends { name?: string }>(tools: readonly T[]): T[
 }
 
 /** Exported for tests — false for compaction/summary (no tools) and toolChoice none. */
+/**
+ * The classic plugin marks OpenCode's agent="compaction" through chat.params.
+ * OpenCode 2.0 removed that hook, so its plugin writes the same request-local
+ * option from session hooks. The session marker is a fallback only when a
+ * host does not preserve mutable options; explicit false prevents concurrent
+ * title/generate calls from inheriting a compaction marker.
+ * Do not infer this from tools/toolChoice: standalone no-tool calls are valid.
+ */
+function isCompactionCall(callOptions: LanguageModelV3CallOptions, sessionKey: string | undefined): boolean {
+  const providerOptions = callOptions.providerOptions?.cursor as Record<string, unknown> | undefined
+  const compactionOption = providerOptions?.[CURSOR_COMPACTION_OPTION]
+  return compactionOption === true || (
+    compactionOption === undefined && !!sessionKey && isCompactionSession(sessionKey)
+  )
+}
+
 export function computeAllowTools(
   toolCount: number,
   toolChoice: LanguageModelV3CallOptions["toolChoice"] | undefined,
@@ -7837,11 +8002,10 @@ export function resetTurnStateForTests(): void {
   hostInterrupts.clear()
   resetContextEpochsForTests()
   cursorListsToolRequests = false
-  resetEarlyToolRowsForTests()
   hostInterrupts.clear()
   toolCallsOfStoppedTurns.clear()
   resetModelFallbackStopsForTests()
-  resetLostTurnsForTests()
+  resetLostRequestsForTests()
   resetFrozenRequestContextsForTests()
 }
 
@@ -7874,7 +8038,8 @@ export function foldStreamParts(parts: V3Part[]): LanguageModelV3GenerateResult 
   for (const part of parts) {
     if (part.type === "text-delta") text += part.delta
     else if (part.type === "reasoning-delta") reasoning += part.delta
-    else if (part.type === "tool-call" && !part.providerExecuted) {
+    else if (part.type === "tool-call") {
+      if (part.providerExecuted) continue
       content.push({
         type: "tool-call",
         toolCallId: part.toolCallId,

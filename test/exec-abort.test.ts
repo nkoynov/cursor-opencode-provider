@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it } from "bun:test"
 import { SessionActivityTracker } from "../src/activity.js"
 import {
   deliverContinuationResults,
-  pendingExecIds,
   preparePriorSessionForFreshTurn,
   pumpWithRecovery,
   resetTurnStateForTests,
@@ -132,31 +131,29 @@ describe("Cursor's exec abort (ExecServerControlMessage.abort)", () => {
     const { controller, parts } = collector()
     await pumpWithRecovery({ initialSession: session, controller, recover: async () => { throw new Error("no") } })
     expect(parts.filter((part) => part.type === "tool-call").map((part) => part.toolCallId)).toEqual([`cursor_${session.sessionId}_1`])
-    expect(pendingExecIds(session)).toEqual([1])
+    expect(session.pending.get(1)?.aborted).toBeFalsy()
 
     script.push(kvSet(7), heartbeat(), execAbort(1), text("Moving on."))
-    await until(() => session.pending.get(1)?.aborted === true && session.queuedFrame !== undefined)
+    await until(() => session.pending.get(1)?.aborted === true && (session.heldFrames?.length ?? 0) > 0)
 
     expect(clientMessages(session.writes).map((message) => message.kv_client_message?.id).filter((id) => id !== undefined)).toEqual([7])
     expect(session.pending.get(1)?.aborted).toBe(true)
-    expect(pendingExecIds(session)).toEqual([])
-    const queued = await session.queuedFrame!
-    expect((queued.value as Frame).payload).toEqual(text("Moving on.").payload)
+    expect(session.heldFrames?.map((held) => held.payload)).toEqual([text("Moving on.").payload])
   })
 
-  it("leaves a KV read on the held Run to the pump", async () => {
+  it("aborts an exec the tool-call ordering still holds back", async () => {
     const script = scriptedFrames([listed(1), ...shell(1, "a")])
     const session = heldSession(script.frames)
     const { controller } = collector()
     await pumpWithRecovery({ initialSession: session, controller, recover: async () => { throw new Error("no") } })
+    const order = { calls: [], deferred: [{ execId: 2, callId: "b", mutating: false, read: { done: false as const, value: text("x") } }], progressAt: Date.now() }
+    session.toolCallOrder = order
 
-    const get = frame({ kv_server_message: { id: 8, get_blob_args: { blob_id: Uint8Array.from([8, 1, 2, 3]) } } })
-    script.push(get)
-    await until(() => session.queuedFrame !== undefined)
-    await Bun.sleep(10)
+    script.push(execAbort(2))
+    await until(() => order.deferred.length === 0)
 
-    expect(clientMessages(session.writes).filter((message) => message.kv_client_message)).toEqual([])
-    expect(((await session.queuedFrame!).value as Frame).payload).toEqual(get.payload)
+    expect(order.deferred).toEqual([])
+    expect(session.heldFrames ?? []).toEqual([])
   })
 
   it("drops the host's late result without a write and keeps the same Run", async () => {

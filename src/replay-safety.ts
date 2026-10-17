@@ -37,11 +37,9 @@ export type DecodedReplayFrame = {
   kv?: Record<string, unknown>
   execControl?: Record<string, unknown>
   interactionQuery?: Record<string, unknown>
-  checkpointBytes?: Uint8Array
 }
 
 export type ReplayFrameAnalysis = {
-  semanticProgress: boolean
   barrier?: ReplayBarrierReason
 }
 
@@ -153,22 +151,6 @@ function decodedMatchesWire(topLevel: StrictRawField | undefined, decoded: Decod
   )
 }
 
-function hasSemanticProgress(decoded: DecodedReplayFrame): boolean {
-  const update = decoded.interactionUpdate
-  const text = (update?.text_delta as Record<string, unknown> | undefined)?.text
-  const thinking = (update?.thinking_delta as Record<string, unknown> | undefined)?.text
-  return (typeof text === "string" && text.length > 0)
-    || (typeof thinking === "string" && thinking.length > 0)
-    || !!update?.turn_ended
-    || !!update?.tool_call_started
-    || !!update?.tool_call_completed
-    || !!decoded.exec
-    || !!decoded.kv
-    || !!decoded.execControl
-    || !!decoded.interactionQuery
-    || !!decoded.checkpointBytes?.length
-}
-
 /**
  * Field numbers and wire types of a frame, nested three levels, without any
  * payload bytes: `1:2{16:2{1:0}}`. Compare it with `agent.proto` when a frame
@@ -214,8 +196,5 @@ export function analyzeReplayFrame(
     barrier = "non-control-exec"
   }
 
-  return {
-    semanticProgress: hasSemanticProgress(decoded),
-    barrier,
-  }
+  return { barrier }
 }

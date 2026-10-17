@@ -71,7 +71,8 @@ function softBackgroundWindow(policy: CursorShellPolicy, shellId: number): strin
 function capturedOutput(bytes: string): string[] {
   return [
     `  cursor_output=${bytes}`,
-    `  tail -c +$((cursor_header + 1)) "$cursor_terminal" | head -c "$cursor_output" | head -c ${MAX_LAUNCHER_OUTPUT_BYTES}`,
+    // BSD head rejects `-c 0` ("illegal byte count") and its stderr reaches the result.
+    `  if [ "$cursor_output" -gt 0 ]; then tail -c +$((cursor_header + 1)) "$cursor_terminal" | head -c "$cursor_output" | head -c ${MAX_LAUNCHER_OUTPUT_BYTES}; fi`,
     `  if [ "$cursor_output" -gt ${MAX_LAUNCHER_OUTPUT_BYTES} ]; then printf "\\n[Partial output: terminal file contains more output]\\n"; fi`,
   ]
 }

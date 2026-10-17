@@ -1,5 +1,6 @@
 import { trace } from "../debug.js"
 import { restoreEarlySteers, serializeEarlySteers } from "../host-steer.js"
+import { restoreLostRequest, serializeLostRequest } from "../lost-request.js"
 import {
   getFrozenRequestContext,
   setFrozenRequestContext,
@@ -64,6 +65,7 @@ export async function hydrateConversationState(
 
   restoreConversationBinding(sessionKey, persisted.conversationId)
   restoreEarlySteers(sessionKey, persisted.earlySteers)
+  restoreLostRequest(sessionKey, persisted.lostRequest)
   if (persisted.checkpoint) setCheckpoint(persisted.conversationId, persisted.checkpoint)
   restoreConversationBlobs(persisted.conversationId, persisted.blobs)
   setFrozenRequestContext(persisted.conversationId, persisted.requestContext)
@@ -147,6 +149,7 @@ export async function persistConversationState(
     systemPromptHash: input.systemPromptHash,
     hostNote: input.hostNote,
     earlySteers: serializeEarlySteers(input.sessionKey),
+    lostRequest: serializeLostRequest(input.sessionKey),
     ...(input.modelFallbackStop ? { modelFallbackStop: input.modelFallbackStop } : {}),
     ...(heldImages ? { sentImageHashes: heldImages.hashes, sentImagesCheckpoint: heldImages.checkpoint } : {}),
     ...(provenance?.conversationId === input.conversationId

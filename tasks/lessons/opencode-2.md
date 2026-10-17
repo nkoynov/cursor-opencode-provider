@@ -19,6 +19,13 @@ Operator setup: [OpenCode 2.0](../../docs/opencode-2.md).
   loaded modules lost workspace state. Carry the session directory and exact
   session id in request headers; affinity ids can identify a parent instead
   (`test/plugin-opencode2.test.ts`, `test/prompt-history.test.ts`).
+- **Share whole relations across module copies.** Running tools were
+  process-wide but parent links, activity and prompts were per copy, so a
+  child's tool never renewed the parent's Run when the plugin and provider were
+  different copies (`session-activity.v1`, `test/activity.test.ts`).
+- **`isRetryable: false` does not stop a retry.** 2.0 classifies an
+  `APICallError` by status and retries 408/409/429/5xx; only `x-should-retry:
+  false` overrides it (`hostFacingError`, `test/errors.test.ts`).
 - **A new plugin header does not prove a new SDK.** Pin the intended binary,
   isolate config, set the local provider entry before daemon start, and restart
   after rebuilding ([local setup](../../docs/opencode-2.md#from-a-local-clone-cursor_opencode2_dev_entry)).

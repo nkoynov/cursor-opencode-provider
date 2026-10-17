@@ -1,10 +1,43 @@
-export type SessionActivitySource = {
-  lastActivityAt(sessionId: string): number | undefined
-  /** Whether the host reports this tool call as started and not yet finished. */
-  isToolRunning?(toolCallId: string): boolean
+import { processShared } from "./process-shared.js"
+
+/** A host tool may keep its Run open this long from its own start. */
+export const RUNNING_TOOL_CAP_MS = 4 * 60 * 60 * 1_000
+
+type RunningTool = { sessionId: string; startedAt: number }
+
+/**
+ * Everything the tracker knows, as plain data. The plugin that receives host
+ * events and the provider that holds the Run can be different module copies
+ * (OpenCode 2 loads one per location), so the process-wide tracker keeps this
+ * in `processShared`: parent links, activity and prompts must all be seen by
+ * the copy that renews the Run's lease.
+ */
+export type SessionActivityState = {
+  parentBySession: Map<string, string>
+  lastActivityBySession: Map<string, number>
+  /** Open host prompts: `${sessionId}\0${requestId}` → session id and when it opened. */
+  openPrompts: Map<string, { sessionId: string; openedAt: number }>
+  /** `${sessionId}\0${callId}` → when that host tool started running. */
+  runningTools: Map<string, RunningTool>
 }
 
-type OpenPrompt = { sessionId: string; openedAt: number }
+export function createSessionActivityState(): SessionActivityState {
+  return {
+    parentBySession: new Map(),
+    lastActivityBySession: new Map(),
+    openPrompts: new Map(),
+    runningTools: new Map(),
+  }
+}
+
+export type SessionActivitySource = {
+  lastActivityAt(sessionId: string): number | undefined
+  /**
+   * Latest 4h ceiling among host tools still running in this session or a
+   * descendant. Undefined when none are still inside their own ceiling.
+   */
+  runningToolDeadline?(sessionId: string, now: number, toolCapMs: number): number | undefined
+}
 
 const MAX_ANCESTRY_DEPTH = 64
 const MAX_TRACKED_SESSIONS = 1_024
@@ -17,32 +50,17 @@ const ACTIVITY_RETENTION_MS = 24 * 60 * 60 * 1_000
  * stalled: the host emits no events until the user answers, so an open prompt
  * counts as current activity for its session and every ancestor.
  */
-type ActivityState = {
-  parentBySession: Map<string, string>
-  lastActivityBySession: Map<string, number>
-  sessionByRunningTool: Map<string, string>
-  /** Open host prompts: `${sessionId}\0${requestId}` → session id and when it opened. */
-  openPrompts: Map<string, OpenPrompt>
-}
-
-const newActivityState = (): ActivityState => ({
-  parentBySession: new Map(),
-  lastActivityBySession: new Map(),
-  sessionByRunningTool: new Map(),
-  openPrompts: new Map(),
-})
-
 export class SessionActivityTracker implements SessionActivitySource {
   private readonly parentBySession: Map<string, string>
   private readonly lastActivityBySession: Map<string, number>
-  private readonly sessionByRunningTool: Map<string, string>
-  private readonly openPrompts: Map<string, OpenPrompt>
+  private readonly openPrompts: Map<string, { sessionId: string; openedAt: number }>
+  private readonly runningTools: Map<string, RunningTool>
 
-  constructor(state: ActivityState = newActivityState()) {
+  constructor(state: SessionActivityState = createSessionActivityState()) {
     this.parentBySession = state.parentBySession
     this.lastActivityBySession = state.lastActivityBySession
-    this.sessionByRunningTool = state.sessionByRunningTool
     this.openPrompts = state.openPrompts
+    this.runningTools = state.runningTools
   }
 
   linkSession(sessionId: string, parentId?: string): void {
@@ -98,46 +116,61 @@ export class SessionActivityTracker implements SessionActivitySource {
     this.recordActivity(sessionId, at)
   }
 
+  /**
+   * The host started running this tool. A repeated start keeps the original
+   * time so a later event cannot extend the 4h ceiling.
+   */
+  toolStarted(sessionId: string, callId: string, at = Date.now()): void {
+    if (!sessionId || !callId || !Number.isFinite(at)) return
+    const key = `${sessionId}\0${callId}`
+    if (!this.runningTools.has(key)) this.runningTools.set(key, { sessionId, startedAt: at })
+    this.recordActivity(sessionId, at)
+  }
+
+  /** Drop every running tool for this session. Activity history stays. */
+  endRunningTools(sessionId: string, at = Date.now()): void {
+    if (!sessionId) return
+    let ended = false
+    for (const [key, tool] of this.runningTools) {
+      if (tool.sessionId !== sessionId) continue
+      this.runningTools.delete(key)
+      ended = true
+    }
+    if (ended) this.recordActivity(sessionId, at)
+  }
+
+  /** The host finished the tool. The normal inactivity cap applies from now. */
+  toolEnded(sessionId: string, callId: string, at = Date.now()): void {
+    if (!sessionId || !callId) return
+    this.runningTools.delete(`${sessionId}\0${callId}`)
+    this.recordActivity(sessionId, at)
+  }
+
+  runningToolDeadline(sessionId: string, now: number, toolCapMs: number): number | undefined {
+    let deadline: number | undefined
+    for (const tool of this.runningTools.values()) {
+      if (!this.belongsTo(tool.sessionId, sessionId)) continue
+      const cap = tool.startedAt + toolCapMs
+      if (now >= cap) continue
+      deadline = deadline === undefined ? cap : Math.max(deadline, cap)
+    }
+    return deadline
+  }
+
   removeSession(sessionId: string): void {
     this.parentBySession.delete(sessionId)
     this.lastActivityBySession.delete(sessionId)
     for (const [key, prompt] of this.openPrompts) {
       if (prompt.sessionId === sessionId) this.openPrompts.delete(key)
     }
-    this.endSessionTools(sessionId)
-  }
-
-  toolStarted(sessionId: string, toolCallId: string): void {
-    if (!sessionId || !toolCallId) return
-    this.sessionByRunningTool.delete(toolCallId)
-    this.sessionByRunningTool.set(toolCallId, sessionId)
-    while (this.sessionByRunningTool.size > MAX_TRACKED_SESSIONS) {
-      const oldest = this.sessionByRunningTool.keys().next().value as string | undefined
-      if (!oldest) break
-      this.sessionByRunningTool.delete(oldest)
-    }
-  }
-
-  toolEnded(toolCallId: string): void {
-    this.sessionByRunningTool.delete(toolCallId)
-  }
-
-  /** The session's execution ended, so none of its tools still runs. */
-  endSessionTools(sessionId: string): void {
-    for (const [toolCallId, owner] of this.sessionByRunningTool) {
-      if (owner === sessionId) this.sessionByRunningTool.delete(toolCallId)
-    }
-  }
-
-  isToolRunning(toolCallId: string): boolean {
-    return this.sessionByRunningTool.has(toolCallId)
+    this.clearRunningTools(sessionId)
   }
 
   clear(): void {
     this.parentBySession.clear()
     this.lastActivityBySession.clear()
-    this.sessionByRunningTool.clear()
     this.openPrompts.clear()
+    this.runningTools.clear()
   }
 
   /** A prompt is open in `sessionId` or in one of its descendants. */
@@ -180,16 +213,36 @@ export class SessionActivityTracker implements SessionActivitySource {
       if (!oldest) break
       this.parentBySession.delete(oldest)
     }
+    for (const [key, tool] of this.runningTools) {
+      if (tool.startedAt < oldestAllowed) this.runningTools.delete(key)
+    }
+    // A tool whose end event never arrived must not grow the map without bound.
+    while (this.runningTools.size > MAX_TRACKED_SESSIONS) {
+      const oldest = this.runningTools.keys().next().value as string | undefined
+      if (!oldest) break
+      this.runningTools.delete(oldest)
+    }
+  }
+
+  private belongsTo(toolSessionId: string, sessionId: string): boolean {
+    let current: string | undefined = toolSessionId
+    for (let depth = 0; current && depth < MAX_ANCESTRY_DEPTH; depth++) {
+      if (current === sessionId) return true
+      current = this.parentBySession.get(current)
+    }
+    return false
+  }
+
+  private clearRunningTools(sessionId: string): void {
+    for (const [key, tool] of this.runningTools) {
+      if (tool.sessionId === sessionId) this.runningTools.delete(key)
+    }
   }
 }
 
-// OpenCode 2 can evaluate the plugin and the AI SDK model as separate copies
-// of this module (one per Location). The plugin's session, tool and prompt
-// events must reach the copy that holds the Run, so every copy shares one state.
-const ACTIVITY_STATE = Symbol.for("cursor-opencode-provider.session-activity-state")
-const globals = globalThis as typeof globalThis & { [ACTIVITY_STATE]?: ActivityState }
-
-export const sessionActivity = new SessionActivityTracker(globals[ACTIVITY_STATE] ??= newActivityState())
+export const sessionActivity = new SessionActivityTracker(
+  processShared("session-activity.v1", createSessionActivityState),
+)
 
 /**
  * Open or close a host prompt from an OpenCode event. OpenCode 1.x publishes
@@ -225,5 +278,51 @@ export function applyHostPromptEvent(
     case "form.cancelled":
       tracker.closePrompt(text(data.sessionID), text(data.id))
       break
+  }
+}
+
+/**
+ * A host tool that is actually running holds the Run past the inactivity cap.
+ * OpenCode 1 reports that on the tool part (`running`, and not provider-executed).
+ * OpenCode 2 reports it on `session.tool.called` when `executed` is not true.
+ */
+export function applyHostToolEvent(
+  tracker: SessionActivityTracker,
+  type: unknown,
+  payload: unknown,
+): void {
+  const data = payload && typeof payload === "object" ? payload as Record<string, unknown> : {}
+  const text = (value: unknown) => typeof value === "string" ? value : ""
+  if (type === "message.part.updated") {
+    const part = data.part && typeof data.part === "object" ? data.part as Record<string, unknown> : undefined
+    if (!part || part.type !== "tool") return
+    const sessionId = text(part.sessionID)
+    const callId = text(part.callID) || text(part.callId)
+    const state = part.state && typeof part.state === "object" ? part.state as Record<string, unknown> : undefined
+    const metadata = part.metadata && typeof part.metadata === "object"
+      ? part.metadata as Record<string, unknown>
+      : undefined
+    if (!sessionId || !callId || !state) return
+    if (state.status === "running" && metadata?.providerExecuted !== true) tracker.toolStarted(sessionId, callId)
+    else if (state.status === "completed" || state.status === "error") tracker.toolEnded(sessionId, callId)
+    return
+  }
+  if (type === "session.tool.called") {
+    const sessionId = text(data.sessionID)
+    const callId = text(data.id) || text(data.callID)
+    if (!sessionId || !callId || data.executed === true) return
+    tracker.toolStarted(sessionId, callId)
+    return
+  }
+  if (type === "session.tool.success" || type === "session.tool.failed") {
+    const sessionId = text(data.sessionID)
+    const callId = text(data.id) || text(data.callID)
+    if (sessionId && callId) tracker.toolEnded(sessionId, callId)
+    return
+  }
+  if (type === "session.idle") {
+    const info = data.info && typeof data.info === "object" ? data.info as Record<string, unknown> : undefined
+    const sessionId = text(data.sessionID) || text(info?.id)
+    if (sessionId) tracker.endRunningTools(sessionId)
   }
 }

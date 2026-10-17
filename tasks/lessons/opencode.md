@@ -82,6 +82,15 @@ These are failure lessons shared by both hosts, not a replacement for
   boundaries; a timed-out read still owned its promise. Drains must read past
   display completion until a genuine wait or terminal boundary
   (`test/parallel-pump.test.ts`).
+- **A held Run is still a live stream.** Nothing read it while host tools ran,
+  so a KV write waited for the tool and an abort arrived after the late result.
+  Stopping at the first other frame was not enough: Cursor sends
+  `tool_requests_listed` or a checkpoint right after a step, ahead of its KV
+  writes. Handle KV and aborts at once and queue the rest in order
+  (`readHeldRun`, `test/held-run-reader.test.ts`). A queued frame is not
+  necessarily reached by the next pump: one that ends its step on a queued
+  exec leaves that exec's abort behind it, so re-check the queue whenever the
+  Run is held again (`test/held-run-run.test.ts`).
 - **Backpressure belongs to every response-required write.** KV replies filled
   the stream before an awaited heartbeat exposed it. Serialize writes, label the
   failing operation, and do not replay ambiguous buffered delivery
@@ -92,7 +101,9 @@ These are failure lessons shared by both hosts, not a replacement for
   (`pumpWithRecovery`, `test/parallel-pump.test.ts`).
 - **A helper must not take over its parent.** A smaller catalog was mistaken for
   a helper despite carrying the parent's pending result. Reconcile that result
-  first; isolate genuine helpers (`test/fresh-turn-drain.test.ts`).
+  first; isolate genuine helpers (`test/fresh-turn-drain.test.ts`). An empty
+  catalog is a helper too: OpenCode 2's tool-less call during a running shell
+  cancelled the parent Run (`test/lifecycle-isolation-run.test.ts`).
 - **Drain before replacing a held Run.** Cancellation preserves warmth only with
   a valid terminal acknowledgement and fresh checkpoint. An incomplete drain
   must rebuild without losing the new request (`test/host-interrupt.test.ts`).
@@ -106,6 +117,24 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Injection needs acknowledgement and ordered fallback.** A written note is
   not necessarily consumed. Retry/defer it with its owning turn; an action may
   remove only the batches it captured (`test/host-notes.test.ts`).
+- **Every provider-minted tool-call id must stay recognizable.** Early-row ids
+  routed only through a live-Run table were dropped once the Run closed, so the
+  completed edit never reached Cursor. Keep routes like tombstones and parse the
+  id after a restart (`parseEarlyRowToolCallId`, `test/early-tool-rows.test.ts`).
+- **Carry a lost request only where history cannot.** A Run without a checkpoint
+  seeds host history, which already holds it; prepending as well sent it twice.
+  A failed Run reached no save, so a restart lost the record. Storing the
+  combined text re-prepended it on every failed host retry, stacking OpenCode
+  2's identical interruption note ten times. Deduplicating any carried part
+  then swallowed a deliberate repeat (red, blue, red); only a repeat of the
+  previous attempt's own text is a retry (`carryLostRequest`,
+  `test/lost-request-run.test.ts`).
+- **Predict the tool the remap will produce.** An announced edit on a new file
+  becomes `write`; predicting `edit` showed a failed row beside every created
+  file (`hostToolForCursorEdit`, `test/early-tool-rows.test.ts`).
+- **A renewal source may extend a lease, never shorten it.** A running tool near
+  its 4 h ceiling cut an activity-renewed lease (`refreshHardDeadline`,
+  `test/session.test.ts`).
 
 ## Planning and file mutations
 

@@ -525,6 +525,8 @@ export function cacheHttp2SessionForTests(
   origin: string,
   session: http2.ClientHttp2Session,
 ): void {
+  // Tests re-cache one client per turn; replace its listeners rather than stack them.
+  _http2SessionListenerCleanup.get(session)?.()
   installSessionInvalidation(origin, session)
   _http2SessionCreatedAt.set(session, Date.now())
   _http2Sessions.set(origin, session)

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test"
-import { buildRunRequest, buildHeartbeat } from "../src/protocol/request.js"
+import { buildRunRequest, buildHeartbeat, buildExecHeartbeat } from "../src/protocol/request.js"
 import { buildLiveRequestContext } from "../src/protocol/tools.js"
 import { SYSTEM_INSTRUCTIONS_RULE_PATH, systemInstructionsRule } from "../src/context/build.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
@@ -300,5 +300,21 @@ describe("buildHeartbeat", () => {
     expect(data.length).toBeGreaterThan(0)
     const decoded = decodeMessage<any>("AgentClientMessage", data)
     expect(decoded.client_heartbeat).toBeDefined()
+  })
+})
+
+describe("buildExecHeartbeat", () => {
+  // Expected bytes are derived by hand from Cursor CLI's own schema, not from
+  // src/protocol/messages.ts: agent.proto has AgentClientMessage
+  // `exec_client_control_message = 5`, ExecClientControlMessage `heartbeat = 3`
+  // and ExecClientHeartbeat `uint32 id = 1`. The CLI sends
+  // `{ case: "heartbeat", value: { id: <exec id> } }` every 3000 ms for each
+  // exec it is running (decompiled CLI 2026.09.28). proto3 leaves a zero id out.
+  it.each([
+    [0, "2a021a00"],
+    [7, "2a041a020807"],
+    [300, "2a051a0308ac02"],
+  ])("encodes exec id %d as the CLI's wire bytes", (execId, hex) => {
+    expect(Buffer.from(buildExecHeartbeat(execId)).toString("hex")).toBe(hex)
   })
 })
