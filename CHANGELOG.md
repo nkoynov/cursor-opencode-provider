@@ -21,6 +21,7 @@
 
 ### Fixed
 
+- On OpenCode 2, a Run that stalls or is cut off after Cursor has started answering is retried by OpenCode again, as before #97, and that retry sends a request Cursor never checkpointed once more; only errors Cursor or the provider made final end the turn
 - Web search waits out Exa's free-tier rate limit instead of failing: a 429 from Exa's keyless MCP endpoint is retried after its `Retry-After` (capped at 5 s, plus up to 1 s of jitter so parallel subagents spread out), up to six attempts within the search's 25 s budget. Before, a burst of parallel searches failed most calls with OpenCode's bare "Unable to search the web"
 - After a restart, a turn that resumes a saved conversation no longer attaches every image in the session's history again, and an image you attach is not sent again as history on the next turn ([#78](https://github.com/oakimov/cursor-opencode-provider/pull/78) by [@nkoynov](https://github.com/nkoynov), [#75](https://github.com/oakimov/cursor-opencode-provider/issues/75))
 - On OpenCode 1.x, GPT edits keep existing CRLF line endings even when Cursor sends the replacement as LF ([#81](https://github.com/oakimov/cursor-opencode-provider/pull/81) by [@nkoynov](https://github.com/nkoynov))

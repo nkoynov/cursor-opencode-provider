@@ -6,7 +6,7 @@ import os from "node:os"
 import path from "node:path"
 import { APICallError, type LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
-import { CursorAuthError, CursorRetryExhaustedError, CursorServerError } from "../src/errors.js"
+import { CursorAuthError, CursorRetryExhaustedError, CursorServerError, CursorUnsafeReplayError } from "../src/errors.js"
 import { decodeFramePayload } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
@@ -189,23 +189,34 @@ describe("Run errors as the host sees them", () => {
     expect(runs).toBe(1)
   }, 30_000)
 
-  for (const unsafeReplay of [false, true]) {
-    it(`stops host retries after ${unsafeReplay ? "visible output makes replay unsafe" : "the Run retry budget is spent"}`, async () => {
-      trailer = { error: { code: "unavailable" } }
-      partialOutput = unsafeReplay
-      const error = await streamError(`ses_terminal_${unsafeReplay}`)
+  it("stops host retries after the Run retry budget is spent", async () => {
+    trailer = { error: { code: "unavailable" } }
+    partialOutput = false
+    const error = await streamError("ses_terminal_spent")
 
-      expect(APICallError.isInstance(error)).toBe(true)
-      expect(error).toMatchObject({
-        statusCode: 400,
-        isRetryable: false,
-        responseHeaders: { "x-should-retry": "false" },
-      })
-      const cause = (error as APICallError).cause
-      expect(cause).toMatchObject({ transient: false, replaySafe: false, code: "unavailable" })
-      if (unsafeReplay) expect((error as Error).message).toContain("automatic retry unsafe")
-      else expect(cause).toBeInstanceOf(CursorRetryExhaustedError)
-      expect(runs).toBe(unsafeReplay ? 1 : 2)
-    }, 30_000)
-  }
+    expect(APICallError.isInstance(error)).toBe(true)
+    expect(error).toMatchObject({
+      statusCode: 400,
+      isRetryable: false,
+      responseHeaders: { "x-should-retry": "false" },
+    })
+    const cause = (error as APICallError).cause
+    expect(cause).toMatchObject({ transient: false, replaySafe: false, code: "unavailable" })
+    expect(cause).toBeInstanceOf(CursorRetryExhaustedError)
+    expect(runs).toBe(2)
+  }, 30_000)
+
+  it("leaves the step to OpenCode 2's retry after visible output makes replay unsafe", async () => {
+    trailer = { error: { code: "unavailable" } }
+    partialOutput = true
+    const error = await streamError("ses_unsafe_replay")
+
+    expect(APICallError.isInstance(error)).toBe(false)
+    expect(error).toBeInstanceOf(CursorUnsafeReplayError)
+    expect(error).toMatchObject({ transient: false, replaySafe: false, code: undefined })
+    expect(((error as Error).cause as CursorUnsafeReplayError).code).toBe("unavailable")
+    expect((error as CursorUnsafeReplayError).retryable).not.toBe(false)
+    expect((error as Error).message).toContain("automatic retry unsafe")
+    expect(runs).toBe(1)
+  }, 30_000)
 })

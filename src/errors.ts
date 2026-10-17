@@ -98,6 +98,23 @@ const NON_RETRYABLE_SERVER_STATUS = 400
  */
 export function hostFacingError(error: unknown): Error {
   if (!(error instanceof Error)) return new Error(String(error))
+  // Fork (CP-37): as before #97, OpenCode 2 retries this unclassified error (its retry carries a
+  // lost request once). OpenCode 1.x retries without a cap on its text patterns (sanitized away)
+  // and on a cause's `ECONNRESET`/`ZlibError` code, so the host gets it without the code.
+  if (error instanceof CursorUnsafeReplayError && error.retryable !== false) {
+    if (error.code === undefined) return error
+    return new CursorUnsafeReplayError(error.message, {
+      origin: error.origin,
+      transient: false,
+      replaySafe: false,
+      retryable: error.retryable,
+      statusCode: error.statusCode,
+      grpcStatus: error.grpcStatus,
+      rstCode: error.rstCode,
+      retryAfterMs: error.retryAfterMs,
+      cause: error,
+    })
+  }
   const auth = error instanceof CursorAuthError
   if (!auth && (!(error instanceof CursorProviderError) || error.retryable !== false)) return error
   const connectStatus = error.code !== undefined && Object.hasOwn(CONNECT_CODE_HTTP_STATUS, error.code)
@@ -431,6 +448,14 @@ export function toCursorProviderError(
   })
 }
 
+/** A transient failure the provider cannot replay itself (visible output or stateful work came first). */
+export class CursorUnsafeReplayError extends CursorProviderError {
+  constructor(message: string, options: CursorProviderErrorOptions) {
+    super(message, options)
+    this.name = "CursorUnsafeReplayError"
+  }
+}
+
 export function retrySuppressedError(
   cause: CursorProviderError,
   reason: string,
@@ -440,13 +465,13 @@ export function retrySuppressedError(
   const subject = sanitizeHostTerminalMessage(
     cause.message.replace(/^Cursor Run stream /, "Cursor stream "),
   )
-  return new CursorProviderError(
+  return new CursorUnsafeReplayError(
     `${subject} ${reason}; automatic retry unsafe (attempt ${attempt}/${maxAttempts})`,
     {
       origin: cause.origin,
       transient: false,
       replaySafe: false,
-      retryable: false,
+      retryable: cause.retryable,
       statusCode: cause.statusCode,
       grpcStatus: cause.grpcStatus,
       rstCode: cause.rstCode,

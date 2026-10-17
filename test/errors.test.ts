@@ -6,6 +6,7 @@ import {
   CursorRetryExhaustedError,
   CursorServerError,
   CursorTransportError,
+  CursorUnsafeReplayError,
   cursorGrpcError,
   cursorHttpError,
   hostFacingError,
@@ -314,22 +315,58 @@ describe("Cursor provider errors", () => {
     expect(suppressed.message).toContain("automatic retry unsafe")
   })
 
-  it("projects spent and unsafe retries as terminal even when their cause was an HTTP 503", () => {
-    const last = cursorHttpError("Cursor request failed:", 503)
-    for (const failure of [
-      new CursorRetryExhaustedError(3, last),
-      retrySuppressedError(last, "after visible output", 1, 3),
-    ]) {
-      expect(failure).toMatchObject({ statusCode: 503, transient: false, retryable: false })
-      const host = hostFacingError(failure)
-      expect(APICallError.isInstance(host)).toBe(true)
-      expect(host).toMatchObject({
-        statusCode: 400,
-        isRetryable: false,
-        responseHeaders: { "x-should-retry": "false" },
-      })
-      expect((host as APICallError).cause).toBe(failure)
-      expect(host.message).not.toContain("503")
+  it("projects a spent retry as terminal even when its cause was an HTTP 503", () => {
+    const failure = new CursorRetryExhaustedError(3, cursorHttpError("Cursor request failed:", 503))
+    expect(failure).toMatchObject({ statusCode: 503, transient: false, retryable: false })
+    const host = hostFacingError(failure)
+    expect(APICallError.isInstance(host)).toBe(true)
+    expect(host).toMatchObject({
+      statusCode: 400,
+      isRetryable: false,
+      responseHeaders: { "x-should-retry": "false" },
+    })
+    expect((host as APICallError).cause).toBe(failure)
+    expect(host.message).not.toContain("503")
+  })
+
+  it("leaves an unsafe replay of a transient failure to OpenCode 2's retry, unmatched by OpenCode 1.x's uncapped one", () => {
+    // OpenCode 1.x's SessionRetry message patterns (packages/opencode/src/session/retry.ts, v1.18.16).
+    const openCode1Retries = (message: string) => {
+      const lower = message.toLowerCase()
+      return lower.includes("too_many_requests") || lower.includes("exhausted") || lower.includes("unavailable") || [
+        /429|500|502|503|504|524/i,
+        /rate increased too quickly|rate limit|rate-limit|rate_limit|too many requests/i,
+        /overloaded|service unavailable|service_unavailable|service-unavailable|internal error|internal_error|internal server error|server error|server_error|server-error|provider returned error|provider_returned_error|provider-returned-error/i,
+        /terminated|fetch failed|failed to fetch|network error|upstream connect|connection error|connection refused|connection lost|socket connection was closed|socket hang up|reset before headers|getaddrinfo|enotfound|eai_again|econnrefused|econnreset|etimedout/i,
+        /^timeout$|\b(?:request|response|connection|network|stream|read) (?:timeout|timed out|time out)\b/i,
+        /try your request again|retry your request|resource exhausted|resource_exhausted/i,
+      ].some((pattern) => pattern.test(message))
     }
+    for (const cause of [
+      cursorHttpError("Cursor request failed:", 503),
+      new CursorTransportError("Cursor Run stream read-idle timeout after 120000ms — connection presumed dead"),
+      new CursorServerError("Cursor API error (code=unavailable)", { transient: true, replaySafe: true, code: "unavailable" }),
+      new CursorTransportError("Cursor Run transport interrupted", { transient: true, replaySafe: true, code: "ECONNRESET" }),
+      new CursorTransportError("Cursor Run transport interrupted", { transient: true, replaySafe: true, code: "ZlibError" }),
+    ]) {
+      const failure = retrySuppressedError(cause, "after visible output or stateful server activity", 1, 3)
+      expect(failure).toMatchObject({ transient: false, replaySafe: false })
+      expect(failure.retryable).not.toBe(false)
+      const host = hostFacingError(failure)
+      expect(host).toBeInstanceOf(CursorUnsafeReplayError)
+      expect(host.message).toBe(failure.message)
+      expect(APICallError.isInstance(host)).toBe(false)
+      // OpenCode 1.x MessageV2.fromError turns these codes into a retryable APIError.
+      expect(["ECONNRESET", "ZlibError"]).not.toContain((host as { code?: string }).code)
+      expect(openCode1Retries(host.message)).toBe(false)
+    }
+  })
+
+  it("keeps an unsafe replay final when Cursor's verdict on its cause was final", () => {
+    const cause = new CursorServerError("Cursor API error (code=unavailable)", {
+      transient: true, replaySafe: true, code: "unavailable", retryable: false,
+    })
+    const host = hostFacingError(retrySuppressedError(cause, "after visible output", 1, 3))
+    expect(host).toMatchObject({ statusCode: 400, isRetryable: false, responseHeaders: { "x-should-retry": "false" } })
   })
 })

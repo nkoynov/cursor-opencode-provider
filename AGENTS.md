@@ -146,6 +146,15 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   attempts with a longer backoff before it ends as final. An
   `ERROR_CUSTOM_MESSAGE` whose protobuf `value` does not decode is read from the
   details' JSON `debug` (`customMessageFromDebug`), so it still ends the turn.
+- Fork (CP-37): a transient failure the provider cannot replay after visible
+  output (`retrySuppressedError` → `CursorUnsafeReplayError`, a stall or a
+  read-idle cut) keeps its cause's verdict and reaches the host as an
+  unclassified error, as before #97: OpenCode 2 retries the step (capped) and
+  that retry carries a lost request once. OpenCode 1.x retries without a cap,
+  so it must not match 1.x's patterns or carry a 5xx status, and
+  `hostFacingError` drops its `code` (1.x retries `ECONNRESET` and
+  `ZlibError`). Final verdicts,
+  spent retries and auth stay final.
 
 ## Context, identity and persistence
 
