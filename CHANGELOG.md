@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- Web search waits out Exa's free-tier rate limit instead of failing: a 429 from Exa's keyless MCP endpoint is retried after its `Retry-After` (capped at 5 s, plus up to 1 s of jitter so parallel subagents spread out), up to six attempts within the search's 25 s budget. Before, a burst of parallel searches failed most calls with OpenCode's bare "Unable to search the web"
 - On OpenCode 1.x, GPT edits keep existing CRLF line endings even when Cursor sends the replacement as LF ([#81](https://github.com/oakimov/cursor-opencode-provider/pull/81) by [@nkoynov](https://github.com/nkoynov))
 - Patch conversions preserve blank lines and reject paths or file content they cannot preserve exactly
 - On OpenCode 1.x and 2, file writes and edits use the current turn's permitted tools after a model switch; OpenCode 2 GPT models use `patch` instead of first failing on `write` ([#81](https://github.com/oakimov/cursor-opencode-provider/pull/81) by [@nkoynov](https://github.com/nkoynov), [#80](https://github.com/oakimov/cursor-opencode-provider/issues/80))

@@ -7,6 +7,41 @@ import type { ToolContext, ToolResult } from "@opencode-ai/plugin"
 
 const EXA_MCP_URL = "https://mcp.exa.ai/mcp"
 const WEB_SEARCH_TIMEOUT_MS = 25_000
+// Exa's keyless MCP endpoint answers bursts (parallel subagents searching) with 429 and `retry-after: 1`
+const RATE_LIMIT_MAX_ATTEMPTS = 6
+const RATE_LIMIT_MAX_WAIT_MS = 5_000
+const RATE_LIMIT_JITTER_MS = 1_000
+
+export type WebSearchRetryOptions = {
+  sleep?: (ms: number, signal: AbortSignal) => Promise<void>
+  random?: () => number
+  now?: () => number
+}
+
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason)
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(signal.reason)
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort)
+      resolve()
+    }, ms)
+    signal.addEventListener("abort", onAbort, { once: true })
+  })
+}
+
+function retryAfterMs(header: string | null, now: number): number {
+  const value = header?.trim()
+  if (value) {
+    if (/^\d+(\.\d+)?$/.test(value)) return Number(value) * 1000
+    const date = Date.parse(value)
+    if (Number.isFinite(date)) return Math.max(0, date - now)
+  }
+  return 1_000
+}
 
 export type OpenCodeWebSearchArgs = {
   query: string
@@ -169,40 +204,56 @@ export async function fetchOpenCodeWebSearchText(
   args: OpenCodeWebSearchArgs,
   signal: AbortSignal | undefined,
   fetchImpl: typeof fetch = fetch,
+  retry: WebSearchRetryOptions = {},
 ): Promise<string> {
+  const sleep = retry.sleep ?? abortableSleep
+  const random = retry.random ?? Math.random
+  const now = retry.now ?? Date.now
+  const deadline = now() + WEB_SEARCH_TIMEOUT_MS
   const controller = new AbortController()
   const abort = () => controller.abort(signal?.reason)
   if (signal?.aborted) abort()
   else signal?.addEventListener("abort", abort, { once: true })
   const timeout = setTimeout(() => controller.abort(new Error("Web search timed out")), WEB_SEARCH_TIMEOUT_MS)
+  const body = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/call",
+    params: {
+      name: "web_search_exa",
+      arguments: {
+        query: args.query,
+        type: args.type ?? "auto",
+        numResults: args.numResults ?? 8,
+        livecrawl: args.livecrawl ?? "fallback",
+        contextMaxCharacters: args.contextMaxCharacters,
+      },
+    },
+  })
 
   try {
-    const response = await fetchImpl(exaMcpUrl(), {
-      method: "POST",
-      headers: {
-        accept: "application/json, text/event-stream",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "tools/call",
-        params: {
-          name: "web_search_exa",
-          arguments: {
-            query: args.query,
-            type: args.type ?? "auto",
-            numResults: args.numResults ?? 8,
-            livecrawl: args.livecrawl ?? "fallback",
-            contextMaxCharacters: args.contextMaxCharacters,
-          },
+    for (let attempt = 1; ; attempt++) {
+      const response = await fetchImpl(exaMcpUrl(), {
+        method: "POST",
+        headers: {
+          accept: "application/json, text/event-stream",
+          "content-type": "application/json",
         },
-      }),
-      signal: controller.signal,
-    })
-    const raw = await response.text()
-    if (!response.ok) throw new Error(`Web search failed (${response.status}): ${raw.slice(0, 500)}`)
-    return parseOpenCodeWebSearchResponse(raw) ?? "No search results found. Please try a different query."
+        body,
+        signal: controller.signal,
+      })
+      const raw = await response.text()
+      if (response.status === 429 && attempt < RATE_LIMIT_MAX_ATTEMPTS) {
+        const wait = Math.min(retryAfterMs(response.headers.get("retry-after"), now()), RATE_LIMIT_MAX_WAIT_MS)
+          + Math.floor(random() * RATE_LIMIT_JITTER_MS)
+        if (now() + wait < deadline) {
+          await sleep(wait, controller.signal)
+          continue
+        }
+      }
+      if (!response.ok) throw new Error(`Web search failed (${response.status}): ${raw.slice(0, 500)}`)
+      return parseOpenCodeWebSearchResponse(raw) ?? "No search results found. Please try a different query."
+    }
   } finally {
     clearTimeout(timeout)
     signal?.removeEventListener("abort", abort)
