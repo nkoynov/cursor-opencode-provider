@@ -241,7 +241,6 @@ import {
   CursorRetryExhaustedError,
   CursorServerError,
   CursorTransportError,
-  failedOnCompression,
   isCapacityFailure,
   isRejectedCredentialError,
   isTransientGrpcStatus,
@@ -899,12 +898,9 @@ async function doStreamImpl(
     || (!options.accessToken && options.apiKey !== undefined && isExchangeableApiKey(options.apiKey))
   let prefetchedToken: string | undefined
   const requestedAt = Date.now()
-  let compressionRetried = false
   // pumpWithRecovery owns the complete per-turn attempt budget.  Opening a
   // replacement session here must be a single attempt; otherwise setup retry
   // loops nest inside recovery and `maxAttempts` no longer caps total Runs.
-  // The one exception is a Run request Cursor refused for its compression,
-  // sent once more uncompressed.
   const openSession = async (startOptions?: { recovery?: CursorRunRecovery; isolate?: boolean }) => {
     const forceRefresh = forceCredentialRefresh
     forceCredentialRefresh = false
@@ -913,19 +909,10 @@ async function doStreamImpl(
     const token = prefetched !== undefined && !forceRefresh
       ? prefetched
       : await resolveRunBearerToken(options, forceRefresh)
-    const start = () => startSession(modelId, token, callOptions, options, {
+    const opened = await startSession(modelId, token, callOptions, options, {
       ...startOptions,
       requestedAt,
     })
-    let opened: CursorSession
-    try {
-      opened = await start()
-    } catch (error) {
-      if (compressionRetried || !failedOnCompression(error)) throw error
-      compressionRetried = true
-      trace("Run compression rejected while the Run request was uploading — opening the Run once more uncompressed")
-      opened = await start()
-    }
     cancelIfHostStoppedSince(opened)
     return opened
   }
@@ -1320,7 +1307,7 @@ export async function pumpWithRecovery(input: {
         attempt--
         continue
       }
-      if (!compressionFallbackUsed && (pumpedSession.stream.compressionRejected?.() || failedOnCompression(failure))) {
+      if (!compressionFallbackUsed && pumpedSession.stream.compressionRejected?.()) {
         compressionFallbackUsed = true
         const checkpoint = resumableCheckpoint(pumpedSession)
         if (failure.replaySafe || checkpoint) {
@@ -1379,10 +1366,32 @@ export async function pumpWithRecovery(input: {
   }
 }
 
-/** A Run request write that failed because Cursor refused the Run's compression may be sent again uncompressed. */
-function markCompressionRejection(error: unknown, stream: BidiStream): unknown {
-  if (stream.compressionRejected?.() && error instanceof CursorProviderError) error.compressionRejected = true
-  return error
+/**
+ * Send a new Run's request. Cursor may refuse a gzip Run before the upload finishes; the same request then goes
+ * once more on a new stream, which the transport opens uncompressed.
+ */
+export async function sendRunRequest(
+  stream: BidiStream,
+  request: Uint8Array,
+  operation: string,
+  reopen: () => Promise<BidiStream>,
+): Promise<BidiStream> {
+  try {
+    await writeWithBackpressure(stream, request, operation)
+    return stream
+  } catch (error) {
+    if (!stream.compressionRejected?.()) throw error
+  }
+  try { stream.destroy() } catch { /* already closed */ }
+  trace(`Run compression: ${operation} refused while uploading — sending it once more uncompressed`)
+  const next = await reopen()
+  try {
+    await writeWithBackpressure(next, request, operation)
+    return next
+  } catch (error) {
+    try { next.destroy() } catch { /* already closed */ }
+    throw error
+  }
 }
 
 const EARLY_ROW_RUN_REPLACED = "Cursor's stream was interrupted before this call was sent; the model continues on a new stream."
@@ -2025,7 +2034,7 @@ async function startSession(
   // Do NOT pass callOptions.abortSignal into the h2 Run stream. OpenCode aborts
   // that signal when a turn ends with tool-calls; the Cursor stream must stay
   // open until we write the exec results on the next doStream.
-  const stream = await bidiRunStream(token, {
+  let stream = await bidiRunStream(token, {
     baseURL: agentBaseUrl,
     headers: options.headers,
   })
@@ -2140,12 +2149,13 @@ async function startSession(
   if (conversationState) trace(`hash checkpoint sha256=${sha(conversationState)}`)
 
   try {
-    await writeWithBackpressure(stream, reqBytes, "initial Run request")
+    stream = await sendRunRequest(stream, reqBytes, "initial Run request",
+      () => bidiRunStream(token, { baseURL: agentBaseUrl, headers: options.headers }))
     userTurnHostNotes.sent()
     if (sessionKey && fallbackReply) forgetModelFallbackStop(sessionKey, fallbackReply.stop)
   } catch (error) {
     stream.destroy()
-    throw markCompressionRejection(error, stream)
+    throw error
   }
   const historyImages = sessionKey && !ephemeralRun ? runHistoryImages(heldImages) : undefined
   if (historyImages) noteHistoryImagesSent(historyImages, imageExtraction.hashes)
@@ -2293,8 +2303,12 @@ async function startSession(
     abortIfNeeded()
     // Do not pass OpenCode's abortSignal into the h2 stream: a tool-calls abort
     // must not tear down a Run we still need to pump. Check abort around open.
-    const next = await bidiRunStream(freshToken, { baseURL: agentBaseUrl, headers: options.headers })
-    abortIfNeeded(next)
+    const openNext = async () => {
+      const opened = await bidiRunStream(freshToken, { baseURL: agentBaseUrl, headers: options.headers })
+      abortIfNeeded(opened)
+      return opened
+    }
+    let next = await openNext()
     const conversationState = session.resumeCheckpoint ?? getCheckpoint(session.conversationId)
     const nextRunId = crypto.randomUUID()
     const reqBytes = buildRunRequest({
@@ -2312,10 +2326,10 @@ async function startSession(
       mode: cursorAgentModeWireValue(getActiveCursorMode(session.openCodeSessionId)),
     })
     try {
-      await writeWithBackpressure(next, reqBytes, "progress-only continuation Run")
+      next = await sendRunRequest(next, reqBytes, "progress-only continuation Run", openNext)
     } catch (error) {
       try { next.destroy() } catch {}
-      throw markCompressionRejection(error, next)
+      throw error
     }
     abortIfNeeded(next)
     session.heartbeatCancel?.()

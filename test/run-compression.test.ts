@@ -2,13 +2,14 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import http2 from "node:http2"
 import net from "node:net"
 import { gunzipSync } from "node:zlib"
-import { CursorProviderError, CursorServerError, CursorTransportError, failedOnCompression, isCompressionRejection } from "../src/errors.js"
-import { connectFrameError, pumpWithRecovery } from "../src/language-model.js"
+import { CursorProviderError, CursorServerError, CursorTransportError, isCompressionRejection } from "../src/errors.js"
+import { connectFrameError, pumpWithRecovery, sendRunRequest } from "../src/language-model.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
 import { encodeFrame, FLAG_GZIP, streamFrames } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { describeTtftBreakdown } from "../src/protocol/ttft.js"
 import type { CursorSession, Frame } from "../src/session.js"
+import type { BidiStream } from "../src/transport/connect.js"
 import {
   bidiRunStream,
   closeCachedHttp2SessionsForTests,
@@ -280,6 +281,57 @@ function controller(parts: unknown[] = []) {
 
 const unsupported = { code: "unimplemented", message: "unknown compression \"gzip\"" }
 
+function writeStream(name: string, log: string[], outcome: "ok" | "fail", refused = false): BidiStream {
+  return {
+    write(message: Uint8Array) {
+      log.push(`${name} write ${message.length}`)
+      if (outcome === "fail") throw new CursorTransportError(`${name} closed before drain`, { transient: false, replaySafe: false })
+      return true
+    },
+    compressionRejected: () => refused,
+    end() {},
+    frames: () => ({ async *[Symbol.asyncIterator]() {} }),
+    destroy() { log.push(`${name} destroy`) },
+    isClosed: () => false,
+    onTerminal: () => () => {},
+  }
+}
+
+describe("sendRunRequest", () => {
+  const request = new Uint8Array(4096)
+
+  it("keeps the stream the request went out on", async () => {
+    const log: string[] = []
+    const first = writeStream("first", log, "ok")
+    expect(await sendRunRequest(first, request, "initial Run request", async () => writeStream("next", log, "ok"))).toBe(first)
+    expect(log).toEqual(["first write 4096"])
+  })
+
+  it("sends a request Cursor refused while it uploaded once more on a new stream", async () => {
+    const log: string[] = []
+    const next = writeStream("next", log, "ok")
+    const sent = await sendRunRequest(writeStream("first", log, "fail", true), request, "initial Run request", async () => next)
+    expect(sent).toBe(next)
+    expect(log).toEqual(["first write 4096", "first destroy", "next write 4096"])
+  })
+
+  it("does not resend after a failure Cursor did not tie to compression", async () => {
+    const log: string[] = []
+    const failure = await sendRunRequest(writeStream("first", log, "fail"), request, "initial Run request",
+      async () => writeStream("next", log, "ok")).catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(CursorProviderError)
+    expect(log).toEqual(["first write 4096"])
+  })
+
+  it("resends only once", async () => {
+    const log: string[] = []
+    const failure = await sendRunRequest(writeStream("first", log, "fail", true), request, "initial Run request",
+      async () => writeStream("next", log, "fail", true)).catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(CursorProviderError)
+    expect(log).toEqual(["first write 4096", "first destroy", "next write 4096", "next destroy"])
+  })
+})
+
 describe("compression fallback", () => {
   it("reopens a refused gzip Run once, outside the retry budget", async () => {
     const recoveries: unknown[] = []
@@ -294,30 +346,6 @@ describe("compression fallback", () => {
     })
     expect(final.sessionId).toBe("uncompressed")
     expect(recoveries).toEqual([{ kind: "rebase" }])
-  })
-
-  it("reopens a Run whose own write failed on the refusal", async () => {
-    const failure = new CursorTransportError("Cursor Run stream closed before drain", { transient: false, replaySafe: true })
-    failure.compressionRejected = true
-    const wrapped = new CursorTransportError("initial Run request backpressure drain failed", {
-      transient: false, replaySafe: true, cause: failure,
-    })
-    expect(failedOnCompression(wrapped)).toBe(true)
-    expect(failedOnCompression(new CursorTransportError("other", { transient: false, replaySafe: true }))).toBe(false)
-    let recoveries = 0
-    const session = fakeSession("write-refused", [])
-    session.frames = { next: async () => { throw wrapped } }
-    const final = await pumpWithRecovery({
-      initialSession: session,
-      controller: controller(),
-      retryPolicy: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0 },
-      recover: async () => {
-        recoveries++
-        return fakeSession("uncompressed", [turnEnded()])
-      },
-    })
-    expect(final.sessionId).toBe("uncompressed")
-    expect(recoveries).toBe(1)
   })
 
   it("falls back only once per turn", async () => {

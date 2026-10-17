@@ -33,8 +33,6 @@ export class CursorProviderError extends Error {
    * Recovery must reseed a new conversation instead of resuming that checkpoint.
    */
   checkpointUnusable?: boolean
-  /** The Run announced gzip and Cursor refused it for that; it can be sent again uncompressed. */
-  compressionRejected?: boolean
   /** Another attempt by the host cannot succeed soon (account refusal, capacity after our own backoff). */
   hostRetryUseless?: boolean
   readonly statusCode?: number
@@ -242,15 +240,6 @@ export function isCompressionRejection(
   if (codes.some((code) => COMPRESSION_UNSUPPORTED_CODES.has(code))) return true
   return codes.some((code) => COMPRESSION_DECODE_CODES.has(code))
     && /compress|gzip|encoding/i.test(error.serverMessage ?? "")
-}
-
-/** Whether this failure, or one it wraps, ended a Run that Cursor refused for its compression. */
-export function failedOnCompression(error: unknown): boolean {
-  for (let current = error, depth = 0; current && typeof current === "object" && depth < 8; depth++) {
-    if ((current as CursorProviderError).compressionRejected) return true
-    current = (current as { cause?: unknown }).cause
-  }
-  return false
 }
 
 export function isAuthGrpcStatus(status: number | string): boolean {
