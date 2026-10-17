@@ -659,6 +659,29 @@ describe("deliverContinuationResults", () => {
     expect(live.pending.has(49)).toBe(false)
   })
 
+  it.each(["bash", "shell"])("preserves partial %s output in an interrupted shell stream", async (toolName) => {
+    const writes: Uint8Array[] = []
+    const live = fakeSession(`partial-${toolName}`)
+    live.stream.write = frame => { writes.push(frame) }
+    const toolCallId = `cursor_${live.sessionId}_12`
+    const output = "feature/cp16\r\n#!/bin/sh\r\nPREFIX=/usr/local\r\na/b.txt  \r\n"
+    sessionManager.registerPending(12, live, "shell_stream", toolName)
+    const kept = await deliverContinuationResults(live, [{
+      toolCallId, sessionId: live.sessionId, execId: 12, toolName,
+      output, error: "Tool execution interrupted", interrupted: true,
+    }])
+    const messages = writes.map(frame => decodeMessage<{
+      exec_client_message?: { shell_stream?: { stdout?: { data: string }; stderr?: { data: string }; exit?: { aborted: boolean; abort_reason: number } } }
+      exec_client_control_message?: { stream_close?: { id: number } }
+    }>("AgentClientMessage", frame))
+    expect(kept).toBe(live)
+    expect(messages.flatMap(message => message.exec_client_message?.shell_stream?.stdout?.data ?? []).join("")).toBe(output)
+    expect(messages[2]?.exec_client_message?.shell_stream?.stderr?.data).toBe("Tool execution interrupted")
+    expect(messages[3]?.exec_client_message?.shell_stream?.exit).toMatchObject({ aborted: true, abort_reason: 1 })
+    expect(messages[4]?.exec_client_control_message?.stream_close?.id).toBe(12)
+    expect(live.pending.size).toBe(0)
+  })
+
   it("returns a sanitized OpenCode timeout as Cursor's typed aborted shell exit", async () => {
     const writes: Uint8Array[] = []
     const live = fakeSession("timeout-write")

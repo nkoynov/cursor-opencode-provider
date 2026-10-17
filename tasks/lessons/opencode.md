@@ -46,7 +46,13 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Display completion is not execution authority.** Replaying a completed UI
   record duplicates effects without returning its result to Cursor. Mirror only
   final todo/plan state; Task executes through #28, using its correlated display
-  title (`test/tool-call-bridge.test.ts`).
+  title (`test/tool-call-bridge.test.ts`). Match attachment paths as well as the
+  Task id before answering prerequisite reads, ahead of runtime-file interception:
+  either reader otherwise consumes the Task title. Keep exact filenames and
+  quote paths in the child prompt; trimming broke live attachment reads on both
+  majors. A failed stat must not become a successful placeholder
+  ([#82](https://github.com/oakimov/cursor-opencode-provider/issues/82),
+  `test/task-attachments.test.ts`).
 - **Aliases need execution mappings and capability flags.** Wording alone did
   not prevent native web/resource collisions. Unknown underscore names are not
   MCP server ids (`resolveToolServerIdentity`, `test/tools.test.ts`).
@@ -234,7 +240,16 @@ These are failure lessons shared by both hosts, not a replacement for
   compaction metadata controls reset (`resolveTurnToolState`).
 - **Ground paths and tool observations explicitly.** Structured workspace facts
   alone did not prevent invented prefixes; flattening tool output into assistant
-  prose taught fake execution (`test/prompt-history.test.ts`).
+  prose taught fake execution (`test/prompt-history.test.ts`). Ground only
+  structured path results: rewriting shell stdout prefixed branch names,
+  shebangs and assignments and misplaced paths printed after a `cd`
+  ([#96](https://github.com/oakimov/cursor-opencode-provider/issues/96)).
+  Check the host projections before the encoder too: secondary display cleanup
+  must respect the captured native exit, and failed shell streams must retain
+  partial stdout (`test/plugin.test.ts`, `test/plugin-opencode2.test.ts`,
+  `test/continuation-session.test.ts`). Private wrapper cleanup removes exactly
+  the launcher's separator, preserving spaces, CRLF, blank lines and literal
+  placeholders (`test/shell-timeout.test.ts`).
 - **Keep occupancy, work and money separate.** Hosts replace message tokens but
   add step costs; Run-wide generation inflated tok/s. Use checkpoint occupancy,
   retain stale markers, and keep raw counters distinct from synthetic billing

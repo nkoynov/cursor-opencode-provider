@@ -170,6 +170,10 @@ A prompt sent before those servers finish connecting will not see their tools. O
 | — | A Cursor background shell that ends posts OpenCode's `<shell>` completion note (as a `<system-update>`) through `session.synthetic`: the model gets it at the next step, or it starts a turn in an idle session. It is dropped when the model already read the finished terminal record |
 | Package root / `plugin` | OpenCode 2 `Host.resolve` loads `exports["./server"]` → this entry (`{ id, setup }`). The same module dual-exports `server: CursorPlugin` so OpenCode 1.18 still gets the classic plugin. |
 
+Shell output keeps path-like text, whitespace and successful timeout-shaped
+text unchanged. Internal wrapper markers are removed without trimming command
+output, and failed shell streams retain partial output alongside their error.
+
 The shell integration follows each host's execution order. OpenCode 1.18.31
 [checks permissions before `shell.env`](https://github.com/anomalyco/opencode/blob/v1.18.31/packages/opencode/src/tool/shell.ts#L599-L637).
 OpenCode 2.0.27 [runs `create.before` before its permission callback and then spawns the selected executable](https://github.com/anomalyco/opencode/blob/v2.0.27/packages/core/src/shell.ts#L263-L307),
@@ -186,6 +190,14 @@ The permission and terminal-failure events release unstarted shell reservations
 immediately; running jobs retain their records.
 
 Generated-image saving uses the same handle-only `cursor_image_save` tool on classic and OpenCode 2.0. Classic/OCP surfaces raise `external_directory` then `edit` before the write. Stock OpenCode 2.0 has no public `ask`, so the 2.0 entrypoint still advertises the tool (`permission: "edit"` so agents that deny edits do not get it) and commits after containment; the id is opaque, so the model cannot write arbitrary files.
+
+## Task attachments
+
+Cursor Task attachments reach the native `subagent` prompt as exact, quoted
+file paths, retaining Cursor's description input. The child opens each file
+through its own permission-checked tools; attachment bytes are not read into
+the parent. Choose an image-capable child model for image inspection. See
+[shared subagent routing](../README.md#native-subagent-routing).
 
 ## File editing
 

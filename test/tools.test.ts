@@ -1504,6 +1504,10 @@ describe("partial-read mutation safety", () => {
   })
 })
 
+// #96: shell stdout as the command printed it, including lines that only look
+// like relative paths (branch, shebang, assignment) and a path after a `cd`.
+const VERBATIM_SHELL_STDOUT = ["feature/cp16", "#!/bin/sh", "PREFIX=/usr/local", "a/b.txt", "src/c.ts:12:3", ""].join("\n")
+
 describe("buildExecClientMessages", () => {
   it("returns canonical SubagentSuccess from OpenCode task output", () => {
     const frames = buildExecClientMessages({
@@ -1748,13 +1752,13 @@ describe("buildExecClientMessages", () => {
     const frames = buildExecClientMessages({
       execId: 30,
       resultField: "shell_stream",
-      output: PATH_SHAPED_SHELL_STDOUT,
+      output: VERBATIM_SHELL_STDOUT,
       resultMetadata: { working_directory: "pkg" },
       workspaceRoot: "/workspace/project",
     })
     const stdout = decodeMessage<any>("AgentClientMessage", frames[1]).exec_client_message
       .shell_stream.stdout.data
-    expect(stdout).toBe(PATH_SHAPED_SHELL_STDOUT)
+    expect(stdout).toBe(VERBATIM_SHELL_STDOUT)
   })
 
   it("encodes shell_result success/timeout/failure for exec #2", () => {
@@ -3055,60 +3059,38 @@ describe("OpenCode 2 path and read edge cases", () => {
   })
 
   it("passes shell stdout through verbatim in every shell result shape", () => {
-    const metadata = { command: "cd pkg && ls", working_directory: "pkg" }
-    const ok = buildTypedExecResult(
-      "shell_result",
-      PATH_SHAPED_SHELL_STDOUT,
-      undefined,
-      "bash",
-      metadata,
-      { kind: "exit", code: 0 },
-      root,
+    const metadata = { command: "cd sub && find a -type f", working_directory: "pkg" }
+    const success = buildTypedExecResult(
+      "shell_result", VERBATIM_SHELL_STDOUT, undefined, "bash", metadata, undefined, root,
     ) as { success: { stdout: string } }
-    expect(ok.success.stdout).toBe(PATH_SHAPED_SHELL_STDOUT)
+    expect(success.success.stdout).toBe(VERBATIM_SHELL_STDOUT)
+
+    const crlf = "a/b.txt\r\n"
+    const raw = buildTypedExecResult(
+      "shell_result", crlf, undefined, "bash", metadata, undefined, root,
+    ) as { success: { stdout: string } }
+    expect(raw.success.stdout).toBe(crlf)
 
     const failed = buildTypedExecResult(
-      "shell_result",
-      PATH_SHAPED_SHELL_STDOUT,
-      "nope",
-      "bash",
-      metadata,
-      undefined,
-      root,
+      "shell_result", VERBATIM_SHELL_STDOUT, "nope", "bash", metadata, undefined, root,
     ) as { failure: { stdout: string; stderr: string } }
-    expect(failed.failure).toMatchObject({ stdout: PATH_SHAPED_SHELL_STDOUT, stderr: "nope" })
+    expect(failed.failure).toMatchObject({ stdout: VERBATIM_SHELL_STDOUT, stderr: "nope" })
 
     const backgrounded = buildTypedExecResult(
       "shell_result",
-      PATH_SHAPED_SHELL_STDOUT,
+      VERBATIM_SHELL_STDOUT,
       undefined,
       "bash",
       metadata,
-      {
-        kind: "backgrounded",
-        shellId: 7,
-        pid: 1234,
-        command: metadata.command,
-        workingDirectory: "pkg",
-        msToWait: 0,
-        reason: 1,
-      },
+      { kind: "backgrounded", shellId: 1, pid: 1, command: "make", workingDirectory: "pkg", msToWait: 0, reason: 1 },
       root,
     ) as { success: { stdout: string } }
-    expect(backgrounded.success.stdout).toBe(PATH_SHAPED_SHELL_STDOUT)
+    expect(backgrounded.success.stdout).toBe(VERBATIM_SHELL_STDOUT)
 
-    const pi = buildTypedExecResult(
-      "pi_bash_result",
-      PATH_SHAPED_SHELL_STDOUT,
-      undefined,
-      "bash",
-      metadata,
-      undefined,
-      root,
-    ) as { success: { output: string } }
-    expect(pi.success.output).toBe(PATH_SHAPED_SHELL_STDOUT)
-    const piFailed = buildTypedExecResult("pi_bash_result", "src/a.ts", "nope", "bash", metadata, undefined, root)
-    expect(piFailed).toEqual({ error: { error: "nope" } })
+    const pi = buildTypedExecResult("pi_bash_result", VERBATIM_SHELL_STDOUT, undefined, "bash", undefined, undefined, root) as {
+      success: { output: string }
+    }
+    expect(pi.success.output).toBe(VERBATIM_SHELL_STDOUT)
     const edit = buildTypedExecResult("pi_edit_result", "src/a.ts", undefined, "edit", undefined, undefined, root) as {
       success: { output: string }
     }

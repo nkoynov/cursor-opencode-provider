@@ -321,11 +321,6 @@ export type CursorSession = {
    */
   deferredCreatePlanCalls?: Set<string>
   /**
-   * Task calls whose attachment reads the provider answered. Cursor sends their
-   * subagent request next; a completion without one is Cursor refusing the Task.
-   */
-  taskAttachmentCalls?: Set<string>
-  /**
    * Legacy edit calls whose authoritative exec path is still in progress.
    * Cursor implements these as read -> whole-file write; retaining the path
    * lets the pump expose the final mutation to OpenCode as a targeted edit.

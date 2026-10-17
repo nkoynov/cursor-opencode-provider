@@ -134,9 +134,11 @@ describe("Cursor failure and refusal wire arms", () => {
       expect(frames[0].exec_client_message.shell_stream[refusal]).toBeDefined()
     }
     const interrupted = wire("shell_stream", "interrupted", undefined, true)
-    expect(interrupted[2].exec_client_message.shell_stream.exit).toMatchObject({ aborted: true, abort_reason: 1, code: 0 })
+    expect(interrupted).toHaveLength(5)
+    expect(interrupted[1].exec_client_message.shell_stream.stdout.data).toBe("partial")
+    expect(interrupted[3].exec_client_message.shell_stream.exit).toMatchObject({ aborted: true, abort_reason: 1, code: 0 })
     expect(wire("shell_result", "interrupted", undefined, true)[0].exec_client_message.shell_result.failure.aborted).toBe(true)
-    expect(wire("shell_stream", "")[2].exec_client_message.shell_stream.exit.code).toBe(1)
+    expect(wire("shell_stream", "")[3].exec_client_message.shell_stream.exit.code).toBe(1)
   })
 
   // Field numbers checked against the extracted agent.v1 protocol, rather than

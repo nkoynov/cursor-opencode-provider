@@ -859,6 +859,7 @@ export function buildCompleteEditReadMessages(
   }
 }
 
+/** 1x1 transparent PNG: satisfies Cursor's binary-attachment check without file bytes. */
 const TASK_ATTACHMENT_PLACEHOLDER = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=",
   "base64",
@@ -866,28 +867,49 @@ const TASK_ATTACHMENT_PLACEHOLDER = Buffer.from(
 
 /**
  * Answer Cursor's read of a Task attachment without the file's bytes. Cursor
- * only puts them in the subagent's own context, which OpenCode's subagent tool
- * cannot take, but refuses the Task unless the read returns binary data. The
- * path reaches the subagent's prompt instead ({@link appendTaskAttachments}),
- * and the child reads it under its own permissions.
+ * puts them only in SubagentArgs.selected_context, which OpenCode's subagent
+ * tools cannot take, yet refuses the Task unless the read returns binary data.
+ * The path reaches the subagent prompt instead ({@link appendTaskAttachments})
+ * and the child reads it under its own permissions. A missing or non-regular
+ * target gets the same typed rejection as any native read.
  */
 export function buildTaskAttachmentReadMessages(
   execId: number,
   sourcePath: string,
   resultPath = sourcePath,
 ): Uint8Array[] {
+  // Unlike an ordinary host read, this path has no later executor to surface
+  // stat errors. Never mistake EACCES/ELOOP (or invalid input) for a real file.
   try {
-    if (!fs.statSync(sourcePath).isFile()) throw new Error("not a file")
-  } catch {
-    return buildReadRejectionMessages(execId, { file_not_found: { path: resultPath } })
+    const rejected = classifyReadTargetStat(sourcePath, fs.statSync(sourcePath))
+    if (rejected) return buildReadRejectionMessages(execId, rejected)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    const rejected = code === "ENOENT" || code === "ENOTDIR"
+      ? { file_not_found: { path: sourcePath } }
+      : undefined
+    return buildReadRejectionMessages(execId, rejected ?? {
+      error: { path: resultPath, error: error instanceof Error ? error.message : String(error) },
+    })
   }
-  return encodeLocalReadSuccess(execId, {
-    path: resultPath,
-    data: TASK_ATTACHMENT_PLACEHOLDER,
-    total_lines: 0,
-    file_size: TASK_ATTACHMENT_PLACEHOLDER.length,
-    truncated: false,
-  })
+  return [
+    encodeMessage("AgentClientMessage", {
+      exec_client_message: {
+        id: execId,
+        local_execution_time_ms: 0,
+        read_result: {
+          success: {
+            path: resultPath,
+            data: TASK_ATTACHMENT_PLACEHOLDER,
+            total_lines: 0,
+            file_size: TASK_ATTACHMENT_PLACEHOLDER.length,
+            truncated: false,
+          },
+        },
+      },
+    }),
+    buildExecStreamClose(execId),
+  ]
 }
 
 /** List Cursor's Task attachments at the end of the subagent prompt as absolute paths. */
@@ -897,8 +919,8 @@ export function appendTaskAttachments(
   workspaceRoot: string,
 ): void {
   if (parsed.resultField !== "subagent_result" || attachments.length === 0) return
-  const prompt = typeof parsed.args.prompt === "string" ? parsed.args.prompt : ""
-  const paths = attachments.map((item) => `- ${path.resolve(workspaceRoot, item.trim())}`)
+  const prompt = str(parsed.args.prompt) ?? ""
+  const paths = attachments.map((item) => `- ${JSON.stringify(resolveReadTargetPath(item, workspaceRoot))}`)
   parsed.args.prompt = `${prompt}\n\nAttached files (open them with your file tools):\n${paths.join("\n")}`
 }
 
@@ -1964,6 +1986,10 @@ export function classifyMissingReadTarget(
     }
     return undefined
   }
+  return classifyReadTargetStat(absolutePath, stat)
+}
+
+function classifyReadTargetStat(absolutePath: string, stat: fs.Stats): Record<string, unknown> | undefined {
   if (stat.isDirectory()) {
     return { invalid_file: { path: absolutePath, reason: "Path is a directory, not a file" } }
   }
@@ -2069,14 +2095,16 @@ export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
   } else if (resultField === "shell_stream") {
     // Real clients always emit Start → Stdout/Stderr* → Exit (capture/tests).
     frames.push(encodeShellStream(input.execId, undefined, { start: {} }))
+    // Retain progress even when the host also reports a failure or interruption.
+    // A command may change directories; stdout must reach Cursor unchanged.
+    if (input.output) {
+      frames.push(encodeShellStream(input.execId, undefined, { stdout: { data: input.output } }))
+    }
     if (input.error) {
       frames.push(encodeShellStream(input.execId, undefined, { stderr: { data: input.error } }))
       frames.push(encodeShellStream(input.execId, input.executionTimeMs, { exit: input.interrupted || input.shellOutcome?.kind === "aborted"
         ? { code: 0, aborted: true, abort_reason: 1 } : { code: 1, aborted: false } }))
     } else {
-      if (input.output) {
-        frames.push(encodeShellStream(input.execId, undefined, { stdout: { data: input.output } }))
-      }
       if (input.shellOutcome?.kind === "backgrounded") {
         frames.push(encodeShellStream(input.execId, input.executionTimeMs, {
           backgrounded: {

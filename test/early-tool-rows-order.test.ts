@@ -298,7 +298,7 @@ describe("Task attachment reads", () => {
     expect(JSON.parse(call.input)).toEqual({
       agent: "general",
       description: "Describe the shot",
-      prompt: `Describe the attached image.\n\nAttached files (open them with your file tools):\n- ${path.join(rootOf(session), "shot.png")}`,
+      prompt: `Describe the attached image.\n\nAttached files (open them with your file tools):\n- ${JSON.stringify(path.join(rootOf(session), "shot.png"))}`,
     })
     expect([...session.pending.keys()]).toEqual([2])
     const read = written
@@ -329,10 +329,9 @@ describe("Task attachment reads", () => {
     )
     const parts = await pumpOnce(session)
     expect(hostCalls(parts)).toEqual([])
-    expect(session.taskAttachmentCalls?.size ?? 0).toBe(0)
     const read = written
       .map((message) => decodeMessage("AgentClientMessage", message) as any)
       .find((message) => message.exec_client_message?.id === 1)
-    expect(read.exec_client_message.read_result).toEqual({ file_not_found: { path: "gone.png" } })
+    expect(read.exec_client_message.read_result).toEqual({ file_not_found: { path: path.join(rootOf(session), "gone.png") } })
   })
 })

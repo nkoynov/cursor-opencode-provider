@@ -768,7 +768,7 @@ export function extractExecDisplayCallId(execMsg: Record<string, unknown>): stri
   return undefined
 }
 
-/** The file paths a display TaskToolCall attaches; Cursor reads each one before its subagent request. */
+/** File paths a display TaskToolCall attaches; Cursor reads each one before its subagent request. */
 export function taskToolCallAttachments(toolCall: Record<string, unknown> | undefined): string[] {
   if (!toolCall || findToolVariant(toolCall) !== "task_tool_call") return []
   const payload = asRecord(toolCall.task_tool_call)

@@ -4727,21 +4727,6 @@ export async function pump(
   }
 
   /**
-   * Cursor reads a Task's attachments before its subagent request. A host read
-   * would end the step before the subagent request arrives.
-   */
-  const answerTaskAttachmentRead = async (parsed: ParsedExecRequest): Promise<boolean> => {
-    const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
-    const requestedPath = opencodePathArg(parsed.args) ?? ""
-    const ok = await writeExecFrames(
-      buildTaskAttachmentReadMessages(parsed.id, path.resolve(workspaceRoot, requestedPath), requestedPath),
-      `task attachment read id=${parsed.id}`,
-    )
-    if (ok) trace(`exec: task attachment read answered id=${parsed.id} path=${JSON.stringify(requestedPath)}`)
-    return ok
-  }
-
-  /**
    * Cursor's streamed edit handshake needs the complete target before it sends
    * the replacement through write_args. OpenCode's ordinary read tool caps at
    * 50 KB, so forwarding this private prerequisite read teaches Cursor's editor
@@ -4866,6 +4851,36 @@ export async function pump(
       offset: typeof parsed.args.offset === "number" ? parsed.args.offset : undefined,
       limit: typeof parsed.args.limit === "number" ? parsed.args.limit : undefined,
     })
+  }
+
+  /**
+   * Cursor reads each Task attachment, tagged with the Task's call id, before
+   * its subagent request. A host read would put the file in this session's
+   * context instead of the child's, cost a step, and claim the display call
+   * that carries the Task's title. Answer it here and keep the display call.
+   * Returns undefined when this is not an attachment read, false when the
+   * reply failed and the attempt was closed.
+   */
+  const answerTaskAttachmentRead = async (
+    parsed: ParsedExecRequest,
+    displayCallId: string | undefined,
+  ): Promise<boolean | undefined> => {
+    if (!displayCallId || parsed.resultField !== "read_result" || parsed.toolName !== "read") return undefined
+    const display = parseDisplayToolCall(displayCallId, session.displayToolCalls.get(displayCallId))
+    if (display?.variant !== "task_tool_call") return undefined
+    const requested = opencodePathArg(parsed.args) ?? ""
+    const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
+    const target = resolveReadTargetPath(requested, workspaceRoot)
+    if (!taskToolCallAttachments(session.displayToolCalls.get(displayCallId)).some(
+      (attachment) => resolveReadTargetPath(attachment, workspaceRoot) === target,
+    )) return undefined
+    const ok = await writeExecFrames(
+      buildTaskAttachmentReadMessages(parsed.id, target, requested),
+      `reply to task attachment read id=${parsed.id}`,
+    )
+    if (!ok) return false
+    trace(`exec: task attachment read answered id=${parsed.id} callId=${displayCallId} path=${JSON.stringify(requested)}`)
+    return true
   }
 
   /**
@@ -5780,7 +5795,6 @@ export async function pump(
       }
       if (callId) session.editToolCalls?.delete(callId)
       if (callId) announcedCalls.delete(callId)
-      const refusedAttachmentTask = !!callId && session.taskAttachmentCalls?.delete(callId) === true
       if (callId) session.resultsAfterCheckpoint?.awaiting.delete(callId)
       if (callId) noteCursorWaitEnded(session, callId)
       noteToolCallFinished(order, callId)
@@ -5803,13 +5817,11 @@ export async function pump(
           // overwrite the host's list with a plan that does not exist.
           const deferredPlan = display?.variant === "create_plan_tool_call"
             && session.deferredCreatePlanCalls?.delete(callId) === true
-          const bridged = display && !deferredPlan && !refusedAttachmentTask
+          const bridged = display && !deferredPlan
             ? resolveBridgedOpenCodeToolCall(display, advertised, session.hostToolDialect)
             : undefined
           if (deferredPlan) {
             trace(`display tool_call_completed: deferred create_plan not mirrored callId=${callId}`)
-          } else if (refusedAttachmentTask) {
-            trace(`display tool_call_completed: Task refused after its attachment reads, not bridged callId=${callId}`)
           } else if (!display) {
             const callIdLog = callId.replace(/\r?\n/g, "\\n")
             // AgentServerMessage.interaction_update(1).tool_call_completed(3).tool_call(2)
@@ -5993,6 +6005,13 @@ export async function pump(
         openModelStep()
         const displayCallId = extractExecDisplayCallId(esm)
         const parsed = parseExecServerMessage(esm, session.hostToolDialect)
+        // Task prerequisites take precedence over the runtime-file reader:
+        // even a terminal/catalog attachment must keep its Task's display owner.
+        if (session.allowTools && esm.read_args && parsed) {
+          const attachmentRead = await answerTaskAttachmentRead(parsed, displayCallId)
+          if (attachmentRead === false) return
+          if (attachmentRead) continue
+        }
         // Provider-owned spills and terminal records never wait for, or hold back, the step's host calls.
         // Before answering: an answer that starts on a finished terminal record shows its end.
         const mcpRead = parsed?.toolName === "read" && parsed.resultField === "mcp_result"
@@ -6012,13 +6031,13 @@ export async function pump(
           if (displayCallId) session.displayToolCalls.delete(displayCallId)
           continue
         }
-        const taskAttachmentRead = !!displayCallId
+        const readUnderTask = !!displayCallId
           && parsed?.resultField === "read_result"
           && parsed.toolName === "read"
           && parseDisplayToolCall(displayCallId, session.displayToolCalls.get(displayCallId))?.variant === "task_tool_call"
-        // An edit's private prerequisite read is not the call's own request; its write is. Nor is a Task's attachment read.
+        // An edit's private prerequisite read is not the call's own request; its write is. Nor is a read under a Task's call.
         const ownRequestCallId = displayCallId
-          && !taskAttachmentRead
+          && !readUnderTask
           && !(parsed?.resultField === "read_result" && session.editToolCalls?.has(displayCallId))
           ? displayCallId
           : undefined
@@ -6067,7 +6086,6 @@ export async function pump(
                 taskToolCallAttachments(stored),
                 workspaceRootFromRequestContext(session.requestContext),
               )
-              session.taskAttachmentCalls?.delete(displayCallId)
               if (description?.trim()) {
                 trace(
                   `exec: preferred TaskToolCall description callId=${displayCallId} ` +
@@ -6133,11 +6151,6 @@ export async function pump(
               trace(`exec: dropped ${toollessText.length} chars of tool-less narration before refused id=${parsed.id}`)
               toollessText = ""
             }
-            continue
-          }
-          if (taskAttachmentRead) {
-            if (!await answerTaskAttachmentRead(parsed)) return
-            ;(session.taskAttachmentCalls ??= new Set()).add(displayCallId!)
             continue
           }
           // Cursor writes a generated image with an ordinary write exec whose

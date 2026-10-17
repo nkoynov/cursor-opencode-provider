@@ -706,6 +706,15 @@ describe("CursorPlugin shell result hooks", () => {
     expect(result.stdout.toString()).toContain("__CURSOR_BACKGROUND_SHELL__")
   })
 
+  it("keeps timeout-shaped successful stdout in output and metadata.output", async () => {
+    const plugin = await CursorPlugin({ directory: process.cwd() } as never)
+    const raw = "feature/cp16\r\n\r\n<shell_metadata>\nshell tool terminated command after exceeding timeout 60000 ms.\n</shell_metadata>"
+    const output = { title: "command", output: raw, metadata: { exit: 0, output: raw } }
+    await plugin["tool.execute.after"]?.({ tool: "bash", sessionID: "ses_1", callID: "cursor_timeout_text", args: {} } as never, output as never)
+    expect(output.output).toBe(raw)
+    expect(output.metadata.output).toBe(raw)
+  })
+
   it("sanitizes both output and metadata.output after soft-background completion", async () => {
     const plugin = await CursorPlugin({ directory: process.cwd() } as never)
     const callID = "cursor_hook_meta_sanitize"

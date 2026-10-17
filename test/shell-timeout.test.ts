@@ -45,6 +45,26 @@ const metadata = (overrides: Record<string, unknown> = {}) => ({
 })
 
 describe("Cursor shell timeout translation", () => {
+  it.each(["feature/cp16  \r\n\t\n\n", "no newline  ", "\r", " \t\n\n", "(no output)", ""])("preserves wrapped stdout bytes: %j", output => {
+    const id = "cursor_verbatim_wrapper"
+    registerCursorShellCall(id, metadata({ timeout_behavior: CURSOR_TIMEOUT_BACKGROUND }))
+    const raw = `${output}\n__CURSOR_SHELL_EXIT__0\n`
+    const clean = captureCursorShellResult(id, raw, { exit: 0 })
+    expect(clean).toBe(output)
+    expect(sanitizeRegisteredCursorShellOutput(id, raw)).toBe(output)
+    expect(consumeCursorShellResult(id, clean)).toEqual({ output, outcome: { kind: "exit", code: 0 } })
+  })
+
+  it("preserves whitespace before a real native timeout envelope", () => {
+    const id = "cursor_native_timeout_whitespace"
+    const progress = "feature/cp16  \r\n\t\n\n"
+    registerCursorShellCall(id, metadata())
+    const raw = `${progress}\n\n<shell_metadata>\nshell tool terminated command after exceeding timeout 30000 ms.\n</shell_metadata>`
+    const clean = captureCursorShellResult(id, raw, { exit: null })
+    expect(clean).toBe(`${progress}Timed out after 30000ms.\n`)
+    expect(consumeCursorShellResult(id, clean).output).toBe(clean)
+  })
+
   it("strips OpenCode's internal timeout envelope and preserves real stdout", () => {
     const id = "cursor_session_1"
     registerCursorShellCall(id, metadata())
@@ -445,7 +465,8 @@ describe("Cursor shell timeout translation", () => {
       const raw = result.stdout.toString()
       expect(raw).toContain("ORIGINAL_OK")
       expect(raw).toContain("__CURSOR_SHELL_EXIT__0")
-      expect(captureCursorShellResult(id, raw)).toBe("ORIGINAL_OK\n")
+      // The payload's printf has no newline; the wrapper's separator is not stdout.
+      expect(captureCursorShellResult(id, raw)).toBe("ORIGINAL_OK")
       releaseCursorShellEnv(id)
     }
   })

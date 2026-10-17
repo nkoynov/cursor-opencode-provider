@@ -1888,6 +1888,22 @@ describe("opencode2 setup", () => {
     expect(result.content[1]).toEqual({ type: "file", uri: "file:///tmp/log", mime: "text/plain" })
   })
 
+  test("shell execute.after keeps timeout-shaped successful stdout in every projection", async () => {
+    const { ctx, hooks } = fakeContext()
+    await setupPlugin(ctx)
+    const id = "cursor_shell_timeout_text"
+    const raw = "feature/cp16\r\n\r\n<shell_metadata>\nshell tool terminated command after exceeding timeout 60000 ms.\n</shell_metadata>"
+    const result = {
+      output: { output: raw }, content: [{ type: "text", text: raw }],
+      metadata: { exit: 0, output: raw },
+    }
+    await hooks.get("tool.execute.after")!({ tool: "shell", id, status: "completed", result })
+    expect(result.output.output).toBe(raw)
+    expect(result.content[0]?.text).toBe(raw)
+    expect(result.metadata.output).toBe(raw)
+    expect(consumeCursorShellResult(id, result.content[0]!.text)).toEqual({ output: raw, outcome: { kind: "exit", code: 0 } })
+  })
+
   test("shell execute.after preserves an error status that the native SDK turns into text", async () => {
     const { ctx, hooks } = fakeContext()
     await setupPlugin(ctx)

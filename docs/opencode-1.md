@@ -100,6 +100,14 @@ without a variant retains Cursor's declared default effort for that tier.
 Saved 500k variants on the base/Fast entries remain valid after upgrading;
 reselect the dedicated 500k entry to use its full host context budget.
 
+## Task attachments
+
+Cursor Task attachments reach the native `task` prompt as exact, quoted file
+paths, retaining Cursor's description. The child opens each file through its
+own permission-checked tools; attachment bytes are not read into the parent.
+Choose an image-capable child model for image inspection. See
+[shared subagent routing](../README.md#native-subagent-routing).
+
 ## File editing
 
 Eligible GPT models receive `apply_patch` instead of `edit` / `write`. The
@@ -110,6 +118,10 @@ their requested contents. See [shared patch behavior](../README.md#apply_patch--
 and [1.x incident lessons](../tasks/lessons/opencode-1.md).
 
 ## Shell failures and interruption
+
+Shell output keeps path-like text, whitespace and successful timeout-shaped
+text unchanged. Internal wrapper markers are removed without trimming command
+output, and failed shell streams retain partial output alongside their error.
 
 The classic plugin releases unstarted shell reservations from persisted tool
 error events as well as the after hook, because rejection can stop the host

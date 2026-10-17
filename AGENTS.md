@@ -289,17 +289,13 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   available: 1.x `apply_patch`, 2.0 `patch`, `task`/`subagent`, and `shell`/`bash`.
   2.0 `execute` is JavaScript. Refuse lossy patches before mutation, including
   2.0 CRLF. Keep the correlated Task display title over a prompt fragment.
+  Answer a Task's correlated attachment reads with placeholder bytes, never the
+  file or a host read; list the attachment paths in the subagent prompt.
 - Strip read envelopes while retaining `[Partial read: …]` meaning. Explicit
   pagination alone is not truncation. Reject whole-file writes/overwriting Add
   File patches that echo incomplete content; allow targeted source edits.
-  Resolve relative result paths against the workspace without rewriting prose.
-- Fork: shell output reaches Cursor verbatim, as Cursor CLI sends it; never
-  rewrite it, because a `cd` in the command changes what its paths mean and most
-  path-shaped lines (`S=/tmp/x`, `#!/bin/sh`, diff lines) are not paths.
-- Fork: Cursor reads each `TaskToolArgs.attachments` file through a `read_args`
-  carrying the Task's `tool_call_id` before `SubagentArgs`, and refuses the Task
-  unless it gets `data`. `answerTaskAttachmentRead` answers with a placeholder
-  image without reading the file, and the paths go into the subagent prompt.
+  Resolve relative grep/glob/directory paths against the workspace. Shell stdout
+  reaches Cursor verbatim, as Cursor CLI sends it; a `cd` changes its paths.
 - `WriteArgs.file_bytes` and `encoding_hint` are content. Private legacy-edit
   reads need complete correlated content; external/symlink-escaped files require
   the exact host-authorized read first. Final mutation remains a host edit/patch.

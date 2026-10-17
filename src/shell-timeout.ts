@@ -563,9 +563,15 @@ export function prepareCursorShellCreate(event: {
 }
 
 function withoutMarker(output: string, index: number): string {
-  let clean = output.slice(0, index).replace(/[\t ]+$/gm, "").replace(/\n{2,}$/, "\n")
-  if (clean.trim() === "" || clean.trim() === "(no output)") clean = ""
-  return clean
+  // OpenCode appends two LFs before its native timeout envelope. Preserve the
+  // payload, including whitespace-only output, and strip only its placeholder.
+  const clean = output.slice(0, index).replace(/\n\n$/, "")
+  return clean === "(no output)" ? "" : clean
+}
+
+/** Our launchers append exactly one LF before their sentinel, even after CR. */
+function withoutPrivateMarker(output: string, index: number): string {
+  return output.slice(0, index).replace(/\n$/, "")
 }
 
 /**
@@ -665,7 +671,7 @@ function parseSoftBackgroundOutcome(
     const pid = Number(background.values[1] || shellId)
     if (Number.isSafeInteger(pid) && pid > 0 && pid <= 0xffff_ffff) {
       return {
-        output: withoutMarker(output, background.index),
+        output: withoutPrivateMarker(output, background.index),
         outcome: {
           kind: "backgrounded",
           shellId,
@@ -681,13 +687,13 @@ function parseSoftBackgroundOutcome(
   }
   if (timeout && timeout.index === finalIndex) {
     return {
-      output: withoutMarker(output, timeout.index),
+      output: withoutPrivateMarker(output, timeout.index),
       outcome: { kind: "timeout", timeoutMs: Number(timeout.values[0]) },
     }
   }
   if (exit && exit.index === finalIndex) {
     return {
-      output: withoutMarker(output, exit.index),
+      output: withoutPrivateMarker(output, exit.index),
       outcome: { kind: "exit", code: Number(exit.values[0]) },
     }
   }
@@ -706,7 +712,7 @@ function parseBackgroundSpawnOutcome(
   const pid = Number(match.values[1] || shellId)
   if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 0xffff_ffff) return undefined
   return {
-    output: withoutMarker(output, match.index),
+    output: withoutPrivateMarker(output, match.index),
     outcome: {
       kind: "backgrounded",
       shellId,
@@ -731,6 +737,7 @@ function parseBackgroundSpawnOutcome(
 export function sanitizeCursorShellDisplayOutput(
   output: string,
   policy?: CursorShellPolicy,
+  capturedOutcome?: CursorShellOutcome,
 ): string {
   if (typeof output !== "string") return output
   if (policy?.backgroundSpawn) {
@@ -743,7 +750,10 @@ export function sanitizeCursorShellDisplayOutput(
     const wrapper = parseSoftBackgroundOutcome(output, policy)
     if (wrapper) return formatShellOutcomeDisplay(wrapper.output, wrapper.outcome)
   }
-  const timeout = parseOpenCodeTimeout(output)
+  // Secondary display strings share the native outcome already captured from
+  // the primary output. A successful command may print this exact envelope.
+  const timeout = !capturedOutcome || capturedOutcome.kind === "timeout"
+    ? parseOpenCodeTimeout(output) : undefined
   if (timeout) {
     return formatShellOutcomeDisplay(timeout.output, {
       kind: "timeout",
@@ -757,7 +767,7 @@ export function sanitizeCursorShellDisplayOutput(
 export function sanitizeRegisteredCursorShellOutput(toolCallId: string, output: string): string {
   if (typeof output !== "string") return output
   if (typeof toolCallId !== "string" || !toolCallId) return output
-  return sanitizeCursorShellDisplayOutput(output, policies.get(toolCallId))
+  return sanitizeCursorShellDisplayOutput(output, policies.get(toolCallId), outcomes.get(toolCallId))
 }
 
 /**
