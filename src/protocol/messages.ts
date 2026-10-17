@@ -1914,6 +1914,11 @@ export function createMessageTypes(): protobuf.Root {
     { id: 1, name: "mcp_tools", type: "McpToolDefinition", repeated: true },
   ])
 
+  addType(root, "PreFetchedBlob", [
+    { id: 1, name: "id", type: "bytes" },
+    { id: 2, name: "value", type: "bytes" },
+  ])
+
   addType(root, "AgentRunRequest", [
     { id: 1, name: "conversation_state", type: "bytes" },
     { id: 2, name: "action", type: "ConversationAction" },
@@ -1925,6 +1930,7 @@ export function createMessageTypes(): protobuf.Root {
     { id: 12, name: "field_12", type: "uint32" },
     { id: 14, name: "selected_subagent_models", type: "RequestedModel", repeated: true },
     { id: 16, name: "conversation_group_id", type: "string" },
+    { id: 17, name: "pre_fetched_blobs", type: "PreFetchedBlob", repeated: true },
     { id: 25, name: "run_id", type: "string" },
   ])
 
@@ -2179,6 +2185,16 @@ export function createMessageTypes(): protobuf.Root {
 
   // ── AgentServerMessage ──
 
+  addType(root, "TtftBreakdown", [
+    { id: 1, name: "server_first_token_ms", type: "double" },
+    { id: 2, name: "pre_stream_setup_ms", type: "double" },
+    { id: 3, name: "wait_for_first_event_ms", type: "double" },
+    { id: 4, name: "provider_ttft_ms", type: "double" },
+    { id: 5, name: "slow_pool_wait_ms", type: "double" },
+    { id: 6, name: "client_prep_ms", type: "double" },
+    { id: 7, name: "client_clock", type: "bool" },
+  ])
+
   addType(
     root,
     "AgentServerMessage",
@@ -2189,6 +2205,7 @@ export function createMessageTypes(): protobuf.Root {
       { id: 4, name: "kv_server_message", type: "KvServerMessage" },
       { id: 5, name: "exec_server_control_message", type: "ExecServerControlMessage" },
       { id: 7, name: "interaction_query", type: "InteractionQuery" },
+      { id: 8, name: "ttft_breakdown", type: "TtftBreakdown" },
     ],
     [{ name: "message", fields: ["interaction_update", "exec_server_message", "conversation_checkpoint_update", "kv_server_message", "exec_server_control_message", "interaction_query"] }],
   )

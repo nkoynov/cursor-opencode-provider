@@ -1,5 +1,5 @@
 import { CURSOR_API_HOST, CONNECT_PROTOCOL_VERSION, SERVER_CONFIG_PATH } from "../shared.js"
-import { encodeFrame, streamFrames } from "../protocol/framing.js"
+import { encodeFrame, FLAG_GZIP, streamFrames } from "../protocol/framing.js"
 import { createCursorChecksumHeader } from "../protocol/checksum.js"
 import { getDeviceIds } from "../protocol/device-id.js"
 import { resolveClientVersion } from "../protocol/client-version.js"
@@ -14,12 +14,29 @@ import {
   CursorProviderError,
 } from "../errors.js"
 import { withAbortDeadline } from "../deadline.js"
+import { existsSync } from "node:fs"
 import http2 from "node:http2"
 import type { Duplex } from "node:stream"
 import type { TLSSocket } from "node:tls"
 import { openProxiedTlsSocket, proxyEndpoint, resolveHttpsProxyUrl } from "./https-proxy.js"
 
 const API_BASE = `https://${CURSOR_API_HOST}`
+// Cursor CLI sends Run messages with connect-es sendCompression gzip and the default compressMinBytes (1 KiB).
+const COMPRESS_MIN_BYTES = 1024
+
+function sendGzipEnabled(): boolean {
+  if (process.env.CURSOR_PROVIDER_SEND_GZIP === "1") return true
+  const flag = process.env.CURSOR_PROVIDER_SEND_GZIP_FILE
+  return !!flag && existsSync(flag)
+}
+
+function encodeOutboundFrame(msg: Uint8Array, gzip: boolean): Uint8Array {
+  if (!gzip || msg.length <= COMPRESS_MIN_BYTES) return encodeFrame(0x00, msg)
+  const started = performance.now()
+  const frame = encodeFrame(FLAG_GZIP, msg)
+  trace(`outbound frame gzip: raw=${msg.length}B wire=${frame.length - 5}B ms=${(performance.now() - started).toFixed(1)}`)
+  return frame
+}
 const DEFAULT_UNARY_TIMEOUT_MS = 5_000
 const MAX_TIMER_MS = 2_147_483_647
 
@@ -773,12 +790,15 @@ export async function bidiRunStream(
     acquireSession(options.baseURL, sessionOptions),
     resolveClientVersion(),
   ])
+  const sendGzip = sendGzipEnabled()
+  trace(`Run stream: sendGzip=${sendGzip}`)
   const headers = {
     ...buildBaseHeaders(token, clientVersion, options.headers),
     ":method": "POST",
     ":path": "/agent.v1.AgentService/Run",
     "content-type": "application/connect+proto",
     "connect-accept-encoding": "gzip,br",
+    ...(sendGzip ? { "connect-content-encoding": "gzip" } : {}),
     // The CLI's streaming interceptor sets this on the bidi Run stream
     // (decompiled client.ts:1190). Without it Cursor may treat the stream as
     // non-streaming.
@@ -1201,7 +1221,7 @@ export async function bidiRunStream(
       const resendQueue = resending ?? (failing ? unanswered : undefined)
       if (resendQueue && !locallyClosed && !terminalEvent) {
         // Goes out with the rest of the Run if it is sent again, and is dropped with it otherwise.
-        resendQueue.push(encodeFrame(0x00, msg))
+        resendQueue.push(encodeOutboundFrame(msg, sendGzip))
         return true
       }
       if (failing) {
@@ -1210,7 +1230,7 @@ export async function bidiRunStream(
         }
         throw observedFailure() ?? new CursorRunInterruptedError("Cursor Run stream is no longer writable")
       }
-      const frame = encodeFrame(0x00, msg)
+      const frame = encodeOutboundFrame(msg, sendGzip)
       try {
         const accepted = send(frame)
         unanswered?.push(frame)

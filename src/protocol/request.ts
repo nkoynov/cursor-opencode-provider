@@ -45,6 +45,8 @@ export type RunRequestInput = {
    * value). Cursor CLI sends its current mode on every user message.
    */
   mode?: number
+  /** Checkpoint blobs sent inline (AgentRunRequest.pre_fetched_blobs #17) instead of on Cursor's get_blob requests. */
+  preFetchedBlobs?: Array<{ id: Uint8Array; value: Uint8Array }>
 }
 
 /**
@@ -167,6 +169,7 @@ export function buildRunRequest(input: RunRequestInput): Uint8Array {
     unknown_flag: 0,
     field_12: 0,
   }
+  if (!seeded && input.preFetchedBlobs?.length) runRequest.pre_fetched_blobs = input.preFetchedBlobs
 
   return encodeMessage("AgentClientMessage", {
     run_request: runRequest,

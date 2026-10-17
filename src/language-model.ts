@@ -171,9 +171,11 @@ import {
 } from "./protocol/token-details.js"
 import {
   conversationBlobCount,
+  getConversationBlob,
   inspectConversationBlobGraph,
   type ConversationBlobGraphStats,
 } from "./protocol/blob-store.js"
+import { collectReachableConversationBlobIds } from "./protocol/blob-reachability.js"
 import {
   bindConversationId,
   hasConversationBinding,
@@ -362,6 +364,30 @@ import {
 
 /** Unknown frame layouts already traced in this process; each is logged once. */
 const unknownFrameLayouts = new Set<string>()
+
+function prefetchBlobsEnabled(): boolean {
+  const flag = process.env.CURSOR_PROVIDER_PREFETCH_FILE
+  return !!flag && fs.existsSync(flag)
+}
+
+function checkpointBlobsForPrefetch(
+  conversationId: string,
+  checkpoint: Uint8Array,
+): Array<{ id: Uint8Array; value: Uint8Array }> | undefined {
+  try {
+    const ids = collectReachableConversationBlobIds(checkpoint, (id) => getConversationBlob(conversationId, id))
+    const blobs: Array<{ id: Uint8Array; value: Uint8Array }> = []
+    for (const key of ids) {
+      const id = Uint8Array.from(Buffer.from(key, "hex"))
+      const value = getConversationBlob(conversationId, id)
+      if (value) blobs.push({ id, value })
+    }
+    return blobs
+  } catch (error) {
+    trace(`prefetch blobs: graph walk failed: ${String(error)}`)
+    return undefined
+  }
+}
 
 let _availableModels: ModelInfo[] | undefined
 // mtime of the cache file the last time we loaded it. Compared on each call
@@ -2030,7 +2056,14 @@ async function startSession(
   // After compaction or an unsafe checkpoint reset there is no checkpoint —
   // seed a new Cursor conversation from OpenCode's authoritative history.
   const cursorMode = getActiveCursorMode(sessionKey)
+  const preFetchedBlobs = conversationState && prefetchBlobsEnabled()
+    ? checkpointBlobsForPrefetch(conversationId, conversationState)
+    : undefined
+  if (preFetchedBlobs) {
+    trace(`prefetch blobs: count=${preFetchedBlobs.length} bytes=${preFetchedBlobs.reduce((n, b) => n + b.value.length, 0)}`)
+  }
   const reqBytes = buildRunRequest({
+    preFetchedBlobs,
     messageId: runId,
     text: userText,
     images,
@@ -5165,6 +5198,7 @@ export async function pump(
     // carried output or stateful activity.
     if (!isSoleControlFrame(payload)) onlyControlFrames = false
 
+    if (asm.ttft_breakdown) trace(`ttft breakdown: ${JSON.stringify(asm.ttft_breakdown)}`)
     {
       const iuKind = iu ? Object.keys(iu).find((k) => iu[k]) : undefined
       trace(
