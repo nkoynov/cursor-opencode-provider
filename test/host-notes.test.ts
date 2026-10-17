@@ -16,6 +16,7 @@ import {
   releaseHostNoteInjectionsForTests,
   resetTurnStateForTests,
   restorePersistedHostNotes,
+  settleTerminalCheckpointSavesForTests,
 } from "../src/language-model.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import {
@@ -148,6 +149,7 @@ function serverSends(live: CursorSession, ...before: Frame[]): CursorSession {
 const controller = { enqueue() {}, error(error: Error) { throw error } } as unknown as ReadableStreamDefaultController<any>
 
 async function hostNoteAfterRestart(root: string, sessionKey: string): Promise<string | undefined> {
+  await settleTerminalCheckpointSavesForTests()
   resetConversationPersistenceForTests()
   resetConversationBindingsForTests()
   resetCheckpointsForTests()

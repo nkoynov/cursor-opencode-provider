@@ -24,7 +24,8 @@ import {
   serializeModelFallbackStop,
   type ModelFallbackStop,
 } from "../src/model-fallback.js"
-import { pump, resetTurnStateForTests } from "../src/language-model.js"
+import { pump, resetTurnStateForTests, settleTerminalCheckpointSavesForTests } from "../src/language-model.js"
+import { getPersistedConversation } from "../src/protocol/conversation-persistence.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { decodeFramePayload, encodeFrame } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
@@ -547,6 +548,8 @@ describe("stopping a Run at the first switched step", () => {
     const next = peekConversationId(session.openCodeSessionId!)
     expect(next).not.toBe(before)
     expect(getCheckpoint(next)).toBeDefined()
+    await settleTerminalCheckpointSavesForTests()
+    expect((await getPersistedConversation(session.cacheDir!, session.openCodeSessionId!))?.conversationId).toBe(next)
   })
 
   it(`continues on the other model with ${ALLOW_MODEL_FALLBACK_ENV}=1, as before`, async () => {
