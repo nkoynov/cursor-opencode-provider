@@ -1062,8 +1062,9 @@ export class SessionManager {
         trace("continuation lease renewed from OpenCode session activity")
       }
     }
-    // Cursor no longer waits on an exec it aborted, so the host's running tool does not hold it.
-    if (toolCapAt !== undefined && !pending.aborted) {
+    // Any expired pending closes the Run, so a running tool holds every pending exec, unless
+    // Cursor aborted them all and no longer waits on the Run.
+    if (toolCapAt !== undefined && [...session.pending.values()].some((other) => !other.aborted)) {
       const renewedDeadline = Math.min(now + session.policy.hardCapMs, toolCapAt)
       if (renewedDeadline > pending.hardDeadlineAt) {
         pending.hardDeadlineAt = renewedDeadline

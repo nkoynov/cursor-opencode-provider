@@ -155,6 +155,18 @@ describe("held Run lease while the host still runs a tool", () => {
     expect(session.closed).toBe(true)
   })
 
+  it("keeps holding the Run for a running tool after Cursor aborts a sibling exec of its step", () => {
+    const { clock, tracker, manager } = leaseFixture()
+    const session = heldSession("ses_aborted_sibling")
+    manager.registerPending(1, session, "shell_result", "shell")
+    manager.registerPending(2, session, "shell_result", "shell")
+    tracker.toolStarted("ses_aborted_sibling", `cursor_${session.sessionId}_2`, clock.now())
+    manager.markExecAborted(session, 1)
+
+    clock.advance(40 * MINUTE)
+    expect(session.closed).toBe(false)
+  })
+
   it("sees a tool the plugin's separate copy of the module recorded", async () => {
     const pluginCopy = await import(`../src/activity.js?copy=${Date.now()}`) as typeof import("../src/activity.js")
     const { sessionActivity } = await import("../src/activity.js")
