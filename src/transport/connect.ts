@@ -405,7 +405,13 @@ const WRITE_DRAIN_TIMEOUT_CODE = "CURSOR_WRITE_DRAIN_TIMEOUT"
 const WRITE_SLICE_BYTES = 64 * 1024
 // Node and Bun fail every new stream with ENHANCE_YOUR_CALM once a session's unsent bytes pass
 // maxSessionMemory (10 MB by default), and all Runs share one session; slicing bounds each Run's share.
-const RUN_SESSION_OPTIONS = { maxSessionMemory: 256 } satisfies http2.ClientSessionOptions
+// Node and Bun default to 64 KiB receive windows: Cursor's MB-sized set_blob frames then arrive at one window per RTT.
+export const RUN_STREAM_WINDOW_BYTES = 8 * 1024 * 1024
+export const RUN_SESSION_WINDOW_BYTES = 16 * 1024 * 1024
+const RUN_SESSION_OPTIONS = {
+  maxSessionMemory: 256,
+  settings: { initialWindowSize: RUN_STREAM_WINDOW_BYTES },
+} satisfies http2.ClientSessionOptions
 export const HTTP2_SESSION_MAX_AGE_MS = 15 * 60_000
 // Cursor CLI pings an agent connection before use only after 10 s without a response or ping reply.
 export const HTTP2_SESSION_LIVE_WINDOW_MS = 10_000
@@ -644,6 +650,14 @@ function validateCachedSession(
   })
 }
 
+function raiseSessionWindow(session: http2.ClientHttp2Session): void {
+  try {
+    session.setLocalWindowSize(RUN_SESSION_WINDOW_BYTES)
+  } catch (error) {
+    trace(`h2 session window not raised: ${errorMessage(error)}`)
+  }
+}
+
 function connectSession(origin: string): Promise<http2.ClientHttp2Session> {
   return new Promise((resolve, reject) => {
     let settled = false
@@ -696,7 +710,8 @@ function connectSession(origin: string): Promise<http2.ClientHttp2Session> {
       tunnelSocket = undefined
       cacheReadySession(origin, session)
       noteSessionInbound(session)
-      trace(`h2 session connected: origin=${origin}`)
+      raiseSessionWindow(session)
+      trace(`h2 session connected: origin=${origin} localWindow=${session.state?.localWindowSize ?? "?"}`)
       resolve(session)
     }
     const timer = setTimeout(() => {
