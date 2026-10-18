@@ -992,6 +992,8 @@ export function createCursorLanguageModel(
     try {
       return await doStreamImpl(modelId, options, callOptions, retryPolicy, retryBudget)
     } catch (error) {
+      // Already shaped for the host, such as the 413 that makes it compact.
+      if (APICallError.isInstance(error)) throw error
       const failure = toCursorProviderError(error, { replaySafe: true, fallback: "Cursor Run setup failed" })
       try {
         if (callOptions.abortSignal?.aborted) {
