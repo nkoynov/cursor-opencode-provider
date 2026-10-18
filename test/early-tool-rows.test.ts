@@ -342,6 +342,11 @@ describe("early edit rows", () => {
     const callId = "edit-outside"
     const { session, parts } = pumpSession([
       partial(callId, outside),
+      encodeMessage("AgentServerMessage", {
+        interaction_update: {
+          tool_call_started: { call_id: callId, tool_call: { edit_tool_call: { args: { path: outside } } } },
+        },
+      }),
       // Outside the workspace, the edit's private read goes through the host's permission-aware read.
       encodeMessage("AgentServerMessage", {
         exec_server_message: { id: 3, read_args: { path: outside, tool_call_id: callId } },
@@ -370,6 +375,11 @@ describe("early edit rows", () => {
     fs.symlinkSync(outside, link)
     const { session, parts } = pumpSession([
       partial("edit-link", link),
+      encodeMessage("AgentServerMessage", {
+        interaction_update: {
+          tool_call_started: { call_id: "edit-link", tool_call: { edit_tool_call: { args: { path: link } } } },
+        },
+      }),
       encodeMessage("AgentServerMessage", {
         exec_server_message: { id: 6, read_args: { path: link, tool_call_id: "edit-link" } },
       }),
