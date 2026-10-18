@@ -4498,8 +4498,10 @@ export function continuationAfterEarlySteers(
   if (steers.length === 0 && newTexts.length === 0) return undefined
   const results = extractTrailingToolResults([...prompt.slice(0, tail.start), ...tail.notes])
   if (results.length === 0 || findContinuationSession(results) !== held) return undefined
-  const injectNew = steers.length === 0 && heldRunTakesSteers(held, results, guard)
-  if (steers.length === 0 && !injectNew) return undefined
+  const takesSteers = steers.length === 0 && heldRunTakesSteers(held, results, guard)
+  if (steers.length === 0 && !takesSteers) return undefined
+  // A deferred later call of the step would run after a message the model already sees.
+  const injectNew = takesSteers && !hasDeferredToolExecs(held.toolCallOrder)
   // The host has already promoted these messages. Inject them, or keep them for a follow-up after the
   // held turn, rather than superseding its tool results or dropping all but the last user message.
   const added: EarlySteer[] = []
@@ -7247,8 +7249,6 @@ function heldRunTakesSteers(
 ): boolean {
   if (!guard?.userStep || held.closed || held.hostInterrupted || !held.runId) return false
   if (sessionManager.isActivelyPumping(held) || isProperCatalogSubset(guard.incomingTools, held.toolCatalog ?? [])) return false
-  // A deferred later call would run after the message the model sees as newer.
-  if (hasDeferredToolExecs(held.toolCallOrder)) return false
   const heldModel = held.cacheDiagnostics?.modelId
   if (heldModel !== undefined && heldModel !== guard.wireModelId) return false
   if (results.some((r) => r.sessionId !== held.sessionId || held.pending.get(r.execId)?.state !== "pending")) return false

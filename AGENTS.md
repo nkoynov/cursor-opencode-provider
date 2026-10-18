@@ -164,8 +164,9 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   has asked the host for nothing since it (`earlierCheckpointStale`: a pending
   exec or a query the provider answered). The attempt's own checkpoint resumes
   unless a query the provider answered came after it
-  (`interactionAfterCheckpoint`). A held Run takes no promoted steer while a
-  later exec of its step is still deferred (`heldRunTakesSteers`).
+  (`interactionAfterCheckpoint`). A promoted steer is not injected while a
+  later exec of its step is still deferred; it goes as a follow-up Run
+  (`continuationAfterEarlySteers`).
 
 ## Context, identity and persistence
 

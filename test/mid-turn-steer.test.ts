@@ -207,6 +207,19 @@ describe("mid-turn user message after a complete step", () => {
     }
   })
 
+  it("keeps the message for a follow-up while a later call of the step is still deferred", () => {
+    const held = heldReads("deferred")
+    held.toolCallOrder = {
+      calls: [{ callId: "call_3", mutating: true }],
+      deferred: [{ execId: 3, callId: "call_3", mutating: true, read: { done: true, value: undefined } }],
+      progressAt: Date.now(),
+    }
+    const found = steered(steer("deferred", user("b")))!
+    expect(found.results.map((r) => r.execId)).toEqual([1, 2])
+    expect(found.messages).toEqual([])
+    expect(steered(steer("deferred", user("b")))?.messages).toEqual([])
+  })
+
   it("accepts a step whose results have no text slot", () => {
     const held = heldSession("writes")
     sessionManager.registerPending(1, held, "write_result", "write", false, { path: "/w/out.ts" })
@@ -316,18 +329,6 @@ describe("cases that stay a fresh turn", () => {
   it("a held Run still waiting on another exec", () => {
     heldReads("partial", [1, 2, 3])
     expect(steered(steer("partial", user("b")))).toBeUndefined()
-  })
-
-  it("a held Run with a later call's exec still deferred behind the results", () => {
-    const held = heldReads("deferred")
-    held.toolCallOrder = {
-      calls: [{ callId: "cursor_deferred_3", mutating: true }],
-      deferred: [{ execId: 3, callId: "cursor_deferred_3", mutating: true, read: { done: true, value: undefined } }],
-      progressAt: Date.now(),
-    }
-    expect(steered(steer("deferred", user("b")))).toBeUndefined()
-    held.toolCallOrder = undefined
-    expect(steered(steer("deferred", user("b")))?.messages).toEqual(["b"])
   })
 
   it("a held Run without a known run id", () => {
@@ -440,6 +441,32 @@ describe("doStream with a mid-turn user message", () => {
       "reasoning-start", "reasoning-delta:checking 3.ts", "reasoning-end",
       "text-start", "text-delta:\n\nok", "text-end",
     ])
+  })
+
+  it("runs a deferred later call of the step before the message, which goes as a follow-up Run", async () => {
+    const held = heldReads("deferred-stream")
+    held.resumeCheckpoint = new Uint8Array([1])
+    held.toolCallOrder = {
+      calls: [{ callId: "call_1", mutating: false }, { callId: "call_2", mutating: false }, { callId: "call_3", mutating: true }],
+      deferred: [{
+        execId: 3, callId: "call_3", mutating: true,
+        read: { done: false, value: serverFrame({ text_delta: { text: "Deferred call ran." } }) },
+      }],
+      progressAt: Date.now(),
+    }
+    const followUps: string[] = []
+    held.reopenWithUserMessage = async (text) => {
+      followUps.push(text)
+      serve(held, [() => serverFrame({ text_delta: { text: "ok" } }), turnEnded])
+    }
+    serve(held, [completed("call_1"), completed("call_2"), checkpoint, turnEnded])
+
+    const { parts } = await streamSteer(held, steer("deferred-stream", user("also check 3.ts")))
+
+    expect(injections(held.writes)).toEqual([])
+    expect(followUps).toEqual(["also check 3.ts"])
+    const texts = parts.filter((part: any) => part.type === "text-delta").map((part: any) => part.delta)
+    expect(texts).toEqual(["Deferred call ran.", "\n\nok"])
   })
 
   it("keeps the step unfinished while a steer's follow-up Run continues it, so a Stop there keeps the conversation", async () => {
