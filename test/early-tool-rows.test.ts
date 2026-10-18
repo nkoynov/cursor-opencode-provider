@@ -408,6 +408,10 @@ describe("early edit rows", () => {
     expect(editReadGoesToHost(path.join(path.dirname(outside), "missing.txt"), workspace)).toBe(false)
     expect(editReadGoesToHost(outside, workspace)).toBe(true)
     expect(editReadGoesToHost(path.join(workspace, "link.txt"), workspace)).toBe(true)
+    // An empty file outside the workspace also has its read sent to the host, so it gets no early `write` row.
+    const emptyOutside = path.join(path.dirname(outside), "empty.txt")
+    fs.writeFileSync(emptyOutside, "")
+    expect(editReadGoesToHost(emptyOutside, workspace)).toBe(true)
   })
 
   it("closes the row when the exec is a different tool", async () => {
