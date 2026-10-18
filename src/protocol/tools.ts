@@ -2115,8 +2115,7 @@ export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
     frames.push(encodeShellStream(input.execId, undefined, { start: {} }))
     // Retain progress even when the host also reports a failure or interruption.
     // A command may change directories; stdout must reach Cursor unchanged.
-    // Fork: a failure without captured output repeats its error text as output; that goes out as stderr only.
-    if (input.output && input.output !== input.error) {
+    if (input.output) {
       frames.push(encodeShellStream(input.execId, undefined, { stdout: { data: input.output } }))
     }
     if (input.error) {
