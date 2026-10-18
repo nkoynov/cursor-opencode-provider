@@ -5,7 +5,7 @@ import type { HostToolDialect } from "./protocol/tools.js"
 import type { AccessTokenProvider } from "./auth-renewal.js"
 
 export type CursorRetryOptions = {
-  /** Total attempts including the initial request. Default: 3, or 6 when Cursor refuses the Run for capacity; set, it caps both. */
+  /** Optional total attempt ceiling (including the initial request), across host retries; set, it also caps capacity refusals (default 6 attempts). */
   maxAttempts?: number
   /** Initial full-jitter backoff ceiling; capacity refusals start at four times this. Default: 500ms. */
   baseDelayMs?: number
@@ -45,7 +45,7 @@ export type CreateCursorOptions = {
   cacheDir?: string
   /** Held-stream policy. Defaults: heartbeat 5s, semantic idle 120s, tool inactivity 10m. */
   continuation?: CursorContinuationOptions
-  /** Fresh-turn retry policy. Defaults: 3 attempts, 500ms base, 8000ms cap. */
+  /** Run retry policy. Defaults: 10 transport / 3 server retries, 500ms base, 8000ms delay cap. */
   retry?: CursorRetryOptions
   /** Fallback host dialect when schemas are omitted or ambiguous. Default: OpenCode 1.x. */
   defaultDialect?: HostToolDialect

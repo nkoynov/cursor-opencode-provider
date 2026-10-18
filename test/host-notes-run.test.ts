@@ -19,7 +19,7 @@ import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests } from "../
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { sessionManager } from "../src/session.js"
 import { notifyHostInterrupt } from "../src/host-interrupt.js"
-import { resetTurnStateForTests, restorePersistedHostNotes } from "../src/language-model.js"
+import { resetTurnStateForTests, restorePersistedHostNotes, settleRunSavesForTests } from "../src/language-model.js"
 import { encodePersistedHostNotes } from "../src/protocol/host-notes.js"
 import { peekConversationId, resetConversationBindingsForTests, sessionIdToUuid } from "../src/protocol/conversation-bind.js"
 import { getCheckpoint, resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
@@ -211,7 +211,7 @@ describe("seeded Runs through a full provider Run", () => {
       const rules = request.action.user_message_action.request_context.rules as Array<{ content: string }>
       expect(rules).toHaveLength(1)
       expect(rules[0]!.content).toStartWith("Host system prompt: build with bazel.")
-    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+    } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
   }, 30_000)
 })
 
@@ -257,7 +257,7 @@ describe("history images through a full provider Run", () => {
 
   async function withRoot(run: (root: string) => Promise<void>): Promise<void> {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-history-images-"))
-    try { await run(root) } finally { fs.rmSync(root, { recursive: true, force: true }) }
+    try { await run(root) } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
   }
 
   it("attaches an explicit image once, and not again after a restart", () => withRoot(async (root) => {
@@ -543,7 +543,7 @@ describe("compaction Runs through a full provider Run", () => {
         expect((error as APICallError).message).not.toMatch(/prompt is too long/i)
       }
       expect(runs).toHaveLength(0)
-    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+    } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
   }, 30_000)
 
   it("sends a compaction request that fits, with the history and the summary prompt last", async () => {
@@ -566,7 +566,7 @@ describe("compaction Runs through a full provider Run", () => {
         .action.user_message_action.user_message.text as string
       expect(text).toContain(transcript)
       expect(text).toEndWith(SUMMARY_PROMPT)
-    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+    } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
   }, 30_000)
 })
 
@@ -634,7 +634,7 @@ describe("host notes through a full provider Run", () => {
         expect(after.action.user_message_action.user_message.text).not.toContain("<conversation_history>")
       } else expect(after.conversation_id).not.toBe(before.conversation_id)
       expect(after.action.user_message_action.user_message.text).toContain("Answer this new message without reading again.")
-    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+    } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
   }
 
   // The fork delivers a result that is not an interruption on the held Run and injects the next message as a steer.
@@ -674,7 +674,7 @@ describe("host notes through a full provider Run", () => {
       const injections = runs[0]!.received.filter((received) => received.conversation_action?.inject_context_action)
       expect(injections.map((received) => received.conversation_action.inject_context_action.user_context.user_message.text))
         .toEqual([message])
-    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+    } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
   }
 
   it("keeps the checkpoint after a native abort result is followed by a new user turn", async () => {
@@ -761,7 +761,7 @@ describe("host notes through a full provider Run", () => {
       const injections = runs[0]!.received.filter((message) => message.conversation_action?.inject_context_action)
       expect(injections).toHaveLength(1)
       expect(injections[0]!.conversation_action.inject_context_action.user_context.user_message.text).toBe(notices.join("\n\n"))
-    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+    } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
   }, 30_000)
 
   it("lifts read instructions when their pending result arrives with a mid-step user message", async () => {
@@ -804,7 +804,7 @@ describe("host notes through a full provider Run", () => {
       expect(steers.map((message) => message.conversation_action.inject_context_action.user_context.user_message.text))
         .toEqual([instruction, "Which build command should I use?"])
       expect(runs).toHaveLength(1)
-    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+    } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
   }, 30_000)
 
   it("rebases a fresh turn when finishing the prior Run throws", async () => {
@@ -842,7 +842,7 @@ describe("host notes through a full provider Run", () => {
       ] as Prompt, sessionKey)
       expect(textOf(second)).toBe("Recovered after the prior drain failed.")
       expect(runs.length).toBeGreaterThan(1)
-    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+    } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
   }, 30_000)
 
   it("delivers a completed result and steers the held Run when the next message carries tools", async () => {
@@ -894,7 +894,7 @@ describe("host notes through a full provider Run", () => {
       // A tool-less lifecycle Run remains ephemeral and cannot rotate the
       // owning conversation's binding merely because preparation was busy.
       if (!toolsEnabled) expect(peekConversationId(sessionKey)).toBe(previous.conversation_id)
-    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+    } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
   }, 30_000)
 
   it("preserves a deferred note missing from rewritten history across an early Run failure", async () => {
@@ -925,6 +925,7 @@ describe("host notes through a full provider Run", () => {
           .toContain("<system_reminder>\nUse bazel for builds.\n</system_reminder>")
       }
     } finally {
+      await settleRunSavesForTests()
       fs.rmSync(root, { recursive: true, force: true })
     }
   }, 30_000)
@@ -955,7 +956,7 @@ describe("host notes through a full provider Run", () => {
       expect(text).toStartWith("<conversation_history>\n")
       expect(text.split("Use bazel.")).toHaveLength(2)
       expect(text).not.toContain("<system_reminder>")
-    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+    } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
   }, 30_000)
 
   it("still sends a deferred read instruction when the replay budget cuts the result that carried it", async () => {
@@ -984,7 +985,7 @@ describe("host notes through a full provider Run", () => {
       expect(text).toContain("more characters left out of this replay")
       expect(text.split("Use bazel.")).toHaveLength(2)
       expect(text).toContain("<system_reminder>")
-    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+    } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
   }, 30_000)
 
   it("injects a mid-step OpenCode 2 instruction once and carries a between-turns update with the next message", async () => {
@@ -1057,6 +1058,7 @@ describe("host notes through a full provider Run", () => {
       expect(userText).not.toContain("builds with bazel")
       expect(runs[1]!.received.filter((message) => message.conversation_action?.inject_context_action)).toEqual([])
     } finally {
+      await settleRunSavesForTests()
       fs.rmSync(root, { recursive: true, force: true })
     }
   }, 30_000)

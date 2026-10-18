@@ -288,99 +288,86 @@ describe("a tool input Cursor holds until the model has written it", () => {
   })
 })
 
-describe("resuming again from the checkpoint a Run resumed from", () => {
-  const carried = Uint8Array.from([0x0a, 0x01, 0x07])
+describe("resuming again from the turn's checkpoint", () => {
+  const first = [0x0a, 0x01, 0x07]
+  const checkpointed = (id: string) => fakeSession(id, [
+    { frame: text("partial") },
+    { frame: checkpoint(first) },
+    { frame: endStreamError("internal") },
+  ])
+  const resumed = (recovery: CursorRunRecovery | undefined) =>
+    Array.from((recovery as { checkpoint: Uint8Array }).checkpoint)
 
-  it("resumes it after visible output instead of giving up", async () => {
+  it("resumes it after visible output when the resumed Run fails before a newer one", async () => {
     const recoveries: CursorRunRecovery[] = []
-    const parts: any[] = []
     const final = await pumpWithRecovery({
-      initialSession: fakeSession("resumed", [
-        { frame: text("partial") },
-        { frame: endStreamError("internal") },
-      ], { carriedCheckpoint: carried }),
-      controller: controller(parts),
+      initialSession: checkpointed("first"),
+      controller: controller(),
       retryPolicy: noDelay,
       recover: async (recovery) => {
         recoveries.push(recovery)
-        return fakeSession("resumed-again", [{ frame: text(" rest") }, { frame: turnEnded() }])
+        return recoveries.length === 1
+          ? fakeSession("resumed", [{ frame: text(" more") }, { frame: endStreamError("internal") }])
+          : fakeSession("resumed-again", [{ frame: text(" rest") }, { frame: turnEnded() }])
       },
     })
     expect(final.sessionId).toBe("resumed-again")
-    expect(recoveries).toHaveLength(1)
-    expect(recoveries[0]).toMatchObject({ kind: "resume", conversationId: "conv-resumed" })
-    expect(Buffer.from((recoveries[0] as { checkpoint: Uint8Array }).checkpoint)).toEqual(Buffer.from(carried))
+    expect(recoveries.map((recovery) => recovery.kind)).toEqual(["resume", "resume"])
+    expect(resumed(recoveries[1])).toEqual(first)
   })
 
   it("prefers a checkpoint the resumed Run received", async () => {
     const recoveries: CursorRunRecovery[] = []
-    const session = fakeSession("resumed-newer", [
-      { frame: text("partial") },
-      { frame: checkpoint([0x0a, 0x01, 0x09]) },
-      { frame: endStreamError("internal") },
-    ], { carriedCheckpoint: carried })
     await pumpWithRecovery({
-      initialSession: session,
+      initialSession: checkpointed("first-newer"),
       controller: controller(),
       retryPolicy: noDelay,
       recover: async (recovery) => {
         recoveries.push(recovery)
-        return fakeSession("after-newer", [{ frame: turnEnded() }])
+        return recoveries.length === 1
+          ? fakeSession("resumed-newer", [
+            { frame: text(" more") },
+            { frame: checkpoint([0x0a, 0x01, 0x09]) },
+            { frame: endStreamError("internal") },
+          ])
+          : fakeSession("after-newer", [{ frame: turnEnded() }])
       },
     })
-    expect(session.carriedCheckpoint).toBeUndefined()
-    expect(Array.from((recoveries[0] as { checkpoint: Uint8Array }).checkpoint)).toEqual([0x0a, 0x01, 0x09])
+    expect(resumed(recoveries[1])).toEqual([0x0a, 0x01, 0x09])
   })
 
-  it("rebases a replay-safe failure as before", async () => {
-    const recoveries: CursorRunRecovery[] = []
-    await pumpWithRecovery({
-      initialSession: fakeSession("resumed-safe", [{ frame: endStreamError("internal") }], { carriedCheckpoint: carried }),
-      controller: controller(),
-      retryPolicy: noDelay,
-      recover: async (recovery) => {
-        recoveries.push(recovery)
-        return fakeSession("rebased", [{ frame: turnEnded() }])
-      },
-    })
-    expect(recoveries).toEqual([{ kind: "rebase" }])
-  })
-
-  it("drops it once the Run asks the host for anything", () => {
-    const session = fakeSession("asked-host", [], { carriedCheckpoint: carried })
+  it("marks an earlier checkpoint stale once the Run asks the host for anything", () => {
+    const session = fakeSession("asked-host", [])
     sessionManager.registerPending(1, session, "shell_result", "bash")
-    expect(session.carriedCheckpoint).toBeUndefined()
+    expect(session.earlierCheckpointStale).toBe(true)
     sessionManager.close(session)
   })
 
-  it("drops it once the Run answers an interaction query", async () => {
-    const session = fakeSession("queried", [
-      { frame: frame({ interaction_query: { id: 4, web_search_request_query: new Uint8Array() } }) },
-      { frame: text("partial") },
-      { frame: endStreamError("internal") },
-    ], { carriedCheckpoint: carried })
+  it("does not resume it once the resumed Run answers an interaction query", async () => {
+    const recoveries: CursorRunRecovery[] = []
     await expect(pumpWithRecovery({
-      initialSession: session,
+      initialSession: checkpointed("first-queried"),
       controller: controller(),
       retryPolicy: noDelay,
-      recover: async () => fakeSession("unused", [{ frame: turnEnded() }]),
-    })).rejects.toThrow("automatic retry unsafe")
-    expect(session.carriedCheckpoint).toBeUndefined()
+      recover: async (recovery) => {
+        recoveries.push(recovery)
+        return fakeSession("queried", [
+          { frame: frame({ interaction_query: { id: 4, web_search_request_query: new Uint8Array() } }) },
+          { frame: text("partial") },
+          { frame: endStreamError("internal") },
+        ])
+      },
+    })).rejects.toMatchObject({ hostRetryable: true })
+    expect(recoveries).toHaveLength(1)
   })
 
-  it("drops it when the turn ends", async () => {
-    const session = fakeSession("turn-done", [{ frame: turnEnded() }], { carriedCheckpoint: carried })
-    await pump(session, controller(), ids)
-    expect(session.carriedCheckpoint).toBeUndefined()
-  })
-
-  it("gives up after visible output when nothing was carried", async () => {
+  it("leaves a drop after visible output to the host when the turn has no checkpoint", async () => {
     await expect(pumpWithRecovery({
       initialSession: fakeSession("fresh", [{ frame: text("partial") }, { frame: endStreamError("internal") }]),
       controller: controller(),
       retryPolicy: noDelay,
       recover: async () => fakeSession("unused", [{ frame: turnEnded() }]),
-    })).rejects.toThrow("automatic retry unsafe")
+    })).rejects.toMatchObject({ hostRetryable: true })
   })
 })
 
@@ -421,7 +408,7 @@ describe("capacity failures", () => {
   })
 
   it("gives capacity refusals six attempts unless maxAttempts is set", () => {
-    expect(resolveRetryPolicy(undefined)).toMatchObject({ maxAttempts: 3, capacityMaxAttempts: 6 })
+    expect(resolveRetryPolicy(undefined)).toMatchObject({ maxAttempts: undefined, capacityMaxAttempts: 6 })
     expect(resolveRetryPolicy({ maxAttempts: 2 })).toMatchObject({ maxAttempts: 2, capacityMaxAttempts: 2 })
   })
 

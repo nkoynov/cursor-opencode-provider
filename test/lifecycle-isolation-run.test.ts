@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test"
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test"
 import fs from "node:fs"
 import http2 from "node:http2"
 import net from "node:net"
@@ -10,10 +10,11 @@ import { decodeFramePayload } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
 import { sessionManager } from "../src/session.js"
-import { resetTurnStateForTests } from "../src/language-model.js"
+import { resetTurnStateForTests, settleRunSavesForTests } from "../src/language-model.js"
 import { resetConversationBindingsForTests } from "../src/protocol/conversation-bind.js"
 import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
+import { getHostCacheDirOverride, setHostCacheDirOverride } from "../src/context/paths.js"
 
 const ORIGIN = "https://agentn.lifecycle-isolation-test.cursor.sh"
 const PROXY_KEYS = ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"] as const
@@ -94,7 +95,13 @@ afterAll(async () => {
   }
 })
 
+// `createCursor({ cacheDir })` sets the process-wide host cache root; a later
+// test would write into this file's removed temp dir.
+let previousCache: string | undefined
+beforeEach(() => { previousCache = getHostCacheDirOverride() })
+
 afterEach(() => {
+  setHostCacheDirOverride(previousCache)
   sessionManager.dispose()
   resetTurnStateForTests()
   resetConversationPersistenceForTests()
@@ -146,6 +153,10 @@ describe("tool-less lifecycle call beside a held Run", () => {
       // No cancel result and no cancel action reached the parent Run.
       expect(parentWrites.filter((kind) => kind !== "client_heartbeat" && kind !== "exec_client_control_message")).toEqual([])
     } finally {
+      // The parent Run is still held for its tool and saves its state after a
+      // second; close it and wait for that save, or it recreates the root.
+      sessionManager.dispose()
+      await settleRunSavesForTests()
       fs.rmSync(root, { recursive: true, force: true })
     }
   }, 30_000)

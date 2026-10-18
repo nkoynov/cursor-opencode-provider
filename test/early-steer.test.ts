@@ -13,12 +13,12 @@ import { createCursor } from "../src/index.js"
 import { decodeFramePayload } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { buildHeartbeat } from "../src/protocol/request.js"
-import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
+import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests, lastFrameArrival } from "../src/transport/connect.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { sessionManager, type CursorSession } from "../src/session.js"
 import { resetTurnProvenanceForTests } from "../src/protocol/turn-provenance.js"
 import { resetConversationBlobsForTests } from "../src/protocol/blob-store.js"
-import { resetTurnStateForTests, settleTerminalCheckpointSavesForTests } from "../src/language-model.js"
+import { resetTurnStateForTests, settleRunSavesForTests, settleTerminalCheckpointSavesForTests } from "../src/language-model.js"
 import { resetConversationBindingsForTests } from "../src/protocol/conversation-bind.js"
 import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { getPersistedConversation, resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
@@ -233,6 +233,7 @@ async function withModel(
       retry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 },
     }).languageModel("composer-2.5"), root)
   } finally {
+    await settleRunSavesForTests()
     fs.rmSync(root, { recursive: true, force: true })
   }
 }
@@ -840,7 +841,7 @@ describe("a steer sent while Cursor waits inside a step", () => {
     })
   }, 30_000)
 
-  for (const mode of ["taken", "not taken", "follow-up fails", "follow-up drops"] as const) {
+  for (const mode of ["taken", "not taken", "follow-up fails", "follow-up drops", "follow-up checkpoint"] as const) {
     it(`continues the held Run when OpenCode adds its copy after the step's tool results (${mode})`, async () => {
       const delivered = mode === "taken"
       await withModel(`tools-${mode.replaceAll(" ", "-")}`, async (model, cacheDir) => {
@@ -857,6 +858,10 @@ describe("a steer sent while Cursor waits inside a step", () => {
               if (delivered) injectionState(run, injectionId, "delivered")
               completeRead(run)
               endTurn(run, delivered ? "Read it. STEERED" : "Read it.")
+            } else if (message.run_request && mode === "follow-up checkpoint" && runs.indexOf(run) === 1) {
+              run.send({ conversation_checkpoint_update: Uint8Array.of(10, 1, 42) })
+              run.send({ interaction_update: { thinking_delta: { text: "Taking the follow-up" } } })
+              run.end("unavailable")
             } else if (message.run_request && mode === "follow-up drops" && runs.indexOf(run) === 1) {
               // The follow-up Run drops before any checkpoint holds the steer.
               run.send({ interaction_update: { text_delta: { text: "STEER" } } })
@@ -872,6 +877,15 @@ describe("a steer sent while Cursor waits inside a step", () => {
         if (mode === "follow-up fails") {
           sessionManager.findOpenByOpenCodeSessionId(sessionKey)!.reopenWithUserMessage = async () => {
             throw new Error("connection refused")
+          }
+        }
+        if (mode === "follow-up checkpoint") {
+          const session = sessionManager.findOpenByOpenCodeSessionId(sessionKey)!
+          const reopen = session.reopenWithUserMessage!
+          session.reopenWithUserMessage = async (text, signal) => {
+            const before = lastFrameArrival()
+            await reopen(text, signal)
+            await waitFor(() => lastFrameArrival() > before, "the follow-up checkpoint before reopen returns")
           }
         }
         const step = readStep(call, file, message.text)
@@ -892,6 +906,18 @@ describe("a steer sent while Cursor waits inside a step", () => {
           return
         }
         const second = await continuation
+        if (mode === "follow-up checkpoint") {
+          expect(runs).toHaveLength(3)
+          expect(userText(runs[1]!)).toBe(message.text)
+          expect(runs[2]!.received[0]!.run_request).toMatchObject({
+            action: { resume_action: {} }, conversation_state: Uint8Array.of(10, 1, 42),
+            conversation_id: runs[0]!.received[0]!.run_request.conversation_id,
+          })
+          expect(textOf(second)).toStartWith("Read it.")
+          expect(textOf(second)).toEndWith("STEERED")
+          expect(runs[0]!.received.filter(m => m.exec_client_message?.read_result)).toHaveLength(1)
+          return
+        }
         expect(runs[0]!.received.filter((m) => m.exec_client_message?.read_result)).toHaveLength(1)
         expect(runs[0]!.received.filter((m) => m.conversation_action?.cancel_action)).toEqual([])
         expect(injectionsOf(runs[0]!)).toHaveLength(1)

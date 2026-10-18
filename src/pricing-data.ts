@@ -310,6 +310,11 @@ export const CURSOR_MODEL_COSTS = {
     "input": 1.25,
     "output": 4.25,
     "cache_read": 0.15
+  },
+  "muse-wonder-1.0": {
+    "input": 4,
+    "output": 20,
+    "cache_read": 0.2
   }
 } as const
 
@@ -475,6 +480,10 @@ export const CURSOR_MODEL_CONTEXTS = {
   "muse-spark-1.3": {
     "maxContext": 300000,
     "maxContextForMaxMode": 1000000
+  },
+  "muse-wonder-1.0": {
+    "maxContext": 300000,
+    "maxContextForMaxMode": 1000000
   }
 } as const
 
@@ -609,6 +618,9 @@ export const CURSOR_MODEL_CAPABILITIES = {
     "supportsImages": true
   },
   "muse-spark-1.3": {
+    "supportsImages": true
+  },
+  "muse-wonder-1.0": {
     "supportsImages": true
   }
 } as const

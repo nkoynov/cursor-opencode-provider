@@ -514,6 +514,52 @@ describe("parallel tool-call pump", () => {
     expect(session.closed).toBe(true)
   })
 
+  it.each([false, true])("keeps a completed host tool as a replay barrier in the next pump (prior checkpoint: %s)", async checkpointed => {
+    const { session } = fixture([
+      ...(checkpointed ? [frame({ conversation_checkpoint_update: Uint8Array.of(10, 1, 1) })] : []),
+      shell(1), text("after the command"),
+    ])
+    const first = collect()
+    await pump(session, first.controller, ids)
+    const call = toolCalls(first.parts)[0]!
+    expect(call).toBeDefined()
+    await deliverContinuationResults(session, [{
+      toolCallId: call.toolCallId, sessionId: session.sessionId, execId: 1,
+      toolName: call.toolName, output: "command completed",
+    }])
+    const failure = await pumpWithRecovery({
+      initialSession: session,
+      controller: collect().controller,
+      recover: async () => { throw new Error("A completed command must not be replayed") },
+    }).catch((error: unknown) => error)
+    expect(failure).toMatchObject({ retryable: false, replaySafe: false })
+    expect((failure as { hostRetryable?: boolean }).hostRetryable).toBeUndefined()
+  })
+
+  it("resumes a checkpoint received after a completed host tool result", async () => {
+    const checkpoint = Uint8Array.of(10, 1, 2)
+    const { session } = fixture([
+      shell(1), frame({ conversation_checkpoint_update: checkpoint }), text("after the result"),
+    ])
+    const first = collect()
+    await pump(session, first.controller, ids)
+    const call = toolCalls(first.parts)[0]!
+    await deliverContinuationResults(session, [{
+      toolCallId: call.toolCallId, sessionId: session.sessionId, execId: 1,
+      toolName: call.toolName, output: "command completed",
+    }])
+    const recoveries: unknown[] = []
+    await pumpWithRecovery({
+      initialSession: session,
+      controller: collect().controller,
+      recover: async recovery => {
+        recoveries.push(recovery)
+        return fixture([ended()]).session
+      },
+    })
+    expect(recoveries).toEqual([{ kind: "resume", conversationId: session.conversationId, checkpoint }])
+  })
+
   it("retains a guard-timed-out iterator read for the continuation", async () => {
     await noteToolRequestsListedSeen()
     const { session } = fixture([])

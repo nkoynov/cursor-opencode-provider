@@ -1,3 +1,4 @@
+import "./node-tmpdir.mjs"
 import assert from "node:assert/strict"
 import http2 from "node:http2"
 import net from "node:net"

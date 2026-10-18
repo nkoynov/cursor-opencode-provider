@@ -829,6 +829,59 @@ export function remapNativeSubagentForCatalog(
 const MAX_EDIT_SOURCE_BYTES = 50 * 1024 * 1024
 
 /**
+ * Who answers the private read Cursor sends under an edit's call id. Both the
+ * exec handler and the early tool row decide from this, so a row never opens
+ * for an edit whose read becomes its own host call.
+ *
+ * - `empty`: no target. The provider answers an empty file; creation continues.
+ * - `complete`: a readable regular file within Cursor's edit limit whose real
+ *   path is inside the workspace. The provider answers its complete content.
+ * - `external`: an existing target not proven inside the workspace by real
+ *   path, including through a symlink rooted in it. OpenCode's
+ *   permission-aware `read` answers; once authorized, the continuation
+ *   upgrades the result to the complete content.
+ * - `host`: any other existing target (not a regular file, too large,
+ *   unreadable, or not stat-able). OpenCode's `read` answers as is.
+ */
+export type CursorEditReadAnswer = "empty" | "complete" | "external" | "host"
+
+export function cursorEditReadAnswer(absolutePath: string, workspaceRoot: string): CursorEditReadAnswer {
+  try {
+    fs.lstatSync(absolutePath)
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "empty" : "host"
+  }
+  // Do not bypass OpenCode's external-directory permission boundary.
+  let relative: string
+  try {
+    relative = path.relative(fs.realpathSync(workspaceRoot), fs.realpathSync(absolutePath))
+  } catch {
+    return "external"
+  }
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return "external"
+  try {
+    const stat = fs.statSync(absolutePath)
+    if (!stat.isFile() || stat.size > MAX_EDIT_SOURCE_BYTES) return "host"
+    fs.closeSync(fs.openSync(absolutePath, "r"))
+    return "complete"
+  } catch {
+    return "host"
+  }
+}
+
+/**
+ * The edit's private read becomes its own host `read` call. A read the edit
+ * handshake leaves to the host can still be answered by the provider's
+ * missing-target validation (a dangling symlink, a directory); that read
+ * never reaches the host.
+ */
+export function cursorEditReadReachesHost(absolutePath: string, workspaceRoot: string): boolean {
+  const answer = cursorEditReadAnswer(absolutePath, workspaceRoot)
+  if (answer !== "external" && answer !== "host") return false
+  return classifyMissingReadTarget(absolutePath) === undefined
+}
+
+/**
  * Complete the private read inside Cursor's legacy edit transaction without
  * routing it through OpenCode's user-facing `read` tool. The latter caps every
  * result at 50 KB, while Cursor's editor needs the complete file to calculate
@@ -1018,11 +1071,11 @@ function planWholeFileEdit(source: string, target: string): WholeFileEditReplace
 /**
  * Host tool a Cursor edit announcement will become, using the same file facts
  * as `remapCorrelatedEditWriteForCatalog` and `remapEditToolsForCatalog`. An
- * existing file becomes `edit`, else the patch tool. A missing or empty file
- * stays `write` (an empty source has no text an edit could replace), else
- * becomes the patch tool's Add File. A name
- * is withheld when those remaps would refuse the file or not produce that
- * tool: no workspace for a relative path, not a regular file, too large,
+ * existing file becomes `edit`, else the patch tool. A missing file is a
+ * creation, which stays `write`, else becomes the patch tool's Add File; so
+ * does an empty file, which has no text for an `edit` to replace. A name is
+ * withheld when those remaps would refuse the file or not produce that tool:
+ * no workspace for a relative path, not a regular file, too large,
  * unreadable, or `patch` with carriage returns.
  */
 export function hostToolForCursorEdit(
@@ -1044,24 +1097,6 @@ export function hostToolForCursorEdit(
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined
     return catalog.has("write") ? "write" : patchTool
-  }
-}
-
-/** Cursor's private read of an existing file outside the workspace, or one it can't read, goes to OpenCode's read tool, as its own host call. */
-export function editReadGoesToHost(filePath: string, workspaceRoot: string): boolean {
-  const absolute = path.resolve(workspaceRoot, filePath)
-  try {
-    fs.lstatSync(absolute)
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ENOENT"
-  }
-  try {
-    const relative = path.relative(fs.realpathSync(workspaceRoot), fs.realpathSync(absolute))
-    if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return true
-    fs.accessSync(absolute, fs.constants.R_OK)
-    return false
-  } catch {
-    return true
   }
 }
 

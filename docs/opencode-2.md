@@ -173,6 +173,8 @@ A prompt sent before those servers finish connecting will not see their tools. O
 Shell output keeps path-like text, whitespace and successful timeout-shaped
 text unchanged. Internal wrapper markers are removed without trimming command
 output, and failed shell streams retain partial output alongside their error.
+A host shell failure reaches Cursor once as stderr in streamed and unary
+results; distinct command output remains on stdout.
 
 The shell integration follows each host's execution order. OpenCode 1.18.31
 [checks permissions before `shell.env`](https://github.com/anomalyco/opencode/blob/v1.18.31/packages/opencode/src/tool/shell.ts#L599-L637).
@@ -206,6 +208,34 @@ removes `edit` / `write`. The provider accepts direct dynamic patch calls and
 converts Cursor-native file execs from the current permitted catalog. It refuses
 patch operations that would lose CRLF bytes before changing a file. Native
 `edit` / `write` remain unchanged when permitted; see [shared patch behavior](../README.md#apply_patch--patch-on-gpt-models).
+
+## Interrupted model requests
+
+OpenCode retries a transient failure after only text or reasoning when the
+turn has no new checkpoint. An unfinished tool display row also permits retry
+if no exec or started tool lifecycle arrived; it closes without execution.
+Stateful activity stays a replay barrier. Like Cursor CLI, an active Run with no
+pending host work fails after 30 s without an inbound frame; heartbeats and
+partial inputs renew that deadline, while client heartbeats do not. The 120 s
+transport read-idle watchdog remains a backstop. A drop immediately after
+completed tool results can rebuild from complete host history
+before new output; missing results or unrepresented activity remain final.
+Recovery retains the latest eligible checkpoint across token renewal, including
+a rejected credential on an untouched resumed attempt. Checkpoints received
+while a completed tool result drains remain eligible. Follow-ups retain
+checkpoints received while opening the new Run. Two resumed attempts that stream without saving a
+checkpoint end the turn.
+History recovery keeps completed results from earlier resumed Runs too.
+
+The provider shares Cursor CLI's limits of 10 transport retries and 3 server
+retries across this turn, including OpenCode's retries. OpenCode can stop earlier.
+The host's plain-text interruption notice does not reset the provider's budget,
+including appended `<system-reminder>` or `<system-update>` text parts.
+Only retry identity ignores these notes; Cursor still receives their content.
+Set `CURSOR_ENDLESS_RETRIES=1` or `true` before starting the host (or its daemon)
+to bypass count limits while retaining replay guards, Stop, final errors, the
+two-resume cutoff and the 180 s consecutive semantic-stall retry window.
+See [retry limits](../README.md#retry-limits) for classification and SDK options.
 
 ## Mid-turn steers and Stop
 

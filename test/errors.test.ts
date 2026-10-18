@@ -9,6 +9,8 @@ import {
   cursorGrpcError,
   cursorHttpError,
   hostFacingError,
+  hostRetryError,
+  noProgressResumeError,
   retrySuppressedError,
   sanitizeHostTerminalMessage,
   toCursorProviderError,
@@ -40,7 +42,7 @@ describe("Cursor provider errors", () => {
 
   it("strictly bounds retry policy options", () => {
     expect(resolveRetryPolicy(undefined)).toEqual({
-      maxAttempts: 3,
+      maxAttempts: undefined,
       baseDelayMs: 500,
       maxDelayMs: 8_000,
       capacityMaxAttempts: 6,
@@ -331,5 +333,34 @@ describe("Cursor provider errors", () => {
       expect((host as APICallError).cause).toBe(failure)
       expect(host.message).not.toContain("503")
     }
+  })
+
+  it("lets the host retry a turn that only showed output, as Cursor CLI resends the action", () => {
+    const cause = new CursorTransportError("Cursor Run transport interrupted", {
+      transient: true,
+      replaySafe: false,
+      code: "NGHTTP2_INTERNAL_ERROR",
+      retryAfterMs: 1_500,
+    })
+    const failure = hostRetryError(cause)
+    expect(failure).toMatchObject({ hostRetryable: true, transient: false, replaySafe: false })
+    expect(failure.retryable).toBeUndefined()
+    const host = hostFacingError(failure)
+    expect(APICallError.isInstance(host)).toBe(true)
+    // No status: OpenCode 2 then treats it as a transport failure and honours the header.
+    expect(host).toMatchObject({
+      statusCode: undefined,
+      isRetryable: true,
+      responseHeaders: { "x-should-retry": "true", "retry-after-ms": "1500" },
+    })
+    expect((host as APICallError).cause).toBe(failure)
+  })
+
+  it("ends the turn after resumes that made no progress, as Cursor CLI does", () => {
+    const cause = new CursorTransportError("Cursor Run transport interrupted", { transient: true, replaySafe: false })
+    const host = hostFacingError(noProgressResumeError(cause, 2))
+    expect(APICallError.isInstance(host)).toBe(true)
+    expect(host).toMatchObject({ isRetryable: false, responseHeaders: { "x-should-retry": "false" } })
+    expect(host.message).toContain("2 resume attempts made no progress")
   })
 })

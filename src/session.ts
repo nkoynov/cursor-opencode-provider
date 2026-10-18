@@ -18,6 +18,7 @@ import type { HostNoteBatch } from "./protocol/host-notes.js"
 import type { RunHistoryImages } from "./protocol/sent-history-images.js"
 import type { OpenCodeModelCost } from "./pricing.js"
 import type { RunCostEstimate } from "./billing.js"
+import type { ReplaySafetyState } from "./replay-safety.js"
 
 export type Frame = { flags: number; payload: Uint8Array }
 
@@ -38,7 +39,8 @@ export type CursorContinuationPolicy = {
 }
 
 export const DEFAULT_CONTINUATION_POLICY: Readonly<CursorContinuationPolicy> = {
-  semanticIdleMs: 120_000,
+  // Cursor CLI aborts an active attempt after 30 s without an inbound frame.
+  semanticIdleMs: 30_000,
   hardCapMs: 600_000,
   heartbeatMs: 5_000,
 }
@@ -211,11 +213,21 @@ export type CursorSession = {
   /** Latest eligible checkpoint emitted by this Run attempt. */
   resumeCheckpoint?: Uint8Array
   /**
-   * The checkpoint a resumed Run started from, kept until the Run sends a newer
-   * one, asks the host for anything, or ends its turn: until then, resuming it
-   * again replays nothing the host acted on (Cursor CLI resumes the same way).
+   * This Run asked the host for something, or the provider answered a query, since its last
+   * checkpoint: an earlier checkpoint of the turn would replay it, so recovery resumes none.
    */
-  carriedCheckpoint?: Uint8Array
+  earlierCheckpointStale?: boolean
+  /**
+   * This Run sent a user message or tool result after its last checkpoint:
+   * recovery must not resume earlier state that lacks the delivered input.
+   */
+  checkpointRevoked?: boolean
+  /** Only a delivered host result, rather than an unrepresented follow-up, revoked it. */
+  checkpointRevokedByHostResult?: boolean
+  /** Ignore queued checkpoints received before the latest message/result delivery. */
+  resumeCheckpointAfterFrame?: number
+  /** Stateful replay barriers survive host tool-step boundaries on this Run. */
+  replaySafety?: ReplaySafetyState
   /** History images this Run's checkpoints hold or may hold; absent for a Run outside an OpenCode session. */
   historyImages?: RunHistoryImages
   /** Cursor-side waits (AwaitShell) in flight, by call id. */
@@ -708,7 +720,7 @@ export class SessionManager {
     const now = this.now()
     const key = this.key(session.sessionId, execId)
     this.tombstones.delete(key)
-    session.carriedCheckpoint = undefined
+    session.earlierCheckpointStale = true
     session.pending.set(execId, {
       resultField,
       toolName,
@@ -770,7 +782,12 @@ export class SessionManager {
     }
   }
 
-  async deliverClaim(claim: ContinuationClaim, frames: readonly Uint8Array[]): Promise<DeliveryOutcome> {
+  async deliverClaim(
+    claim: ContinuationClaim,
+    frames: readonly Uint8Array[],
+    /** Called at each actual serialized write, before write() and its drain. */
+    beforeWrite?: () => void,
+  ): Promise<DeliveryOutcome> {
     const { session, execId, pending } = claim
     const key = this.key(session.sessionId, execId)
     const unavailable = (framesWritten: number): DeliveryOutcome | undefined => {
@@ -805,7 +822,10 @@ export class SessionManager {
       }
       for (const frame of frames) {
         try {
-          await writeStreamMessage(session.stream, frame, "continuation result")
+          await writeStreamMessage(session.stream, frame, "continuation result", beforeWrite ? () => {
+            beforeWrite()
+            return true
+          } : undefined)
         } catch (error) {
           // write() returned false before the drain failed: the bytes are buffered.
           if (error instanceof StreamWriteDrainError) framesWritten++

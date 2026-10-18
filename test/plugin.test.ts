@@ -31,6 +31,7 @@ import {
   queueHostAgentModeSwitch,
   resetHostAgentModeSwitchForTests,
 } from "../src/host-agent-mode.js"
+import { reapBackgroundSpawn } from "./background-spawn.js"
 
 // Characters safeLabel must remove from emitted names/keys (issue #2).
 const INVALID = new RegExp("[()<>&\"'`]")
@@ -704,6 +705,7 @@ describe("CursorPlugin shell result hooks", () => {
       stderr: "pipe",
     })
     expect(result.stdout.toString()).toContain("__CURSOR_BACKGROUND_SHELL__")
+    await reapBackgroundSpawn(result.stdout.toString())
   })
 
   it("keeps timeout-shaped successful stdout in output and metadata.output", async () => {

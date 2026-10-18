@@ -8,6 +8,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { createManagedTerminal } from "../src/terminal-runner.js"
+import { writeStreamMessage } from "../src/stream-write.js"
 
 let _seq = 0
 it("releases an unstarted shell reservation when cancellation closes its Run without a tool result", () => {
@@ -179,6 +180,34 @@ describe("SessionManager", () => {
     pendingDrains[1]!()
     await expect(delivery).resolves.toEqual({ kind: "delivered", framesWritten: 2 })
     expect(mgr.classify(s.sessionId, 9)).toMatchObject({ kind: "duplicate", reason: "delivered" })
+  })
+
+  it("captures result boundaries at each queued write, never at enqueue or duplicate delivery", async () => {
+    const mgr = new SessionManager()
+    const s = fakeSession()
+    const events: string[] = []
+    let drain!: () => void
+    s.stream.write = bytes => { events.push(`write:${bytes[0]}`); return bytes[0] !== 0 }
+    s.stream.waitForDrain = () => new Promise<void>(resolve => { drain = resolve })
+    mgr.registerPending(12, s, "mcp_result")
+    const claim = mgr.claim(s.sessionId, 12)
+    if ("kind" in claim) throw new Error("expected continuation claim")
+    const previous = writeStreamMessage(s.stream, Uint8Array.of(0), "preceding reply")
+    const delivery = mgr.deliverClaim(claim, [Uint8Array.of(1), Uint8Array.of(2)], () => { events.push("boundary") })
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve))
+      expect(events).toEqual(["write:0"])
+      expect(await mgr.deliverClaim(claim, [Uint8Array.of(3)], () => { events.push("duplicate-boundary") }))
+        .toMatchObject({ kind: "duplicate" })
+      drain()
+      await previous
+      expect(await delivery).toEqual({ kind: "delivered", framesWritten: 2 })
+      expect(events).toEqual(["write:0", "boundary", "write:1", "boundary", "write:2"])
+    } finally {
+      drain?.()
+      await Promise.allSettled([previous, delivery])
+      mgr.dispose()
+    }
   })
 
   it("does not replay a continuation frame whose drain fails after the write is buffered", async () => {

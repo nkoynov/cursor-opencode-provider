@@ -1,6 +1,6 @@
 {
   "name": "cursor-opencode-provider",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "description": "Use Cursor subscription models from OpenCode via Cursor's Connect-RPC agent protocol",
   "type": "module",
   "license": "MIT",
@@ -77,6 +77,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
     "test": "bun test",
+    "test:coverage": "bun test --coverage --coverage-reporter=lcov && bun scripts/strip-copied-coverage.ts",
     "test:node-http2": "bun run build && node test/node-http2-cleanup.mjs && node test/node-http2-resend.mjs && node test/node-http2-drain.mjs && node test/node-http2-session-memory.mjs",
     "test:watch": "bun test --watch",
     "generate:pricing": "bun run scripts/generate-cursor-pricing.ts",

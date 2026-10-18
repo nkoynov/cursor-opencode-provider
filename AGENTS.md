@@ -16,6 +16,15 @@ agent protocol. TypeScript ESM; Bun installs/tests; `tsc` builds `dist/`.
   [host guide](docs/README.md). Follow [CONTRIBUTING.md](CONTRIBUTING.md) and the
   [review rules](docs/review-rules.md), including every Greptile finding and
   applicable Codecov issue. User-facing changes need an Unreleased changelog line.
+- Never leave TMPDIR remnants, from tests, scripts or your own scratch work
+  (files, directories, worktrees, detached processes and their logs). Remove
+  what you create before finishing; first await the writes and stop the
+  processes that could recreate it (`settleRunSavesForTests`,
+  `reapBackgroundSpawn`, `stopProcessesUsing`), and restore the process-wide
+  host cache root that `createCursor({ cacheDir })` sets. `test/preload.ts`
+  gives every `bun test` run a private TMPDIR and fails the run when anything
+  is left in it; Node test scripts import `test/node-tmpdir.mjs` first for the
+  same guard.
 
 ## Non-negotiable provider / compatibility-layer boundary
 
@@ -53,6 +62,7 @@ bun install
 bun run typecheck          # source and test projects
 bun run build              # tsc → dist/
 bun test
+bun run test:coverage      # CI's lcov run, with copied-module records stripped
 bun run test:node-http2     # build + Node transport regressions
 bun run check:pricing      # fixture coverage, not live regeneration
 bun run generate:pricing   # live Cursor pricing/context/capability metadata
@@ -141,11 +151,18 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   actions, final error codes, `isRetryable: false` and bare `permission_denied`
   end the turn. Final and auth failures reach both hosts as `APICallError` with
   `x-should-retry: false`, a status below 500 and a message without OpenCode 1.x
-  retry triggers (`src/errors.ts`); the Connect code stays on `cause`.
+  retry triggers (`src/errors.ts`); the Connect code stays on `cause`. A
+  `hostRetryable` failure is the exception: an `APICallError` with
+  `isRetryable: true`, `x-should-retry: true` and no status, so both hosts retry.
 - Fork: a capacity refusal without a final verdict (`isCapacityFailure`) gets six
-  attempts with a longer backoff before it ends as final. An
-  `ERROR_CUSTOM_MESSAGE` whose protobuf `value` does not decode is read from the
-  details' JSON `debug` (`customMessageFromDebug`), so it still ends the turn.
+  attempts with a longer backoff, counted apart from the shared CLI retry
+  budget, before it ends as final. An `ERROR_CUSTOM_MESSAGE` whose protobuf
+  `value` does not decode is read from the details' JSON `debug`
+  (`customMessageFromDebug`), so it still ends the turn.
+- Fork: recovery resumes the turn's latest checkpoint only while the attempt
+  has asked the host for nothing since it (`earlierCheckpointStale`: a pending
+  exec or a query the provider answered); the attempt's own checkpoint resumes
+  as before.
 
 ## Context, identity and persistence
 
@@ -221,8 +238,10 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   never publishes `session.idle`, so `session.execution.*` ends running tools.
   Frames queue as `heldFrames` → `queuedFrame` → stream; `putBackFrame` requeues.
 - Respect `tool_requests_listed` when emitting parallel calls. Early edit rows
-  predict the remapped host tool, close if no exec arrives, and retain routing
-  after Run closure/restart so a late result can rebuild from history.
+  predict the remapped host tool, open none when the edit's private read goes
+  to the host, complete with a hand-off note when the call runs as another
+  host tool, close as unfinished if no exec arrives, and retain routing after
+  Run closure/restart so a late result can rebuild from history.
 - Fork: until this process has seen `tool_requests_listed`, every host call
   ends its own AI SDK step. After that, `pump` keeps the step open after a host
   tool-call until every listed call has reached it (its exec, or its display
@@ -237,13 +256,23 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   ones. A held-back exec is released anyway after 15 s without progress
   (`toolCallOrderTiming.releaseQuietMs`), so a call Cursor never closes cannot
   stall the Run.
-- Fork early rows: an empty existing file predicts `write`, as the edit remap
-  leaves it. A row opens only while no other call of the step is announced or
-  started and unfinished and no exec is held back; otherwise the earlier call's
-  exec would close it as failed.
+- Fork early rows: a row opens only while no other call of the step is announced
+  or started and unfinished and no exec is held back; otherwise the earlier
+  call's exec would close it as failed.
 - Drain a held Run before a fresh user turn. Rebuild late tool results from
   host history; checkpoint resume would request the tool again. Never replay
   side effects after the replay barrier or treat EOF as successful `stop`.
+- Retry like Cursor CLI's Run loop: an attempt without its own checkpoint
+  resumes the turn's latest eligible one. Delivered tool results and follow-up
+  user messages revoke earlier checkpoints; queued frames use receipt order.
+  Stateful barriers survive host tool steps. Two resumed attempts that stream
+  without a new checkpoint end the turn. With
+  no checkpoint in the turn, a transient failure after only text or reasoning
+  is `hostRetryable` (the CLI resends the action). A silent drop immediately
+  after delivered host results may rebase from history only when every observed
+  exec has a completed result and no opaque activity occurred. Include all
+  completed tool steps; never resume their earlier checkpoint. Other barriers
+  stay final.
   Missing-blob recovery is limited to the initial control-only checkpoint path
   (`isSoleControlFrame`); unknown/mixed frames keep the normal replay barrier.
 - Carry an uncheckpointed request only on its unchanged checkpoint; persist it
@@ -287,6 +316,7 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   File patches that echo incomplete content; allow targeted source edits.
   Resolve relative grep/glob/directory paths against the workspace. Shell stdout
   reaches Cursor verbatim, as Cursor CLI sends it; a `cd` changes its paths.
+  A failed host shell call's text reaches Cursor once, as stderr, not as stdout.
 - `WriteArgs.file_bytes` and `encoding_hint` are content. Private legacy-edit
   reads need complete correlated content; external/symlink-escaped files require
   the exact host-authorized read first. Final mutation remains a host edit/patch.

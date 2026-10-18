@@ -105,7 +105,8 @@ describe("debug log paths / modes (F9)", () => {
   })
 
   it("truncates when the log reaches the size cap", () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-provider-debug-cap-over-"))
+    // The truncation notice includes the path; it may itself contain old log bytes.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-provider-debug-cap-over-xxxxx-"))
     const file = path.join(root, "debug.log")
     try {
       fs.writeFileSync(file, "x".repeat(64), { mode: 0o600 })
@@ -115,7 +116,7 @@ describe("debug log paths / modes (F9)", () => {
       expect(body).toContain("debug: size-cap truncate")
       expect(body).toContain("wasBytes=64")
       expect(body).toContain("maxBytes=32")
-      expect(body).not.toContain("xxxxx")
+      expect(body.split("\n").slice(2).join("\n")).toBe("")
       expect(fs.statSync(file).mode & 0o777).toBe(0o600)
     } finally {
       fs.rmSync(root, { recursive: true, force: true })

@@ -3,6 +3,16 @@ import { createHash } from "node:crypto"
 /** Shown when an announced edit never becomes a host tool call. */
 export const EARLY_ROW_CLOSED = "Cursor did not finish this tool call."
 
+/**
+ * Shown when the announced call runs as a host tool the row did not predict,
+ * such as a rewrite with unchanged content, which stays a `write`. The row's
+ * tool name cannot change once started (OpenCode 2 rejects a renamed call),
+ * so it completes and names the call that carries on.
+ */
+export function earlyRowHandoff(toolName: string): string {
+  return `Cursor continued this call as \`${toolName}\`.`
+}
+
 export type EarlyToolRow = {
   cursorCallId: string
   toolCallId: string

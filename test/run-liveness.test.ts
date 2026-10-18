@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test"
-import { attachSessionHeartbeat, drainSessionUntilTurnEnded, pump } from "../src/language-model.js"
+import { attachSessionHeartbeat, drainSessionUntilTurnEnded, pump, pumpWithRecovery } from "../src/language-model.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { ASK_QUESTION_RESULT_FIELD } from "../src/protocol/ask-question.js"
-import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
+import { resolveContinuationPolicy, sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import type { CursorProviderError } from "../src/errors.js"
 import { sessionFixture } from "./session-fixture.js"
 
@@ -80,6 +80,44 @@ afterEach(() => {
 })
 
 describe("Run liveness", () => {
+  it("uses Cursor CLI's 30 second silence default while retaining explicit overrides", () => {
+    expect(resolveContinuationPolicy(undefined).semanticIdleMs).toBe(30_000)
+    expect(resolveContinuationPolicy({ semanticIdleMs: 180_000 }).semanticIdleMs).toBe(180_000)
+    expect(resolveContinuationPolicy({ softHealthMs: 180_000 }).semanticIdleMs).toBe(180_000)
+  })
+
+  it("leaves a real silence deadline after reasoning and an unfinished row to the host", async () => {
+    const parts: Array<{ type: string; providerExecuted?: boolean }> = []
+    const session = livenessSession([
+      { afterMs: 0, frame: serverFrame({ interaction_update: { thinking_delta: { text: "Preparing the edit" } } }) },
+      { afterMs: 0, frame: serverFrame({ interaction_update: { partial_tool_call: { call_id: "unfinished",
+        tool_call: { edit_tool_call: { args: { path: "unfinished.txt" } } } } } }) },
+    ], 40)
+    session.permittedToolNames = new Set(["write"])
+    session.requestContext.env = { workspace_paths: [process.cwd()] }
+    live.push(session)
+    let sawRow = false
+    const output = collect(parts)
+    const enqueue = output.enqueue.bind(output)
+    output.enqueue = part => {
+      enqueue(part)
+      if (part.type !== "tool-input-start") return
+      sawRow = true
+      const deadline = session.semanticDeadlineAt
+      // Client traffic is not an inbound server frame and must not delay the cutoff.
+      sessionManager.recordHeartbeatWrite(session)
+      expect(session.semanticDeadlineAt).toBe(deadline)
+    }
+    const failure = await pumpWithRecovery({
+      initialSession: session, controller: output,
+      recover: async () => { throw new Error("The host owns this output-only retry") },
+    }).catch((error: unknown) => error)
+    expect(sawRow).toBe(true)
+    expect(failure).toMatchObject({ hostRetryable: true, code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
+    expect(parts.filter(part => part.type === "tool-call").every(part => part.providerExecuted)).toBe(true)
+    expect(session.pending.size).toBe(0)
+  })
+
   it("keeps a Run alive on heartbeats alone for longer than the idle limit", async () => {
     const parts: Array<{ type: string; delta?: string }> = []
     const session = livenessSession([

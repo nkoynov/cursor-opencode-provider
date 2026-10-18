@@ -26,6 +26,7 @@ import {
   setCursorShellPath,
   shellPolicyFromMetadata,
 } from "../src/shell-timeout.js"
+import { reapBackgroundSpawn } from "./background-spawn.js"
 
 afterEach(() => resetCursorShellCalls())
 
@@ -349,7 +350,7 @@ describe("Cursor shell timeout translation", () => {
     })
   })
 
-  it("exec-replaces bash -c original command via BASH_ENV injector", () => {
+  it("exec-replaces bash -c original command via BASH_ENV injector", async () => {
     setCursorShellPath("/bin/bash")
     const id = "cursor_session_env_exec_bash"
     registerCursorShellCall(id, {
@@ -367,6 +368,7 @@ describe("Cursor shell timeout translation", () => {
     const stdout = result.stdout.toString()
     expect(stdout.includes("SHOULD_NOT_RUN")).toBe(false)
     expect(stdout).toContain("__CURSOR_BACKGROUND_SHELL__")
+    await reapBackgroundSpawn(stdout)
     releaseCursorShellEnv(id)
   })
 
@@ -471,7 +473,7 @@ describe("Cursor shell timeout translation", () => {
     }
   })
 
-  it("replaces the inline background fallback with a wrapper file on sh", () => {
+  it("replaces the inline background fallback with a wrapper file on sh", async () => {
     setCursorShellPath("/bin/sh")
     const id = "cursor_session_bg_spawn_sh"
     const command = "sleep 1"
@@ -492,6 +494,7 @@ describe("Cursor shell timeout translation", () => {
       stderr: "pipe",
     })
     expect(result.stdout.toString()).toContain("__CURSOR_BACKGROUND_SHELL__")
+    await reapBackgroundSpawn(result.stdout.toString())
     releaseCursorShellEnv(id)
   })
 })

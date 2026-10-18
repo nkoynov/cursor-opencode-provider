@@ -12,7 +12,7 @@ import path from "node:path"
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
 import { notifyHostInterrupt } from "../src/host-interrupt.js"
-import { HELD_RUN_SAVE_DELAY_MS, resetTurnStateForTests } from "../src/language-model.js"
+import { HELD_RUN_SAVE_DELAY_MS, resetTurnStateForTests, settleRunSavesForTests } from "../src/language-model.js"
 import { decodeFramePayload } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
@@ -246,6 +246,7 @@ async function continueAfterStop(stop: Stop, abortedMessage: boolean) {
       reseeded: (next.action.user_message_action.user_message.text as string).includes("<conversation_history>"),
     }
   } finally {
+    await settleRunSavesForTests()
     fs.rmSync(root, { recursive: true, force: true })
   }
 }
@@ -332,6 +333,7 @@ describe("a turn stopped mid-step, continued by the next process", () => {
       expect(next.conversation_id).toBe(stopped.conversation_id)
       expect(state.root_prompt_messages_json).toEqual(["cancelled"])
     } finally {
+      await settleRunSavesForTests()
       fs.rmSync(root, { recursive: true, force: true })
     }
   }, 30_000)
@@ -388,6 +390,7 @@ describe("a turn stopped mid-step, continued by the next process", () => {
       expect(next.conversation_id).toBe(stopped.conversation_id)
       expect(state.root_prompt_messages_json).toEqual(["cancelled"])
     } finally {
+      await settleRunSavesForTests()
       fs.rmSync(root, { recursive: true, force: true })
     }
   }, 30_000)
@@ -447,6 +450,7 @@ describe("a turn stopped mid-step, continued by the next process", () => {
       expect((next.action.user_message_action.user_message.text as string).includes("<conversation_history>")).toBe(false)
     } finally {
       setConversationPersistenceHookForTests(undefined)
+      await settleRunSavesForTests()
       fs.rmSync(root, { recursive: true, force: true })
     }
   }, 30_000)
@@ -513,6 +517,7 @@ describe("a turn stopped mid-step, continued by the next process", () => {
         .toBe("The file says alpha.")
       expect(parts.find((part) => part.type === "finish")).toMatchObject({ finishReason: { unified: "stop" } })
     } finally {
+      await settleRunSavesForTests()
       fs.rmSync(root, { recursive: true, force: true })
     }
   }, 30_000)

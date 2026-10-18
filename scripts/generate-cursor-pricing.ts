@@ -101,6 +101,7 @@ const DISPLAY_NAME_TO_MODEL_ID: Record<string, string> = {
   "Kimi K2.7 Code": "kimi-k2.7-code",
   "Kimi K3": "kimi-k3",
   "Muse Spark 1.3": "muse-spark-1.3",
+  "Muse Wonder": "muse-wonder-1.0",
 }
 
 /** Rows we intentionally ignore (variant-only pricing, unused models, duplicates). */

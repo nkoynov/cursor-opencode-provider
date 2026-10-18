@@ -174,7 +174,7 @@ describe("a turn whose Run failed before Cursor checkpointed the request", () =>
     try {
       const { sessionKey, base } = checkpointedSession()
       const failed = await step(sessionKey, [...history, user(REQUEST)] as Prompt)
-      expect(failed.error?.message).toContain("automatic retry unsafe")
+      expect(failed.error?.message).toContain("the turn can be sent again")
 
       const retried = await step(sessionKey, [...history, user(REQUEST), thoughtOnly("Writing the table."), user(CONTINUE)] as Prompt)
       expect(retried.text).toBe("done")
@@ -234,7 +234,7 @@ describe("a turn whose Run failed before Cursor checkpointed the request", () =>
   })
 
   it("does not carry a request Cursor checkpointed before the Run and its recoveries failed", async () => {
-    const resumesFailing: ScriptedFrame[][] = [[{ endStreamError: "internal" }], [{ endStreamError: "internal" }]]
+    const resumesFailing: ScriptedFrame[][] = [[{ endStreamError: "internal" }], [{ endStreamError: "internal" }], [{ endStreamError: "internal" }]]
     const cursor = fakeCursorRuns([
       [
         { interaction_update: { text_delta: { text: "Reading first." } } },
@@ -249,9 +249,10 @@ describe("a turn whose Run failed before Cursor checkpointed the request", () =>
       const failed = await step(sessionKey, [...history, user(REQUEST)] as Prompt)
       expect(failed.error).toBeDefined()
       await step(sessionKey, [...history, user(REQUEST), assistant("Reading first."), user(CONTINUE)] as Prompt)
+      // The next turn stays on the checkpoint that holds the request, as Cursor CLI resumes it.
       const text = runText(cursor.runs.at(-1))
-      expect(text).toEndWith(`</conversation_history>\n\n${CONTINUE}`)
-      expect(text.split(REQUEST)).toHaveLength(2)
+      expect(text).toStartWith(CONTINUE)
+      expect(text).not.toContain(REQUEST)
     } finally {
       cursor.restore()
     }

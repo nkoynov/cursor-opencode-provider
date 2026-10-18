@@ -315,6 +315,7 @@ export class CursorRunInterruptedError extends CursorTransportError {
       transient: true,
       replaySafe: true,
       cause: options?.cause,
+      code: options?.cause === undefined ? "CURSOR_STREAM_CLOSED_EARLY" : undefined,
     })
     this.name = "CursorRunInterruptedError"
   }

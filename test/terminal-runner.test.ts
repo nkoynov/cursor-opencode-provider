@@ -5,7 +5,7 @@ import os from "node:os"
 import { createManagedTerminal, releaseUnstartedTerminal, type ManagedTerminal } from "../src/terminal-runner.js"
 import { runtimeExecMessages, runtimeLayout } from "../src/runtime-files.js"
 import { decodeMessageSparse } from "../src/protocol/messages.js"
-import { spawnSync } from "node:child_process"
+import { processTable, stopProcessesUsing } from "./process-cleanup.js"
 import { CURSOR_TIMEOUT_BACKGROUND, captureCursorShellResult, consumeCursorShellResult, registerCursorShellCall, resetCursorShellCalls } from "../src/shell-timeout.js"
 
 let root: string
@@ -20,6 +20,13 @@ afterEach(async () => {
     try { supervisor = Number(fs.readFileSync(path.join(job.directory, "ready"), "utf8")) } catch { continue /* never started: no record will finish */ }
     try { process.kill(supervisor, "SIGTERM") } catch { continue /* already stopped */ }
     await waitDone(job).catch(() => {})
+  }
+  // A launcher that had not written `ready` yet, or a collector finishing after
+  // `done`, still writes into the job directory: removing the root first lets
+  // it recreate the files.
+  const jobsDir = path.join(dir, "terminals", ".jobs")
+  if (fs.existsSync(jobsDir) && fs.readdirSync(jobsDir, { withFileTypes: true }).some(entry => entry.isDirectory())) {
+    await stopProcessesUsing(dir)
   }
   resetCursorShellCalls()
   fs.rmSync(dir, { recursive: true, force: true })
@@ -39,23 +46,6 @@ async function waitFor(predicate: () => boolean, ms = 6000) {
   const end = Date.now() + ms
   while (!predicate() && Date.now() < end) await Bun.sleep(25)
   return predicate()
-}
-/** Live processes from procfs when present (minimal Linux images ship no `ps`), else `ps`. */
-function processTable(): { pid: number; ppid: number; command: string }[] {
-  if (fs.existsSync("/proc/self/stat")) {
-    return fs.readdirSync("/proc").filter(name => /^\d+$/.test(name)).flatMap(name => {
-      try {
-        const stat = fs.readFileSync(`/proc/${name}/stat`, "utf8")
-        const ppid = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1])
-        const command = fs.readFileSync(`/proc/${name}/cmdline`, "utf8").replaceAll("\0", " ").trim()
-        return [{ pid: Number(name), ppid, command }]
-      } catch { return [] }
-    })
-  }
-  return spawnSync("ps", ["-axo", "pid=,ppid=,command="], { encoding: "utf8" }).stdout.split("\n").flatMap(line => {
-    const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line)
-    return match ? [{ pid: Number(match[1]), ppid: Number(match[2]), command: match[3]! }] : []
-  })
 }
 const processesFor = (terminal: ManagedTerminal) =>
   processTable().filter(entry => entry.command.includes(terminal.directory)).map(entry => `${entry.pid} ${entry.command}`)

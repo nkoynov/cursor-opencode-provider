@@ -3,6 +3,7 @@ import path from "node:path"
 import { createHash } from "node:crypto"
 import { APICallError } from "@ai-sdk/provider"
 import protobuf from "protobufjs"
+import { newRetryBudget, turnRetryBudget, forgetRetryBudget, reserveRetry, resetRetryBudgetsForTests, type RetryBudget } from "./retry-budget.js"
 import type { LanguageModelV3, LanguageModelV3CallOptions, LanguageModelV3StreamResult, LanguageModelV3GenerateResult, LanguageModelV3StreamPart, LanguageModelV3Usage, LanguageModelV3FinishReason } from "@ai-sdk/provider"
 import type { CreateCursorOptions, CursorRetryOptions } from "./index.js"
 import {
@@ -83,8 +84,9 @@ import {
   appendTaskAttachments,
   remapCorrelatedEditWriteForCatalog,
   remapEditToolsForCatalog,
-  editReadGoesToHost,
   hostToolForCursorEdit,
+  cursorEditReadAnswer,
+  cursorEditReadReachesHost,
   buildCompleteEditReadMessages,
   buildTaskAttachmentReadMessages,
   rejectPartialReadMutation,
@@ -176,6 +178,7 @@ import {
   EARLY_ROW_CLOSED,
   EarlyToolRows,
   cursorEditAnnouncement,
+  earlyRowHandoff,
   earlyRowToolCallId,
   parseEarlyRowToolCallId,
   shouldOpenEarlyRow,
@@ -272,9 +275,11 @@ import {
   CursorServerError,
   CursorTransportError,
   hostFacingError,
+  hostRetryError,
   isCapacityFailure,
   isRejectedCredentialError,
   isTransientGrpcStatus,
+  noProgressResumeError,
   retrySuppressedError,
   toCursorProviderError,
 } from "./errors.js"
@@ -413,7 +418,6 @@ const toolCallsOfStoppedTurns = new Set<string>()
 const MAX_STOPPED_TURN_TOOL_CALLS = 256
 export const MAX_TURN_STATE_SESSIONS = 256
 const DEFAULT_RETRY_POLICY = {
-  maxAttempts: 3,
   baseDelayMs: 500,
   maxDelayMs: 8_000,
 } as const
@@ -502,7 +506,7 @@ export function isSoleControlFrame(payload: Uint8Array): boolean {
 }
 
 export type CursorRetryPolicy = {
-  maxAttempts: number
+  maxAttempts?: number
   baseDelayMs: number
   maxDelayMs: number
   /** Total attempts when Cursor refuses the Run for capacity. Default: `maxAttempts`. */
@@ -526,10 +530,10 @@ export function resolveRetryPolicy(options: CursorRetryOptions | undefined): Cur
       throw new CursorProtocolError(`Unknown Cursor retry option: ${key}`)
     }
   }
-  const maxAttempts = retryInteger("maxAttempts", options?.maxAttempts, DEFAULT_RETRY_POLICY.maxAttempts)
+  const maxAttempts = options?.maxAttempts === undefined ? undefined : retryInteger("maxAttempts", options.maxAttempts, 1)
   const baseDelayMs = retryInteger("baseDelayMs", options?.baseDelayMs, DEFAULT_RETRY_POLICY.baseDelayMs)
   const maxDelayMs = retryInteger("maxDelayMs", options?.maxDelayMs, DEFAULT_RETRY_POLICY.maxDelayMs)
-  if (maxAttempts > MAX_RETRY_ATTEMPTS) {
+  if (maxAttempts !== undefined && maxAttempts > MAX_RETRY_ATTEMPTS) {
     throw new CursorProtocolError(`Cursor retry maxAttempts must be no greater than ${MAX_RETRY_ATTEMPTS}`)
   }
   if (baseDelayMs > MAX_RETRY_DELAY_MS || maxDelayMs > MAX_RETRY_DELAY_MS) {
@@ -919,6 +923,29 @@ function noteRunImageCheckpoint(session: CursorSession, checkpoint: Uint8Array, 
   )
 }
 
+/** A resumed model step cannot replay a result or follow-up absent from its checkpoint. */
+function invalidateResumeCheckpoint(session: CursorSession, afterFrame = lastFrameArrival(), hostResult = false): void {
+  session.resumeCheckpoint = undefined
+  // A later result cannot make an earlier uncheckpointed follow-up appear
+  // represented in this call's host history. Only a new checkpoint clears it.
+  session.checkpointRevokedByHostResult = hostResult
+    && (!session.checkpointRevoked || session.checkpointRevokedByHostResult === true)
+  session.checkpointRevoked = true
+  session.resumeCheckpointAfterFrame = afterFrame
+}
+
+/** A queued checkpoint predating a delivered result still describes the old step. */
+function acceptResumeCheckpoint(session: CursorSession, bytes: Uint8Array, frame: Frame): void {
+  const arrived = frameArrival(frame)
+  if (session.resumeCheckpointAfterFrame !== undefined && arrived !== undefined
+    && arrived <= session.resumeCheckpointAfterFrame) return
+  session.resumeCheckpoint = Uint8Array.from(bytes)
+  session.checkpointRevoked = false
+  session.checkpointRevokedByHostResult = false
+  session.earlierCheckpointStale = false
+  session.resumeCheckpointAfterFrame = undefined
+}
+
 /** `resumeCheckpoint` is set only by a checkpoint this Run received and did not drop. */
 function confirmRunImagesAtTurnEnd(session: CursorSession): void {
   if (!session.historyImages || !session.openCodeSessionId) return
@@ -958,8 +985,31 @@ export function createCursorLanguageModel(
   })
   // Credential resolution and session setup can fail before a stream exists.
   // Both public entrypoints must project those failures just like pump errors.
-  const doStream = (callOptions: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> =>
-    doStreamImpl(modelId, options, callOptions).catch((error) => { throw hostFacingError(error) })
+  const doStream = async (callOptions: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> => {
+    const retryPolicy = resolveRetryPolicy(options.retry)
+    const retryBudget = turnRetryBudget(opencodeSessionKey(callOptions),
+      retryTurnKey(callOptions.prompt), retryTurnKey(callOptions.prompt, true))
+    try {
+      return await doStreamImpl(modelId, options, callOptions, retryPolicy, retryBudget)
+    } catch (error) {
+      const failure = toCursorProviderError(error, { replaySafe: true, fallback: "Cursor Run setup failed" })
+      try {
+        if (callOptions.abortSignal?.aborted) {
+          forgetRetryBudget(opencodeSessionKey(callOptions), retryBudget)
+          throw new CursorLocalCancellationError("Cursor Run setup cancelled", error)
+        }
+        if (!failure.replaySafe && (failure.transient || failure.origin === "transport")) {
+          throw retrySuppressedError(failure, "while opening the Run", retryBudget.retries + 1, retryPolicy.maxAttempts ?? 14)
+        }
+        if (!failure.transient) throw failure
+        reserveRetry(retryBudget, failure, retryPolicy.maxAttempts)
+        retryBudget.hostRetryPending = true
+        throw hostRetryError(failure, true)
+      } catch (terminal) {
+        throw hostFacingError(terminal)
+      }
+    }
+  }
   return {
     specificationVersion: "v3",
     provider: providerId,
@@ -997,13 +1047,14 @@ async function doStreamImpl(
   modelId: string,
   options: CreateCursorOptions,
   callOptions: LanguageModelV3CallOptions,
+  retryPolicy: CursorRetryPolicy,
+  retryBudget: RetryBudget,
 ): Promise<LanguageModelV3StreamResult> {
   await restoreSessionState(opencodeSessionKey(callOptions), opencodeGlobalCacheDir())
   const withoutAnswered = await leaveOutAnsweredEarlySteers(callOptions.prompt, opencodeSessionKey(callOptions))
   if (withoutAnswered === "all") return { stream: answeredSteerStream() }
   if (withoutAnswered) callOptions = { ...callOptions, prompt: withoutAnswered }
   const prompt = callOptions.prompt
-  const retryPolicy = resolveRetryPolicy(options.retry)
   // The Bearer token is resolved for every Run this call opens, including
   // recovery Runs after a long-held tool: a host `getAccessToken` (or the
   // apiKey exchange) renews it, so a Run never starts on a token that expired
@@ -1235,6 +1286,16 @@ async function doStreamImpl(
               controller,
               abortSignal: callOptions.abortSignal,
               retryPolicy,
+              retryBudget,
+              canRebaseFromHistory: (failed) => {
+                if (failed !== session || trailingToolResults.length === 0
+                  || !failed.checkpointRevokedByHostResult || failed.pending.size > 0
+                  || failed.replaySafety?.historyRebaseUnsafe) return false
+                const completed = new Set(extractToolResults(prompt)
+                  .map(result => `${result.sessionId}:${result.execId}`))
+                const execs = failed.replaySafety?.execs
+                return !!execs?.length && execs.every(exec => completed.has(`${exec.sessionId}:${exec.id}`))
+              },
               recover: (recovery) => openSession({ recovery }),
               onSession: (next) => { activeSession = next },
               ...(steeredPrompt ? { steer: true } : {}),
@@ -1244,6 +1305,9 @@ async function doStreamImpl(
             })
           } finally {
             pumpingThisStream = false
+          }
+          if (activeSession.closed && activeSession.pending.size === 0) {
+            forgetRetryBudget(opencodeSessionKey(callOptions), retryBudget)
           }
           try {
             controller.close()
@@ -1260,6 +1324,9 @@ async function doStreamImpl(
             pendingExecs: activeSession.pending.size,
           })
         } catch (e) {
+          if (e instanceof CursorLocalCancellationError || callOptions.abortSignal?.aborted) {
+            forgetRetryBudget(opencodeSessionKey(callOptions), retryBudget)
+          }
           activeSession.pumpActive = false
           trace(`pull: pump threw (cleaning up): ${(e as Error).message}`)
           // A Run the host stopped is drained and closed by its cancel.
@@ -1314,6 +1381,9 @@ export async function pumpWithRecovery(input: {
   controller: ReadableStreamDefaultController<V3Part>
   abortSignal?: AbortSignal
   retryPolicy?: CursorRetryPolicy
+  retryBudget?: RetryBudget
+  /** Proven completed host results can seed history without replaying their calls. */
+  canRebaseFromHistory?: (session: CursorSession) => boolean
   recover: (recovery: CursorRunRecovery) => Promise<CursorSession>
   onSession?: (session: CursorSession) => void
   maxRecoveries?: number
@@ -1330,13 +1400,23 @@ export async function pumpWithRecovery(input: {
   let session = input.initialSession
   const retryPolicy = input.retryPolicy ?? {
     ...DEFAULT_RETRY_POLICY,
-    maxAttempts: (input.maxRecoveries ?? 1) + 1,
+    ...(input.maxRecoveries === undefined ? {} : { maxAttempts: input.maxRecoveries + 1 }),
   }
-  const maxRecoveries = retryPolicy.maxAttempts - 1
-  const capacityMaxRecoveries = (retryPolicy.capacityMaxAttempts ?? retryPolicy.maxAttempts) - 1
+  const retryBudget = input.retryBudget ?? newRetryBudget()
+  const maxRecoveries = retryPolicy.maxAttempts === undefined ? 13 : retryPolicy.maxAttempts - 1
+  // Fork: capacity refusals keep their own longer backoff, outside the CLI budget.
+  const capacityMaxRecoveries = (retryPolicy.capacityMaxAttempts ?? retryPolicy.maxAttempts ?? DEFAULT_CAPACITY_MAX_ATTEMPTS) - 1
+  let capacityRetries = 0
   const startedAt = Date.now()
   let credentialRenewed = false
   let compressionFallbackUsed = false
+  // As in Cursor CLI's Run retry loop: an attempt without a checkpoint of its
+  // own resumes the latest one this turn received, and two resumed attempts
+  // that streamed without saving a new checkpoint stop the automatic retries.
+  let turnCheckpoint: Uint8Array | undefined
+  let resumedAttempt = false
+  let noProgressResumes = 0
+  let openingFailure: CursorProviderError | undefined
   input.onSession?.(session)
 
   const resumableCheckpoint = (pumpedSession: CursorSession) =>
@@ -1345,7 +1425,7 @@ export async function pumpWithRecovery(input: {
   const reopen = async (
     pumpedSession: CursorSession,
     failure: CursorProviderError,
-    checkpoint = resumableCheckpoint(pumpedSession),
+    checkpoint: Uint8Array | undefined,
   ) => {
     const toolCallIds = pumpedSession.resultsAfterCheckpoint?.toolCallIds
     const recovery: CursorRunRecovery = failure.checkpointUnusable
@@ -1358,9 +1438,13 @@ export async function pumpWithRecovery(input: {
           }
         : {
             kind: "rebase",
+            ...(input.canRebaseFromHistory?.(pumpedSession) ? { reason: "completed-tool-results" as const } : {}),
             ...(input.steer ? { steer: true } : {}),
             ...(toolCallIds?.size ? { toolCallIds: new Set(toolCallIds) } : {}),
           }
+    resumedAttempt = recovery.kind === "resume"
+    // A rebase opens another conversation; its checkpoints start over.
+    if (!resumedAttempt) turnCheckpoint = undefined
     // Host notes the failed Run never acknowledged belong to this turn.
     const unackedNotes = takeHostNoteInjections(pumpedSession)
     const unackedNoteCount = unackedNotes.reduce((count, batch) => count + batch.notes.length, 0)
@@ -1389,6 +1473,10 @@ export async function pumpWithRecovery(input: {
       recovery.kind === "resume" ? next.sessionId : undefined,
     )
     if (recovery.kind === "resume") {
+      next.replaySafety = {
+        ...pumpedSession.replaySafety,
+        execs: pumpedSession.replaySafety?.execs?.slice(),
+      }
       next.userTurnHostNotes = pumpedSession.userTurnHostNotes
       next.usageEstimate = { ...pumpedSession.usageEstimate }
       next.editToolCalls = new Map(pumpedSession.editToolCalls)
@@ -1417,10 +1505,27 @@ export async function pumpWithRecovery(input: {
     return next
   }
 
+  // A replacement can fail before pump() starts (for example while connecting).
+  // Classify it in this same loop rather than exposing an unbudgeted host retry.
+  const reopenAttempt = async (pumped: CursorSession, failure: CursorProviderError, checkpoint: Uint8Array | undefined) => {
+    try {
+      session = await reopen(pumped, failure, checkpoint)
+    } catch (error) {
+      const failure = toCursorProviderError(error, { replaySafe: true, fallback: "Cursor recovery setup failed" })
+      // The failed upload belongs to the replacement Run. The preceding Run's
+      // checkpoint cannot prove that the replacement did not already start work.
+      if (!failure.replaySafe && (failure.transient || failure.origin === "transport")) {
+        throw retrySuppressedError(failure, "while opening the replacement Run", retryBudget.retries + 1, maxRecoveries + 1)
+      }
+      if (!failure.transient) throw error
+      openingFailure = failure
+    }
+  }
+
   for (let attempt = 0; ; attempt++) {
     const pumpedSession = session
     const pumpOwner = Symbol("cursor-pump")
-    sessionManager.beginPump(pumpedSession, pumpOwner)
+    if (!openingFailure) sessionManager.beginPump(pumpedSession, pumpOwner)
     // OpenCode 1.x stops a turn by aborting the signal, before the AI SDK cancels
     // the stream. Cancel at Cursor, as the stream's cancel() does, so Cursor ends
     // the Run on a checkpoint; a reply still waiting for drain would hold the
@@ -1440,6 +1545,11 @@ export async function pumpWithRecovery(input: {
       ? listenForHostSteers(pumpedSession.openCodeSessionId, (steer) => injectHostSteer(pumpedSession, steer))
       : undefined
     try {
+      if (openingFailure) {
+        const failure = openingFailure
+        openingFailure = undefined
+        throw failure
+      }
       await pump(
         pumpedSession,
         input.controller,
@@ -1449,10 +1559,14 @@ export async function pumpWithRecovery(input: {
         },
         input.abortSignal,
       )
+      if (pumpedSession.closed && pumpedSession.pending.size === 0) {
+        forgetRetryBudget(pumpedSession.openCodeSessionId, retryBudget)
+      }
       return session
     } catch (error) {
       // A cancelled Run's stream fails or ends on purpose; recovering would restart the stopped turn.
       if (pumpedSession.hostInterrupted || input.abortSignal?.aborted) {
+        forgetRetryBudget(pumpedSession.openCodeSessionId, retryBudget)
         if (error instanceof CursorLocalCancellationError) throw error
         throw new CursorLocalCancellationError("Cursor Run cancelled: the host stopped the turn", error)
       }
@@ -1460,11 +1574,25 @@ export async function pumpWithRecovery(input: {
         replaySafe: error instanceof CursorProviderError ? error.replaySafe : false,
         fallback: "Cursor Run interrupted",
       })
+      // A renewable credential error may follow a checkpoint too. Retain it
+      // before either recovery path so a later attempt can still resume it.
+      const ownCheckpoint = resumableCheckpoint(pumpedSession)
+      if (ownCheckpoint) {
+        turnCheckpoint = ownCheckpoint
+        noProgressResumes = 0
+      } else if (pumpedSession.checkpointRevoked || pumpedSession.resultsAfterCheckpoint || pumpedSession.earlierCheckpointStale) {
+        turnCheckpoint = undefined
+      }
+      const checkpoint = turnCheckpoint
+      // The inherited tool barrier forbids replaying the action, but an untouched
+      // replacement may renew and resume its checkpoint without replaying tools.
+      const untouchedCheckpointResume = resumedAttempt && checkpoint !== undefined
+        && failure.replayBarrier === undefined && !failure.checkpointUnusable
       if (
         input.renewRejectedCredential
         && !credentialRenewed
         && isRejectedCredentialError(failure)
-        && failure.replaySafe
+        && (failure.replaySafe || untouchedCheckpointResume)
       ) {
         credentialRenewed = true
         trace(
@@ -1473,30 +1601,48 @@ export async function pumpWithRecovery(input: {
         )
         sessionManager.close(pumpedSession, "remote-error", failure)
         input.renewRejectedCredential()
-        session = await reopen(pumpedSession, failure)
+        await reopenAttempt(
+          pumpedSession,
+          failure,
+          checkpoint,
+        )
         attempt--
         continue
       }
       if (!compressionFallbackUsed && pumpedSession.stream.compressionRejected?.()) {
         compressionFallbackUsed = true
-        const checkpoint = resumableCheckpoint(pumpedSession)
         if (failure.replaySafe || checkpoint) {
           trace(`Run compression rejected: sessionId=${pumpedSession.sessionId} — reopening once uncompressed`)
           sessionManager.close(pumpedSession, "remote-error", failure)
-          session = await reopen(pumpedSession, failure, checkpoint)
+          await reopenAttempt(pumpedSession, failure, checkpoint)
           attempt--
           continue
         }
       }
       if (!failure.transient) throw failure
-      // A replay-safe failure keeps the rebase path, in case the carried checkpoint is what failed.
-      const carried = !pumpedSession.resumeCheckpoint && !pumpedSession.resultsAfterCheckpoint && !failure.replaySafe
-        ? pumpedSession.carriedCheckpoint
-        : undefined
-      const checkpoint = resumableCheckpoint(pumpedSession) ?? carried
       const capacity = isCapacityFailure(failure)
       const recoveries = capacity ? capacityMaxRecoveries : maxRecoveries
-      if (!failure.replaySafe && !checkpoint) {
+      if (!pumpedSession.resumeCheckpoint && !pumpedSession.checkpointRevoked && !pumpedSession.resultsAfterCheckpoint
+        && resumedAttempt && failure.replayBarrier) {
+        noProgressResumes++
+        if (noProgressResumes >= 2) {
+          trace(
+            `Run resume made no progress: sessionId=${pumpedSession.sessionId} resumes=${noProgressResumes} ` +
+              `err=${failure.message} — stopping automatic resume`,
+          )
+          throw noProgressResumeError(failure, noProgressResumes)
+        }
+      }
+      const historyRecovery = failure.replayBarrier === undefined && input.canRebaseFromHistory?.(pumpedSession)
+      if (!failure.replaySafe && !checkpoint && !historyRecovery) {
+        // Cursor CLI sends the same action again. Shown output keeps the
+        // provider from doing so; the host can, unless a side effect would repeat.
+        if (failure.replayBarrier === "output-only" && !pumpedSession.checkpointRevoked) {
+          trace(`Run interrupted after output only: sessionId=${pumpedSession.sessionId} — leaving the retry to the host`)
+          reserveRetry(retryBudget, failure, retryPolicy.maxAttempts)
+          retryBudget.hostRetryPending = true
+          throw hostRetryError(failure)
+        }
         throw retrySuppressedError(
           failure,
           "after visible output or stateful server activity",
@@ -1504,12 +1650,15 @@ export async function pumpWithRecovery(input: {
           recoveries + 1,
         )
       }
-      if (attempt >= recoveries) {
-        throw new CursorRetryExhaustedError(attempt + 1, failure, Date.now() - startedAt)
+      if (capacity) {
+        if (capacityRetries >= capacityMaxRecoveries) {
+          throw new CursorRetryExhaustedError(attempt + 1, failure, Date.now() - startedAt)
+        }
+        capacityRetries++
+      } else {
+        reserveRetry(retryBudget, failure, retryPolicy.maxAttempts)
       }
-      const resuming = checkpoint
-        ? `resuming ${checkpoint.length}B checkpoint${carried ? " this Run resumed from" : ""}`
-        : "rebasing fresh Run"
+      const resuming = checkpoint ? `resuming ${checkpoint.length}B checkpoint` : "rebasing fresh Run"
       trace(
         `Run interrupted: sessionId=${pumpedSession.sessionId} attempt=${attempt + 1}/${recoveries} ` +
           `err=${failure.message} — ${resuming}`,
@@ -1518,7 +1667,7 @@ export async function pumpWithRecovery(input: {
       const delayMs = retryDelayMs(failure, attempt + 1, retryPolicy)
       trace(`Run retry backoff: attempt=${attempt + 1}/${recoveries} delayMs=${delayMs}${capacity ? " (capacity)" : ""}`)
       await sleepForRetry(delayMs, input.abortSignal)
-      session = await reopen(pumpedSession, failure, checkpoint)
+      await reopenAttempt(pumpedSession, failure, checkpoint)
     } finally {
       input.abortSignal?.removeEventListener("abort", stopPumpedRun)
       stopSteers?.()
@@ -1621,7 +1770,7 @@ export type CursorRunRecovery =
    */
   | {
     kind: "rebase"
-    reason?: "checkpoint-unusable" | "unfinished-prior-run"
+    reason?: "checkpoint-unusable" | "unfinished-prior-run" | "completed-tool-results"
     steer?: boolean
     toolCallIds?: ReadonlySet<string>
   }
@@ -2013,7 +2162,8 @@ async function startSession(
     )
   }
   let carriedRequest: string | undefined
-  if (sessionKey && liveTurn && recovery?.kind !== "rebase") {
+  // A resumed Run continues the turn its checkpoint already holds, so it neither carries nor re-keys the record.
+  if (sessionKey && liveTurn && !recovery) {
     // A Run without a checkpoint seeds the host history, which already holds
     // the earlier request; only a checkpoint can be missing it.
     const rebuildFromHistory = !conversationState?.length
@@ -2413,7 +2563,6 @@ async function startSession(
     conversationId,
     cacheDir,
     resumeCheckpoint: undefined,
-    ...(resuming ? { carriedCheckpoint: Uint8Array.from(resumeRecovery!.checkpoint) } : {}),
     ...(historyImages ? { historyImages } : {}),
     tokenDetails: priorTokenDetails,
     tokenDetailsFresh: false,
@@ -2986,11 +3135,14 @@ async function readHeldFrames(session: CursorSession, frames: CursorSession["fra
   }
 }
 
+/** In-progress saves still writing; see `settleRunSavesForTests`. */
+const runSavesInFlight = new Set<Promise<void>>()
+
 /** Save a Run's conversation before Cursor ends its turn, with the latest checkpoint Cursor sent. */
 function persistRunInProgress(session: CursorSession, where: string): Promise<void> {
   const sessionKey = session.openCodeSessionId
   if (!sessionKey) return Promise.resolve()
-  return persistConversationState(session.cacheDir ?? opencodeGlobalCacheDir(), {
+  const save = persistConversationState(session.cacheDir ?? opencodeGlobalCacheDir(), {
     sessionKey,
     conversationId: session.conversationId,
     requestContext: session.requestContext,
@@ -3003,6 +3155,9 @@ function persistRunInProgress(session: CursorSession, where: string): Promise<vo
   }).catch((error) => {
     trace(`conversation persistence: ${where} save failed sessionKey=${sessionKey}: ${String(error)}`)
   })
+  runSavesInFlight.add(save)
+  void save.finally(() => runSavesInFlight.delete(save))
+  return save
 }
 
 /** How long a Run must wait on host tools before its state is saved for a restart. */
@@ -3054,6 +3209,7 @@ export function cancelRunForHostInterrupt(
 
 async function cancelRun(session: CursorSession, reason: string, opts?: { graceMs?: number }): Promise<void> {
   session.hostInterrupted = reason
+  forgetRetryBudget(session.openCodeSessionId)
   dropLostRequest(session.openCodeSessionId)
   // Stopped while its turn end was being saved, the host may have kept only part of the step.
   if (session.openCodeSessionId && sessionManager.isActivelyPumping(session)) {
@@ -3110,6 +3266,17 @@ const hostInterrupts = new Map<string, { at: number; reason: string }>()
 /** Cancels still draining; a shutdown or the next turn waits for them so their final save is not cut off. */
 const cancelsInFlight = new Map<CursorSession, Promise<void>>()
 
+/**
+ * Test helper: wait for host-interrupt cancels and in-progress Run saves, which
+ * write after the call that started them returned. Close the Runs first, so a
+ * held Run's save timer finds them closed instead of starting another save.
+ */
+export async function settleRunSavesForTests(): Promise<void> {
+  while (cancelsInFlight.size > 0 || runSavesInFlight.size > 0 || terminalSavesInFlight.size > 0) {
+    await Promise.all([...cancelsInFlight.values(), ...runSavesInFlight, ...terminalSavesInFlight])
+  }
+}
+
 function cancelForHostInterrupt(session: CursorSession, reason: string): void {
   void cancelRunForHostInterrupt(session, reason)
 }
@@ -3143,6 +3310,7 @@ onHostInterrupt(async (openCodeSessionId, reason, at) => {
   for (const [id, stop] of hostInterrupts) {
     if (stop.at < at - HOST_INTERRUPT_MEMORY_MS) hostInterrupts.delete(id)
   }
+  forgetRetryBudget(openCodeSessionId)
   hostInterrupts.set(openCodeSessionId, { at, reason })
   dropLostRequest(openCodeSessionId)
   for (const session of sessionManager.openSessionsStoppedWith(openCodeSessionId)) {
@@ -3311,8 +3479,7 @@ export async function drainSessionUntilTurnEnded(
           if (session.cacheDiagnostics) session.cacheDiagnostics.checkpointUpdates++
           setCheckpoint(session.conversationId, bytes)
           noteCheckpoint(session.openCodeSessionId, bytes)
-          session.resumeCheckpoint = Uint8Array.from(bytes)
-          session.carriedCheckpoint = undefined
+          acceptResumeCheckpoint(session, bytes, frame)
           noteRunImageCheckpoint(session, bytes, frame)
           markEarlySteersCheckpointed(session.openCodeSessionId, session.sessionId)
           const tokenDetails = decodeConversationTokenDetails(bytes)
@@ -3795,7 +3962,13 @@ async function deliverContinuationResultsNow(
       ? attachHookAdditionalContexts(frames, hookContexts)
       : undefined
     if (notedFrames) frames = notedFrames
-    const outcome = await sessionManager.deliverClaim(claim, frames)
+    // Ignore checkpoints from before the final result frame's actual write,
+    // including time spent queued behind another write, but admit those that
+    // arrive while that frame drains. Earlier result frames are incomplete.
+    let beforeResultWrite = lastFrameArrival()
+    const outcome = await sessionManager.deliverClaim(claim, frames, () => {
+      beforeResultWrite = lastFrameArrival()
+    })
     if (outcome.kind !== "delivered") {
       trace(`continuation: delivery stopped execId=${r.execId} reason=${outcome.reason}`)
       if (outcome.kind === "duplicate") continue
@@ -3805,6 +3978,9 @@ async function deliverContinuationResultsNow(
     // An edit's read result only lets Cursor send the edit's write.
     if (!(pending.resultField === "read_result" && pending.displayCallId && session.editToolCalls?.has(pending.displayCallId))) {
       noteToolCallFinished(session.toolCallOrder, pending.displayCallId)
+    }
+    if (outcome.framesWritten > 0 || (pending.bridged && !pending.aborted)) {
+      invalidateResumeCheckpoint(session, beforeResultWrite, true)
     }
     if (session.historyImages) noteHistoryImagesSent(session.historyImages, deliveredImageHashes, lastFrameArrival())
     if (deliveredSwitchMode) {
@@ -3908,16 +4084,21 @@ function continuationResultInput(
   r: ExtractedToolResult,
   shellResult: { output: string; outcome?: CursorShellOutcome; error?: string } | undefined,
 ): ToolResultInput {
+  const error = r.error ?? shellResult?.error
+  // A failed host tool reports one text as both output and error. Include
+  // failures captured by the shell hook when the SDK keeps only text.
+  // Distinct partial command output still belongs on stdout.
+  const failureText = shellResult !== undefined && error !== undefined && r.output === error
   return {
     execId: r.execId,
     resultField: pending.resultField,
-    output: shellResult?.output ?? r.output,
-    error: r.error ?? shellResult?.error,
+    output: failureText ? "" : shellResult?.output ?? r.output,
+    error,
     toolName: pending.toolName ?? r.toolName,
     resultMetadata: pending.resultMetadata,
     shellOutcome: shellResult?.outcome,
     workspaceRoot: workspaceRootFromRequestContext(session.requestContext),
-    images: r.error ? [] : execResultImages(pending.resultField, r.images),
+    images: error ? [] : execResultImages(pending.resultField, r.images),
     refusal: r.refusal,
     interrupted: r.interrupted,
   }
@@ -4602,7 +4783,7 @@ export async function pump(
     closeHeldToolStep(reason)
   }
   let planHandoffCancellationRequested = false
-  const replaySafety = new AttemptReplaySafety(session.sessionId)
+  const replaySafety = new AttemptReplaySafety(session.sessionId, session.replaySafety ??= {})
   /** The error a Connect end-of-stream frame carries; without one the Run was cut off. */
   const endStreamFailure = (frame: Frame): CursorProviderError => {
     let payload = ""
@@ -4766,32 +4947,18 @@ export async function pump(
     const absolutePath = resolvePath(requestedPath)
     if (absolutePath !== resolvePath(editPath)) return false
 
-    let exists = true
-    try {
-      fs.lstatSync(absolutePath)
-    } catch (error) {
-      const code = error && typeof error === "object" && "code" in error
-        ? (error as { code?: unknown }).code
-        : undefined
-      if (code !== "ENOENT") return false
-      exists = false
+    const answer = cursorEditReadAnswer(absolutePath, workspaceRoot)
+    if (answer === "external") {
+      parsed.resultMetadata = {
+        ...parsed.resultMetadata,
+        correlatedEditCallId: displayCallId,
+      }
+      return false
     }
+    if (answer === "host") return false
 
-    if (exists) {
-      // Do not bypass OpenCode's external-directory permission boundary, even
-      // through a symlink rooted in the workspace.
+    if (answer === "complete") {
       try {
-        const realRoot = fs.realpathSync(workspaceRoot)
-        const realTarget = fs.realpathSync(absolutePath)
-        const relative = path.relative(realRoot, realTarget)
-        if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-          parsed.resultMetadata = {
-            ...parsed.resultMetadata,
-            correlatedEditCallId: displayCallId,
-          }
-          return false
-        }
-
         const frames = buildCompleteEditReadMessages(parsed.id, absolutePath, requestedPath)
         if (!frames) return false
         for (const frame of frames) {
@@ -4816,6 +4983,7 @@ export async function pump(
       }
     }
 
+    // "empty": a missing target.
     try {
       for (const frame of buildExecClientMessages({
         execId: parsed.id,
@@ -5024,7 +5192,8 @@ export async function pump(
     for (const pending of session.pending.values()) if (isOwedCursorExec(pending)) owed++
     return owed
   }
-  const closeEarlyRow = (row: EarlyToolRow) => {
+  /** `continuedAs`: the host tool this Cursor call runs as instead; otherwise it never ran. */
+  const closeEarlyRow = (row: EarlyToolRow, continuedAs?: string) => {
     replaySafety.markBarrier("visible-tool-row")
     // Text that streamed while the row was open ends before its tool-call.
     closeOpenSpans()
@@ -5040,8 +5209,8 @@ export async function pump(
       type: "tool-result",
       toolCallId: row.toolCallId,
       toolName: row.toolName,
-      result: EARLY_ROW_CLOSED,
-      isError: true,
+      result: continuedAs ? earlyRowHandoff(continuedAs) : EARLY_ROW_CLOSED,
+      isError: !continuedAs,
     } as V3Part)
   }
   const settleOpenEarlyRows = () => {
@@ -5475,8 +5644,10 @@ export async function pump(
       }
     }
     if (replayFrame.barrier) replaySafety.markBarrier(replayFrame.barrier)
-    // The provider answers some queries itself (a plan file, an image approval); replaying one would repeat it.
-    if (interactionQuery) session.carriedCheckpoint = undefined
+    // The provider answers some queries itself (a plan file, an image approval); resuming a checkpoint
+    // from before one would repeat it, so only a later checkpoint of this Run is resumed.
+    if (interactionQuery) session.earlierCheckpointStale = true
+    if (replayFrame.barrier === "non-control-exec") replaySafety.recordExec(esm?.id)
     // Reseeding is allowed only while every frame so far was positively a
     // control frame. Anything else, including unknown top-level fields, may have
     // carried output or stateful activity.
@@ -5507,9 +5678,8 @@ export async function pump(
         cacheDiagnostics.checkpointUpdates++
         setCheckpoint(session.conversationId, bytes)
         noteCheckpoint(session.openCodeSessionId, bytes)
-        session.resumeCheckpoint = Uint8Array.from(bytes)
-        if (switchGuard) switchGuard.latestCheckpoint = session.resumeCheckpoint
-        session.carriedCheckpoint = undefined
+        acceptResumeCheckpoint(session, bytes, frame)
+        if (switchGuard) switchGuard.latestCheckpoint = Uint8Array.from(bytes)
         noteRunImageCheckpoint(session, bytes, frame)
         const results = session.resultsAfterCheckpoint
         if (results && !results.unconfirmed && results.awaiting.size === 0) session.resultsAfterCheckpoint = undefined
@@ -5608,7 +5778,6 @@ export async function pump(
       }
       const turnEnded = iu.turn_ended as Record<string, unknown>
       recordTurnEndedCost(session, turnEnded)
-      session.carriedCheckpoint = undefined
       session.toolCallOrder = undefined
       settleOpenEarlyRows()
       // A checkpoint from before the step's results (or from an earlier Run) would drop the step
@@ -5639,6 +5808,7 @@ export async function pump(
         if (session.openCodeSessionId) resumeEmittedStep(session.openCodeSessionId, session.conversationId)
         const followUp = steers.undelivered.map((steer) => steer.text)
         try {
+          const beforeFollowup = lastFrameArrival()
           await session.reopenWithUserMessage(followUp.join("\n\n"), abortSignal)
           if (session.openCodeSessionId && checkpoint?.length) {
             rememberLostRequest({
@@ -5648,8 +5818,8 @@ export async function pump(
               text: followUp.join("\n\n"),
             })
           }
-          // Resuming the checkpoint from before the follow-up would send the steer again.
-          session.resumeCheckpoint = undefined
+          // Revoke the old state, admitting checkpoints received while reopening.
+          invalidateResumeCheckpoint(session, beforeFollowup)
           endingTurns.delete(session)
           textBreakPending = true
           continue
@@ -5683,12 +5853,14 @@ export async function pump(
         trace("progress-only: continuing attempt=1")
         if (session.openCodeSessionId) resumeEmittedStep(session.openCodeSessionId, session.conversationId)
         try {
+          const beforeFollowup = lastFrameArrival()
           await session.reopenWithUserMessage(
             progressOnlyContinuationPrompt(
               workspaceRootFromRequestContext(session.requestContext),
             ),
             abortSignal,
           )
+          invalidateResumeCheckpoint(session, beforeFollowup)
           endingTurns.delete(session)
           assistantText = ""
           continue
@@ -6311,7 +6483,7 @@ export async function pump(
               workspaceRootFromRequestContext(session.requestContext),
             )
             if (parsed.toolName !== boundEarly.toolName || predicted !== boundEarly.toolName) {
-              closeEarlyRow(boundEarly)
+              closeEarlyRow(boundEarly, parsed.toolName)
             } else {
               replaySafety.markBarrier("visible-tool-row")
               safeEnqueue({ type: "tool-input-end", id: boundEarly.toolCallId } as V3Part)
@@ -6726,8 +6898,9 @@ export async function pump(
       })
     ) {
       const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
-      // That read would end this step before the edit's exec and close the row as failed.
-      const toolName = editReadGoesToHost(announced.path, workspaceRoot)
+      // An edit whose private read goes to the host gets that read as its first
+      // exec, which would close the row as a failed edit.
+      const toolName = cursorEditReadReachesHost(path.resolve(workspaceRoot, announced.path), workspaceRoot)
         ? undefined
         : hostToolForCursorEdit(announced.path, fileToolNames(), workspaceRoot)
       if (!toolName) earlyRows.skip(announced.callId)
@@ -7548,6 +7721,35 @@ export function cursorTurnEndedProviderMetadata(
   }
 }
 
+/** Partial assistant output may grow on a host retry; it is not a new user turn. */
+export function retryTurnKey(prompt: LanguageModelV3CallOptions["prompt"], withoutLastInterruptionNotice = false): string {
+  // OpenCode 2 runner/llm.ts emits this synthetic after an incomplete stream;
+  // runner/to-llm-message.ts lowers it to an ordinary user text part. Limit
+  // recognition to exact, standalone text after assistant output. A plugin's
+  // trailing host-note parts do not identify a user turn: they may appear only
+  // on this request and disappear from the next request's history. Normalize
+  // them for hashing only. The budget admits the continuation only after a
+  // requested host retry and remembers its full key across tool steps.
+  const interrupted = "The previous response was interrupted. Continue from where you left off without repeating completed content."
+  const messages = prompt.filter(message => message.role !== "system" && !hostTailNote(message)).map(message => {
+    if (message.role !== "user") return message
+    let end = message.content.length
+    while (end > 1 && hostTailNote({ role: "user", content: [message.content[end - 1]!] }) !== undefined) end--
+    return end === message.content.length ? message : { ...message, content: message.content.slice(0, end) }
+  })
+  let end = messages.length
+  while (end > 0 && messages[end - 1]!.role !== "user") end--
+  const last = messages[end - 1]
+  if (withoutLastInterruptionNotice && last?.role === "user" && last.content.length === 1
+    && last.content[0]?.type === "text" && last.content[0].text === interrupted
+    && messages[end - 2]?.role === "assistant") {
+    // Remove only this continuation, retaining earlier literal user requests.
+    end--
+    while (end > 0 && messages[end - 1]!.role !== "user") end--
+  }
+  return createHash("sha256").update(JSON.stringify(messages.slice(0, end))).digest("hex")
+}
+
 /** Characters a shortened tool call input or result keeps in a history transcript. */
 export const TRANSCRIPT_TOOL_RESULT_CHARS = 2_000
 const TRANSCRIPT_TOOL_INPUT_CHARS = 2_000
@@ -8238,6 +8440,7 @@ export function resolveTurnConversationReset(input: {
 }
 
 export function resetTurnStateForTests(): void {
+  resetRetryBudgetsForTests()
   toolCatalogBySession.clear()
   postCompactionRebaseBySession.clear()
   promptIdentityBySession.clear()

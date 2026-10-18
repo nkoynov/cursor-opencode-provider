@@ -2046,6 +2046,20 @@ describe("progress-only continuation pump", () => {
     }
   })
 
+  it("revokes the earlier checkpoint when a progress follow-up opens but drops", async () => {
+    const session = fakeSession([textDeltaPayload("Checking the workspace"), turnEndedPayload()], [])
+    session.resumeCheckpoint = Uint8Array.of(1, 2, 3)
+    session.reopenWithUserMessage = async () => { session.frames = iteratorFrom([]) }
+    const controller = {
+      enqueue() {},
+      error(error: unknown) { throw error },
+    } as unknown as ReadableStreamDefaultController<import("@ai-sdk/provider").LanguageModelV3StreamPart>
+    await expect(pump(session, controller, { textId: "text", reasoningId: "reasoning" }))
+      .rejects.toMatchObject({ transient: true, replaySafe: false })
+    expect(session.resumeCheckpoint).toBeUndefined()
+    expect(session.checkpointRevoked).toBe(true)
+  })
+
   it("does not reopen a complete answer that starts with a progress verb", async () => {
     const writes: Uint8Array[] = []
     const session = fakeSession(

@@ -22,6 +22,7 @@ export type CursorProviderErrorOptions = CursorErrorDiagnostics & {
   transient: boolean
   replaySafe: boolean
   retryable?: boolean
+  hostRetryable?: boolean
   cause?: unknown
 }
 
@@ -44,6 +45,14 @@ export class CursorProviderError extends Error {
   /** Cursor's classified verdict, or false once provider retries must stop. */
   readonly retryable?: boolean
   readonly serverMessage?: string
+  /**
+   * The provider stopped, but the host may send the turn again: the failed
+   * attempt only showed text or reasoning, before any checkpoint. Cursor CLI
+   * resends the same action in this case.
+   */
+  readonly hostRetryable?: boolean
+  /** What the failed attempt did that a replay inside the Run would repeat. */
+  replayBarrier?: "output-only" | "stateful"
 
   constructor(message: string, options: CursorProviderErrorOptions) {
     super(message, options.cause === undefined ? undefined : { cause: options.cause })
@@ -58,6 +67,7 @@ export class CursorProviderError extends Error {
     this.retryAfterMs = options.retryAfterMs
     this.retryable = options.retryable
     this.serverMessage = options.serverMessage
+    this.hostRetryable = options.hostRetryable
   }
 }
 
@@ -95,10 +105,29 @@ const NON_RETRYABLE_SERVER_STATUS = 400
  * patterns, so the status is the Connect code's HTTP status capped below 500
  * (Cursor CLI decides from the verdict, never the code) and the message is
  * sanitized. The original code stays on `cause`.
+ *
+ * A `hostRetryable` failure is the opposite: Cursor CLI would send the same
+ * action again, but output the host already shows stops the provider from
+ * doing so. It becomes an `APICallError` with `isRetryable: true`, which
+ * OpenCode 1.x retries as the same step, and `x-should-retry: true` without a
+ * status, which OpenCode 2 continues after the shown output.
  */
 export function hostFacingError(error: unknown): Error {
   if (!(error instanceof Error)) return new Error(String(error))
   const auth = error instanceof CursorAuthError
+  if (!auth && error instanceof CursorProviderError && error.hostRetryable) {
+    return new APICallError({
+      message: error.message,
+      url: "cursor://agent.v1.AgentService/Run",
+      requestBodyValues: {},
+      responseHeaders: {
+        "x-should-retry": "true",
+        ...(error.retryAfterMs === undefined ? {} : { "retry-after-ms": String(error.retryAfterMs) }),
+      },
+      isRetryable: true,
+      cause: error,
+    })
+  }
   if (!auth && (!(error instanceof CursorProviderError) || error.retryable !== false)) return error
   const connectStatus = error.code !== undefined && Object.hasOwn(CONNECT_CODE_HTTP_STATUS, error.code)
     ? CONNECT_CODE_HTTP_STATUS[error.code]!
@@ -429,6 +458,51 @@ export function toCursorProviderError(
     code,
     cause: error,
   })
+}
+
+/**
+ * A transient failure after the attempt showed only text or reasoning, before
+ * any checkpoint of the turn. Cursor CLI sends the same action again; the host
+ * does that here (see `hostFacingError`), and the lost-request record carries
+ * the user's request once.
+ */
+export function hostRetryError(cause: CursorProviderError, beforeOutput = false): CursorProviderError {
+  return new CursorProviderError(
+    beforeOutput
+      ? `${cause.message}; the Run could not start and the turn can be sent again`
+      : `${cause.message} after visible output, before Cursor saved a checkpoint; the turn can be sent again`,
+    {
+      origin: cause.origin,
+      transient: false,
+      replaySafe: false,
+      hostRetryable: true,
+      statusCode: cause.statusCode,
+      grpcStatus: cause.grpcStatus,
+      rstCode: cause.rstCode,
+      code: cause.code,
+      retryAfterMs: cause.retryAfterMs,
+      cause,
+    },
+  )
+}
+
+/**
+ * Cursor CLI stops automatic resumes after two resumed attempts that streamed
+ * but saved no checkpoint, so the turn does not repeat the same work forever.
+ */
+export function noProgressResumeError(cause: CursorProviderError, resumes: number): CursorProviderError {
+  return new CursorProviderError(
+    `Cursor Run stopped after ${resumes} resume attempts made no progress; ` +
+      "send a message to continue from the last saved state",
+    {
+      origin: cause.origin,
+      transient: false,
+      replaySafe: false,
+      retryable: false,
+      code: cause.code,
+      cause,
+    },
+  )
 }
 
 export function retrySuppressedError(

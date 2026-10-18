@@ -131,6 +131,66 @@ These are failure lessons shared by both hosts, not a replacement for
   eligible checkpoint only behind the replay barrier; a late tool result needs
   history recovery because `resume_action` re-requests that tool
   (`pumpWithRecovery`, `test/parallel-pump.test.ts`).
+- **A replay the provider must refuse can still be the host's to retry.**
+  Making every suppressed replay final ended a turn whose Run dropped after
+  only reasoning; its request reached Cursor only with the next message
+  ([#100](https://github.com/oakimov/cursor-opencode-provider/issues/100)).
+  Cursor CLI resends the action, resumes the turn's latest checkpoint, and stops
+  after two resumes without a new one. Match its 30 s inbound-silence default;
+  outbound client heartbeats cannot extend it. The transport's 120 s read-idle
+  watchdog is a separate backstop (`test/run-liveness.test.ts`).
+  Classify the constructed error, not only the signature table: CLI marks a
+  stream ending without `turnEnded` as transport, so it receives ten retries,
+  even though a different early-close signature uses the server category
+  (`test/run-error-host.test.ts`, `test/retry-budget.test.ts`).
+  Its separate 10-transport / 3-server retry budgets belong to the user turn,
+  not one provider call: an output-only
+  failure handed to an older host with unbounded retries otherwise restarts the
+  allowance forever. Share counts across module copies and host tool steps;
+  distinguish partial assistant output and host reminders from a new user turn.
+  Test the canonical host projection: OpenCode 2's interruption notice is plain
+  user text, not a `<system-reminder>`, and otherwise reset the budget on every
+  continuation (`test/run-error-host.test.ts`). Admit it only after a requested
+  host retry, retaining its full prompt key across tool steps; a later literal
+  user request with that text still needs a new budget. Normalize recognized
+  trailing host-note parts in every user message for identity only: plugins
+  append them to the initial request too, without persisting them in history.
+  Keep actual request content and attachment/new-request boundaries intact.
+  An unfinished partial-tool row has no execution authority; close it as
+  unfinished and classify it as output only. Started tool lifecycles, execs and
+  unknown frames still forbid that host retry (`test/run-interruption.test.ts`).
+  Immediately after completed host results, history recovery needs every observed
+  exec's result, no new output, and no opaque interaction or unknown frame.
+  Seed all completed tool steps; retaining only the last result loses earlier work. Never use the stale
+  checkpoint for that recovery. A later tool result must not erase an earlier
+  uncheckpointed follow-up's barrier: that follow-up may be absent from the
+  host prompt. Only a newer eligible checkpoint clears the revocation.
+  Capture result cutoffs at each actual serialized write, before its drain;
+  after-drain timestamps rejected valid checkpoints, while a cutoff before the
+  queue admitted checkpoints predating the completed result. Retain every
+  exec's owning session across resumes: bare stream-local ids both collide and
+  lose earlier completed results (`test/run-error-host.test.ts`, `test/session.test.ts`).
+  Reject an unsafe replacement upload before consulting the preceding Run's
+  checkpoint: that checkpoint says nothing about work the replacement may have
+  started. Failed drains must also project as terminal to both hosts, including
+  during credential renewal and endless mode (`test/run-interruption.test.ts`).
+  Endless mode bypasses counts only, preserving replay guards and CLI's 180 s
+  consecutive-stall retry window (`src/retry-budget.ts`,
+  `test/retry-budget.test.ts`, `test/run-error-host.test.ts`).
+  Record every barrier, not the first:
+  text before a stateful frame must not read as output-only. Keep stateful
+  barriers on the Run across tool-step pumps, and retain checkpoints before
+  credential renewal as well as transient recovery; otherwise a completed
+  command becomes host-retryable or a renewed attempt forgets its saved state.
+  Result delivery and follow-up user actions invalidate older checkpoints;
+  compare frame arrival order so a queued pre-result checkpoint cannot become
+  eligible just because the pump reads it after delivery. Capture a follow-up's
+  arrival cutoff before opening its replacement Run: its checkpoint can arrive
+  before the old stream finishes draining. An inherited tool barrier still
+  permits one credential renewal on an untouched resume with an eligible
+  checkpoint; new output or stateful activity must prevent it
+  (`AttemptReplaySafety`, `test/parallel-pump.test.ts`,
+  `test/run-interruption.test.ts`, `test/run-error-host.test.ts`).
 - **A helper must not take over its parent.** A smaller catalog was mistaken for
   a helper despite carrying the parent's pending result. Reconcile that result
   first; isolate genuine helpers (`test/fresh-turn-drain.test.ts`). An empty
@@ -163,7 +223,15 @@ These are failure lessons shared by both hosts, not a replacement for
   `test/lost-request-run.test.ts`).
 - **Predict the tool the remap will produce.** An announced edit on a new file
   becomes `write`; predicting `edit` showed a failed row beside every created
-  file (`hostToolForCursorEdit`, `test/early-tool-rows.test.ts`).
+  file. An empty file has no text to replace, so it stays `write` too. A
+  prediction also needs the exec's first step: an edit of a file outside the
+  workspace sends its private read to OpenCode's `read`, which closed the row
+  as a failed edit on 193 of 530 edits in a day (#106). Decide both from one
+  predicate. Content-dependent remaps stay unpredictable: a rewrite with
+  unchanged content stays a `write`. OpenCode 2 rejects a renamed call and
+  both hosts reject an identical `edit`, so such a row completes as a hand-off
+  naming the real call, never as a failure (`hostToolForCursorEdit`,
+  `cursorEditReadReachesHost`, `earlyRowHandoff`, `test/early-tool-rows.test.ts`).
 - **Silence of model text is not inactivity.** A large tool input arrived as
   heartbeats/token counts for minutes; renew semantic liveness on every inbound
   frame. Pending real execs also need the CLI's three-second client heartbeats,
@@ -247,9 +315,15 @@ These are failure lessons shared by both hosts, not a replacement for
   Check the host projections before the encoder too: secondary display cleanup
   must respect the captured native exit, and failed shell streams must retain
   partial stdout (`test/plugin.test.ts`, `test/plugin-opencode2.test.ts`,
-  `test/continuation-session.test.ts`). Private wrapper cleanup removes exactly
-  the launcher's separator, preserving spaces, CRLF, blank lines and literal
-  placeholders (`test/shell-timeout.test.ts`).
+  `test/continuation-session.test.ts`). A failed host tool's single text is
+  both `output` and `error`; sending both put it in stdout and stderr
+  ([#101](https://github.com/oakimov/cursor-opencode-provider/issues/101)).
+  Deduplicate against the effective error, including a shell-hook failure when
+  the SDK retains only text; keep distinct partial output on stdout
+  (`test/continuation-session.test.ts`).
+  Like Cursor CLI, stdout is only what the command printed. Private wrapper
+  cleanup removes exactly the launcher's separator, preserving spaces, CRLF,
+  blank lines and literal placeholders (`test/shell-timeout.test.ts`).
 - **Keep occupancy, work and money separate.** Hosts replace message tokens but
   add step costs; Run-wide generation inflated tok/s. Use checkpoint occupancy,
   retain stale markers, and keep raw counters distinct from synthetic billing
@@ -362,15 +436,39 @@ These are failure lessons shared by both hosts, not a replacement for
   stop later pushes in the same shell sequence. Require successful exit before
   publishing, and scan commit bodies and coauthor trailers as well as author /
   committer identities. A clean file diff alone does not establish privacy.
+- **Coverage must be measured on the commit it is reported for.** On a pull
+  request, checkout tests the merge with main while codecov-action files the
+  report under the PR head. Once main changed `src/language-model.ts`, PR #107's
+  patch showed 4 missing lines that were main's uncovered branch at the same
+  line numbers; the PR's own lines were all hit. The required job keeps testing
+  the merge; a separate PR job measures coverage on the head
+  (`.github/workflows/ci.yml`).
 - **Isolate fixture state.** Capture teardown paths before awaiting; restore
   host-agent callbacks and cache overrides. One leaked cache root broke later
   plugin tests (`test/host-interrupt.test.ts`).
+- **A removed temp dir can come back.** Tests left about 200 TMPDIR entries per
+  run ([#102](https://github.com/oakimov/cursor-opencode-provider/issues/102)):
+  cutting the whole project-folder path put it outside a long cache root;
+  background spawns kept their logs and children; a stop's save and terminal
+  supervisors wrote after the `finally`/`afterEach` removal; a held Run's save
+  landed after its test removed the dir. On Linux only, three tests left
+  `createCursor({ cacheDir })`'s process-wide cache root set, so later files
+  wrote into their removed dirs and failed tests that expected the default
+  root. Wait for the writers, restore the root, then remove; `test/preload.ts`
+  fails any run that leaves an entry and lists its files. Killing only a
+  background shell's marker PID leaves compound-command descendants alive;
+  stop its tree and await exit (`test/background-spawn.test.ts`). A failed
+  process listing or a writer surviving termination must fail cleanup, not
+  silently permit removal (`test/process-cleanup.test.ts`). Test log content
+  separately from its path-bearing diagnostic header (`test/debug.test.ts`).
 - **Match CI environments.** Narrow PATH fixtures omitted mkdir; Linux shell
   tests need an init reaper. Strip temporary module copies from coverage and
   include Bun editor types (`scripts/strip-copied-coverage.ts`).
 - **Keep one current policy across docs and prompts.** A rebase can add review
   rules; reviewer patches still need whole-path validation. Changelog fixes
-  compare with the release, not an intermediate PR state. Concurrent Unreleased
+  compare with the release, not an intermediate PR state. A versioned heading
+  or package version bump does not establish publication. Verify release status
+  and keep entries in the maintainer-designated upcoming release. Concurrent changelog
   insertions can conflict despite independent code; compare the union of entries
   after each dependency merge. Keep AGENTS.md to
   current invariants and source pointers; merge incident rationale here or in

@@ -24,7 +24,7 @@ import {
   serializeModelFallbackStop,
   type ModelFallbackStop,
 } from "../src/model-fallback.js"
-import { pump, resetTurnStateForTests, settleTerminalCheckpointSavesForTests } from "../src/language-model.js"
+import { pump, resetTurnStateForTests, settleRunSavesForTests, settleTerminalCheckpointSavesForTests } from "../src/language-model.js"
 import { getPersistedConversation } from "../src/protocol/conversation-persistence.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { decodeFramePayload, encodeFrame } from "../src/protocol/framing.js"
@@ -282,7 +282,8 @@ describe("stopping a Run at the first switched step", () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-model-fallback-"))
     setHostCacheDirOverride(path.join(root, "cache"))
   })
-  afterAll(() => {
+  afterAll(async () => {
+    await settleRunSavesForTests()
     setHostCacheDirOverride(undefined)
     fs.rmSync(root, { recursive: true, force: true })
   })
@@ -648,7 +649,8 @@ describe("the turn after a stop", () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-model-fallback-e2e-"))
     setHostCacheDirOverride(path.join(root, "cache"))
   })
-  afterAll(() => {
+  afterAll(async () => {
+    await settleRunSavesForTests()
     setHostCacheDirOverride(undefined)
     fs.rmSync(root, { recursive: true, force: true })
   })

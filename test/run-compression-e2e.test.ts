@@ -12,7 +12,7 @@ import path from "node:path"
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
-import { resetTurnStateForTests } from "../src/language-model.js"
+import { resetTurnStateForTests, settleRunSavesForTests } from "../src/language-model.js"
 import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { resetConversationBindingsForTests } from "../src/protocol/conversation-bind.js"
 import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
@@ -99,7 +99,11 @@ afterAll(async () => {
   }
 })
 
-afterEach(() => {
+const roots: string[] = []
+
+afterEach(async () => {
+  await settleRunSavesForTests()
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true })
   setHostCacheDirOverride(undefined)
   sessionManager.dispose()
   resetTurnStateForTests()
@@ -113,6 +117,7 @@ afterEach(() => {
 
 async function turn(text: string, sessionKey: string): Promise<LanguageModelV3StreamPart[]> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-gzip-refusal-"))
+  roots.push(root)
   const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root })
     .languageModel("composer-2.5")
   const { stream } = await model.doStream({

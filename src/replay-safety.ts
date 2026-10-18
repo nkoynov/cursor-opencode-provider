@@ -11,21 +11,60 @@ export type ReplayBarrierReason =
   | "stateful-interaction"
   | "unknown-or-malformed-frame"
 
+/** Host output without execution authority: sending the turn again repeats no side effect. */
+const OUTPUT_ONLY_BARRIERS: ReadonlySet<ReplayBarrierReason> = new Set([
+  "visible-text", "visible-reasoning", "visible-tool-row",
+])
+
+/** Plain Run-owned state retained across host tool-step pump calls. */
+export type ReplaySafetyState = {
+  statefulBarrier?: ReplayBarrierReason
+  /** Every exec needs its owner's host result; ids can restart on a resumed Run. */
+  execs?: Array<{ sessionId: string; id: number }>
+  /** History cannot represent opaque interactions, unknown frames or started display work. */
+  historyRebaseUnsafe?: boolean
+}
+
 export class AttemptReplaySafety {
   private barrierReason: ReplayBarrierReason | undefined
+  private stateful = false
 
-  constructor(private readonly sessionId: string) {}
+  constructor(
+    private readonly sessionId: string,
+    private readonly state: ReplaySafetyState = {},
+  ) {
+    this.stateful = state.statefulBarrier !== undefined
+  }
 
   markBarrier(reason: ReplayBarrierReason): void {
+    if (!OUTPUT_ONLY_BARRIERS.has(reason)) {
+      this.stateful = true
+      this.state.statefulBarrier ??= reason
+      if (reason !== "non-control-exec") this.state.historyRebaseUnsafe = true
+    }
     if (this.barrierReason) return
     this.barrierReason = reason
     trace(`replay barrier: reason=${reason} sessionId=${this.sessionId}`)
   }
 
+  recordExec(id: unknown): void {
+    const execs = this.state.execs ??= []
+    if (typeof id !== "number" || !Number.isSafeInteger(id)
+      || execs.some(exec => exec.sessionId === this.sessionId && exec.id === id)) {
+      this.state.historyRebaseUnsafe = true
+      return
+    }
+    execs.push({ sessionId: this.sessionId, id })
+  }
+
   applyTo(failure: CursorProviderError): CursorProviderError {
-    failure.replaySafe = this.barrierReason === undefined && failure.replaySafe
+    failure.replaySafe = this.barrierReason === undefined && !this.stateful && failure.replaySafe
     if (this.barrierReason) {
-      trace(`replay suppressed: reason=${this.barrierReason} sessionId=${this.sessionId}`)
+      failure.replayBarrier = this.stateful ? "stateful" : "output-only"
+      trace(
+        `replay suppressed: reason=${this.barrierReason} barrier=${failure.replayBarrier} ` +
+          `sessionId=${this.sessionId}`,
+      )
     }
     return failure
   }

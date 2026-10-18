@@ -9,7 +9,7 @@ import { createCursor } from "../src/index.js"
 import { getHostCacheDirOverride, setHostCacheDirOverride } from "../src/context/paths.js"
 import { notifyHostInterrupt } from "../src/host-interrupt.js"
 import { CursorLocalCancellationError, CursorProviderError } from "../src/errors.js"
-import { pump, resetTurnStateForTests } from "../src/language-model.js"
+import { pump, resetTurnStateForTests, settleRunSavesForTests } from "../src/language-model.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
 import { encodeFrame } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
@@ -379,6 +379,8 @@ describe("provider upload cancellation", () => {
       sessionManager.dispose()
       closeCachedHttp2SessionsForTests()
       if (reopened) await failureOf(reopened)
+      // The stop saves the cancelled Run afterwards; that write would recreate the dir.
+      await settleRunSavesForTests()
       setHostCacheDirOverride(previousCache)
       await fs.rm(cacheDir, { recursive: true, force: true })
     }

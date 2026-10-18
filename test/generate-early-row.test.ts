@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test"
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test"
 import fs from "node:fs"
 import http2 from "node:http2"
 import net from "node:net"
@@ -10,10 +10,11 @@ import { decodeFramePayload } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
 import { sessionManager } from "../src/session.js"
-import { resetTurnStateForTests } from "../src/language-model.js"
+import { resetTurnStateForTests, settleRunSavesForTests } from "../src/language-model.js"
 import { resetConversationBindingsForTests } from "../src/protocol/conversation-bind.js"
 import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
+import { getHostCacheDirOverride, setHostCacheDirOverride } from "../src/context/paths.js"
 
 const ORIGIN = "https://agentn.generate-early-row-test.cursor.sh"
 const PROXY_KEYS = ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"] as const
@@ -82,7 +83,13 @@ afterAll(async () => {
   }
 })
 
+// `createCursor({ cacheDir })` sets the process-wide host cache root; a later
+// test would write into this file's removed temp dir.
+let previousCache: string | undefined
+beforeEach(() => { previousCache = getHostCacheDirOverride() })
+
 afterEach(() => {
+  setHostCacheDirOverride(previousCache)
   sessionManager.dispose()
   resetTurnStateForTests()
   resetConversationPersistenceForTests()
@@ -108,6 +115,7 @@ describe("doGenerate with an announced edit that never runs", () => {
 
       expect(result.content).toEqual([{ type: "text", text: "No change was needed." }])
     } finally {
+      await settleRunSavesForTests()
       fs.rmSync(root, { recursive: true, force: true })
     }
   }, 30_000)

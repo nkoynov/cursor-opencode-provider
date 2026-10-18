@@ -8,13 +8,15 @@ import {
   pump,
   pumpWithRecovery,
   rememberMirroredTodos,
+  type CursorRunRecovery,
   snapshotMirroredTodosBySession,
 } from "../src/language-model.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
-import { CursorAuthError, CursorRetryExhaustedError, CursorServerError } from "../src/errors.js"
+import { CursorAuthError, CursorRetryExhaustedError, CursorServerError, CursorTransportError, hostFacingError } from "../src/errors.js"
 import { billingLedger } from "../src/billing.js"
+import { writeStreamMessage } from "../src/stream-write.js"
 import { sessionFixture } from "./session-fixture.js"
 
 function fakeSession(id: string, frames: Frame[], writes: Uint8Array[] = []): CursorSession {
@@ -269,6 +271,51 @@ describe("interrupted Cursor Run handling", () => {
     expect(parts.some((part: any) => part.type === "finish")).toBe(false)
   })
 
+  for (const afterRow of ["eof", "read-idle", "semantic-idle", "unknown", "started", "exec"] as const) {
+    it(`retries an unfinished display row only without stateful activity (${afterRow})`, async () => {
+      const session = fakeSession(`unfinished-row-${afterRow}`, [
+        serverFrame({ interaction_update: { thinking_delta: { text: "Preparing an edit" } } }),
+        serverFrame({ interaction_update: { partial_tool_call: { call_id: "unfinished-edit",
+          tool_call: { edit_tool_call: { args: { path: "unfinished.txt" } } } } } }),
+        ...(afterRow === "unknown" ? [{ flags: 0, payload: Uint8Array.of(0xa2, 0x06, 0) }] : []),
+        ...(afterRow === "started" ? [serverFrame({ interaction_update: { tool_call_started: { call_id: "unfinished-edit" } } })] : []),
+        ...(afterRow === "exec" ? [serverFrame({ exec_server_message: { id: 4, list_mcp_resources_exec_args: {} } })] : []),
+      ])
+      session.toolCatalog = [{ name: "write", description: "Write a file" }]
+      session.permittedToolNames = new Set(["write"])
+      session.requestContext.env = { workspace_paths: [process.cwd()] }
+      const next = session.frames.next.bind(session.frames)
+      session.frames.next = async () => {
+        const frame = await next()
+        if (frame.done && (afterRow === "read-idle" || afterRow === "semantic-idle")) {
+          throw new CursorTransportError("Cursor Run stalled", { transient: true, replaySafe: true,
+            code: afterRow === "read-idle" ? "CURSOR_READ_IDLE_TIMEOUT" : "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
+        }
+        return frame
+      }
+      const parts: Array<{ type: string; providerExecuted?: boolean; result?: string }> = []
+      try {
+        const failure = await pumpWithRecovery({
+          initialSession: session,
+          controller: controller(parts),
+          recover: async () => { throw new Error("Already displayed output must be retried by the host") },
+        }).catch((error: unknown) => error)
+        const outputOnly = ["eof", "read-idle", "semantic-idle"].includes(afterRow)
+        expect(hostFacingError(failure)).toMatchObject({ isRetryable: outputOnly,
+          responseHeaders: { "x-should-retry": String(outputOnly) } })
+        expect(parts.filter(part => part.type === "tool-input-start")).toHaveLength(1)
+        expect(parts.filter(part => part.type === "tool-input-end")).toHaveLength(1)
+        const calls = parts.filter(part => part.type === "tool-call")
+        expect(calls).toHaveLength(1)
+        expect(calls[0]!.providerExecuted).toBe(true)
+        expect(parts.find(part => part.type === "tool-result")?.result).toBe("Cursor did not finish this tool call.")
+        expect(session.pending.size).toBe(0)
+      } finally {
+        sessionManager.close(session)
+      }
+    })
+  }
+
   it("recovers once on a fresh session and completes only after turn_ended", async () => {
     const interrupted = fakeSession("first", [])
     const recovered = fakeSession("second", [
@@ -406,19 +453,20 @@ describe("interrupted Cursor Run handling", () => {
     expect(writes).toHaveLength(4)
   })
 
-  it("surfaces a second interruption instead of retrying forever", async () => {
+  it("stops early EOF after ten transport retries, like Cursor CLI", async () => {
     let recoveries = 0
     await expect(
       pumpWithRecovery({
         initialSession: fakeSession("first-eof", []),
         controller: controller([]),
+        retryPolicy: { baseDelayMs: 0, maxDelayMs: 0 },
         recover: async () => {
           recoveries++
           return fakeSession("second-eof", [])
         },
       }),
     ).rejects.toBeInstanceOf(CursorRetryExhaustedError)
-    expect(recoveries).toBe(1)
+    expect(recoveries).toBe(10)
   })
 
   it("does not leak OpenCode SessionRetry triggers after unavailable retries finish", async () => {
@@ -514,6 +562,112 @@ describe("interrupted Cursor Run handling", () => {
     expect(renewals).toBe(0)
   })
 
+  it("retains a checkpoint across credential renewal and a later output-only failure", async () => {
+    const checkpoint = Uint8Array.from([0x0a, 0x01, 0x09])
+    const recoveries: CursorRunRecovery[] = []
+    const finalSession = await pumpWithRecovery({
+      initialSession: fakeSession("checkpoint-before-renewal", [
+        serverFrame({ conversation_checkpoint_update: checkpoint }),
+        endStreamError("unauthenticated"),
+      ]),
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 2, baseDelayMs: 0, maxDelayMs: 0 },
+      renewRejectedCredential: () => {},
+      recover: async (recovery) => {
+        recoveries.push(recovery)
+        return recoveries.length === 1
+          ? fakeSession("renewed-without-checkpoint", [
+              serverFrame({ interaction_update: { thinking_delta: { text: "continuing" } } }),
+            ])
+          : fakeSession("renewed-recovered", [turnEnded()])
+      },
+    })
+    expect(finalSession.sessionId).toBe("renewed-recovered")
+    expect(recoveries).toHaveLength(2)
+    for (const recovery of recoveries) {
+      expect(recovery).toMatchObject({ kind: "resume", checkpoint })
+    }
+  })
+
+  it.each([false, true])("renews an untouched checkpoint resume after an earlier tool barrier (new checkpoint: %s)", async newCheckpoint => {
+    const checkpoint = Uint8Array.of(10, 1, 11)
+    const replacementCheckpoint = Uint8Array.of(10, 1, 12)
+    const initial = fakeSession("tool-before-renewal", [
+      serverFrame({ conversation_checkpoint_update: checkpoint }),
+      endStreamError("unavailable"),
+    ])
+    initial.replaySafety = { statefulBarrier: "non-control-exec" }
+    const rejected = fakeSession("untouched-resume", [
+      ...(newCheckpoint ? [serverFrame({ conversation_checkpoint_update: replacementCheckpoint })] : []),
+      endStreamError("unauthenticated"),
+    ])
+    const renewed = fakeSession("renewed-resume", [turnEnded()])
+    rejected.conversationId = renewed.conversationId = initial.conversationId
+    const recoveries: CursorRunRecovery[] = []
+    let renewals = 0
+    const final = await pumpWithRecovery({
+      initialSession: initial,
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 2, baseDelayMs: 0, maxDelayMs: 0 },
+      renewRejectedCredential: () => { renewals++ },
+      recover: async recovery => {
+        recoveries.push(recovery)
+        return recoveries.length === 1 ? rejected : renewed
+      },
+    })
+    expect(final).toBe(renewed)
+    expect(renewals).toBe(1)
+    expect(recoveries).toEqual([
+      { kind: "resume", conversationId: initial.conversationId, checkpoint },
+      { kind: "resume", conversationId: initial.conversationId, checkpoint: newCheckpoint ? replacementCheckpoint : checkpoint },
+    ])
+    expect(renewed.replaySafety).toEqual(initial.replaySafety)
+  })
+
+  it.each(["output", "tool display", "revoked checkpoint"])("does not renew a resumed credential after %s", async activity => {
+    const initial = fakeSession("before-resume-activity", [
+      serverFrame({ conversation_checkpoint_update: Uint8Array.of(10, 1, 13) }),
+    ])
+    initial.replaySafety = { statefulBarrier: "non-control-exec" }
+    const rejected = fakeSession("resume-activity", [
+      ...(activity === "output" ? [serverFrame({ interaction_update: { text_delta: { text: "Visible progress" } } })] : []),
+      ...(activity === "tool display" ? [serverFrame({ interaction_update: { tool_call_started: { call_id: "new-tool" } } })] : []),
+      endStreamError("unauthenticated"),
+    ])
+    rejected.checkpointRevoked = activity === "revoked checkpoint"
+    let renewals = 0
+    let recoveries = 0
+    const failure = await pumpWithRecovery({
+      initialSession: initial,
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 2, baseDelayMs: 0, maxDelayMs: 0 },
+      renewRejectedCredential: () => { renewals++ },
+      recover: async () => { recoveries++; return rejected },
+    }).catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(CursorAuthError)
+    expect(recoveries).toBe(1)
+    expect(renewals).toBe(0)
+  })
+
+  it("never renews twice after a checkpointed tool result", async () => {
+    const initial = fakeSession("tool-before-two-rejections", [
+      serverFrame({ conversation_checkpoint_update: Uint8Array.of(10, 1, 14) }),
+    ])
+    initial.replaySafety = { statefulBarrier: "non-control-exec" }
+    let renewals = 0
+    let recoveries = 0
+    const failure = await pumpWithRecovery({
+      initialSession: initial,
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 2, baseDelayMs: 0, maxDelayMs: 0 },
+      renewRejectedCredential: () => { renewals++ },
+      recover: async () => { recoveries++; return fakeSession(`rejection-${recoveries}`, [endStreamError("unauthenticated")]) },
+    }).catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(CursorAuthError)
+    expect(recoveries).toBe(2)
+    expect(renewals).toBe(1)
+  })
+
   it("does not renew when the source cannot, after visible output, or on permission_denied", async () => {
     const cases = [
       { session: fakeSession("static", [endStreamError("unauthenticated")]), renew: false },
@@ -545,6 +699,103 @@ describe("interrupted Cursor Run handling", () => {
     }
   })
 
+  it.each([false, true])("keeps transport counts across replacement checkpoints (endless=%s)", async endless => {
+    const saved = process.env.CURSOR_ENDLESS_RETRIES
+    if (endless) process.env.CURSOR_ENDLESS_RETRIES = "1"
+    else delete process.env.CURSOR_ENDLESS_RETRIES
+    let attempts = 0
+    const checkpointedFailure = () => {
+      attempts++
+      const session = fakeSession(`transport-budget-${attempts}`, [
+        serverFrame({ conversation_checkpoint_update: Uint8Array.of(10, 1, attempts) }),
+        ...(endless && attempts === 15 ? [turnEnded()] : []),
+      ])
+      const next = session.frames.next.bind(session.frames)
+      session.frames.next = async () => {
+        const frame = await next()
+        if (frame.done) throw new CursorTransportError("reset", { transient: true, replaySafe: true, code: "ECONNRESET" })
+        return frame
+      }
+      return session
+    }
+    try {
+      const pumping = pumpWithRecovery({
+        initialSession: checkpointedFailure(), controller: controller([]),
+        retryPolicy: { baseDelayMs: 0, maxDelayMs: 0 },
+        recover: async () => checkpointedFailure(),
+      })
+      if (endless) await pumping
+      else await expect(pumping).rejects.toBeInstanceOf(CursorRetryExhaustedError)
+      expect(attempts).toBe(endless ? 15 : 11)
+    } finally {
+      if (saved === undefined) delete process.env.CURSOR_ENDLESS_RETRIES
+      else process.env.CURSOR_ENDLESS_RETRIES = saved
+    }
+  })
+
+  it("budgets replacement connection failures in the same loop", async () => {
+    let openings = 0
+    await expect(pumpWithRecovery({
+      initialSession: fakeSession("before-replacement-connect-failures", []),
+      controller: controller([]), retryPolicy: { baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async () => {
+        openings++
+        throw new CursorTransportError("connect reset", { transient: true, replaySafe: true, code: "ECONNRESET" })
+      },
+    })).rejects.toBeInstanceOf(CursorRetryExhaustedError)
+    // The initial EOF and failed replacement opens share ten transport retries.
+    expect(openings).toBe(10)
+  })
+
+  for (const endless of [false, true]) {
+    for (const renewal of [false, true]) {
+      for (const upload of ["throw", "drain"] as const) {
+        it(`ends an unsafe replacement ${upload} with an older checkpoint (renewal=${renewal}, endless=${endless})`, async () => {
+          const saved = process.env.CURSOR_ENDLESS_RETRIES
+          if (endless) process.env.CURSOR_ENDLESS_RETRIES = "true"
+          else delete process.env.CURSOR_ENDLESS_RETRIES
+          const checkpoint = Uint8Array.of(10, 1, 21)
+          let openings = 0
+          let renewals = 0
+          let uploadFailure: unknown
+          try {
+            const failure = await pumpWithRecovery({
+              initialSession: fakeSession("before-unsafe-replacement", [
+                serverFrame({ conversation_checkpoint_update: checkpoint }),
+                ...(renewal ? [endStreamError("unauthenticated")] : []),
+              ]),
+              controller: controller([]), retryPolicy: { baseDelayMs: 0, maxDelayMs: 0 },
+              renewRejectedCredential: () => { renewals++ },
+              recover: async recovery => {
+                openings++
+                expect(recovery).toMatchObject({ kind: "resume", checkpoint })
+                // A second opening makes the buggy path finish instead of looping.
+                if (openings > 1) return fakeSession("unexpected-replay", [turnEnded()])
+                const stream = fakeSession("ambiguous-upload", []).stream
+                const reset = Object.assign(new Error("upload connection reset"), { code: "ECONNRESET" })
+                stream.write = () => { if (upload === "throw") throw reset; return false }
+                stream.waitForDrain = async () => { throw reset }
+                try { await writeStreamMessage(stream, Uint8Array.of(1), "replacement Run request") }
+                catch (error) { uploadFailure = error; throw error }
+                throw new Error("The replacement upload must fail")
+              },
+            }).catch((error: unknown) => error)
+
+            expect(hostFacingError(failure)).toMatchObject({
+              statusCode: 400, isRetryable: false, responseHeaders: { "x-should-retry": "false" },
+            })
+            expect(failure).toMatchObject({ retryable: false, replaySafe: false, cause: uploadFailure })
+            expect(openings).toBe(1)
+            expect(renewals).toBe(renewal ? 1 : 0)
+          } finally {
+            if (saved === undefined) delete process.env.CURSOR_ENDLESS_RETRIES
+            else process.env.CURSOR_ENDLESS_RETRIES = saved
+          }
+        })
+      }
+    }
+  }
+
   it("uses retry.maxAttempts as the total Run attempt budget", async () => {
     let recoveries = 0
     await expect(
@@ -562,23 +813,157 @@ describe("interrupted Cursor Run handling", () => {
     expect(recoveries).toBe(2)
   })
 
-  it("does not recover after visible output because replay could duplicate text", async () => {
+  it("leaves the retry to the host after output only, before any checkpoint", async () => {
     let recoveries = 0
     const parts: any[] = []
-    await expect(
-      pumpWithRecovery({
-        initialSession: fakeSession("partial", [
-          serverFrame({ interaction_update: { text_delta: { text: "partial" } } }),
-        ]),
-        controller: controller(parts),
-        recover: async () => {
-          recoveries++
-          return fakeSession("unused", [])
-        },
-      }),
-    ).rejects.toThrow("automatic retry unsafe")
+    const failure = await pumpWithRecovery({
+      initialSession: fakeSession("partial", [
+        serverFrame({ interaction_update: { thinking_delta: { text: "thinking" } } }),
+        serverFrame({ interaction_update: { text_delta: { text: "partial" } } }),
+      ]),
+      controller: controller(parts),
+      recover: async () => {
+        recoveries++
+        return fakeSession("unused", [])
+      },
+    }).catch((error: unknown) => error)
+
+    // Replaying here would show the text twice; Cursor CLI sends the action again.
+    expect(failure).toMatchObject({ hostRetryable: true, transient: false, replaySafe: false })
+    expect((failure as Error).message).not.toContain("automatic retry unsafe")
     expect(recoveries).toBe(0)
     expect(parts.some((part) => part.type === "text-delta" && part.delta === "partial")).toBe(true)
+  })
+
+  it("keeps a failure final when the attempt did more than show output", async () => {
+    const getBlob = lengthDelimitedField(1, new TextEncoder().encode("inline blob"))
+    const getWithUnknownField = Uint8Array.from([
+      ...varintField(1, 15),
+      ...lengthDelimitedField(2, getBlob),
+      ...fixed32Field(20),
+    ])
+    let recoveries = 0
+    const failure = await pumpWithRecovery({
+      initialSession: fakeSession("output-then-state", [
+        // Text first: the later stateful frame must still decide the verdict.
+        serverFrame({ interaction_update: { text_delta: { text: "partial" } } }),
+        { flags: 0, payload: lengthDelimitedField(4, getWithUnknownField) },
+      ]),
+      controller: controller([]),
+      recover: async () => {
+        recoveries++
+        return fakeSession("unused", [])
+      },
+    }).catch((error: unknown) => error)
+
+    expect(failure).toMatchObject({ retryable: false, replaySafe: false })
+    expect((failure as { hostRetryable?: boolean }).hostRetryable).toBeUndefined()
+    expect((failure as Error).message).toContain("automatic retry unsafe")
+    expect(recoveries).toBe(0)
+  })
+
+  it("resumes the turn's latest checkpoint when a resumed attempt saved none, like Cursor CLI", async () => {
+    const checkpoint = Uint8Array.from([0x0a, 0x01, 0x05])
+    const sessions = [
+      fakeSession("resume-no-output", []),
+      fakeSession("resume-output", [serverFrame({ interaction_update: { text_delta: { text: " more" } } })]),
+      fakeSession("resume-done", [
+        serverFrame({ interaction_update: { text_delta: { text: " done" } } }),
+        serverFrame({ interaction_update: { turn_ended: { input_tokens: 1, output_tokens: 1 } } }),
+      ]),
+    ]
+    const recoveries: CursorRunRecovery[] = []
+    const parts: any[] = []
+    const finalSession = await pumpWithRecovery({
+      initialSession: fakeSession("checkpointed-first", [
+        serverFrame({ interaction_update: { text_delta: { text: "partial" } } }),
+        serverFrame({ conversation_checkpoint_update: checkpoint }),
+      ]),
+      controller: controller(parts),
+      retryPolicy: { maxAttempts: 4, baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async (recovery) => {
+        recoveries.push(recovery)
+        return sessions[recoveries.length - 1]!
+      },
+    })
+
+    expect(finalSession).toBe(sessions[2])
+    expect(recoveries.map((recovery) => recovery.kind)).toEqual(["resume", "resume", "resume"])
+    for (const recovery of recoveries) {
+      expect(Buffer.from((recovery as { checkpoint: Uint8Array }).checkpoint)).toEqual(Buffer.from(checkpoint))
+    }
+    expect(parts.filter((part) => part.type === "finish")).toHaveLength(1)
+  })
+
+  it("does not count a prior tool-step barrier as streaming from a silent resumed attempt", async () => {
+    const checkpoint = Uint8Array.from([0x0a, 0x01, 0x08])
+    const initial = fakeSession("prior-tool-checkpoint", [
+      serverFrame({ conversation_checkpoint_update: checkpoint }),
+    ])
+    initial.replaySafety = { statefulBarrier: "non-control-exec" }
+    let recoveries = 0
+    const finalSession = await pumpWithRecovery({
+      initialSession: initial,
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 4, baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async () => {
+        recoveries++
+        return fakeSession(`silent-resume-${recoveries}`, recoveries === 3 ? [turnEnded()] : [])
+      },
+    })
+    expect(finalSession.sessionId).toBe("silent-resume-3")
+    expect(recoveries).toBe(3)
+  })
+
+  it.each([false, true])("stops after two resumed attempts stream without saving a checkpoint (endless=%s)", async endless => {
+    const saved = process.env.CURSOR_ENDLESS_RETRIES
+    if (endless) process.env.CURSOR_ENDLESS_RETRIES = "true"
+    else delete process.env.CURSOR_ENDLESS_RETRIES
+    const checkpoint = Uint8Array.from([0x0a, 0x01, 0x06])
+    let recoveries = 0
+    const failure = await pumpWithRecovery({
+      initialSession: fakeSession("checkpointed-then-stuck", [
+        serverFrame({ conversation_checkpoint_update: checkpoint }),
+      ]),
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 6, baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async () => {
+        recoveries++
+        return fakeSession(`stuck-${recoveries}`, [
+          serverFrame({ interaction_update: { thinking_delta: { text: "again" } } }),
+        ])
+      },
+    }).catch((error: unknown) => error)
+
+    expect(failure).toMatchObject({ retryable: false, transient: false })
+    expect((failure as Error).message).toContain("2 resume attempts made no progress")
+    expect(recoveries).toBe(2)
+    if (saved === undefined) delete process.env.CURSOR_ENDLESS_RETRIES
+    else process.env.CURSOR_ENDLESS_RETRIES = saved
+  })
+
+  it("does not resume an earlier checkpoint once the Run sent a newer user message", async () => {
+    let recoveries = 0
+    const revoked = fakeSession("revoked", [
+      serverFrame({ interaction_update: { text_delta: { text: "after steer" } } }),
+    ])
+    revoked.checkpointRevoked = true
+    const failure = await pumpWithRecovery({
+      initialSession: fakeSession("checkpointed-before-steer", [
+        serverFrame({ conversation_checkpoint_update: Uint8Array.from([0x0a, 0x01, 0x07]) }),
+      ]),
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 4, baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async () => {
+        recoveries++
+        if (recoveries > 1) throw new Error("A revoked checkpoint must not be resumed")
+        return revoked
+      },
+    }).catch((error: unknown) => error)
+
+    expect(failure).toMatchObject({ retryable: false })
+    expect((failure as { hostRetryable?: boolean }).hostRetryable).toBeUndefined()
+    expect(recoveries).toBe(1)
   })
 
   it("replies to decoded KV requests with unknown fields, then suppresses replay", async () => {

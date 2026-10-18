@@ -27,8 +27,10 @@ Operator setup: [OpenCode 2.0](../../docs/opencode-2.md).
   `APICallError` by status and retries 408/409/429/5xx; only `x-should-retry:
   false` overrides it. An unrecognized failure without a status also retries:
   project pre-stream failures from both public generation methods and mark
-  spent/unsafe provider retries terminal, alongside final server verdicts
-  (`hostFacingError`, `test/errors.test.ts`, `test/run-error-host.test.ts`).
+  spent or side-effecting provider retries terminal, alongside final server
+  verdicts. An output-only failure needs `x-should-retry: true` and no status:
+  2.0 then continues after the shown output (`hostFacingError`,
+  `test/errors.test.ts`, `test/run-error-host.test.ts`).
 - **A new plugin header does not prove a new SDK.** Pin the intended binary,
   isolate config, set the local provider entry before daemon start, and restart
   after rebuilding ([local setup](../../docs/opencode-2.md#from-a-local-clone-cursor_opencode2_dev_entry)).
