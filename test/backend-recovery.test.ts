@@ -363,6 +363,23 @@ describe("resuming again from the turn's checkpoint", () => {
     expect(recoveries).toHaveLength(0)
   })
 
+  it("does not resume the Run's own checkpoint from before a state-changing host exec", async () => {
+    const recoveries: CursorRunRecovery[] = []
+    await pumpWithRecovery({
+      initialSession: fakeSession("own-then-exec", [{ frame: endStreamError("internal") }], {
+        resumeCheckpoint: Uint8Array.from(first),
+        sideEffectAfterCheckpoint: true,
+      }),
+      controller: controller(),
+      retryPolicy: noDelay,
+      recover: async (recovery) => {
+        recoveries.push(recovery)
+        return fakeSession("after-exec", [{ frame: turnEnded() }])
+      },
+    }).catch(() => undefined)
+    expect(recoveries.every((recovery) => recovery.kind !== "resume")).toBe(true)
+  })
+
   it("resumes a checkpoint the Run received after its interaction query", async () => {
     const recoveries: CursorRunRecovery[] = []
     await pumpWithRecovery({
@@ -546,6 +563,22 @@ describe("capacity failures", () => {
     }).catch((error: unknown) => error)
     expect(recoveries).toBe(0)
     expect(failure).toBeInstanceOf(CursorRetryExhaustedError)
+  })
+
+  it("counts the capacity limit across the turn's host retries", async () => {
+    let recoveries = 0
+    const failure = await pumpWithRecovery({
+      initialSession: fakeSession("cap-turn", [{ frame: endStreamError("resource_exhausted") }]),
+      controller: controller(),
+      retryPolicy: { baseDelayMs: 0, maxDelayMs: 0, capacityMaxAttempts: 6 },
+      retryBudget: { ...newRetryBudget(), capacity: 5 },
+      recover: async () => {
+        recoveries++
+        return fakeSession("cap-seventh", [{ frame: turnEnded() }])
+      },
+    }).catch((error: unknown) => error)
+    expect(recoveries).toBe(0)
+    expect(failure).toMatchObject({ attempts: 6 })
   })
 
   it("keeps retrying capacity refusals in endless retry mode", async () => {

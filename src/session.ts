@@ -217,8 +217,8 @@ export type CursorSession = {
    * checkpoint: an earlier checkpoint of the turn would replay it, so recovery resumes none.
    */
   earlierCheckpointStale?: boolean
-  /** An interaction query came after this Run's own latest checkpoint, which would replay it too. */
-  interactionAfterCheckpoint?: boolean
+  /** An interaction query or a state-changing host exec came after this Run's own latest checkpoint, which would replay it too. */
+  sideEffectAfterCheckpoint?: boolean
   /** Calls of the current step Cursor began streaming that no exec or completion has ended yet. */
   announcedCallIds?: Set<string>
   /**

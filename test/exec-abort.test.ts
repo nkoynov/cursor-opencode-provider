@@ -169,6 +169,15 @@ describe("Cursor's exec abort (ExecServerControlMessage.abort)", () => {
     expect(session.pending.size).toBe(0)
   })
 
+  it("does not resume the Run's own checkpoint from before a state-changing host exec", async () => {
+    const checkpoint = frame({ conversation_checkpoint_update: Uint8Array.of(10, 1, 7) })
+    const session = heldSession(scriptedFrames([checkpoint, listed(1), ...shell(1, "a")]).frames)
+    const { controller } = collector()
+    await pumpWithRecovery({ initialSession: session, controller, recover: async () => { throw new Error("no") } })
+    expect(session.resumeCheckpoint).toEqual(Uint8Array.of(10, 1, 7))
+    expect(session.sideEffectAfterCheckpoint).toBe(true)
+  })
+
   it("stops resuming the checkpoint from before a withdrawn exec the host ran anyway", async () => {
     const session = heldSession(scriptedFrames().frames)
     session.resumeCheckpoint = Uint8Array.of(10, 1, 7)

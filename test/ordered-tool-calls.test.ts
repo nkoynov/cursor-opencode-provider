@@ -147,6 +147,8 @@ describe("ordered tool calls", () => {
     expect(calls(second)).toEqual(["bash#2"])
     expect(finishes(second)).toEqual(["tool-calls"])
     expect(session.toolCallOrder?.deferred).toEqual([])
+    expect(session.replaySafety?.historyRebaseUnsafe).toBeFalsy()
+    expect(session.replaySafety?.execs?.filter((exec) => exec.id === 2)).toHaveLength(1)
   })
 
   it("waits for an edit whose read goes through the host before running the next command", async () => {
@@ -165,6 +167,7 @@ describe("ordered tool calls", () => {
 
     const first = await pumpOnce(session)
     expect(calls(first)).toEqual(["read#1"])
+    expect(session.replaySafety?.hostCalls ?? []).not.toContain("edit")
 
     await deliverAll(session)
     const pumping = pumpOnce(session)
@@ -172,6 +175,7 @@ describe("ordered tool calls", () => {
     script.push(editWrite(3, "edit", target))
     const second = await pumping
     expect(calls(second)).toEqual(["edit#3"])
+    expect(session.replaySafety?.hostCalls).toContain("edit")
 
     await deliverAll(session)
     const third = await pumpOnce(session)

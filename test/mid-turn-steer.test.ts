@@ -238,6 +238,10 @@ describe("mid-turn user message after a complete step", () => {
     partial.announcedCallIds = new Set(["call_3"])
     expect(steered(steer("partial-only", user("b")))?.messages).toEqual([])
     sessionManager.dispose()
+    const carried = heldReads("carried")
+    carried.carriedToolStep = { listed: 3, resolved: new Set(["call_1", "call_2"]) }
+    expect(steered(steer("carried", user("b")))?.messages).toEqual([])
+    sessionManager.dispose()
     const answered = heldReads("answered")
     answered.toolCallOrder = { calls: [{ callId: "call_1", mutating: false }, { callId: "call_2", mutating: false }], deferred: [], progressAt: Date.now() }
     expect(steered(steer("answered", user("b")))?.messages).toEqual(["b"])

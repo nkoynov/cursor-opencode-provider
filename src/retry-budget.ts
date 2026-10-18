@@ -92,7 +92,7 @@ export function reserveRetry(budget: RetryBudget, failure: CursorProviderError, 
   const stallExpired = stalled && budget.stallStartedAt !== undefined && now - budget.stallStartedAt >= 180_000
   if (stallExpired || (!endlessRetriesEnabled() && (
     budget[category] >= (category === "server" ? 3 : 10)
-    || (maxAttempts !== undefined && budget.retries >= maxAttempts - 1)
+    || (maxAttempts !== undefined && budget.retries + (budget.capacity ?? 0) >= maxAttempts - 1)
   ))) throw new CursorRetryExhaustedError(budget.retries + 1, failure)
   if (stalled) budget.stallStartedAt ??= now
   budget[category]++

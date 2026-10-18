@@ -17,6 +17,11 @@ const server = () => new CursorServerError("unavailable", { transient: true, rep
 const stall = () => new CursorTransportError("Stalled", { transient: true, replaySafe: true, code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
 
 describe("Cursor CLI retry budgets", () => {
+  it("counts capacity retries against an explicit maxAttempts", () => {
+    expect(() => reserveRetry({ ...newRetryBudget(), retries: 1, capacity: 1 }, transport(), 3)).toThrow(CursorRetryExhaustedError)
+    expect(() => reserveRetry({ ...newRetryBudget(), retries: 1 }, transport(), 3)).not.toThrow()
+  })
+
   it("ignores only standalone host interruption notices in an ongoing turn", () => {
     const notice = "The previous response was interrupted. Continue from where you left off without repeating completed content."
     const user = (text: string): LanguageModelV3Prompt[number] => ({ role: "user", content: [{ type: "text", text }] })

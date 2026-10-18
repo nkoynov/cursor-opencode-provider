@@ -947,7 +947,7 @@ function acceptResumeCheckpoint(session: CursorSession, bytes: Uint8Array, frame
   session.checkpointRevoked = false
   session.checkpointRevokedByHostResult = false
   session.earlierCheckpointStale = false
-  session.interactionAfterCheckpoint = false
+  session.sideEffectAfterCheckpoint = false
   session.resumeCheckpointAfterFrame = undefined
   return true
 }
@@ -1301,8 +1301,9 @@ async function doStreamImpl(
                   || !historyRepresentsRun(failed.replaySafety)) return false
                 const completed = new Set(extractToolResults(prompt)
                   .map(result => `${result.sessionId}:${result.execId}`))
-                const execs = failed.replaySafety?.execs
-                return !!execs?.length && execs.every(exec => completed.has(`${exec.sessionId}:${exec.id}`))
+                const execs = failed.replaySafety?.execs ?? []
+                if (!execs.length && !failed.replaySafety?.hostCalls?.length) return false
+                return execs.every(exec => completed.has(`${exec.sessionId}:${exec.id}`))
               },
               recover: (recovery) => openSession({ recovery }),
               onSession: (next) => { activeSession = next },
@@ -1414,11 +1415,6 @@ export async function pumpWithRecovery(input: {
   const maxRecoveries = retryPolicy.maxAttempts === undefined ? 13 : retryPolicy.maxAttempts - 1
   // Fork: capacity refusals keep their own longer backoff, outside the CLI budget.
   const capacityMaxRecoveries = (retryPolicy.capacityMaxAttempts ?? retryPolicy.maxAttempts ?? DEFAULT_CAPACITY_MAX_ATTEMPTS) - 1
-  let capacityRetries = 0
-  // An explicit maxAttempts is a ceiling on every Run of the turn, capacity retries included.
-  const budgetCeiling = () => retryPolicy.maxAttempts === undefined
-    ? undefined
-    : retryPolicy.maxAttempts - (retryBudget.capacity ?? 0)
   const startedAt = Date.now()
   let credentialRenewed = false
   let compressionFallbackUsed = false
@@ -1432,7 +1428,7 @@ export async function pumpWithRecovery(input: {
   input.onSession?.(session)
 
   const resumableCheckpoint = (pumpedSession: CursorSession) =>
-    pumpedSession.resultsAfterCheckpoint || pumpedSession.interactionAfterCheckpoint ? undefined : pumpedSession.resumeCheckpoint
+    pumpedSession.resultsAfterCheckpoint || pumpedSession.sideEffectAfterCheckpoint ? undefined : pumpedSession.resumeCheckpoint
 
   const reopen = async (
     pumpedSession: CursorSession,
@@ -1653,7 +1649,7 @@ export async function pumpWithRecovery(input: {
         // provider from doing so; the host can, unless a side effect would repeat.
         if (failure.replayBarrier === "output-only" && !pumpedSession.checkpointRevoked) {
           trace(`Run interrupted after output only: sessionId=${pumpedSession.sessionId} — leaving the retry to the host`)
-          reserveRetry(retryBudget, failure, budgetCeiling())
+          reserveRetry(retryBudget, failure, retryPolicy.maxAttempts)
           retryBudget.hostRetryPending = true
           throw hostRetryError(failure)
         }
@@ -1665,15 +1661,15 @@ export async function pumpWithRecovery(input: {
         )
       }
       if (capacity) {
-        const ceiling = budgetCeiling()
-        if (!endlessRetriesEnabled() && (capacityRetries >= capacityMaxRecoveries
-          || (ceiling !== undefined && retryBudget.retries >= ceiling - 1))) {
-          throw new CursorRetryExhaustedError(attempt + 1, failure, Date.now() - startedAt)
+        // Turn-wide, and with an explicit maxAttempts one ceiling on every Run of the turn.
+        const capacityRetries = retryBudget.capacity ?? 0
+        if (!endlessRetriesEnabled() && (capacityRetries >= capacityMaxRecoveries || (retryPolicy.maxAttempts !== undefined
+          && retryBudget.retries + capacityRetries >= retryPolicy.maxAttempts - 1))) {
+          throw new CursorRetryExhaustedError(capacityRetries + 1, failure, Date.now() - startedAt)
         }
-        capacityRetries++
-        retryBudget.capacity = (retryBudget.capacity ?? 0) + 1
+        retryBudget.capacity = capacityRetries + 1
       } else {
-        reserveRetry(retryBudget, failure, budgetCeiling())
+        reserveRetry(retryBudget, failure, retryPolicy.maxAttempts)
       }
       const resuming = checkpoint ? `resuming ${checkpoint.length}B checkpoint` : "rebasing fresh Run"
       trace(
@@ -4516,6 +4512,7 @@ export function continuationAfterEarlySteers(
   const laterCalls = hasDeferredToolExecs(held.toolCallOrder)
     || (held.toolCallOrder?.calls ?? []).some((call) => !answeredCalls.has(call.callId))
     || [...held.announcedCallIds ?? []].some((callId) => !answeredCalls.has(callId))
+    || held.carriedToolStep !== undefined
   const injectNew = takesSteers && !laterCalls
   // The host has already promoted these messages. Inject them, or keep them for a follow-up after the
   // held turn, rather than superseding its tool results or dropping all but the last user message.
@@ -5672,9 +5669,10 @@ export async function pump(
     // from before one would repeat it, so only a later checkpoint is resumed.
     if (interactionQuery) {
       session.earlierCheckpointStale = true
-      session.interactionAfterCheckpoint = true
+      session.sideEffectAfterCheckpoint = true
     }
-    if (replayFrame.barrier === "non-control-exec") replaySafety.recordExec(esm?.id)
+    // A held exec was recorded when it first arrived.
+    if (replayFrame.barrier === "non-control-exec" && !released) replaySafety.recordExec(esm?.id)
     // Reseeding is allowed only while every frame so far was positively a
     // control frame. Anything else, including unknown top-level fields, may have
     // carried output or stateful activity.
@@ -6504,9 +6502,13 @@ export async function pump(
           }
           if (displayCallId) {
             session.displayToolCalls.delete(displayCallId)
-            replaySafety.claimDisplayCall(displayCallId)
+            // An edit's private read leaves its write, the call's own work, still to come.
+            if (resultFinishesToolCall(session, { resultField: parsed.resultField, displayCallId })) {
+              replaySafety.claimDisplayCall(displayCallId)
+            }
             trace(`exec: claimed display callId=${displayCallId}`)
           }
+          if (execMutates) session.sideEffectAfterCheckpoint = true
           const boundEarly = earlyRows.claim(displayCallId)
           let earlyToolCallId: string | undefined
           if (boundEarly) {

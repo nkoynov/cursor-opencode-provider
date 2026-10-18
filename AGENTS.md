@@ -155,7 +155,7 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   `hostRetryable` failure is the exception: an `APICallError` with
   `isRetryable: true`, `x-should-retry: true` and no status, so both hosts retry.
 - Fork: a capacity refusal without a final verdict (`isCapacityFailure`) gets six
-  attempts with a longer backoff, counted apart from the shared CLI retry
+  attempts per turn with a longer backoff, counted apart from the shared CLI retry
   budget, before it ends as final; an explicit `retry.maxAttempts` caps both
   together across the turn (`RetryBudget.capacity`), and endless retry mode
   lifts the capacity limit. An `ERROR_CUSTOM_MESSAGE` whose protobuf
@@ -164,10 +164,11 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
 - Fork: recovery resumes the turn's latest checkpoint only while the attempt
   has asked the host for nothing since it (`earlierCheckpointStale`: a pending
   exec or a query the provider answered). The attempt's own checkpoint resumes
-  unless a query the provider answered came after it
-  (`interactionAfterCheckpoint`). A promoted steer is not injected while a
+  unless a query the provider answered or a state-changing host exec came
+  after it (`sideEffectAfterCheckpoint`). A promoted steer is not injected while a
   later call of its step is deferred, announced without its exec yet
-  (`announcedCallIds`), or an edit that has had only its read; it goes
+  (`announcedCallIds`), carried to the next pass (`carriedToolStep`), or an
+  edit that has had only its read; it goes
   as a follow-up Run (`continuationAfterEarlySteers`). A checkpoint or
   `tool_call_completed` that arrived before a result write confirms no steer
   result (`arrivedBeforeResultWrite`).
