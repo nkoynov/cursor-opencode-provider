@@ -414,6 +414,15 @@ describe("early edit rows", () => {
     expect(editReadGoesToHost(emptyOutside, workspace)).toBe(true)
   })
 
+  it.skipIf(process.getuid?.() === 0)("predicts the host read for a workspace file the provider can't read", () => {
+    const workspace = tempDir()
+    const locked = path.join(workspace, "locked.txt")
+    fs.writeFileSync(locked, "secret\n")
+    fs.chmodSync(locked, 0o000)
+    expect(editReadGoesToHost(locked, workspace)).toBe(true)
+    fs.chmodSync(locked, 0o600)
+  })
+
   it("closes the row when the exec is a different tool", async () => {
     const file = existingFile()
     const { session, parts } = pumpSession([

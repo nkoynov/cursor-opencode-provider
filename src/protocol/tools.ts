@@ -1047,7 +1047,7 @@ export function hostToolForCursorEdit(
   }
 }
 
-/** Cursor's private read of an existing file outside the workspace goes to OpenCode's read tool, as its own host call. */
+/** Cursor's private read of an existing file outside the workspace, or one it can't read, goes to OpenCode's read tool, as its own host call. */
 export function editReadGoesToHost(filePath: string, workspaceRoot: string): boolean {
   const absolute = path.resolve(workspaceRoot, filePath)
   try {
@@ -1057,7 +1057,9 @@ export function editReadGoesToHost(filePath: string, workspaceRoot: string): boo
   }
   try {
     const relative = path.relative(fs.realpathSync(workspaceRoot), fs.realpathSync(absolute))
-    return relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)
+    if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return true
+    fs.accessSync(absolute, fs.constants.R_OK)
+    return false
   } catch {
     return true
   }
