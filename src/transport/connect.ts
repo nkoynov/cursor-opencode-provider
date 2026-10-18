@@ -858,6 +858,10 @@ export function lastFrameArrival(): number {
   return lastArrival
 }
 
+export function noteFrameArrivalForTests(frame: object): void {
+  frameArrivals.set(frame, ++lastArrival)
+}
+
 export async function bidiRunStream(
   token: string,
   options: {

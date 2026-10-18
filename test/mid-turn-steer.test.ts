@@ -12,7 +12,7 @@ import {
   type CursorRunRecovery,
 } from "../src/language-model.js"
 import { needsHostHistory, recordEarlySteer } from "../src/host-steer.js"
-import { CursorRunInterruptedError } from "../src/transport/connect.js"
+import { CursorRunInterruptedError, lastFrameArrival, noteFrameArrivalForTests } from "../src/transport/connect.js"
 import { createCursor } from "../src/index.js"
 import { billingLedger } from "../src/billing.js"
 import { getCheckpoint, setCheckpoint } from "../src/protocol/checkpoint.js"
@@ -218,6 +218,20 @@ describe("mid-turn user message after a complete step", () => {
     expect(found.results.map((r) => r.execId)).toEqual([1, 2])
     expect(found.messages).toEqual([])
     expect(steered(steer("deferred", user("b")))?.messages).toEqual([])
+  })
+
+  it("keeps the message for a follow-up while a later announced call has no exec yet", () => {
+    const held = heldReads("announced")
+    held.toolCallOrder = {
+      calls: [{ callId: "call_1", mutating: false }, { callId: "call_2", mutating: false }, { callId: "call_3", mutating: true }],
+      deferred: [],
+      progressAt: Date.now(),
+    }
+    expect(steered(steer("announced", user("b")))?.messages).toEqual([])
+    sessionManager.dispose()
+    const answered = heldReads("answered")
+    answered.toolCallOrder = { calls: [{ callId: "call_1", mutating: false }, { callId: "call_2", mutating: false }], deferred: [], progressAt: Date.now() }
+    expect(steered(steer("answered", user("b")))?.messages).toEqual(["b"])
   })
 
   it("accepts a step whose results have no text slot", () => {
@@ -786,11 +800,18 @@ describe("Run recovery around a mid-turn user message", () => {
       ["after-completion", [completed("call_1"), completed("call_2"), checkpoint], false],
       ["unconfirmed", [completed("call_1"), completed("call_2"), checkpoint], true],
     ]
+    const queued = [completed("call_1"), completed("call_2"), checkpoint].map((make) => {
+      const frame = make()
+      noteFrameArrivalForTests(frame)
+      return () => frame
+    })
+    cases.push(["queued-before-result", queued, false])
     const outcomes: Record<string, CursorRunRecovery | string> = {}
     for (const [name, script, unconfirmed] of cases) {
       const held = heldSession(`stale-checkpoint-drop-${name}`)
       held.resumeCheckpoint = new Uint8Array([1])
       held.resultsAfterCheckpoint = { awaiting: new Set(["call_1", "call_2"]), unconfirmed, toolCallIds: new Set(["cursor_a_1"]) }
+      if (name === "queued-before-result") held.resumeCheckpointAfterFrame = lastFrameArrival()
       serve(held, script)
       await pumpWithRecovery({
         initialSession: held,
@@ -810,6 +831,7 @@ describe("Run recovery around a mid-turn user message", () => {
     // Cursor's tool lifecycle frames bar a blind rebase, and the checkpoint cannot be resumed.
     expect(outcomes["before-completion"]).toContain("automatic retry unsafe")
     expect(outcomes["unconfirmed"]).toContain("automatic retry unsafe")
+    expect(outcomes["queued-before-result"]).toContain("automatic retry unsafe")
     expect(outcomes["after-completion"]).toMatchObject({ kind: "resume", checkpoint: Uint8Array.from([7, 7]) })
   })
 

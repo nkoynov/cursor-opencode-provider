@@ -6,6 +6,8 @@ export type RetryBudget = {
   server: number
   transport: number
   retries: number
+  /** Fork: capacity retries, outside the CLI counts but under an explicit maxAttempts. */
+  capacity?: number
   stallStartedAt?: number
   /** A plain-text host continuation is admitted only after we requested a host retry. */
   hostRetryPending?: boolean

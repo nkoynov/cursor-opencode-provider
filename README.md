@@ -362,7 +362,7 @@ or started tool lifecycle, also permits a host retry: the row closes as unfinish
 and has no tool side effect to repeat.
 
 Set `CURSOR_ENDLESS_RETRIES=1` or `true` before starting OpenCode (or its daemon)
-to bypass both count limits and `retry.maxAttempts`, like Cursor CLI's endless
+to bypass both count limits, the capacity limit and `retry.maxAttempts`, like Cursor CLI's endless
 retry mode. This keeps retrying eligible transient failures; it preserves Stop,
 final errors, authentication rules and tool replay guards. An upload with
 uncertain delivery ends the turn even when an older checkpoint exists.

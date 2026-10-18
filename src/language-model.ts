@@ -934,17 +934,22 @@ function invalidateResumeCheckpoint(session: CursorSession, afterFrame = lastFra
   session.resumeCheckpointAfterFrame = afterFrame
 }
 
-/** A queued checkpoint predating a delivered result still describes the old step. */
-function acceptResumeCheckpoint(session: CursorSession, bytes: Uint8Array, frame: Frame): void {
+function arrivedBeforeResultWrite(session: CursorSession, frame: Frame): boolean {
   const arrived = frameArrival(frame)
-  if (session.resumeCheckpointAfterFrame !== undefined && arrived !== undefined
-    && arrived <= session.resumeCheckpointAfterFrame) return
+  return session.resumeCheckpointAfterFrame !== undefined && arrived !== undefined
+    && arrived <= session.resumeCheckpointAfterFrame
+}
+
+/** A queued checkpoint predating a delivered result still describes the old step. */
+function acceptResumeCheckpoint(session: CursorSession, bytes: Uint8Array, frame: Frame): boolean {
+  if (arrivedBeforeResultWrite(session, frame)) return false
   session.resumeCheckpoint = Uint8Array.from(bytes)
   session.checkpointRevoked = false
   session.checkpointRevokedByHostResult = false
   session.earlierCheckpointStale = false
   session.interactionAfterCheckpoint = false
   session.resumeCheckpointAfterFrame = undefined
+  return true
 }
 
 /** `resumeCheckpoint` is set only by a checkpoint this Run received and did not drop. */
@@ -1411,7 +1416,9 @@ export async function pumpWithRecovery(input: {
   const capacityMaxRecoveries = (retryPolicy.capacityMaxAttempts ?? retryPolicy.maxAttempts ?? DEFAULT_CAPACITY_MAX_ATTEMPTS) - 1
   let capacityRetries = 0
   // An explicit maxAttempts is a ceiling on every Run of the turn, capacity retries included.
-  const budgetCeiling = () => retryPolicy.maxAttempts === undefined ? undefined : retryPolicy.maxAttempts - capacityRetries
+  const budgetCeiling = () => retryPolicy.maxAttempts === undefined
+    ? undefined
+    : retryPolicy.maxAttempts - (retryBudget.capacity ?? 0)
   const startedAt = Date.now()
   let credentialRenewed = false
   let compressionFallbackUsed = false
@@ -1659,11 +1666,12 @@ export async function pumpWithRecovery(input: {
       }
       if (capacity) {
         const ceiling = budgetCeiling()
-        if (capacityRetries >= capacityMaxRecoveries
-          || (ceiling !== undefined && !endlessRetriesEnabled() && retryBudget.retries >= ceiling - 1)) {
+        if (!endlessRetriesEnabled() && (capacityRetries >= capacityMaxRecoveries
+          || (ceiling !== undefined && retryBudget.retries >= ceiling - 1))) {
           throw new CursorRetryExhaustedError(attempt + 1, failure, Date.now() - startedAt)
         }
         capacityRetries++
+        retryBudget.capacity = (retryBudget.capacity ?? 0) + 1
       } else {
         reserveRetry(retryBudget, failure, budgetCeiling())
       }
@@ -4502,8 +4510,11 @@ export function continuationAfterEarlySteers(
   if (results.length === 0 || findContinuationSession(results) !== held) return undefined
   const takesSteers = steers.length === 0 && heldRunTakesSteers(held, results, guard)
   if (steers.length === 0 && !takesSteers) return undefined
-  // A deferred later call of the step would run after a message the model already sees.
-  const injectNew = takesSteers && !hasDeferredToolExecs(held.toolCallOrder)
+  // A later call of the step, deferred or still without its exec, would run after a message the model already sees.
+  const answeredCalls = new Set(results.map((result) => held.pending.get(result.execId)?.displayCallId))
+  const laterCalls = hasDeferredToolExecs(held.toolCallOrder)
+    || (held.toolCallOrder?.calls ?? []).some((call) => !answeredCalls.has(call.callId))
+  const injectNew = takesSteers && !laterCalls
   // The host has already promoted these messages. Inject them, or keep them for a follow-up after the
   // held turn, rather than superseding its tool results or dropping all but the last user message.
   const added: EarlySteer[] = []
@@ -5692,11 +5703,11 @@ export async function pump(
         cacheDiagnostics.checkpointUpdates++
         setCheckpoint(session.conversationId, bytes)
         noteCheckpoint(session.openCodeSessionId, bytes)
-        acceptResumeCheckpoint(session, bytes, frame)
+        const accepted = acceptResumeCheckpoint(session, bytes, frame)
         if (switchGuard) switchGuard.latestCheckpoint = Uint8Array.from(bytes)
         noteRunImageCheckpoint(session, bytes, frame)
         const results = session.resultsAfterCheckpoint
-        if (results && !results.unconfirmed && results.awaiting.size === 0) session.resultsAfterCheckpoint = undefined
+        if (accepted && results && !results.unconfirmed && results.awaiting.size === 0) session.resultsAfterCheckpoint = undefined
         markEarlySteersCheckpointed(session.openCodeSessionId, session.sessionId)
         const tokenDetails = decodeConversationTokenDetails(bytes)
         if (tokenDetails && !(planHandoffCancellationRequested && tokenDetails.usedTokens === 0
@@ -5982,7 +5993,7 @@ export async function pump(
       }
       if (callId) session.editToolCalls?.delete(callId)
       if (callId) announcedCalls.delete(callId)
-      if (callId) session.resultsAfterCheckpoint?.awaiting.delete(callId)
+      if (callId && !arrivedBeforeResultWrite(session, frame)) session.resultsAfterCheckpoint?.awaiting.delete(callId)
       if (callId) noteCursorWaitEnded(session, callId)
       noteToolCallFinished(order, callId)
       // If exec already claimed this call_id, display map entry is gone — skip.

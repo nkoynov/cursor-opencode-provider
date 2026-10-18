@@ -14,6 +14,7 @@ import {
   CursorTransportError,
   isCapacityFailure,
 } from "../src/errors.js"
+import { newRetryBudget } from "../src/retry-budget.js"
 import { sessionFixture } from "./session-fixture.js"
 
 type TimedFrame = { frame: Frame; afterMs?: number }
@@ -519,6 +520,51 @@ describe("capacity failures", () => {
       }).catch((error: unknown) => error)
       expect({ order, recoveries }).toEqual({ order, recoveries: 1 })
       expect(failure).toBeInstanceOf(CursorRetryExhaustedError)
+    }
+  })
+
+  it("keeps capacity retries under an explicit maxAttempts across a host retry", async () => {
+    const retryBudget = newRetryBudget()
+    const retryPolicy = resolveRetryPolicy({ maxAttempts: 3, baseDelayMs: 1, maxDelayMs: 1 })
+    await expect(pumpWithRecovery({
+      initialSession: fakeSession("cap-first", [{ frame: endStreamError("resource_exhausted") }]),
+      controller: controller(),
+      retryPolicy,
+      retryBudget,
+      recover: async () => fakeSession("cap-output", [{ frame: text("partial") }, { frame: endStreamError("internal") }]),
+    })).rejects.toMatchObject({ hostRetryable: true })
+    let recoveries = 0
+    const failure = await pumpWithRecovery({
+      initialSession: fakeSession("cap-host-retry", [{ frame: endStreamError("resource_exhausted") }]),
+      controller: controller(),
+      retryPolicy,
+      retryBudget,
+      recover: async () => {
+        recoveries++
+        return fakeSession("cap-fourth", [{ frame: turnEnded() }])
+      },
+    }).catch((error: unknown) => error)
+    expect(recoveries).toBe(0)
+    expect(failure).toBeInstanceOf(CursorRetryExhaustedError)
+  })
+
+  it("keeps retrying capacity refusals in endless retry mode", async () => {
+    const saved = process.env.CURSOR_ENDLESS_RETRIES
+    process.env.CURSOR_ENDLESS_RETRIES = "1"
+    try {
+      let refusals = 7
+      const final = await pumpWithRecovery({
+        initialSession: fakeSession("endless", [{ frame: endStreamError("resource_exhausted") }]),
+        controller: controller(),
+        retryPolicy: { baseDelayMs: 0, maxDelayMs: 0, capacityMaxAttempts: 6 },
+        recover: async () => refusals-- > 0
+          ? fakeSession(`endless-${refusals}`, [{ frame: endStreamError("resource_exhausted") }])
+          : fakeSession("endless-served", [{ frame: turnEnded() }]),
+      })
+      expect(final.sessionId).toBe("endless-served")
+    } finally {
+      if (saved === undefined) delete process.env.CURSOR_ENDLESS_RETRIES
+      else process.env.CURSOR_ENDLESS_RETRIES = saved
     }
   })
 

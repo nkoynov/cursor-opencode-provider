@@ -157,7 +157,8 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
 - Fork: a capacity refusal without a final verdict (`isCapacityFailure`) gets six
   attempts with a longer backoff, counted apart from the shared CLI retry
   budget, before it ends as final; an explicit `retry.maxAttempts` caps both
-  together. An `ERROR_CUSTOM_MESSAGE` whose protobuf
+  together across the turn (`RetryBudget.capacity`), and endless retry mode
+  lifts the capacity limit. An `ERROR_CUSTOM_MESSAGE` whose protobuf
   `value` does not decode is read from the details' JSON `debug`
   (`customMessageFromDebug`), so it still ends the turn.
 - Fork: recovery resumes the turn's latest checkpoint only while the attempt
@@ -165,8 +166,10 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   exec or a query the provider answered). The attempt's own checkpoint resumes
   unless a query the provider answered came after it
   (`interactionAfterCheckpoint`). A promoted steer is not injected while a
-  later exec of its step is still deferred; it goes as a follow-up Run
-  (`continuationAfterEarlySteers`).
+  later call of its step is deferred or announced without its exec yet; it goes
+  as a follow-up Run (`continuationAfterEarlySteers`). A checkpoint or
+  `tool_call_completed` that arrived before a result write confirms no steer
+  result (`arrivedBeforeResultWrite`).
 - Fork: a `tool_call_started` / `tool_call_completed` frame still sets the
   stateful replay barrier, but blocks the completed-tool-results rebuild only
   while no host exec has claimed its call (`historyRepresentsRun`); upstream
