@@ -169,6 +169,19 @@ describe("Cursor's exec abort (ExecServerControlMessage.abort)", () => {
     expect(session.pending.size).toBe(0)
   })
 
+  it("stops resuming the checkpoint from before a withdrawn exec the host ran anyway", async () => {
+    const session = heldSession(scriptedFrames().frames)
+    session.resumeCheckpoint = Uint8Array.of(10, 1, 7)
+    sessionManager.registerPending(1, session, "shell_stream", "shell")
+    expect(sessionManager.markExecAborted(session, 1)).toBe(true)
+
+    await deliverContinuationResults(session, [shellResult(session, 1)])
+
+    expect(execResults(session.writes)).toEqual([])
+    expect(session.resumeCheckpoint).toBeUndefined()
+    expect(session.checkpointRevokedByHostResult).toBe(true)
+  })
+
   it("is not answered with an error when the host starts a new turn", async () => {
     const script = scriptedFrames([turnEnded()])
     const session = heldSession(script.frames)

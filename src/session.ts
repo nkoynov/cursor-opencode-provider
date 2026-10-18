@@ -219,6 +219,8 @@ export type CursorSession = {
   earlierCheckpointStale?: boolean
   /** An interaction query came after this Run's own latest checkpoint, which would replay it too. */
   interactionAfterCheckpoint?: boolean
+  /** Calls of the current step Cursor began streaming that no exec or completion has ended yet. */
+  announcedCallIds?: Set<string>
   /**
    * This Run sent a user message or tool result after its last checkpoint:
    * recovery must not resume earlier state that lacks the delivered input.

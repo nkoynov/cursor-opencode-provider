@@ -3992,11 +3992,9 @@ async function deliverContinuationResultsNow(
       return undefined
     }
     deliveredResults++
-    // An edit's read result only lets Cursor send the edit's write.
-    if (!(pending.resultField === "read_result" && pending.displayCallId && session.editToolCalls?.has(pending.displayCallId))) {
-      noteToolCallFinished(session.toolCallOrder, pending.displayCallId)
-    }
-    if (outcome.framesWritten > 0 || (pending.bridged && !pending.aborted)) {
+    if (resultFinishesToolCall(session, pending)) noteToolCallFinished(session.toolCallOrder, pending.displayCallId)
+    // A host tool that ran after Cursor withdrew its exec still changed state the checkpoint before it lacks.
+    if (outcome.framesWritten > 0 || pending.bridged || pending.aborted) {
       invalidateResumeCheckpoint(session, beforeResultWrite, true)
     }
     if (session.historyImages) noteHistoryImagesSent(session.historyImages, deliveredImageHashes, lastFrameArrival())
@@ -4511,9 +4509,13 @@ export function continuationAfterEarlySteers(
   const takesSteers = steers.length === 0 && heldRunTakesSteers(held, results, guard)
   if (steers.length === 0 && !takesSteers) return undefined
   // A later call of the step, deferred or still without its exec, would run after a message the model already sees.
-  const answeredCalls = new Set(results.map((result) => held.pending.get(result.execId)?.displayCallId))
+  const answeredCalls = new Set(results.map((result) => {
+    const pending = held.pending.get(result.execId)
+    return pending && resultFinishesToolCall(held, pending) ? pending.displayCallId : undefined
+  }))
   const laterCalls = hasDeferredToolExecs(held.toolCallOrder)
     || (held.toolCallOrder?.calls ?? []).some((call) => !answeredCalls.has(call.callId))
+    || [...held.announcedCallIds ?? []].some((callId) => !answeredCalls.has(callId))
   const injectNew = takesSteers && !laterCalls
   // The host has already promoted these messages. Inject them, or keep them for a follow-up after the
   // held turn, rather than superseding its tool results or dropping all but the last user message.
@@ -5704,7 +5706,7 @@ export async function pump(
         setCheckpoint(session.conversationId, bytes)
         noteCheckpoint(session.openCodeSessionId, bytes)
         const accepted = acceptResumeCheckpoint(session, bytes, frame)
-        if (switchGuard) switchGuard.latestCheckpoint = Uint8Array.from(bytes)
+        if (switchGuard && accepted) switchGuard.latestCheckpoint = Uint8Array.from(bytes)
         noteRunImageCheckpoint(session, bytes, frame)
         const results = session.resultsAfterCheckpoint
         if (accepted && results && !results.unconfirmed && results.awaiting.size === 0) session.resultsAfterCheckpoint = undefined
@@ -5993,6 +5995,7 @@ export async function pump(
       }
       if (callId) session.editToolCalls?.delete(callId)
       if (callId) announcedCalls.delete(callId)
+      if (callId) session.announcedCallIds?.delete(callId)
       if (callId && !arrivedBeforeResultWrite(session, frame)) session.resultsAfterCheckpoint?.awaiting.delete(callId)
       if (callId) noteCursorWaitEnded(session, callId)
       noteToolCallFinished(order, callId)
@@ -6070,6 +6073,7 @@ export async function pump(
               bridged.toolName,
               true,
             )
+            if (callId) replaySafety.claimDisplayCall(callId)
             const toolCallId = `cursor_${session.sessionId}_${execId}`
             const input = JSON.stringify(bridged.args ?? {})
             trace(
@@ -6096,6 +6100,7 @@ export async function pump(
       cacheDiagnostics.stepStarts++
     } else if (iu?.step_completed) {
       cacheDiagnostics.stepCompletes++
+      session.announcedCallIds?.clear()
     } else if (iu?.context_injection_state) {
       if (applyContextInjectionState(session, iu.context_injection_state)) textBreakPending = true
     } else if (esm) {
@@ -6223,6 +6228,7 @@ export async function pump(
           if (displayCallId) {
             toolStep.resolved.add(displayCallId)
             announcedCalls.delete(displayCallId)
+            session.announcedCallIds?.delete(displayCallId)
             noteToolCallFinished(order, displayCallId)
           }
           if (!await writeExecFrames(runtimeMessages, `runtime metadata reply id=${esmId}`)) return
@@ -6242,6 +6248,7 @@ export async function pump(
         if (ownRequestCallId) {
           toolStep.resolved.add(ownRequestCallId)
           announcedCalls.delete(ownRequestCallId)
+          session.announcedCallIds?.delete(ownRequestCallId)
         }
         if (parsed) {
           execMutates = noteToolCallExec(
@@ -6905,7 +6912,10 @@ export async function pump(
       trace(`frame dispatch FAILED (skipping): topField=${topField}`)
     }
     const partialCallId = (iu?.partial_tool_call as { call_id?: unknown } | undefined)?.call_id
-    if (typeof partialCallId === "string" && partialCallId) announcedCalls.add(partialCallId)
+    if (typeof partialCallId === "string" && partialCallId) {
+      announcedCalls.add(partialCallId)
+      ;(session.announcedCallIds ??= new Set()).add(partialCallId)
+    }
     const announced = iu?.partial_tool_call ? cursorEditAnnouncement(iu.partial_tool_call) : undefined
     if (
       announced
@@ -7281,6 +7291,11 @@ export function mayBeUserStep(callOptions: LanguageModelV3CallOptions): boolean 
   if (compaction !== undefined) return compaction !== true
   const sessionKey = opencodeSessionKey(callOptions)
   return !sessionKey || !isCompactionSession(sessionKey)
+}
+
+/** An edit's read result only lets Cursor send the edit's write. */
+function resultFinishesToolCall(session: CursorSession, pending: { resultField: string; displayCallId?: string }): boolean {
+  return !(pending.resultField === "read_result" && pending.displayCallId && session.editToolCalls?.has(pending.displayCallId))
 }
 
 /** Cursor completes an exec's tool call once it has the result; other replies have no such signal. */

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test"
-import { analyzeReplayFrame, describeFrameLayout } from "../src/replay-safety.js"
+import { analyzeReplayFrame, AttemptReplaySafety, describeFrameLayout, historyRepresentsRun, type ReplaySafetyState } from "../src/replay-safety.js"
+import { CursorTransportError } from "../src/errors.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 
 function varint(value: number): number[] {
@@ -127,5 +128,29 @@ describe("Cursor CLI 2026.09.28 frame shapes", () => {
     expect(analyzeReplayFrame(Uint8Array.from(update(26, text)), { interactionUpdate: {} }).barrier).toBe("unknown-or-malformed-frame")
     expect(analyzeReplayFrame(Uint8Array.from([...update(1, text), ...ttft, ...ttft]), { interactionUpdate: { text_delta: { text: "hm" } } }).barrier)
       .toBe("unknown-or-malformed-frame")
+  })
+})
+
+describe("history across announced calls", () => {
+  it("represents a Run only once host execs claimed every announced call", () => {
+    const state: ReplaySafetyState = {}
+    const attempt = new AttemptReplaySafety("run", state)
+    attempt.markBarrier("display-tool-lifecycle", "host")
+    attempt.markBarrier("display-tool-lifecycle", "cursor-side")
+    attempt.claimDisplayCall("host")
+    expect(historyRepresentsRun(state)).toBe(false)
+    attempt.claimDisplayCall("cursor-side")
+    expect(historyRepresentsRun(state)).toBe(true)
+    attempt.markBarrier("display-tool-lifecycle")
+    expect(historyRepresentsRun(state)).toBe(false)
+  })
+
+  it("adds no barrier for Cursor closing a call a host exec already ran", () => {
+    const state: ReplaySafetyState = { statefulBarrier: "non-control-exec", hostCalls: ["host"] }
+    const closing = new AttemptReplaySafety("run", state)
+    closing.markBarrier("display-tool-lifecycle", "host")
+    expect(closing.applyTo(new CursorTransportError("drop", { transient: true, replaySafe: true })).replayBarrier).toBeUndefined()
+    closing.markBarrier("display-tool-lifecycle", "other")
+    expect(closing.applyTo(new CursorTransportError("drop", { transient: true, replaySafe: true })).replayBarrier).toBe("stateful")
   })
 })

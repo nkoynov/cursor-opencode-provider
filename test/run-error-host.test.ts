@@ -313,10 +313,10 @@ describe("checkpoint eligibility across host results", () => {
     }, 30_000)
   }
 
-  for (const scenario of ["complete", "display-lifecycle", "missing-history", "unknown", "unrepresented-exec", "duplicate-exec", "unclaimed-display", "followup-before-result", "new-output", "final-error"] as const) {
+  for (const scenario of ["complete", "display-lifecycle", "display-completed", "missing-history", "unknown", "unrepresented-exec", "duplicate-exec", "unclaimed-display", "followup-before-result", "new-output", "final-error"] as const) {
     it(`recovers a post-result drop only from represented completed work (${scenario})`, async () => {
-      const recovers = scenario === "complete" || scenario === "display-lifecycle"
-      const lifecycle = scenario === "display-lifecycle"
+      const lifecycle = scenario === "display-lifecycle" || scenario === "display-completed"
+      const recovers = scenario === "complete" || lifecycle
       const shellCall = (callId: string) => ({ shell_tool_call: { args: { command: `echo ${callId}`, tool_call_id: callId } } })
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-result-history-"))
       type RunRequest = { conversation_id: string; action: { resume_action?: unknown; user_message_action?: { user_message: { text: string } } } }
@@ -358,6 +358,9 @@ describe("checkpoint eligibility across host results", () => {
             }
             send({ exec_server_message: { id: 2, shell_stream_args: { command: "echo second", tool_call_id: "second" } } })
           } else {
+            if (scenario === "display-completed") {
+              send({ interaction_update: { tool_call_completed: { call_id: "second", tool_call: shellCall("second") } } })
+            }
             if (scenario === "new-output") send({ interaction_update: { text_delta: { text: "new output" } } })
             if (scenario === "final-error") stream.end(frame(Buffer.from('{"error":{"code":"permission_denied"}}'), 2))
             else stream.end() // no checkpoint after either completed result

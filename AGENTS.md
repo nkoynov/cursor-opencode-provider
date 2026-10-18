@@ -166,14 +166,17 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   exec or a query the provider answered). The attempt's own checkpoint resumes
   unless a query the provider answered came after it
   (`interactionAfterCheckpoint`). A promoted steer is not injected while a
-  later call of its step is deferred or announced without its exec yet; it goes
+  later call of its step is deferred, announced without its exec yet
+  (`announcedCallIds`), or an edit that has had only its read; it goes
   as a follow-up Run (`continuationAfterEarlySteers`). A checkpoint or
   `tool_call_completed` that arrived before a result write confirms no steer
   result (`arrivedBeforeResultWrite`).
 - Fork: a `tool_call_started` / `tool_call_completed` frame still sets the
   stateful replay barrier, but blocks the completed-tool-results rebuild only
-  while no host exec has claimed its call (`historyRepresentsRun`); upstream
-  blocked it for every announced call, so the rebuild never ran on real Cursor.
+  while no host exec (or bridged host row) has claimed its call
+  (`historyRepresentsRun`), and adds no barrier once claimed; upstream blocked
+  it for every announced call, so the rebuild never ran on real Cursor. A host
+  result for an exec Cursor withdrew still revokes the checkpoint before it.
 
 ## Context, identity and persistence
 

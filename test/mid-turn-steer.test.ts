@@ -220,7 +220,7 @@ describe("mid-turn user message after a complete step", () => {
     expect(steered(steer("deferred", user("b")))?.messages).toEqual([])
   })
 
-  it("keeps the message for a follow-up while a later announced call has no exec yet", () => {
+  it("keeps the message for a follow-up while a later or unfinished call has no exec yet", () => {
     const held = heldReads("announced")
     held.toolCallOrder = {
       calls: [{ callId: "call_1", mutating: false }, { callId: "call_2", mutating: false }, { callId: "call_3", mutating: true }],
@@ -228,6 +228,15 @@ describe("mid-turn user message after a complete step", () => {
       progressAt: Date.now(),
     }
     expect(steered(steer("announced", user("b")))?.messages).toEqual([])
+    sessionManager.dispose()
+    const edit = heldReads("edit-read")
+    edit.editToolCalls = new Map([["call_2", {}]]) as CursorSession["editToolCalls"]
+    edit.toolCallOrder = { calls: [{ callId: "call_1", mutating: false }, { callId: "call_2", mutating: true }], deferred: [], progressAt: Date.now() }
+    expect(steered(steer("edit-read", user("b")))?.messages).toEqual([])
+    sessionManager.dispose()
+    const partial = heldReads("partial-only")
+    partial.announcedCallIds = new Set(["call_3"])
+    expect(steered(steer("partial-only", user("b")))?.messages).toEqual([])
     sessionManager.dispose()
     const answered = heldReads("answered")
     answered.toolCallOrder = { calls: [{ callId: "call_1", mutating: false }, { callId: "call_2", mutating: false }], deferred: [], progressAt: Date.now() }

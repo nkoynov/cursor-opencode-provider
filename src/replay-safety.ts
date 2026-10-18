@@ -46,6 +46,8 @@ export class AttemptReplaySafety {
   }
 
   markBarrier(reason: ReplayBarrierReason, displayCallId?: string): void {
+    // Cursor closing a call a host exec already ran adds nothing the exec's barrier and result do not hold.
+    if (reason === "display-tool-lifecycle" && displayCallId && this.state.hostCalls?.includes(displayCallId)) return
     if (!OUTPUT_ONLY_BARRIERS.has(reason)) {
       this.stateful = true
       this.state.statefulBarrier ??= reason
