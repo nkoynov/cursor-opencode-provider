@@ -271,7 +271,8 @@ export function createPlanApproved(
 ): boolean {
   if (isError) return false
   const [segment] = parseAnswerSegments([createPlanApprovalItem(question)], output)
-  return (segment ?? "").trim().toLowerCase() === CREATE_PLAN_APPROVAL_YES.toLowerCase()
+  const answer = typeof segment === "string" ? segment : segment?.join(", ")
+  return (answer ?? "").trim().toLowerCase() === CREATE_PLAN_APPROVAL_YES.toLowerCase()
 }
 
 

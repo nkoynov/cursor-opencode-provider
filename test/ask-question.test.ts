@@ -153,6 +153,60 @@ describe("OpenCode answers → Cursor AskQuestionResult (CLI iX parity)", () => 
     ).toEqual({ question_id: "q1", selected_option_ids: ["opt_redis", "opt_memory"] })
   })
 
+  it("maps a label that contains a comma to its option id", () => {
+    const question: CursorAskQuestionItem = {
+      ...QUESTION,
+      options: [
+        { id: "opt_yes", label: "Yes, lower it and add him as #10 (Recommended)" },
+        { id: "opt_lower", label: "Lower it, but keep him off the list" },
+        { id: "opt_leave", label: "Leave it as is" },
+      ],
+    }
+    expect(
+      askQuestionResultFromToolOutput(
+        { title: "t", questions: [question], runAsync: false },
+        questionToolOutput([[question.prompt, "Yes, lower it and add him as #10 (Recommended)"]]),
+        false,
+      ),
+    ).toEqual({ success: { answers: [{ question_id: "q1", selected_option_ids: ["opt_yes"] }] } })
+    expect(
+      askQuestionResultFromToolOutput(
+        { title: "t", questions: [question], runAsync: false },
+        JSON.stringify({ answers: [["Yes, lower it and add him as #10 (Recommended)"]] }),
+        false,
+      ),
+    ).toEqual({ success: { answers: [{ question_id: "q1", selected_option_ids: ["opt_yes"] }] } })
+    expect(
+      answerForQuestion(
+        { ...question, allowMultiple: true },
+        "Leave it as is, Lower it, but keep him off the list, and tell me why",
+      ),
+    ).toEqual({
+      question_id: "q1",
+      selected_option_ids: ["opt_leave", "opt_lower"],
+      freeform_text: "and tell me why",
+    })
+  })
+
+  it("prefers the longest label when one label is a prefix of another", () => {
+    const question: CursorAskQuestionItem = {
+      ...QUESTION,
+      options: [
+        { id: "opt_yes", label: "Yes" },
+        { id: "opt_yes_push", label: "Yes, and push" },
+      ],
+      allowMultiple: true,
+    }
+    expect(answerForQuestion(question, "Yes, and push")).toEqual({
+      question_id: "q1",
+      selected_option_ids: ["opt_yes_push"],
+    })
+    expect(answerForQuestion(question, "Yes, Yes, and push")).toEqual({
+      question_id: "q1",
+      selected_option_ids: ["opt_yes", "opt_yes_push"],
+    })
+  })
+
   it("treats an unrecognised label as the user's freeform answer", () => {
     expect(answerForQuestion(QUESTION, "Postgres with a TTL")).toEqual({
       question_id: "q1",
@@ -162,10 +216,46 @@ describe("OpenCode answers → Cursor AskQuestionResult (CLI iX parity)", () => 
 
   it("substitutes the literal Other for an empty freeform choice, like the CLI", () => {
     expect(answerForQuestion(QUESTION, "   ")).toEqual({ question_id: "q1" })
-    expect(answerForQuestion(QUESTION, "Redis, Something bespoke")).toEqual({
+    expect(answerForQuestion({ ...QUESTION, allowMultiple: true }, "Redis, Something bespoke")).toEqual({
       question_id: "q1",
       selected_option_ids: ["opt_redis"],
       freeform_text: "Something bespoke",
+    })
+  })
+
+  it("keeps a single-select custom answer whole even when it starts with a label", () => {
+    const question: CursorAskQuestionItem = {
+      ...QUESTION,
+      options: [{ id: "opt_yes", label: "Yes, lower it" }, { id: "opt_no", label: "No" }],
+    }
+    expect(answerForQuestion(question, "Yes, lower it, but only tomorrow")).toEqual({
+      question_id: "q1",
+      freeform_text: "Yes, lower it, but only tomorrow",
+    })
+    expect(answerForQuestion(QUESTION, "Redis, but with a TTL")).toEqual({
+      question_id: "q1",
+      freeform_text: "Redis, but with a TTL",
+    })
+  })
+
+  it("keeps OpenCode 2's separate multi-select choices apart", () => {
+    const question: CursorAskQuestionItem = {
+      ...QUESTION,
+      options: [
+        { id: "opt_front", label: "Frontend" },
+        { id: "opt_back", label: "Backend, API" },
+        { id: "opt_both", label: "Frontend, Backend" },
+      ],
+      allowMultiple: true,
+    }
+    const [segment] = parseAnswerSegments(
+      [question],
+      JSON.stringify({ answers: [["Frontend", "Backend, API", "Docs, mostly"]] }),
+    )
+    expect(answerForQuestion(question, segment)).toEqual({
+      question_id: "q1",
+      selected_option_ids: ["opt_front", "opt_back"],
+      freeform_text: "Docs, mostly",
     })
   })
 
@@ -199,7 +289,7 @@ describe("OpenCode answers → Cursor AskQuestionResult (CLI iX parity)", () => 
   })
 
   it("reads OpenCode 2 JSON answers positionally", () => {
-    expect(parseAnswerSegments([QUESTION], JSON.stringify({ answers: [["Redis"]] }))).toEqual(["Redis"])
+    expect(parseAnswerSegments([QUESTION], JSON.stringify({ answers: [["Redis"]] }))).toEqual([["Redis"]])
   })
 })
 

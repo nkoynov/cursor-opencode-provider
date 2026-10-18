@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- An AskQuestion option whose label contains ", " (such as "Yes, do it (Recommended)") reaches Cursor as that selected option, not as the user's own typed answer. The answer was split at every ", ", so no piece matched the label
+
 ## [0.8.3] - 2026-10-18
 
 ### Added
