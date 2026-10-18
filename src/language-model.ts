@@ -3,7 +3,7 @@ import path from "node:path"
 import { createHash } from "node:crypto"
 import { APICallError } from "@ai-sdk/provider"
 import protobuf from "protobufjs"
-import { newRetryBudget, turnRetryBudget, forgetRetryBudget, reserveRetry, resetRetryBudgetsForTests, type RetryBudget } from "./retry-budget.js"
+import { endlessRetriesEnabled, newRetryBudget, turnRetryBudget, forgetRetryBudget, reserveRetry, resetRetryBudgetsForTests, type RetryBudget } from "./retry-budget.js"
 import type { LanguageModelV3, LanguageModelV3CallOptions, LanguageModelV3StreamResult, LanguageModelV3GenerateResult, LanguageModelV3StreamPart, LanguageModelV3Usage, LanguageModelV3FinishReason } from "@ai-sdk/provider"
 import type { CreateCursorOptions, CursorRetryOptions } from "./index.js"
 import {
@@ -943,6 +943,7 @@ function acceptResumeCheckpoint(session: CursorSession, bytes: Uint8Array, frame
   session.checkpointRevoked = false
   session.checkpointRevokedByHostResult = false
   session.earlierCheckpointStale = false
+  session.interactionAfterCheckpoint = false
   session.resumeCheckpointAfterFrame = undefined
 }
 
@@ -1409,6 +1410,8 @@ export async function pumpWithRecovery(input: {
   // Fork: capacity refusals keep their own longer backoff, outside the CLI budget.
   const capacityMaxRecoveries = (retryPolicy.capacityMaxAttempts ?? retryPolicy.maxAttempts ?? DEFAULT_CAPACITY_MAX_ATTEMPTS) - 1
   let capacityRetries = 0
+  // An explicit maxAttempts is a ceiling on every Run of the turn, capacity retries included.
+  const budgetCeiling = () => retryPolicy.maxAttempts === undefined ? undefined : retryPolicy.maxAttempts - capacityRetries
   const startedAt = Date.now()
   let credentialRenewed = false
   let compressionFallbackUsed = false
@@ -1422,7 +1425,7 @@ export async function pumpWithRecovery(input: {
   input.onSession?.(session)
 
   const resumableCheckpoint = (pumpedSession: CursorSession) =>
-    pumpedSession.resultsAfterCheckpoint ? undefined : pumpedSession.resumeCheckpoint
+    pumpedSession.resultsAfterCheckpoint || pumpedSession.interactionAfterCheckpoint ? undefined : pumpedSession.resumeCheckpoint
 
   const reopen = async (
     pumpedSession: CursorSession,
@@ -1641,7 +1644,7 @@ export async function pumpWithRecovery(input: {
         // provider from doing so; the host can, unless a side effect would repeat.
         if (failure.replayBarrier === "output-only" && !pumpedSession.checkpointRevoked) {
           trace(`Run interrupted after output only: sessionId=${pumpedSession.sessionId} — leaving the retry to the host`)
-          reserveRetry(retryBudget, failure, retryPolicy.maxAttempts)
+          reserveRetry(retryBudget, failure, budgetCeiling())
           retryBudget.hostRetryPending = true
           throw hostRetryError(failure)
         }
@@ -1653,12 +1656,14 @@ export async function pumpWithRecovery(input: {
         )
       }
       if (capacity) {
-        if (capacityRetries >= capacityMaxRecoveries) {
+        const ceiling = budgetCeiling()
+        if (capacityRetries >= capacityMaxRecoveries
+          || (ceiling !== undefined && !endlessRetriesEnabled() && retryBudget.retries >= ceiling - 1)) {
           throw new CursorRetryExhaustedError(attempt + 1, failure, Date.now() - startedAt)
         }
         capacityRetries++
       } else {
-        reserveRetry(retryBudget, failure, retryPolicy.maxAttempts)
+        reserveRetry(retryBudget, failure, budgetCeiling())
       }
       const resuming = checkpoint ? `resuming ${checkpoint.length}B checkpoint` : "rebasing fresh Run"
       trace(
@@ -5647,8 +5652,11 @@ export async function pump(
     }
     if (replayFrame.barrier) replaySafety.markBarrier(replayFrame.barrier)
     // The provider answers some queries itself (a plan file, an image approval); resuming a checkpoint
-    // from before one would repeat it, so only a later checkpoint of this Run is resumed.
-    if (interactionQuery) session.earlierCheckpointStale = true
+    // from before one would repeat it, so only a later checkpoint is resumed.
+    if (interactionQuery) {
+      session.earlierCheckpointStale = true
+      session.interactionAfterCheckpoint = true
+    }
     if (replayFrame.barrier === "non-control-exec") replaySafety.recordExec(esm?.id)
     // Reseeding is allowed only while every frame so far was positively a
     // control frame. Anything else, including unknown top-level fields, may have
@@ -7239,6 +7247,8 @@ function heldRunTakesSteers(
 ): boolean {
   if (!guard?.userStep || held.closed || held.hostInterrupted || !held.runId) return false
   if (sessionManager.isActivelyPumping(held) || isProperCatalogSubset(guard.incomingTools, held.toolCatalog ?? [])) return false
+  // A deferred later call would run after the message the model sees as newer.
+  if (hasDeferredToolExecs(held.toolCallOrder)) return false
   const heldModel = held.cacheDiagnostics?.modelId
   if (heldModel !== undefined && heldModel !== guard.wireModelId) return false
   if (results.some((r) => r.sessionId !== held.sessionId || held.pending.get(r.execId)?.state !== "pending")) return false

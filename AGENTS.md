@@ -156,13 +156,16 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   `isRetryable: true`, `x-should-retry: true` and no status, so both hosts retry.
 - Fork: a capacity refusal without a final verdict (`isCapacityFailure`) gets six
   attempts with a longer backoff, counted apart from the shared CLI retry
-  budget, before it ends as final. An `ERROR_CUSTOM_MESSAGE` whose protobuf
+  budget, before it ends as final; an explicit `retry.maxAttempts` caps both
+  together. An `ERROR_CUSTOM_MESSAGE` whose protobuf
   `value` does not decode is read from the details' JSON `debug`
   (`customMessageFromDebug`), so it still ends the turn.
 - Fork: recovery resumes the turn's latest checkpoint only while the attempt
   has asked the host for nothing since it (`earlierCheckpointStale`: a pending
-  exec or a query the provider answered); the attempt's own checkpoint resumes
-  as before.
+  exec or a query the provider answered). The attempt's own checkpoint resumes
+  unless a query the provider answered came after it
+  (`interactionAfterCheckpoint`). A held Run takes no promoted steer while a
+  later exec of its step is still deferred (`heldRunTakesSteers`).
 
 ## Context, identity and persistence
 

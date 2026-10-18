@@ -71,7 +71,7 @@ describe("final failures reach the host as not retryable", () => {
     const failure = await pumpWithRecovery({
       initialSession: refused("full"),
       controller: { enqueue() {}, close() {}, error() {} } as unknown as ReadableStreamDefaultController<any>,
-      retryPolicy: { maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 0, capacityMaxAttempts: 6 },
+      retryPolicy: { baseDelayMs: 0, maxDelayMs: 0, capacityMaxAttempts: 6 },
       recover: async () => refused(`full-${++n}`),
     }).catch((error: unknown) => error)
     expect(failure).toBeInstanceOf(CursorRetryExhaustedError)

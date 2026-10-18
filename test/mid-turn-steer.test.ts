@@ -318,6 +318,18 @@ describe("cases that stay a fresh turn", () => {
     expect(steered(steer("partial", user("b")))).toBeUndefined()
   })
 
+  it("a held Run with a later call's exec still deferred behind the results", () => {
+    const held = heldReads("deferred")
+    held.toolCallOrder = {
+      calls: [{ callId: "cursor_deferred_3", mutating: true }],
+      deferred: [{ execId: 3, callId: "cursor_deferred_3", mutating: true, read: { done: true, value: undefined } }],
+      progressAt: Date.now(),
+    }
+    expect(steered(steer("deferred", user("b")))).toBeUndefined()
+    held.toolCallOrder = undefined
+    expect(steered(steer("deferred", user("b")))?.messages).toEqual(["b"])
+  })
+
   it("a held Run without a known run id", () => {
     const held = heldReads("norun")
     held.runId = undefined

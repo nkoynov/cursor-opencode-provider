@@ -343,6 +343,44 @@ describe("resuming again from the turn's checkpoint", () => {
     sessionManager.close(session)
   })
 
+  it("does not resume the Run's own checkpoint from before an interaction query", async () => {
+    const recoveries: CursorRunRecovery[] = []
+    await expect(pumpWithRecovery({
+      initialSession: fakeSession("own-then-queried", [
+        { frame: text("partial") },
+        { frame: checkpoint(first) },
+        { frame: frame({ interaction_query: { id: 4, web_search_request_query: new Uint8Array() } }) },
+        { frame: endStreamError("internal") },
+      ]),
+      controller: controller(),
+      retryPolicy: noDelay,
+      recover: async (recovery) => {
+        recoveries.push(recovery)
+        return fakeSession("unused", [{ frame: turnEnded() }])
+      },
+    })).rejects.toMatchObject({ hostRetryable: true })
+    expect(recoveries).toHaveLength(0)
+  })
+
+  it("resumes a checkpoint the Run received after its interaction query", async () => {
+    const recoveries: CursorRunRecovery[] = []
+    await pumpWithRecovery({
+      initialSession: fakeSession("queried-then-own", [
+        { frame: frame({ interaction_query: { id: 4, web_search_request_query: new Uint8Array() } }) },
+        { frame: text("partial") },
+        { frame: checkpoint(first) },
+        { frame: endStreamError("internal") },
+      ]),
+      controller: controller(),
+      retryPolicy: noDelay,
+      recover: async (recovery) => {
+        recoveries.push(recovery)
+        return fakeSession("after-query", [{ frame: turnEnded() }])
+      },
+    })
+    expect(resumed(recoveries[0])).toEqual(first)
+  })
+
   it("does not resume it once the resumed Run answers an interaction query", async () => {
     const recoveries: CursorRunRecovery[] = []
     await expect(pumpWithRecovery({
@@ -418,7 +456,7 @@ describe("capacity failures", () => {
     const final = await pumpWithRecovery({
       initialSession: fakeSession("refused", [{ frame: endStreamError("resource_exhausted") }]),
       controller: controller(),
-      retryPolicy: { maxAttempts: 2, baseDelayMs: 0, maxDelayMs: 0, capacityMaxAttempts: 6 },
+      retryPolicy: { baseDelayMs: 0, maxDelayMs: 0, capacityMaxAttempts: 6 },
       recover: async (recovery) => {
         recoveries.push(recovery)
         return refusals-- > 0
@@ -435,7 +473,7 @@ describe("capacity failures", () => {
     const failure = await pumpWithRecovery({
       initialSession: fakeSession("full", [{ frame: endStreamError("resource_exhausted") }]),
       controller: controller(),
-      retryPolicy: { maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 0, capacityMaxAttempts: 6 },
+      retryPolicy: { baseDelayMs: 0, maxDelayMs: 0, capacityMaxAttempts: 6 },
       recover: async () => {
         recoveries++
         return fakeSession(`full-${recoveries}`, [{ frame: endStreamError("resource_exhausted") }])
@@ -464,6 +502,24 @@ describe("capacity failures", () => {
     }).catch((error: unknown) => error)
     expect(recoveries).toBe(2)
     expect((failure as Error).message).toStartWith("Cursor Run failed after 3 attempts")
+  })
+
+  it("counts capacity refusals and other failures against one explicit maxAttempts", async () => {
+    for (const order of [["internal", "resource_exhausted"], ["resource_exhausted", "internal"]]) {
+      const codes = [...order, "internal"]
+      let recoveries = 0
+      const failure = await pumpWithRecovery({
+        initialSession: fakeSession("mixed", [{ frame: endStreamError(codes[0]!) }]),
+        controller: controller(),
+        retryPolicy: resolveRetryPolicy({ maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 }),
+        recover: async () => {
+          recoveries++
+          return fakeSession(`mixed-${recoveries}`, [{ frame: endStreamError(codes[recoveries]!) }])
+        },
+      }).catch((error: unknown) => error)
+      expect({ order, recoveries }).toEqual({ order, recoveries: 1 })
+      expect(failure).toBeInstanceOf(CursorRetryExhaustedError)
+    }
   })
 
 })

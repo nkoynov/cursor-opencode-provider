@@ -217,6 +217,8 @@ export type CursorSession = {
    * checkpoint: an earlier checkpoint of the turn would replay it, so recovery resumes none.
    */
   earlierCheckpointStale?: boolean
+  /** An interaction query came after this Run's own latest checkpoint, which would replay it too. */
+  interactionAfterCheckpoint?: boolean
   /**
    * This Run sent a user message or tool result after its last checkpoint:
    * recovery must not resume earlier state that lacks the delivered input.
