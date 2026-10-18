@@ -1047,6 +1047,22 @@ export function hostToolForCursorEdit(
   }
 }
 
+/** Cursor's private read of an existing file outside the workspace goes to OpenCode's read tool, as its own host call. */
+export function editReadGoesToHost(filePath: string, workspaceRoot: string): boolean {
+  const absolute = path.resolve(workspaceRoot, filePath)
+  try {
+    fs.lstatSync(absolute)
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ENOENT"
+  }
+  try {
+    const relative = path.relative(fs.realpathSync(workspaceRoot), fs.realpathSync(absolute))
+    return relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)
+  } catch {
+    return true
+  }
+}
+
 /**
  * Preserve a legacy Cursor edit's intent when its internal executor follows
  * `edit_tool_call` with a whole-file `write_args` request.

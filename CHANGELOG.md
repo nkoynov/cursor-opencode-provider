@@ -22,6 +22,7 @@
 
 ### Fixed
 
+- An edit of an existing file outside the workspace no longer shows a failed `edit` row ("Cursor did not finish this tool call.") before its read. Cursor reads the file first, and outside the workspace that read goes to OpenCode's permission-aware `read` and ends the step, which closed the early row opened for the edit; the edit itself came in the next step. No early row opens for such an edit now.
 - On OpenCode 2, a Run that stalls or is cut off after Cursor has started answering is retried by OpenCode again, as before #97, and that retry sends a request Cursor never checkpointed once more; only errors Cursor or the provider made final end the turn
 - Web search waits out Exa's free-tier rate limit instead of failing: a 429 from Exa's keyless MCP endpoint is retried after its `Retry-After` (capped at 5 s, plus up to 1 s of jitter so parallel subagents spread out), up to six attempts within the search's 25 s budget. Before, a burst of parallel searches failed most calls with OpenCode's bare "Unable to search the web"
 - A Cursor Task with attached files hands the subagent exact file paths to open itself, keeps Cursor's description, and avoids extra parent reads, including runtime metadata attachments; unstatable attachments report failure ([#82](https://github.com/oakimov/cursor-opencode-provider/issues/82), based on a fix by [@nkoynov](https://github.com/nkoynov))

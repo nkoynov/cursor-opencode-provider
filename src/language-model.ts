@@ -83,6 +83,7 @@ import {
   appendTaskAttachments,
   remapCorrelatedEditWriteForCatalog,
   remapEditToolsForCatalog,
+  editReadGoesToHost,
   hostToolForCursorEdit,
   buildCompleteEditReadMessages,
   buildTaskAttachmentReadMessages,
@@ -6724,11 +6725,11 @@ export async function pump(
         owedPending: owedPendingCount(),
       })
     ) {
-      const toolName = hostToolForCursorEdit(
-        announced.path,
-        fileToolNames(),
-        workspaceRootFromRequestContext(session.requestContext),
-      )
+      const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
+      // That read would end this step before the edit's exec and close the row as failed.
+      const toolName = editReadGoesToHost(announced.path, workspaceRoot)
+        ? undefined
+        : hostToolForCursorEdit(announced.path, fileToolNames(), workspaceRoot)
       if (!toolName) earlyRows.skip(announced.callId)
       else {
         const row: EarlyToolRow = {

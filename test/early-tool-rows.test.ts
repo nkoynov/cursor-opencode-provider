@@ -3,7 +3,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { encodeMessage } from "../src/protocol/messages.js"
-import { hostToolForCursorEdit, toolsToDescriptors } from "../src/protocol/tools.js"
+import { editReadGoesToHost, hostToolForCursorEdit, toolsToDescriptors } from "../src/protocol/tools.js"
 import {
   UNBOUND_EXEC_ID,
   cursorEditAnnouncement,
@@ -335,7 +335,7 @@ describe("early edit rows", () => {
     sessionManager.resolve(session.sessionId, 9)
   })
 
-  it("closes the row when the announced call's exec becomes another tool", async () => {
+  it("opens no row for an edit whose private read goes to the host, so no failed edit precedes the read", async () => {
     const workspace = tempDir()
     const outside = path.join(tempDir(), "outside.txt")
     fs.writeFileSync(outside, "one\n")
@@ -353,19 +353,57 @@ describe("early edit rows", () => {
     session.requestContext.env = { workspace_paths: [workspace] }
     await run(session, parts)
 
-    const start = parts.find((part) => part.type === "tool-input-start")
-    const closed = parts.find((part) => part.type === "tool-call" && part.providerExecuted)
     const read = parts.find((part) => part.type === "tool-call" && !part.providerExecuted)
-    expect(start?.toolName).toBe("edit")
-    expect(closed?.toolCallId).toBe(start?.id)
+    expect(parts.some((part) => part.type === "tool-input-start" && part.id.startsWith("cursor-early_"))).toBe(false)
+    expect(parts.filter((part) => part.type === "tool-call" && part.providerExecuted)).toEqual([])
+    expect(parts.some((part) => part.type === "tool-result" && part.isError)).toBe(false)
     expect(read?.toolName).toBe("read")
     expect(read?.toolCallId.startsWith("cursor_")).toBe(true)
     sessionManager.resolve(session.sessionId, 3)
   })
 
-  it("closes the row when the exec is a different tool", async () => {
+  it("treats a workspace symlink to an outside file like the outside file", async () => {
+    const workspace = tempDir()
+    const outside = path.join(tempDir(), "outside.txt")
+    fs.writeFileSync(outside, "one\n")
+    const link = path.join(workspace, "link.txt")
+    fs.symlinkSync(outside, link)
     const { session, parts } = pumpSession([
-      partial("edit-1", existingFile()),
+      partial("edit-link", link),
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: { id: 6, read_args: { path: link, tool_call_id: "edit-link" } },
+      }),
+    ], [
+      { name: "read", description: "Read" },
+      { name: "edit", description: "Edit" },
+    ])
+    session.requestContext.env = { workspace_paths: [workspace] }
+    await run(session, parts)
+
+    expect(parts.some((part) => part.type === "tool-input-start" && part.id.startsWith("cursor-early_"))).toBe(false)
+    expect(parts.find((part) => part.type === "tool-call")?.toolName).toBe("read")
+    sessionManager.resolve(session.sessionId, 6)
+  })
+
+  it("predicts which edits' private reads go to the host", () => {
+    const workspace = tempDir()
+    const inside = path.join(workspace, "inside.txt")
+    fs.writeFileSync(inside, "one\n")
+    const outside = path.join(tempDir(), "outside.txt")
+    fs.writeFileSync(outside, "one\n")
+    fs.symlinkSync(outside, path.join(workspace, "link.txt"))
+    expect(editReadGoesToHost(inside, workspace)).toBe(false)
+    expect(editReadGoesToHost("inside.txt", workspace)).toBe(false)
+    expect(editReadGoesToHost(path.join(workspace, "missing.txt"), workspace)).toBe(false)
+    expect(editReadGoesToHost(path.join(path.dirname(outside), "missing.txt"), workspace)).toBe(false)
+    expect(editReadGoesToHost(outside, workspace)).toBe(true)
+    expect(editReadGoesToHost(path.join(workspace, "link.txt"), workspace)).toBe(true)
+  })
+
+  it("closes the row when the exec is a different tool", async () => {
+    const file = existingFile()
+    const { session, parts } = pumpSession([
+      partial("edit-1", file),
       encodeMessage("AgentServerMessage", {
         exec_server_message: { id: 4, shell_args: { command: "pwd", tool_call_id: "shell-1" } },
       }),
@@ -373,6 +411,7 @@ describe("early edit rows", () => {
       { name: "edit", description: "Edit" },
       { name: "bash", description: "Shell" },
     ])
+    session.requestContext.env = { workspace_paths: [path.dirname(file)] }
     await run(session, parts)
     const start = parts.find((part) => part.type === "tool-input-start")
     const closed = parts.find((part) => part.type === "tool-call" && part.providerExecuted)
@@ -386,11 +425,13 @@ describe("early edit rows", () => {
   })
 
   it("stays open across later text and closes before the step finishes", async () => {
+    const file = existingFile()
     const { session, parts } = pumpSession([
-      partial("edit-1", existingFile()),
+      partial("edit-1", file),
       encodeMessage("AgentServerMessage", { interaction_update: { text_delta: { text: "still writing" } } }),
       turnEnded(),
     ], [{ name: "edit", description: "Edit" }])
+    session.requestContext.env = { workspace_paths: [path.dirname(file)] }
     await run(session, parts)
     const startAt = parts.findIndex((part) => part.type === "tool-input-start")
     const textAt = parts.findIndex((part) => part.type === "text-delta")
