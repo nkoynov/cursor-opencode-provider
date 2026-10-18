@@ -242,6 +242,10 @@ describe("mid-turn user message after a complete step", () => {
     carried.carriedToolStep = { listed: 3, resolved: new Set(["call_1", "call_2"]) }
     expect(steered(steer("carried", user("b")))?.messages).toEqual([])
     sessionManager.dispose()
+    const uncounted = heldReads("uncounted")
+    uncounted.carriedToolStep = { listed: undefined, resolved: new Set(["call_1", "call_2"]) }
+    expect(steered(steer("uncounted", user("b")))?.messages).toEqual(["b"])
+    sessionManager.dispose()
     const answered = heldReads("answered")
     answered.toolCallOrder = { calls: [{ callId: "call_1", mutating: false }, { callId: "call_2", mutating: false }], deferred: [], progressAt: Date.now() }
     expect(steered(steer("answered", user("b")))?.messages).toEqual(["b"])

@@ -4512,7 +4512,7 @@ export function continuationAfterEarlySteers(
   const laterCalls = hasDeferredToolExecs(held.toolCallOrder)
     || (held.toolCallOrder?.calls ?? []).some((call) => !answeredCalls.has(call.callId))
     || [...held.announcedCallIds ?? []].some((callId) => !answeredCalls.has(callId))
-    || held.carriedToolStep !== undefined
+    || (held.carriedToolStep?.listed !== undefined && held.carriedToolStep.resolved.size < held.carriedToolStep.listed)
   const injectNew = takesSteers && !laterCalls
   // The host has already promoted these messages. Inject them, or keep them for a follow-up after the
   // held turn, rather than superseding its tool results or dropping all but the last user message.
