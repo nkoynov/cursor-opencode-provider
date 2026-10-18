@@ -167,6 +167,10 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   (`interactionAfterCheckpoint`). A promoted steer is not injected while a
   later exec of its step is still deferred; it goes as a follow-up Run
   (`continuationAfterEarlySteers`).
+- Fork: a `tool_call_started` / `tool_call_completed` frame still sets the
+  stateful replay barrier, but blocks the completed-tool-results rebuild only
+  while no host exec has claimed its call (`historyRepresentsRun`); upstream
+  blocked it for every announced call, so the rebuild never ran on real Cursor.
 
 ## Context, identity and persistence
 

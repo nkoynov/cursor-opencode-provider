@@ -23,6 +23,15 @@ export type ReplaySafetyState = {
   execs?: Array<{ sessionId: string; id: number }>
   /** History cannot represent opaque interactions, unknown frames or started display work. */
   historyRebaseUnsafe?: boolean
+  /** Fork: display calls whose lifecycle frames history represents only once a host exec claimed them. */
+  displayCalls?: string[]
+  hostCalls?: string[]
+}
+
+/** Host history holds every call this Run started, so a rebuilt Run repeats none of them. */
+export function historyRepresentsRun(state: ReplaySafetyState | undefined): boolean {
+  if (state?.historyRebaseUnsafe) return false
+  return (state?.displayCalls ?? []).every((callId) => state?.hostCalls?.includes(callId))
 }
 
 export class AttemptReplaySafety {
@@ -36,15 +45,26 @@ export class AttemptReplaySafety {
     this.stateful = state.statefulBarrier !== undefined
   }
 
-  markBarrier(reason: ReplayBarrierReason): void {
+  markBarrier(reason: ReplayBarrierReason, displayCallId?: string): void {
     if (!OUTPUT_ONLY_BARRIERS.has(reason)) {
       this.stateful = true
       this.state.statefulBarrier ??= reason
-      if (reason !== "non-control-exec") this.state.historyRebaseUnsafe = true
+      if (reason === "display-tool-lifecycle" && displayCallId) {
+        const calls = this.state.displayCalls ??= []
+        if (!calls.includes(displayCallId)) calls.push(displayCallId)
+      } else if (reason !== "non-control-exec") {
+        this.state.historyRebaseUnsafe = true
+      }
     }
     if (this.barrierReason) return
     this.barrierReason = reason
     trace(`replay barrier: reason=${reason} sessionId=${this.sessionId}`)
+  }
+
+  /** A host exec took over the display call; its result in host history stands for the call. */
+  claimDisplayCall(callId: string): void {
+    const calls = this.state.hostCalls ??= []
+    if (!calls.includes(callId)) calls.push(callId)
   }
 
   recordExec(id: unknown): void {
@@ -80,6 +100,7 @@ export type DecodedReplayFrame = {
 
 export type ReplayFrameAnalysis = {
   barrier?: ReplayBarrierReason
+  displayCallId?: string
 }
 
 // Field numbers follow Cursor CLI 2026.09.28 `agent.v1`; the extracted
@@ -227,13 +248,17 @@ export function analyzeReplayFrame(
     || !!decoded.execControl
 
   let barrier: ReplayBarrierReason | undefined
-  if (decoded.interactionUpdate?.tool_call_started || decoded.interactionUpdate?.tool_call_completed) {
+  let displayCallId: string | undefined
+  const lifecycle = decoded.interactionUpdate?.tool_call_started ?? decoded.interactionUpdate?.tool_call_completed
+  if (lifecycle) {
     barrier = "display-tool-lifecycle"
+    const callId = (lifecycle as { call_id?: unknown }).call_id
+    if (!malformed && typeof callId === "string" && callId) displayCallId = callId
   } else if (malformed || (topLevel.fn === 4 && !validKv)) {
     barrier = "unknown-or-malformed-frame"
   } else if (topLevel.fn === 2 && !exec.exactRequestContext && !exec.exactMcpState) {
     barrier = "non-control-exec"
   }
 
-  return { barrier }
+  return { barrier, ...(displayCallId ? { displayCallId } : {}) }
 }

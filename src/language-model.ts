@@ -342,7 +342,7 @@ import {
   hostNoteText,
   wrapHostNotesForCursor,
 } from "./protocol/host-notes.js"
-import { analyzeReplayFrame, AttemptReplaySafety, describeFrameLayout } from "./replay-safety.js"
+import { analyzeReplayFrame, AttemptReplaySafety, describeFrameLayout, historyRepresentsRun } from "./replay-safety.js"
 import { noteCursorWaitEnded, noteCursorWaitStarted } from "./cursor-waits.js"
 import {
   deferToolExec,
@@ -1293,7 +1293,7 @@ async function doStreamImpl(
               canRebaseFromHistory: (failed) => {
                 if (failed !== session || trailingToolResults.length === 0
                   || !failed.checkpointRevokedByHostResult || failed.pending.size > 0
-                  || failed.replaySafety?.historyRebaseUnsafe) return false
+                  || !historyRepresentsRun(failed.replaySafety)) return false
                 const completed = new Set(extractToolResults(prompt)
                   .map(result => `${result.sessionId}:${result.execId}`))
                 const execs = failed.replaySafety?.execs
@@ -1481,6 +1481,8 @@ export async function pumpWithRecovery(input: {
       next.replaySafety = {
         ...pumpedSession.replaySafety,
         execs: pumpedSession.replaySafety?.execs?.slice(),
+        displayCalls: pumpedSession.replaySafety?.displayCalls?.slice(),
+        hostCalls: pumpedSession.replaySafety?.hostCalls?.slice(),
       }
       next.userTurnHostNotes = pumpedSession.userTurnHostNotes
       next.usageEstimate = { ...pumpedSession.usageEstimate }
@@ -5652,7 +5654,7 @@ export async function pump(
         trace(`replay frame unknown: layout=${layout} bytes=${payload.length}`)
       }
     }
-    if (replayFrame.barrier) replaySafety.markBarrier(replayFrame.barrier)
+    if (replayFrame.barrier) replaySafety.markBarrier(replayFrame.barrier, replayFrame.displayCallId)
     // The provider answers some queries itself (a plan file, an image approval); resuming a checkpoint
     // from before one would repeat it, so only a later checkpoint is resumed.
     if (interactionQuery) {
@@ -6484,6 +6486,7 @@ export async function pump(
           }
           if (displayCallId) {
             session.displayToolCalls.delete(displayCallId)
+            replaySafety.claimDisplayCall(displayCallId)
             trace(`exec: claimed display callId=${displayCallId}`)
           }
           const boundEarly = earlyRows.claim(displayCallId)

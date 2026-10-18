@@ -313,8 +313,11 @@ describe("checkpoint eligibility across host results", () => {
     }, 30_000)
   }
 
-  for (const scenario of ["complete", "missing-history", "unknown", "unrepresented-exec", "duplicate-exec", "followup-before-result", "new-output", "final-error"] as const) {
+  for (const scenario of ["complete", "display-lifecycle", "missing-history", "unknown", "unrepresented-exec", "duplicate-exec", "unclaimed-display", "followup-before-result", "new-output", "final-error"] as const) {
     it(`recovers a post-result drop only from represented completed work (${scenario})`, async () => {
+      const recovers = scenario === "complete" || scenario === "display-lifecycle"
+      const lifecycle = scenario === "display-lifecycle"
+      const shellCall = (callId: string) => ({ shell_tool_call: { args: { command: `echo ${callId}`, tool_call_id: callId } } })
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-result-history-"))
       type RunRequest = { conversation_id: string; action: { resume_action?: unknown; user_message_action?: { user_message: { text: string } } } }
       const requests: RunRequest[] = []
@@ -337,12 +340,22 @@ describe("checkpoint eligibility across host results", () => {
           if (scenario === "unknown") stream.write(frame(Uint8Array.of(0xa2, 0x06, 0))) // unknown field 100
           if (scenario === "unrepresented-exec") send({ exec_server_message: { id: 90, list_mcp_resources_exec_args: {} } })
           if (scenario === "duplicate-exec") send({ exec_server_message: { id: 1, list_mcp_resources_exec_args: {} } })
+          if (scenario === "unclaimed-display") {
+            const search = { web_search_tool_call: { args: { search_term: "cursor" } } }
+            send({ interaction_update: { tool_call_started: { call_id: "cursor-side", tool_call: search } } })
+            send({ interaction_update: { tool_call_completed: { call_id: "cursor-side", tool_call: search } } })
+          }
+          if (lifecycle) send({ interaction_update: { tool_call_started: { call_id: "first", tool_call: shellCall("first") } } })
           send({ exec_server_message: { id: 1, shell_stream_args: { command: "echo first", tool_call_id: "first" } } })
         } else if (message.exec_client_message) {
           const id = (message.exec_client_message as { id: number }).id
           if (!(message.exec_client_message as Record<string, unknown>).shell_stream || delivered.includes(id)) return
           delivered.push(id)
           if (id === 1) {
+            if (lifecycle) {
+              send({ interaction_update: { tool_call_completed: { call_id: "first", tool_call: shellCall("first") } } })
+              send({ interaction_update: { tool_call_started: { call_id: "second", tool_call: shellCall("second") } } })
+            }
             send({ exec_server_message: { id: 2, shell_stream_args: { command: "echo second", tool_call_id: "second" } } })
           } else {
             if (scenario === "new-output") send({ interaction_update: { text_delta: { text: "new output" } } })
@@ -377,7 +390,7 @@ describe("checkpoint eligibility across host results", () => {
           prompt.push({ role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName, output: { type: "text", value: output } }] })
         }
         if (scenario === "missing-history") prompt.splice(1, 2)
-        if (scenario === "complete") {
+        if (recovers) {
           const parts = await read()
           expect(parts.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
           expect(parts.some(part => part.type === "tool-call")).toBe(false)
