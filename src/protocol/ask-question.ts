@@ -316,10 +316,10 @@ export function asyncResult(): AskQuestionResultMessage {
 export function parseAnswerSegments(
   questions: readonly CursorAskQuestionItem[],
   output: string,
-): Array<string | undefined> {
+): Array<AnswerSegment | undefined> {
   const fromJson = parseJsonAnswerSegments(output, questions.length)
   if (fromJson) return fromJson
-  const answers: Array<string | undefined> = []
+  const answers: Array<AnswerSegment | undefined> = []
   let cursor = 0
   for (const question of questions) {
     const anchor = `"${question.prompt}"="`
@@ -348,18 +348,24 @@ export function parseAnswerSegments(
   return answers
 }
 
-function cellText(cell: unknown): string | undefined {
+/**
+ * One question's answer: prose text whose choices are joined with ", "
+ * (OpenCode 1.x), or the separate choices of OpenCode 2's JSON output.
+ */
+export type AnswerSegment = string | readonly string[]
+
+function cellText(cell: unknown): AnswerSegment | undefined {
   if (typeof cell === "string") return cell
   if (typeof cell === "number" || typeof cell === "boolean") return String(cell)
   if (Array.isArray(cell)) {
-    const parts = cell.map((item) => (typeof item === "string" ? item : "")).filter(Boolean)
-    return parts.length > 0 ? parts.join(", ") : undefined
+    const parts = cell.filter((item): item is string => typeof item === "string" && item.length > 0)
+    return parts.length > 0 ? parts : undefined
   }
   return undefined
 }
 
 /** OpenCode 2 `question` output `{ answers: string[][] }`, or a JSON array of cells. */
-function parseJsonAnswerSegments(output: string, count: number): Array<string | undefined> | undefined {
+function parseJsonAnswerSegments(output: string, count: number): Array<AnswerSegment | undefined> | undefined {
   const trimmed = output.trim()
   if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return undefined
   let parsed: unknown
@@ -390,24 +396,45 @@ const UNANSWERED = "Unanswered"
  */
 export function answerForQuestion(
   question: CursorAskQuestionItem,
-  segment: string | undefined,
+  segment: AnswerSegment | undefined,
 ): Record<string, unknown> {
   const answer: Record<string, unknown> = { question_id: question.id }
-  if (segment === undefined || segment.trim().length === 0 || segment.trim() === UNANSWERED) {
-    return answer
-  }
+  const choices = (typeof segment === "string" ? [segment] : segment ?? [])
+    .map((choice) => choice.trim())
+    .filter((choice) => choice.length > 0 && choice !== UNANSWERED)
+  if (choices.length === 0) return answer
   const byLabel = new Map(
     displayOptions(question).map((option) => [option.label.trim().toLowerCase(), option.id]),
   )
   const selected: string[] = []
   const custom: string[] = []
-  // `multiple: true` answers arrive joined with ", " (question tool `formatted`).
-  for (const piece of segment.split(", ")) {
-    const label = piece.trim()
-    if (!label) continue
-    const optionId = byLabel.get(label.toLowerCase())
+  const take = (choice: string) => {
+    const optionId = byLabel.get(choice.toLowerCase())
     if (optionId !== undefined) selected.push(optionId)
-    else custom.push(label)
+    else custom.push(choice)
+  }
+  if (typeof segment !== "string" || !question.allowMultiple) {
+    choices.forEach(take)
+  } else {
+    // Multi-select prose joins the choices with ", " (question tool `formatted`),
+    // and labels can contain ", " too, so the longest run of pieces that is a label wins.
+    const pieces = choices[0]!.split(", ")
+    for (let start = 0; start < pieces.length;) {
+      let end = pieces.length
+      let optionId: string | undefined
+      for (; end > start; end--) {
+        optionId = byLabel.get(pieces.slice(start, end).join(", ").trim().toLowerCase())
+        if (optionId !== undefined) break
+      }
+      if (optionId !== undefined) {
+        selected.push(optionId)
+        start = end
+        continue
+      }
+      const piece = pieces[start]!.trim()
+      if (piece) custom.push(piece)
+      start++
+    }
   }
   if (selected.length > 0) answer.selected_option_ids = selected
   if (custom.length > 0) answer.freeform_text = custom.join(", ")
