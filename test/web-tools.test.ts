@@ -501,18 +501,20 @@ describe("Exa keyless first, then EXA_API_KEY", () => {
     for (const text of [String(error), ...c.logs, ...exa.requests.map((r) => r.url)]) expect(text).not.toContain(KEY)
   })
 
-  it("sends a key read with a trailing newline without it, and refuses one with a line break inside without quoting it", async () => {
+  it("sends a key read with a trailing newline without it, and refuses a malformed one without quoting it", async () => {
     process.env.EXA_API_KEY = `${KEY}\n`
     const trailing = recorded([() => limited("1"), ok])
     await fetchOpenCodeWebSearchText({ query: "q" }, undefined, trailing.fetchImpl, clock().options)
     expect(trailing.requests[1]!.key).toBe(KEY)
 
-    process.env.EXA_API_KEY = `${KEY}\nsecond-line`
-    const broken = recorded([() => limited("1"), ok])
-    const error = await fetchOpenCodeWebSearchText({ query: "q" }, undefined, broken.fetchImpl, clock().options).catch((e: Error) => e)
-    expect(String(error)).toContain("EXA_API_KEY contains a line break or NUL character")
-    expect(String(error)).not.toContain(KEY)
-    expect(broken.routes()).toEqual(["keyless"])
+    for (const malformed of [`${KEY}\nsecond-line`, `${KEY}\0`, `${KEY}🔑`, `${KEY} copied`]) {
+      process.env.EXA_API_KEY = malformed
+      const broken = recorded([() => limited("1"), ok])
+      const error = await fetchOpenCodeWebSearchText({ query: "q" }, undefined, broken.fetchImpl, clock().options).catch((e: Error) => e)
+      expect(String(error)).toContain("EXA_API_KEY contains a space, line break or non-ASCII character")
+      expect(String(error)).not.toContain(KEY)
+      expect(broken.routes()).toEqual(["keyless"])
+    }
   })
 
   it("writes each search's route to the debug log and never the key", async () => {

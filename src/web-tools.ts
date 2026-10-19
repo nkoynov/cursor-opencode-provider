@@ -327,9 +327,9 @@ export async function fetchOpenCodeWebSearchText(
       }
     }
     for (let attempt = 1; ; attempt++) {
-      // fetch's invalid-header error quotes the whole value, key included
-      if (keyed && apiKey && /[\0\r\n]/.test(apiKey)) {
-        throw new Error("Web search failed: EXA_API_KEY contains a line break or NUL character, so it can't be sent to Exa")
+      // fetch's invalid-header error quotes the whole value, key included; Exa keys are plain ASCII
+      if (keyed && apiKey && /[^\x21-\x7e]/.test(apiKey)) {
+        throw new Error("Web search failed: EXA_API_KEY contains a space, line break or non-ASCII character, so it can't be sent to Exa")
       }
       log(`web-search: ${keyed ? "keyed" : "keyless"} request, attempt ${attempt}${reason ? ` (${reason})` : ""}`)
       const response = await fetchImpl(EXA_MCP_URL, {
