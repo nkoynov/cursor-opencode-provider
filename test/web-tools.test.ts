@@ -107,10 +107,20 @@ describe("Exa rate limits", () => {
   })
 
   it("assumes one second when a 429 has no usable Retry-After and caps long ones", async () => {
-    const { fetchImpl } = scripted([() => limited(null), () => limited("120"), ok])
+    const { fetchImpl } = scripted([() => limited(null), () => limited("40"), ok])
     const c = clock()
     await fetchOpenCodeWebSearchText({ query: "q" }, undefined, fetchImpl, c.options)
     expect(c.waits).toEqual([1_500, 5_500])
+  })
+
+  it("fails at once when Exa asks for a wait longer than the whole search budget", async () => {
+    delete process.env.EXA_API_KEY
+    const { fetchImpl, calls } = scripted([() => limited("67785"), ok])
+    const c = clock()
+    await expect(fetchOpenCodeWebSearchText({ query: "q" }, undefined, fetchImpl, c.options))
+      .rejects.toThrow("Web search failed (429): Exa refuses searches for another 18.8 h; set EXA_API_KEY to search sooner.")
+    expect(calls()).toBe(1)
+    expect(c.waits).toEqual([])
   })
 
   it("reports the 429 after six attempts", async () => {
@@ -257,6 +267,27 @@ describe("Exa keyless concurrency", () => {
     expect(gate.started).toEqual(["a", "b", "c", "d", "e", "f"])
     for (let i = 0; i < 3; i++) await gate.answerNext()
     await Promise.all(again)
+  })
+
+  it("frees the slot of a search aborted mid-request for the next one in line", async () => {
+    delete process.env.EXA_API_KEY
+    const gate = gatedFetch()
+    const controller = new AbortController()
+    const abortable = (async (url: string | URL | Request, init?: RequestInit) => {
+      const pending = gate.fetchImpl(url, init)
+      return Promise.race([pending, new Promise<never>((_, reject) =>
+        init!.signal!.addEventListener("abort", () => reject(init!.signal!.reason), { once: true }))])
+    }) as unknown as typeof fetch
+    const stopped = search("stopped", abortable, undefined, controller.signal)
+    const holders = ["b", "c"].map((q) => search(q, gate.fetchImpl))
+    const queued = search("queued", gate.fetchImpl)
+    await tick()
+    controller.abort(new Error("stopped"))
+    await expect(stopped).rejects.toThrow("stopped")
+    await tick()
+    expect(gate.started).toEqual(["stopped", "b", "c", "queued"])
+    for (let i = 0; i < 4; i++) await gate.answerNext()
+    await Promise.all([...holders, queued])
   })
 
   it("keeps its slot while it waits out a 429, then retries", async () => {

@@ -50,6 +50,10 @@ function retryAfterMs(header: string | null, now: number): number {
   return 1_000
 }
 
+function formatWait(ms: number): string {
+  return ms >= 3_600_000 ? `${(ms / 3_600_000).toFixed(1)} h` : `${Math.ceil(ms / 60_000)} min`
+}
+
 /** Wait for one of the process's keyless Exa slots, first come first served; resolves to its release. */
 function acquireExaKeylessSlot(
   signal: AbortSignal,
@@ -301,9 +305,16 @@ export async function fetchOpenCodeWebSearchText(
         signal: controller.signal,
       })
       const raw = await response.text()
+      const retryAfter = response.status === 429 ? retryAfterMs(response.headers.get("retry-after"), now()) : 0
+      // Exa's keyless daily quota answers with a Retry-After of hours, until midnight UTC
+      if (retryAfter > WEB_SEARCH_TIMEOUT_MS) {
+        throw new Error(
+          `Web search failed (429): Exa refuses searches for another ${formatWait(retryAfter)}`
+            + `${process.env.EXA_API_KEY ? "" : "; set EXA_API_KEY to search sooner"}. ${raw.slice(0, 300)}`,
+        )
+      }
       if (response.status === 429 && attempt < RATE_LIMIT_MAX_ATTEMPTS) {
-        const wait = Math.min(retryAfterMs(response.headers.get("retry-after"), now()), RATE_LIMIT_MAX_WAIT_MS)
-          + Math.floor(random() * RATE_LIMIT_JITTER_MS)
+        const wait = Math.min(retryAfter, RATE_LIMIT_MAX_WAIT_MS) + Math.floor(random() * RATE_LIMIT_JITTER_MS)
         if (now() + wait < deadline) {
           await sleep(wait, controller.signal)
           continue
