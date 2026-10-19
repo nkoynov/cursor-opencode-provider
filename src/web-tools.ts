@@ -143,23 +143,34 @@ function mcpText(value: unknown): string | undefined {
   return undefined
 }
 
-export function parseOpenCodeWebSearchResponse(raw: string): string | undefined {
+/** The JSON-RPC messages of an MCP response: one JSON object, or the `data:` events of an SSE stream. */
+function mcpMessages(raw: string): unknown[] {
   const trimmed = raw.trim()
-  if (!trimmed) return undefined
-  try {
-    const text = mcpText(JSON.parse(trimmed))
+  if (!trimmed) return []
+  const whole = tryParseJson(trimmed)
+  if (whole !== undefined) return [whole]
+  return raw.split("\n").flatMap((line) => {
+    if (!line.startsWith("data: ")) return []
+    const message = tryParseJson(line.slice(6))
+    return message === undefined ? [] : [message]
+  })
+}
+
+export function parseOpenCodeWebSearchResponse(raw: string): string | undefined {
+  for (const message of mcpMessages(raw)) {
+    const text = mcpText(message)
     if (text) return text
-  } catch {
-    // MCP may respond as an SSE stream instead of one JSON object.
   }
-  for (const line of raw.split("\n")) {
-    if (!line.startsWith("data: ")) continue
-    try {
-      const text = mcpText(JSON.parse(line.slice(6)))
-      if (text) return text
-    } catch {
-      // Ignore non-JSON SSE events.
-    }
+  return undefined
+}
+
+/** Exa's MCP answers a failed keyed search (invalid key, no credit) with HTTP 200 and an error result. */
+function mcpToolError(raw: string): string | undefined {
+  for (const message of mcpMessages(raw)) {
+    if (!message || typeof message !== "object") continue
+    const { result, error } = message as { result?: { isError?: unknown }; error?: { message?: unknown } }
+    if (result && typeof result === "object" && result.isError === true) return mcpText(message) ?? "Exa reported an error"
+    if (error && typeof error === "object") return typeof error.message === "string" ? error.message : "Exa reported an error"
   }
   return undefined
 }
@@ -358,6 +369,8 @@ export async function fetchOpenCodeWebSearchText(
         }
       }
       if (!response.ok) throw new Error(`Web search failed (${response.status}): ${raw.slice(0, 500)}`)
+      const toolError = mcpToolError(raw)
+      if (toolError !== undefined) throw new Error(`Web search failed: ${toolError.slice(0, 500)}`)
       return parseOpenCodeWebSearchResponse(raw) ?? "No search results found. Please try a different query."
     }
   } finally {

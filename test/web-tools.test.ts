@@ -466,6 +466,31 @@ describe("Exa keyless first, then EXA_API_KEY", () => {
     expect(keylessQuota.refusedUntil).toBe(1_000_000 + 600_000)
   })
 
+  it("fails a keyed search Exa answers with an MCP error result, as it does for an invalid key", async () => {
+    process.env.EXA_API_KEY = KEY
+    const invalidKey = () => new Response(
+      `event: message\ndata: ${JSON.stringify({
+        result: {
+          content: [{ type: "text", text: "web_search_exa error (401): Invalid API key. Provide a valid key using 'Authorization: Bearer <key>' or 'x-api-key: <key>'." }],
+          isError: true,
+        },
+        jsonrpc: "2.0",
+        id: 1,
+      })}\n\n`,
+      { headers: { "content-type": "text/event-stream" } },
+    )
+    const exa = recorded([() => limited("1"), invalidKey])
+    await expect(fetchOpenCodeWebSearchText({ query: "q" }, undefined, exa.fetchImpl, clock().options))
+      .rejects.toThrow("Web search failed: web_search_exa error (401): Invalid API key.")
+    expect(exa.routes()).toEqual(["keyless", "keyed"])
+  })
+
+  it("fails a search whose 200 answer is a JSON-RPC error", async () => {
+    const exa = recorded([() => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32602, message: "Invalid params" } }))])
+    await expect(fetchOpenCodeWebSearchText({ query: "q" }, undefined, exa.fetchImpl, clock().options))
+      .rejects.toThrow("Web search failed: Invalid params")
+  })
+
   it("keeps the key out of the URL, the route log and errors", async () => {
     process.env.EXA_API_KEY = KEY
     const exa = recorded([() => limited("7200"), () => new Response("{\"error\":\"invalid api key\"}", { status: 401 })])
