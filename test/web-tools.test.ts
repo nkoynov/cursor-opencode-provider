@@ -1,4 +1,8 @@
-import { afterEach, describe, expect, it } from "bun:test"
+import { afterEach, beforeEach, describe, expect, it } from "bun:test"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
+import { processShared } from "../src/process-shared.js"
 import {
   executeOpenCodeWebSearch,
   fetchOpenCodeWebSearchText,
@@ -7,11 +11,21 @@ import {
 } from "../src/web-tools.js"
 
 const originalExaApiKey = process.env.EXA_API_KEY
+const keylessQuota = processShared("web-search.exa-keyless-quota.v1", () => ({ refusedUntil: 0 }))
+
+beforeEach(() => {
+  delete process.env.EXA_API_KEY
+  keylessQuota.refusedUntil = 0
+})
 
 afterEach(() => {
   if (originalExaApiKey === undefined) delete process.env.EXA_API_KEY
   else process.env.EXA_API_KEY = originalExaApiKey
 })
+
+function apiKeyHeader(init: RequestInit | undefined): string | undefined {
+  return new Headers(init?.headers).get("x-api-key") ?? undefined
+}
 
 function context(asks: unknown[]) {
   return {
@@ -54,7 +68,8 @@ describe("OpenCode-backed websearch tool", () => {
       permission: "websearch",
       patterns: ["current release"],
     })])
-    expect(requestUrl).toContain("https://mcp.exa.ai/mcp?exaApiKey=test-key")
+    expect(requestUrl).toBe("https://mcp.exa.ai/mcp")
+    expect(apiKeyHeader(requestInit)).toBeUndefined()
     const body = JSON.parse(String(requestInit?.body))
     expect(body.params).toEqual({
       name: "web_search_exa",
@@ -168,11 +183,14 @@ describe("Exa keyless concurrency", () => {
 
   function gatedFetch() {
     const started: string[] = []
+    const keyed: string[] = []
     const answers: Array<(response: Response) => void> = []
     let inFlight = 0
     let maxInFlight = 0
     const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
-      started.push(JSON.parse(String(init?.body)).params.arguments.query)
+      const query = JSON.parse(String(init?.body)).params.arguments.query
+      started.push(query)
+      if (apiKeyHeader(init)) keyed.push(query)
       maxInFlight = Math.max(maxInFlight, ++inFlight)
       try {
         return await new Promise<Response>((resolve) => answers.push(resolve))
@@ -184,7 +202,7 @@ describe("Exa keyless concurrency", () => {
       answers.shift()!(response)
       await tick()
     }
-    return { fetchImpl, started, answerNext, maxInFlight: () => maxInFlight }
+    return { fetchImpl, started, keyed, answerNext, maxInFlight: () => maxInFlight }
   }
 
   function heldSleep() {
@@ -309,14 +327,177 @@ describe("Exa keyless concurrency", () => {
     expect(gate.started).toEqual(["first", "b", "c", "first", "queued"])
   })
 
-  it("does not limit searches made with an EXA_API_KEY", async () => {
+  it("with an EXA_API_KEY, fills the keyless slots and sends the rest with the key at once", async () => {
     process.env.EXA_API_KEY = "test-key"
     const gate = gatedFetch()
-    const searches = ["k0", "k1", "k2", "k3", "k4"].map((q) => search(q, gate.fetchImpl))
+    const queue = heldSleep()
+    const searches = ["k0", "k1", "k2", "k3", "k4"].map((q) => search(q, gate.fetchImpl, queue.options))
     await tick()
     expect(gate.started).toEqual(["k0", "k1", "k2", "k3", "k4"])
+    expect(gate.keyed).toEqual(["k3", "k4"])
+    expect(queue.waits).toEqual([])
     for (let i = 0; i < 5; i++) await gate.answerNext()
-    await Promise.all(searches)
+    expect(await Promise.all(searches)).toEqual(["found", "found", "found", "found", "found"])
+  })
+
+  it("with an EXA_API_KEY, frees the keyless slot of a search that moved to the key", async () => {
+    process.env.EXA_API_KEY = "test-key"
+    const gate = gatedFetch()
+    const moved = search("moved", gate.fetchImpl)
+    await tick()
+    await gate.answerNext(new Response("{}", { status: 429, headers: { "retry-after": "1" } }))
+    expect(gate.started).toEqual(["moved", "moved"])
+    expect(gate.keyed).toEqual(["moved"])
+    const others = ["a", "b", "c"].map((q) => search(q, gate.fetchImpl))
+    await tick()
+    expect(gate.keyed).toEqual(["moved"])
+    for (let i = 0; i < 4; i++) await gate.answerNext()
+    expect(await Promise.all([moved, ...others])).toEqual(["found", "found", "found", "found"])
+  })
+})
+
+describe("Exa keyless first, then EXA_API_KEY", () => {
+  const KEY = "exa-test-secret-4f9c2a"
+  const ok = () => new Response(JSON.stringify({ result: { content: [{ type: "text", text: "found" }] } }))
+  const limited = (retryAfter: string) => new Response("{\"error\":\"rate limited\"}", {
+    status: 429,
+    headers: { "retry-after": retryAfter },
+  })
+
+  function recorded(responses: Array<() => Response>) {
+    const requests: Array<{ url: string; key: string | undefined }> = []
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      requests.push({ url: String(url), key: apiKeyHeader(init) })
+      return responses[Math.min(requests.length - 1, responses.length - 1)]!()
+    }) as unknown as typeof fetch
+    return { fetchImpl, requests, routes: () => requests.map((r) => r.key ? "keyed" : "keyless") }
+  }
+
+  function clock() {
+    let t = 1_000_000
+    const waits: number[] = []
+    const logs: string[] = []
+    return {
+      waits,
+      logs,
+      advance: (ms: number) => { t += ms },
+      options: {
+        now: () => t,
+        random: () => 0.5,
+        sleep: async (ms: number) => { waits.push(ms); t += ms },
+        log: (message: string) => { logs.push(message) },
+      },
+    }
+  }
+
+  it("uses keyless when it answers, without sending the key", async () => {
+    process.env.EXA_API_KEY = KEY
+    const exa = recorded([ok])
+    const c = clock()
+    await expect(fetchOpenCodeWebSearchText({ query: "q" }, undefined, exa.fetchImpl, c.options)).resolves.toBe("found")
+    expect(exa.requests).toEqual([{ url: "https://mcp.exa.ai/mcp", key: undefined }])
+    expect(c.logs).toEqual(["web-search: keyless request, attempt 1"])
+  })
+
+  it("sends a search Exa refuses keyless with a burst 429 again with the key, without waiting", async () => {
+    process.env.EXA_API_KEY = KEY
+    const exa = recorded([() => limited("1"), ok])
+    const c = clock()
+    await expect(fetchOpenCodeWebSearchText({ query: "q" }, undefined, exa.fetchImpl, c.options)).resolves.toBe("found")
+    expect(exa.routes()).toEqual(["keyless", "keyed"])
+    expect(exa.requests[1]).toEqual({ url: "https://mcp.exa.ai/mcp", key: KEY })
+    expect(c.waits).toEqual([])
+    expect(c.logs).toEqual([
+      "web-search: keyless request, attempt 1",
+      "web-search: keyed request, attempt 1 (keyless 429)",
+    ])
+    expect(keylessQuota.refusedUntil).toBe(0)
+  })
+
+  it("remembers a used-up keyless quota until its Retry-After and goes straight to the key until then", async () => {
+    process.env.EXA_API_KEY = KEY
+    const c = clock()
+    const first = recorded([() => limited("3600"), ok])
+    await expect(fetchOpenCodeWebSearchText({ query: "q" }, undefined, first.fetchImpl, c.options)).resolves.toBe("found")
+    expect(first.routes()).toEqual(["keyless", "keyed"])
+    expect(c.logs[1]).toBe("web-search: keyed request, attempt 1 (keyless quota used up for 1.0 h)")
+
+    c.advance(3_599_000)
+    const during = recorded([ok])
+    await fetchOpenCodeWebSearchText({ query: "q" }, undefined, during.fetchImpl, c.options)
+    expect(during.routes()).toEqual(["keyed"])
+    expect(c.logs[2]).toBe(`web-search: keyed request, attempt 1 (keyless quota used up until ${new Date(1_000_000 + 3_600_000).toISOString()})`)
+
+    const copy = await import(`../src/web-tools.js?copy=${crypto.randomUUID()}`) as typeof import("../src/web-tools.js")
+    const fromCopy = recorded([ok])
+    await copy.fetchOpenCodeWebSearchText({ query: "q" }, undefined, fromCopy.fetchImpl, c.options)
+    expect(fromCopy.routes()).toEqual(["keyed"])
+
+    c.advance(1_000)
+    const after = recorded([ok])
+    await fetchOpenCodeWebSearchText({ query: "q" }, undefined, after.fetchImpl, c.options)
+    expect(after.routes()).toEqual(["keyless"])
+    expect(c.waits).toEqual([])
+  })
+
+  it("retries a keyed 429 after its Retry-After, as without the fallback", async () => {
+    process.env.EXA_API_KEY = KEY
+    const exa = recorded([() => limited("1"), () => limited("2"), ok])
+    const c = clock()
+    await expect(fetchOpenCodeWebSearchText({ query: "q" }, undefined, exa.fetchImpl, c.options)).resolves.toBe("found")
+    expect(exa.routes()).toEqual(["keyless", "keyed", "keyed"])
+    expect(c.waits).toEqual([2_500])
+  })
+
+  it("without a key, ignores the remembered quota and keeps the keyless behaviour", async () => {
+    keylessQuota.refusedUntil = 1_000_000 + 3_600_000
+    const exa = recorded([() => limited("1"), ok])
+    const c = clock()
+    await expect(fetchOpenCodeWebSearchText({ query: "q" }, undefined, exa.fetchImpl, c.options)).resolves.toBe("found")
+    expect(exa.routes()).toEqual(["keyless", "keyless"])
+    expect(c.waits).toEqual([1_500])
+  })
+
+  it("without a key, still remembers a used-up quota for when a key is set", async () => {
+    const exa = recorded([() => limited("600")])
+    const c = clock()
+    await expect(fetchOpenCodeWebSearchText({ query: "q" }, undefined, exa.fetchImpl, c.options))
+      .rejects.toThrow("Exa refuses searches for another 10 min; set EXA_API_KEY to search sooner.")
+    expect(keylessQuota.refusedUntil).toBe(1_000_000 + 600_000)
+  })
+
+  it("keeps the key out of the URL, the route log and errors", async () => {
+    process.env.EXA_API_KEY = KEY
+    const exa = recorded([() => limited("7200"), () => new Response("{\"error\":\"invalid api key\"}", { status: 401 })])
+    const c = clock()
+    const error = await fetchOpenCodeWebSearchText({ query: "q" }, undefined, exa.fetchImpl, c.options).catch((e: Error) => e)
+    expect(String(error)).toContain("Web search failed (401)")
+    expect(exa.routes()).toEqual(["keyless", "keyed"])
+    for (const text of [String(error), ...c.logs, ...exa.requests.map((r) => r.url)]) expect(text).not.toContain(KEY)
+  })
+
+  it("writes each search's route to the debug log and never the key", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "web-search-log-"))
+    const logFile = path.join(dir, "debug.log")
+    const script = `
+      import { fetchOpenCodeWebSearchText } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/web-tools.ts"))}
+      const ok = () => new Response(JSON.stringify({ result: { content: [{ type: "text", text: "found" }] } }))
+      let calls = 0
+      const fetchImpl = async () => ++calls === 1 ? new Response("{}", { status: 429, headers: { "retry-after": "1" } }) : ok()
+      console.log(await fetchOpenCodeWebSearchText({ query: "q" }, undefined, fetchImpl))
+    `
+    const child = Bun.spawnSync([process.execPath, "-e", script], {
+      env: { ...process.env, EXA_API_KEY: KEY, CURSOR_PROVIDER_DEBUG: "1", CURSOR_PROVIDER_DEBUG_FILE: logFile },
+    })
+    try {
+      expect(child.stdout.toString().trim()).toBe("found")
+      const log = fs.readFileSync(logFile, "utf8")
+      expect(log).toContain("web-search: keyless request, attempt 1\n")
+      expect(log).toContain("web-search: keyed request, attempt 1 (keyless 429)\n")
+      expect(log).not.toContain(KEY)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
 

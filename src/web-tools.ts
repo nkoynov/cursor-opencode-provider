@@ -4,6 +4,7 @@
 // plugin load under `opencode2`. The classic `tool(...)` registration therefore
 // lives in ./web-search-tool.ts.
 import type { ToolContext, ToolResult } from "@opencode-ai/plugin"
+import { trace } from "./debug.js"
 import { processShared } from "./process-shared.js"
 
 const EXA_MCP_URL = "https://mcp.exa.ai/mcp"
@@ -18,11 +19,13 @@ const EXA_KEYLESS_MAX_QUEUE_WAIT_MS = 30_000
 
 type SearchSlots = { active: number; waiting: Array<() => void> }
 const exaKeylessSlots = processShared("web-search.exa-keyless-slots.v1", (): SearchSlots => ({ active: 0, waiting: [] }))
+const exaKeylessQuota = processShared("web-search.exa-keyless-quota.v1", () => ({ refusedUntil: 0 }))
 
 export type WebSearchRetryOptions = {
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>
   random?: () => number
   now?: () => number
+  log?: (message: string) => void
 }
 
 function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -54,25 +57,35 @@ function formatWait(ms: number): string {
   return ms >= 3_600_000 ? `${(ms / 3_600_000).toFixed(1)} h` : `${Math.ceil(ms / 60_000)} min`
 }
 
-/** Wait for one of the process's keyless Exa slots, first come first served; resolves to its release. */
-function acquireExaKeylessSlot(
-  signal: AbortSignal,
-  sleep: NonNullable<WebSearchRetryOptions["sleep"]>,
-): Promise<() => void> {
+function exaKeylessSlotRelease(): () => void {
   const slots = exaKeylessSlots
   let released = false
-  const release = () => {
+  return () => {
     if (released) return
     released = true
     const next = slots.waiting.shift()
     if (next) next()
     else slots.active--
   }
+}
+
+/** Take a free keyless Exa slot without waiting; undefined when all are busy. */
+function tryAcquireExaKeylessSlot(): (() => void) | undefined {
+  if (exaKeylessSlots.active >= EXA_KEYLESS_CONCURRENCY) return undefined
+  exaKeylessSlots.active++
+  return exaKeylessSlotRelease()
+}
+
+/** Wait for one of the process's keyless Exa slots, first come first served; resolves to its release. */
+function acquireExaKeylessSlot(
+  signal: AbortSignal,
+  sleep: NonNullable<WebSearchRetryOptions["sleep"]>,
+): Promise<() => void> {
+  const slots = exaKeylessSlots
   if (signal.aborted) return Promise.reject(signal.reason)
-  if (slots.active < EXA_KEYLESS_CONCURRENCY) {
-    slots.active++
-    return Promise.resolve(release)
-  }
+  const free = tryAcquireExaKeylessSlot()
+  if (free) return Promise.resolve(free)
+  const release = exaKeylessSlotRelease()
   return new Promise((resolve, reject) => {
     const timer = new AbortController()
     const leave = () => {
@@ -109,14 +122,6 @@ export type OpenCodeWebSearchArgs = {
   livecrawl?: "fallback" | "preferred"
   type?: "auto" | "fast" | "deep"
   contextMaxCharacters?: number
-}
-
-function exaMcpUrl(): string {
-  const apiKey = process.env.EXA_API_KEY
-  if (!apiKey) return EXA_MCP_URL
-  const url = new URL(EXA_MCP_URL)
-  url.searchParams.set("exaApiKey", apiKey)
-  return url.href
 }
 
 function mcpText(value: unknown): string | undefined {
@@ -291,26 +296,58 @@ export async function fetchOpenCodeWebSearchText(
     },
   })
 
+  const apiKey = process.env.EXA_API_KEY
+  const log = retry.log ?? trace
   let release = () => {}
   try {
-    if (!process.env.EXA_API_KEY) release = await acquireExaKeylessSlot(controller.signal, sleep)
+    // With a key, keyless still goes first to save the key's credit; the key only takes what keyless can't
+    let keyed = false
+    let reason = ""
+    if (!apiKey) release = await acquireExaKeylessSlot(controller.signal, sleep)
+    else if (now() < exaKeylessQuota.refusedUntil) {
+      keyed = true
+      reason = `keyless quota used up until ${new Date(exaKeylessQuota.refusedUntil).toISOString()}`
+    } else {
+      const slot = tryAcquireExaKeylessSlot()
+      if (slot) release = slot
+      else {
+        keyed = true
+        reason = "keyless slots busy"
+      }
+    }
     for (let attempt = 1; ; attempt++) {
-      const response = await fetchImpl(exaMcpUrl(), {
+      log(`web-search: ${keyed ? "keyed" : "keyless"} request, attempt ${attempt}${reason ? ` (${reason})` : ""}`)
+      const response = await fetchImpl(EXA_MCP_URL, {
         method: "POST",
         headers: {
           accept: "application/json, text/event-stream",
           "content-type": "application/json",
+          ...(keyed && apiKey ? { "x-api-key": apiKey } : {}),
         },
         body,
         signal: controller.signal,
       })
       const raw = await response.text()
       const retryAfter = response.status === 429 ? retryAfterMs(response.headers.get("retry-after"), now()) : 0
+      if (response.status === 429 && !keyed) {
+        if (retryAfter > WEB_SEARCH_TIMEOUT_MS) {
+          exaKeylessQuota.refusedUntil = Math.max(exaKeylessQuota.refusedUntil, now() + retryAfter)
+        }
+        if (apiKey) {
+          release()
+          keyed = true
+          reason = retryAfter > WEB_SEARCH_TIMEOUT_MS
+            ? `keyless quota used up for ${formatWait(retryAfter)}`
+            : "keyless 429"
+          attempt = 0
+          continue
+        }
+      }
       // Exa's keyless daily quota answers with a Retry-After of hours, until midnight UTC
       if (retryAfter > WEB_SEARCH_TIMEOUT_MS) {
         throw new Error(
           `Web search failed (429): Exa refuses searches for another ${formatWait(retryAfter)}`
-            + `${process.env.EXA_API_KEY ? "" : "; set EXA_API_KEY to search sooner"}. ${raw.slice(0, 300)}`,
+            + `${apiKey ? "" : "; set EXA_API_KEY to search sooner"}. ${raw.slice(0, 300)}`,
         )
       }
       if (response.status === 429 && attempt < RATE_LIMIT_MAX_ATTEMPTS) {
