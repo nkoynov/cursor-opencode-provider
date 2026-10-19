@@ -307,7 +307,7 @@ export async function fetchOpenCodeWebSearchText(
     },
   })
 
-  const apiKey = process.env.EXA_API_KEY
+  const apiKey = process.env.EXA_API_KEY?.trim()
   const log = retry.log ?? trace
   let release = () => {}
   try {
@@ -327,6 +327,10 @@ export async function fetchOpenCodeWebSearchText(
       }
     }
     for (let attempt = 1; ; attempt++) {
+      // fetch's invalid-header error quotes the whole value, key included
+      if (keyed && apiKey && /[\0\r\n]/.test(apiKey)) {
+        throw new Error("Web search failed: EXA_API_KEY contains a line break or NUL character, so it can't be sent to Exa")
+      }
       log(`web-search: ${keyed ? "keyed" : "keyless"} request, attempt ${attempt}${reason ? ` (${reason})` : ""}`)
       const response = await fetchImpl(EXA_MCP_URL, {
         method: "POST",
