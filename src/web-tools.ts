@@ -4,13 +4,20 @@
 // plugin load under `opencode2`. The classic `tool(...)` registration therefore
 // lives in ./web-search-tool.ts.
 import type { ToolContext, ToolResult } from "@opencode-ai/plugin"
+import { processShared } from "./process-shared.js"
 
 const EXA_MCP_URL = "https://mcp.exa.ai/mcp"
-const WEB_SEARCH_TIMEOUT_MS = 25_000
+const WEB_SEARCH_TIMEOUT_MS = 45_000
 // Exa's keyless MCP endpoint answers bursts (parallel subagents searching) with 429 and `retry-after: 1`
 const RATE_LIMIT_MAX_ATTEMPTS = 6
 const RATE_LIMIT_MAX_WAIT_MS = 5_000
 const RATE_LIMIT_JITTER_MS = 1_000
+// Exa's keyless tier allows about three requests in flight per IP: three sustained, a fourth is refused with 429
+const EXA_KEYLESS_CONCURRENCY = 3
+const EXA_KEYLESS_MAX_QUEUE_WAIT_MS = 30_000
+
+type SearchSlots = { active: number; waiting: Array<() => void> }
+const exaKeylessSlots = processShared("web-search.exa-keyless-slots.v1", (): SearchSlots => ({ active: 0, waiting: [] }))
 
 export type WebSearchRetryOptions = {
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>
@@ -41,6 +48,55 @@ function retryAfterMs(header: string | null, now: number): number {
     if (Number.isFinite(date)) return Math.max(0, date - now)
   }
   return 1_000
+}
+
+/** Wait for one of the process's keyless Exa slots, first come first served; resolves to its release. */
+function acquireExaKeylessSlot(
+  signal: AbortSignal,
+  sleep: NonNullable<WebSearchRetryOptions["sleep"]>,
+): Promise<() => void> {
+  const slots = exaKeylessSlots
+  let released = false
+  const release = () => {
+    if (released) return
+    released = true
+    const next = slots.waiting.shift()
+    if (next) next()
+    else slots.active--
+  }
+  if (signal.aborted) return Promise.reject(signal.reason)
+  if (slots.active < EXA_KEYLESS_CONCURRENCY) {
+    slots.active++
+    return Promise.resolve(release)
+  }
+  return new Promise((resolve, reject) => {
+    const timer = new AbortController()
+    const leave = () => {
+      timer.abort()
+      signal.removeEventListener("abort", onAbort)
+      const index = slots.waiting.indexOf(grant)
+      if (index >= 0) slots.waiting.splice(index, 1)
+    }
+    const grant = () => {
+      leave()
+      resolve(release)
+    }
+    const onAbort = () => {
+      leave()
+      reject(signal.reason)
+    }
+    signal.addEventListener("abort", onAbort, { once: true })
+    slots.waiting.push(grant)
+    sleep(EXA_KEYLESS_MAX_QUEUE_WAIT_MS, timer.signal).then(() => {
+      if (!slots.waiting.includes(grant)) return
+      leave()
+      reject(new Error(
+        `Web search gave up after waiting ${EXA_KEYLESS_MAX_QUEUE_WAIT_MS / 1000} s in line: Exa's keyless tier `
+          + `takes ${EXA_KEYLESS_CONCURRENCY} searches at a time and ${slots.waiting.length} more are waiting. `
+          + "Search again shortly, or set EXA_API_KEY",
+      ))
+    }, () => {})
+  })
 }
 
 export type OpenCodeWebSearchArgs = {
@@ -231,7 +287,9 @@ export async function fetchOpenCodeWebSearchText(
     },
   })
 
+  let release = () => {}
   try {
+    if (!process.env.EXA_API_KEY) release = await acquireExaKeylessSlot(controller.signal, sleep)
     for (let attempt = 1; ; attempt++) {
       const response = await fetchImpl(exaMcpUrl(), {
         method: "POST",
@@ -255,6 +313,7 @@ export async function fetchOpenCodeWebSearchText(
       return parseOpenCodeWebSearchResponse(raw) ?? "No search results found. Please try a different query."
     }
   } finally {
+    release()
     clearTimeout(timeout)
     signal?.removeEventListener("abort", abort)
   }
