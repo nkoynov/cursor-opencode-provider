@@ -20,7 +20,7 @@ Run native OpenCode 1 and native OpenCode 2 separately. A pass on one does not e
    : > "$CURSOR_PROVIDER_DEBUG_FILE"
    ```
 
-   Export these on the process that loads the provider. Restart the complete host/daemon after installation or rebuild; a plugin reload alone is insufficient for OpenCode 2. Once a lane starts, do not rebuild, relink, clear its log, or restart except for the explicit restart test. Preserve each lane's log before starting another. The debug log has a 10 MiB cap: evidence lost to `size-cap truncate` makes affected checks blocked, not passed. See [the log runbook](./cache-log-runbook.md).
+   Export these on the process that loads the provider. Restart the complete host/daemon after installation or rebuild; a plugin reload alone is insufficient for OpenCode 2. Once a lane starts, do not rebuild, relink, clear its log, or restart except for the explicit restart test. Preserve each lane's log before starting another. The debug log has a 10 MiB cap (`CURSOR_PROVIDER_DEBUG_MAX_BYTES`): at the cap it moves to `<file>.1` and only one previous part is kept, so read `.1` before the current file, and evidence lost to a second `size-cap rotate` or to `size-cap truncate` makes affected checks blocked, not passed. See [the log runbook](./cache-log-runbook.md).
 4. Arrange an **observer outside the tested model turn**: the operator's shell/UI or an independent native session observer. It must capture native tool status, permission events, and test-owned filesystem/process observations. For managed shell launches, identify the actual reserved terminal file, `.jobs` index, and job directory from observed runtime paths/owner records. Snapshot before and immediately after rejection/interruption, **before sending another user message**. The tested agent cannot observe this timing after its own turn has stopped. Do not guess the runtime root or inspect unrelated sessions.
 5. The operator owns Reject, Reject with feedback, Interrupt, and restart actions. Record the action, case label, and timestamp. A question-tool answer is not a shell permission decision. Do not auto-approve the cases intended to test rejection.
    Native OpenCode 2 ends the model step on Reject **without** feedback ([native permission contract](https://github.com/anomalyco/opencode/blob/v2.0.27/packages/core/src/permission.ts#L244-L255)). The provider and this prompt cannot keep that same native turn running. This case requires a subsequent user message to resume after observation; do not promise automatic progression across it.
@@ -221,7 +221,7 @@ At the end of each lane, extract its debug log **once** into the evidence direct
 rg -n \
   -e 'outbound Run:|hash requestContext|turn usage validation:|cache diagnosis:' \
   -e 'extractTools:|EMITTED tool-call|debug: enabled file=|reinit=append' \
-  -e 'size-cap truncate|buildEnv:|runtime metadata:' \
+  -e 'size-cap truncate|size-cap rotate|buildEnv:|runtime metadata:' \
   -e 'exec:|continuation:|fresh turn:|fresh turn drain:|Run interrupted|conversation persistence:|conversation reset:' \
   -e 'display tool_call_completed: ERROR|host-agent-mode:|BRIDGED create_plan' \
   -e 'interaction_query: replied|result encode FAILED|delivery stopped' \

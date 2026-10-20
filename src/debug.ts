@@ -10,14 +10,26 @@ import { processShared } from "./process-shared.js"
 // isolate sharing CURSOR_PROVIDER_DEBUG_FILE) append another header instead of
 // wiping earlier EMITTED lines. Operators who want a clean run should truncate
 // the override path before starting the host. Independently, when the file reaches
-// DEBUG_LOG_MAX_BYTES it is size-capped (truncated + new header) so self-verify
-// runs cannot grow without bound. Tokens / checksums: redact in callers.
+// its size cap (DEBUG_LOG_MAX_BYTES, or CURSOR_PROVIDER_DEBUG_MAX_BYTES) it is
+// renamed to `<file>.1`, replacing an older one, and a fresh file starts with a
+// new header, so the log stays bounded at about twice the cap. Tokens /
+// checksums: redact in callers.
 const DEBUG_ENABLED =
   process.env.CURSOR_PROVIDER_DEBUG === "1" ||
   process.env.CURSOR_PROVIDER_DEBUG === "true"
 
-/** Soft cap for the debug log file; exceeded size triggers truncate + new header. */
+/** Default soft cap for the debug log file; reaching it rotates the file to `<file>.1`. */
 export const DEBUG_LOG_MAX_BYTES = 10 * 1024 * 1024
+
+/** `CURSOR_PROVIDER_DEBUG_MAX_BYTES` as a positive integer byte count, else the default cap. */
+export function resolveDebugLogMaxBytes(
+  value: string | undefined = process.env.CURSOR_PROVIDER_DEBUG_MAX_BYTES,
+): number {
+  const trimmed = value?.trim() ?? ""
+  if (!/^\d+$/.test(trimmed)) return DEBUG_LOG_MAX_BYTES
+  const bytes = Number(trimmed)
+  return Number.isSafeInteger(bytes) && bytes > 0 ? bytes : DEBUG_LOG_MAX_BYTES
+}
 
 // A host can load this package more than once in one process (a plugin and an
 // AI SDK package import, or one plugin import per location). Count the copies so
@@ -28,6 +40,7 @@ const MODULE_COPY = ++moduleCopies.count
 let _traceInitialized = false
 let _debugFile: string | undefined
 let _debugFileUsesManagedDirectory = false
+let _debugLogMaxBytes = DEBUG_LOG_MAX_BYTES
 let _announcedLogPath = false
 
 /** Message of an unknown thrown value, for log lines and error text. */
@@ -100,21 +113,40 @@ function copyTag(): string {
   return moduleCopies.count > 1 ? `#${MODULE_COPY} ` : ""
 }
 
+/** Move a regular log file to `previous`; false when it is not one or cannot be moved. */
+function moveDebugLogAside(filePath: string, previous: string): boolean {
+  try {
+    if (!fs.lstatSync(filePath).isFile()) return false
+    fs.chmodSync(filePath, 0o600)
+    // rename replaces whatever `previous` is (even a symlink) without following it.
+    fs.renameSync(filePath, previous)
+    return true
+  } catch {
+    return false
+  }
+}
+
 /**
- * If `filePath` is at least `maxBytes`, truncate it and write a size-cap header.
- * Returns true when a truncate happened. Exported for tests.
+ * If `filePath` is at least `maxBytes`, move it to `<filePath>.1` (replacing an
+ * older one) and start a fresh file with a size-cap header. A path that is not a
+ * regular file, or cannot be moved, is truncated in place instead. Returns true
+ * when the cap was applied. Exported for tests.
  */
-export function truncateDebugLogIfOversized(
+export function rotateDebugLogIfOversized(
   filePath: string,
   maxBytes: number = DEBUG_LOG_MAX_BYTES,
 ): boolean {
   if (!fs.existsSync(filePath)) return false
   const size = fs.statSync(filePath).size
   if (size < maxBytes) return false
+  const previous = `${filePath}.1`
+  const action = moveDebugLogAside(filePath, previous)
+    ? `rotate previous=${previous}`
+    : "truncate"
   fs.writeFileSync(
     filePath,
     debugBannerLine() +
-      `[${new Date().toISOString()}] debug: size-cap truncate file=${filePath} ` +
+      `[${new Date().toISOString()}] debug: size-cap ${action} file=${filePath} ` +
       `wasBytes=${size} maxBytes=${maxBytes}\n`,
     { mode: 0o600 },
   )
@@ -128,11 +160,12 @@ export function trace(msg: string): void {
     if (!_debugFile) {
       _debugFileUsesManagedDirectory = !process.env.CURSOR_PROVIDER_DEBUG_FILE
       _debugFile = resolveDebugLogPath()
+      _debugLogMaxBytes = resolveDebugLogMaxBytes()
     }
     if (!_traceInitialized) {
       ensureSecureDebugLog(_debugFile, { secureParent: _debugFileUsesManagedDirectory })
-      // Drop oversized leftovers from a prior run before appending a reinit banner.
-      truncateDebugLogIfOversized(_debugFile)
+      // Rotate oversized leftovers from a prior run before appending a reinit banner.
+      rotateDebugLogIfOversized(_debugFile, _debugLogMaxBytes)
       const banner = debugBannerLine()
       const preexisting =
         fs.existsSync(_debugFile) && fs.statSync(_debugFile).size > 0
@@ -152,7 +185,7 @@ export function trace(msg: string): void {
           `\n`,
       )
     }
-    truncateDebugLogIfOversized(_debugFile)
+    rotateDebugLogIfOversized(_debugFile, _debugLogMaxBytes)
     fs.appendFileSync(_debugFile, `[${new Date().toISOString()}] ${copyTag()}${msg}\n`)
   } catch {
     /* ignore */

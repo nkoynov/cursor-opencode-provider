@@ -23,6 +23,7 @@
 
 ### Fixed
 
+- The debug log (`CURSOR_PROVIDER_DEBUG`) keeps its previous part when it reaches its size cap: the file moves to `<file>.1`, replacing an older one, and a fresh file starts with a `debug: size-cap rotate previous=<file>.1` line, where the log was truncated and everything before was lost, so under load it held only the last few minutes. `CURSOR_PROVIDER_DEBUG_MAX_BYTES` sets the cap in bytes (default 10 MiB); a value that isn't a positive whole number keeps the default
 - An AskQuestion option whose label contains ", " (such as "Yes, do it (Recommended)") reaches Cursor as that selected option, not as the user's own typed answer. The answer was split at every ", ", so no piece matched the label
 - An edit of an existing file outside the workspace, or of one the provider can't read, no longer shows a failed `edit` row ("Cursor did not finish this tool call.") before its read. Cursor reads the file first, and for such a file that read goes to OpenCode's permission-aware `read` and ends the step, which closed the early row opened for the edit; the edit itself came in the next step. No early row opens for such an edit now.
 - Web search waits out Exa's free-tier rate limit instead of failing: a 429 from Exa's keyless MCP endpoint is retried after its `Retry-After` (capped at 5 s, plus up to 1 s of jitter so parallel subagents spread out), up to six attempts within the search's budget. Before, a burst of parallel searches failed most calls with OpenCode's bare "Unable to search the web"

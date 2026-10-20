@@ -45,10 +45,13 @@ before startup. The provider announces the active path as
 `[cursor-provider] CURSOR_PROVIDER_DEBUG logging to …`. A fresh empty file gets
 a process header on first init. Re-init in the same override path (module
 reload, second isolate) **appends** another header (`reinit=append`) instead of
-wiping earlier lines. Independently, once the file reaches 10 MiB the next
-`trace` call truncates it and writes `debug: size-cap truncate` so growth stays
-bounded. Truncate the override path yourself before a clean run; save a copy
-before comparing two host processes.
+wiping earlier lines. Independently, once the file reaches 10 MiB
+(`CURSOR_PROVIDER_DEBUG_MAX_BYTES`) the next `trace` call moves it to `<file>.1`,
+replacing an older one, and starts a fresh file with `debug: size-cap rotate
+previous=<file>.1` so growth stays bounded; only a file that can't be moved is
+truncated in place (`debug: size-cap truncate`). Truncate the override path and
+remove its `.1` yourself before a clean run; save a copy before comparing two
+host processes.
 
 For OpenCode 2, a plugin reload can append a new header without replacing the
 daemon's cached SDK or language model. Fully restart the daemon after a rebuild.
