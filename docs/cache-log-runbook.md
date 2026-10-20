@@ -49,7 +49,9 @@ wiping earlier lines. Independently, once the file reaches 10 MiB
 (`CURSOR_PROVIDER_DEBUG_MAX_BYTES`) the next `trace` call moves it to `<file>.1`,
 replacing an older one, and starts a fresh file with `debug: size-cap rotate
 previous=<file>.1` so growth stays bounded; only a file that can't be moved is
-truncated in place (`debug: size-cap truncate`). Truncate the override path and
+truncated in place (`debug: size-cap truncate`). Processes sharing one override
+path rotate it without coordinating, so two rotating at the same moment can
+lose a part. Truncate the override path and
 remove its `.1` yourself before a clean run; save a copy before comparing two
 host processes.
 
