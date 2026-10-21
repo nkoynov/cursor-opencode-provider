@@ -256,6 +256,9 @@ function hostTerminalMessage(error: CursorProviderError, kind: CursorFailureKind
   if (kind === "auth" && !(error instanceof CursorAuthError)) {
     return `Cursor authentication failed; check the Cursor API key or sign in again. ${error.message}`
   }
+  const explanation = [details?.title, details?.detail].filter(Boolean).join(" ")
+  if (kind === "usage-limit") return `Cursor usage limit on your account: ${explanation || error.message}`
+  if (kind === "rate-limit") return `Cursor is throttling requests on your account: ${explanation || error.message}`
   return error.message
 }
 

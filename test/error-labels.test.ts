@@ -202,11 +202,13 @@ describe("host labels for Cursor's ErrorDetails", () => {
     for (const error of [9, 10, 23, 44, 45]) {
       const host = forHost(connectFrameError(detailsFrame("resource_exhausted", error, { title: "You've hit your usage limit" })))
       expect(host.statusCode).toBe(402)
+      expect(host.message).toBe("Cursor usage limit on your account: You've hit your usage limit")
       expect(t3Title(openCodeErrorType(host))).toBe("Usage limit reached")
     }
     for (const error of [7, 8, 22, 50, 51]) {
       const host = forHost(connectFrameError(detailsFrame("resource_exhausted", error, { title: "Slow down" })))
       expect(host.statusCode).toBe(429)
+      expect(host.message).toBe("Cursor is throttling requests on your account: Slow down")
       expect(t3Title(openCodeErrorType(host))).toBe("Usage limit reached")
     }
   })
@@ -226,6 +228,7 @@ describe("host labels for Cursor's ErrorDetails", () => {
     expect(spent.message).not.toContain("no capacity")
     const host = forHost(spent)
     expect(host.statusCode).toBe(429)
+    expect(host.message).toBe("Cursor is throttling requests on your account: API key r\u2060ate limit")
     expect(t3Title(openCodeErrorType(host))).toBe("Usage limit reached")
   })
 
