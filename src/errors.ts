@@ -7,6 +7,18 @@ export type CursorErrorOrigin =
   | "protocol"
   | "auth"
 
+export type CursorErrorDetails = {
+  /** `ErrorDetails.error` enum (#1); 0 when omitted, as protobuf decodes it. */
+  error: number
+  title?: string
+  detail?: string
+  isRetryable?: boolean
+  /** `details.analytics_metadata.action_required` (#10 → #1). */
+  actionRequired?: string
+  /** `details.additional_info["providerStatusCode"]` (#7): the model provider's own HTTP status. */
+  providerStatusCode?: string
+}
+
 export type CursorErrorDiagnostics = {
   statusCode?: number
   grpcStatus?: number | string
@@ -15,6 +27,8 @@ export type CursorErrorDiagnostics = {
   retryAfterMs?: number
   /** The message Cursor's error carried (Connect error envelope or `grpc-message`). */
   serverMessage?: string
+  /** Cursor's decoded `aiserver.v1.ErrorDetails`. */
+  cursorDetails?: CursorErrorDetails
 }
 
 export type CursorProviderErrorOptions = CursorErrorDiagnostics & {
@@ -45,6 +59,7 @@ export class CursorProviderError extends Error {
   /** Cursor's classified verdict, or false once provider retries must stop. */
   readonly retryable?: boolean
   readonly serverMessage?: string
+  readonly cursorDetails?: CursorErrorDetails
   /**
    * The provider stopped, but the host may send the turn again: the failed
    * attempt only showed text or reasoning, before any checkpoint. Cursor CLI
@@ -67,6 +82,7 @@ export class CursorProviderError extends Error {
     this.retryAfterMs = options.retryAfterMs
     this.retryable = options.retryable
     this.serverMessage = options.serverMessage
+    this.cursorDetails = options.cursorDetails
     this.hostRetryable = options.hostRetryable
   }
 }
@@ -111,8 +127,12 @@ const NON_RETRYABLE_SERVER_STATUS = 400
  * doing so. It becomes an `APICallError` with `isRetryable: true`, which
  * OpenCode 1.x retries as the same step, and `x-should-retry: true` without a
  * status, which OpenCode 2 continues after the shown output.
+ *
+ * Hosts label a 429 as a usage limit (OpenCode 2 `provider.rate-limit`, which
+ * T3 titles "Usage limit reached"), so Cursor's `ErrorDetails` pick the status
+ * instead of the Connect code where they say what failed: see `cursorFailureKind`.
  */
-export function hostFacingError(error: unknown): Error {
+export function hostFacingError(error: unknown, context: { modelId?: string } = {}): Error {
   if (!(error instanceof Error)) return new Error(String(error))
   const auth = error instanceof CursorAuthError
   if (!auth && error instanceof CursorProviderError && error.hostRetryable) {
@@ -129,12 +149,15 @@ export function hostFacingError(error: unknown): Error {
     })
   }
   if (!auth && (!(error instanceof CursorProviderError) || error.retryable !== false)) return error
+  const kind = auth ? "auth" : cursorFailureKind(error)
   const connectStatus = error.code !== undefined && Object.hasOwn(CONNECT_CODE_HTTP_STATUS, error.code)
     ? CONNECT_CODE_HTTP_STATUS[error.code]!
     : CONNECT_CODE_HTTP_STATUS.unknown!
-  const status = auth ? (error.statusCode === 403 ? 403 : 401) : connectStatus
+  const status = auth
+    ? (error.statusCode === 403 ? 403 : 401)
+    : kind === undefined ? connectStatus : HOST_STATUS_BY_KIND[kind]
   return new APICallError({
-    message: sanitizeHostTerminalMessage(error.message),
+    message: sanitizeHostTerminalMessage(hostTerminalMessage(error, kind, context.modelId)),
     url: "cursor://agent.v1.AgentService/Run",
     requestBodyValues: {},
     statusCode: status >= 500 ? NON_RETRYABLE_SERVER_STATUS : status,
@@ -142,6 +165,98 @@ export function hostFacingError(error: unknown): Error {
     isRetryable: false,
     cause: error,
   })
+}
+
+// `aiserver.v1.ErrorDetails.Error` values, as Cursor CLI names them without the `ERROR_` prefix.
+// BAD_API_KEY, NOT_LOGGED_IN, INVALID_AUTH_ID, AUTH_TOKEN_NOT_FOUND, AUTH_TOKEN_EXPIRED,
+// AGENT_REQUIRES_LOGIN, UNAUTHORIZED, BAD_USER_API_KEY
+const CURSOR_AUTH_ERRORS = new Set([1, 2, 3, 11, 12, 18, 38, 42])
+// FREE_USER_USAGE_LIMIT, PRO_USER_USAGE_LIMIT, PRO_USER_ONLY, USAGE_PRICING_REQUIRED(_CHANGEABLE)
+const CURSOR_USAGE_LIMIT_ERRORS = new Set([9, 10, 23, 44, 45])
+// FREE/PRO_USER_RATE_LIMIT_EXCEEDED, GENERIC_RATE_LIMIT_EXCEEDED, API_KEY_RATE_LIMIT, RATE_LIMITED(_CHANGEABLE)
+const CURSOR_RATE_LIMIT_ERRORS = new Set([7, 8, 22, 34, 50, 51])
+const CURSOR_ERROR_CUSTOM_MESSAGE = 29
+const CURSOR_ERROR_RESOURCE_EXHAUSTED = 41
+const CURSOR_ERROR_PROVIDER_ERROR = 57
+/** Details that name a cause other than Cursor's capacity, whatever the Connect code. */
+const CURSOR_NOT_CAPACITY_ERRORS = new Set([
+  ...CURSOR_AUTH_ERRORS,
+  ...CURSOR_USAGE_LIMIT_ERRORS,
+  ...CURSOR_RATE_LIMIT_ERRORS,
+  CURSOR_ERROR_CUSTOM_MESSAGE,
+  CURSOR_ERROR_PROVIDER_ERROR,
+])
+
+export type CursorFailureKind = "auth" | "usage-limit" | "rate-limit" | "capacity" | "provider"
+
+// OpenCode 2 reads 401/403 as provider.auth, 402 as provider.quota and 429 as
+// provider.rate-limit; the 5xx become NON_RETRYABLE_SERVER_STATUS, provider.invalid-request.
+const HOST_STATUS_BY_KIND: Readonly<Record<CursorFailureKind, number>> = {
+  auth: 401,
+  "usage-limit": 402,
+  "rate-limit": 429,
+  capacity: 503,
+  provider: 502,
+}
+
+/** The nearest `ErrorDetails` along a wrapped failure's causes. */
+function cursorDetailsOf(error: CursorProviderError): CursorErrorDetails | undefined {
+  for (let current: unknown = error, depth = 0; current instanceof CursorProviderError && depth < 8; depth++) {
+    if (current.cursorDetails) return current.cursorDetails
+    current = current.cause
+  }
+  return undefined
+}
+
+/**
+ * What a final failure was, from Cursor's `ErrorDetails` when they name it, else
+ * from the codes `isCapacityFailure` reads. Undefined keeps the Connect code's status,
+ * also for details that explain themselves without an enum: they may be a real limit.
+ */
+export function cursorFailureKind(error: CursorProviderError): CursorFailureKind | undefined {
+  if (error instanceof CursorAuthError) return "auth"
+  const details = cursorDetailsOf(error)
+  if (details && (details.error !== 0 || details.title || details.detail)) {
+    if (CURSOR_AUTH_ERRORS.has(details.error)) return "auth"
+    if (CURSOR_USAGE_LIMIT_ERRORS.has(details.error)) return "usage-limit"
+    if (CURSOR_RATE_LIMIT_ERRORS.has(details.error)) return "rate-limit"
+    if (details.error === CURSOR_ERROR_PROVIDER_ERROR) return "provider"
+    if (details.error === CURSOR_ERROR_RESOURCE_EXHAUSTED) return "capacity"
+    return undefined
+  }
+  return isCapacityFailure(error) ? "capacity" : undefined
+}
+
+function modelVendor(modelId: string | undefined): string | undefined {
+  const id = modelId?.toLowerCase() ?? ""
+  if (id.includes("claude")) return "Anthropic"
+  if (id.includes("gemini")) return "Google"
+  if (id.includes("grok")) return "xAI"
+  if (/gpt|codex|(?:^|[-/])o\d/.test(id)) return "OpenAI"
+  return undefined
+}
+
+function hostTerminalMessage(error: CursorProviderError, kind: CursorFailureKind | undefined, modelId: string | undefined): string {
+  const details = cursorDetailsOf(error)
+  if (kind === "capacity") {
+    // Cursor's High Load detail names the model by its display name.
+    const model = /\bprovider for (.+?) is\b/.exec(details?.detail ?? "")?.[1] ?? modelId ?? "this model"
+    const lead = `Cursor has no capacity for ${model} right now (${details?.title ? `Cursor: ${details.title}` : "capacity_limit"}): ` +
+      "a limit on Cursor's side, not on your key or usage."
+    if (!(error instanceof CursorRetryExhaustedError)) return `${lead} ${error.message}`
+    const over = error.elapsedMs === undefined ? "" : ` over ${Math.round(error.elapsedMs / 1_000)} s`
+    return `${lead} The Run was refused ${error.attempts} times${over}; send the message again in a minute or switch to another model.`
+  }
+  if (kind === "provider") {
+    const status = details?.providerStatusCode ? `, provider status ${details.providerStatusCode}` : ""
+    return `${modelVendor(modelId) ?? "The model provider"} rejected or failed the request ` +
+      `(Cursor ERROR_PROVIDER_ERROR${status}). This is not your key or your usage; ` +
+      "send the message again in a moment or switch to another model."
+  }
+  if (kind === "auth" && !(error instanceof CursorAuthError)) {
+    return `Cursor authentication failed; check the Cursor API key or sign in again. ${error.message}`
+  }
+  return error.message
 }
 
 export class CursorLocalCancellationError extends CursorProviderError {
@@ -275,6 +390,7 @@ export function sanitizeHostTerminalMessage(message: string): string {
 
 export class CursorRetryExhaustedError extends CursorProviderError {
   readonly attempts: number
+  readonly elapsedMs?: number
 
   constructor(attempts: number, last: CursorProviderError, elapsedMs?: number) {
     // Host-facing text must not contain OpenCode SessionRetry trigger words
@@ -300,6 +416,7 @@ export class CursorRetryExhaustedError extends CursorProviderError {
     )
     this.name = "CursorRetryExhaustedError"
     this.attempts = attempts
+    this.elapsedMs = elapsedMs
   }
 }
 
@@ -334,8 +451,13 @@ export function isTransientGrpcStatus(status: number | string): boolean {
 
 const CAPACITY_CODES = new Set(["resource_exhausted", "unavailable", "8", "14"])
 
-/** Cursor refused the Run for capacity: gRPC resource_exhausted or unavailable, HTTP 429 or 503. */
+/**
+ * Cursor refused the Run for capacity: gRPC resource_exhausted or unavailable, HTTP 429 or 503,
+ * unless its `ErrorDetails` name another cause (a provider error, a limit, a login).
+ */
 export function isCapacityFailure(error: CursorProviderError): boolean {
+  const details = cursorDetailsOf(error)
+  if (details && CURSOR_NOT_CAPACITY_ERRORS.has(details.error)) return false
   if (error.statusCode === 429 || error.statusCode === 503) return true
   return [error.code, error.grpcStatus].some((value) =>
     value !== undefined && CAPACITY_CODES.has(String(value).toLowerCase().replaceAll("-", "_")))

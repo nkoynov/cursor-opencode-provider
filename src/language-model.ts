@@ -282,6 +282,7 @@ import {
   noProgressResumeError,
   retrySuppressedError,
   toCursorProviderError,
+  type CursorErrorDetails,
 } from "./errors.js"
 import { readCache, cacheFilePath, resolveVariantParameters, resolveVariantMaxMode, extractCursorVariantParameters, resolveCursorWireModelId, parseCursorContextLimit, type ModelInfo, type ModelParameterValue } from "./models.js"
 import { getFrozenRequestContext, getOrBuildRequestContext, resetFrozenRequestContextsForTests } from "./context/frozen.js"
@@ -640,16 +641,6 @@ function retryInfoProtobufDelayMs(encoded: string): number | undefined {
   return Math.ceil(Number(seconds) * 1_000 + Number(nanos) / 1_000_000)
 }
 
-type CursorErrorDetails = {
-  /** `ErrorDetails.error` enum (#1); 0 when omitted, as protobuf decodes it. */
-  error: number
-  title?: string
-  detail?: string
-  isRetryable?: boolean
-  /** `details.analytics_metadata.action_required` (#10 → #1). */
-  actionRequired?: string
-}
-
 /**
  * An account-level refusal ("Too many computers.") read from the details' JSON
  * `debug` rendering, for when its protobuf `value` does not decode.
@@ -670,7 +661,8 @@ function customMessageFromDebug(record: Record<string, unknown>): CursorErrorDet
 
 /**
  * Decode `aiserver.v1.ErrorDetails`: error #1 and details #2 (title #1,
- * detail #2, is_retryable #4, analytics_metadata #10 { action_required #1 }).
+ * detail #2, is_retryable #4, additional_info #7 map, analytics_metadata #10
+ * { action_required #1 }).
  */
 function decodeCursorErrorDetails(encoded: string): CursorErrorDetails | undefined {
   try {
@@ -692,7 +684,18 @@ function decodeCursorErrorDetails(encoded: string): CursorErrorDetails | undefin
         if (innerTag === 0x0a) details.title = inner.string().trim() || undefined
         else if (innerTag === 0x12) details.detail = inner.string().trim() || undefined
         else if (innerTag === 0x20) details.isRetryable = inner.bool()
-        else if (innerTag === 0x52) {
+        else if (innerTag === 0x3a) {
+          const entry = protobuf.Reader.create(inner.bytes())
+          let key: string | undefined
+          let value: string | undefined
+          while (entry.pos < entry.len) {
+            const entryTag = entry.uint32()
+            if (entryTag === 0x0a) key = entry.string()
+            else if (entryTag === 0x12) value = entry.string()
+            else entry.skipType(entryTag & 7)
+          }
+          if (key === "providerStatusCode" && value?.trim()) details.providerStatusCode = value.trim()
+        } else if (innerTag === 0x52) {
           const analytics = protobuf.Reader.create(inner.bytes())
           while (analytics.pos < analytics.len) {
             const analyticsTag = analytics.uint32()
@@ -781,7 +784,7 @@ export function connectFrameError(payload: string): CursorProviderError {
     if (code === "unauthenticated" && retryable !== false) {
       return new CursorAuthError(
         explanation || `Cursor authentication failed (${code}); reauthenticate with Cursor`,
-        { code, serverMessage, replaySafe: true },
+        { code, serverMessage, cursorDetails, replaySafe: true },
       )
     }
     return new CursorServerError(`Cursor API error (code=${code})${explanation ? `: ${explanation}` : ""}`, {
@@ -790,6 +793,7 @@ export function connectFrameError(payload: string): CursorProviderError {
       replaySafe: true,
       code,
       serverMessage,
+      cursorDetails,
       retryAfterMs: retryAfterMs === undefined
         ? undefined
         : Math.min(MAX_RETRY_DELAY_MS, retryAfterMs),
@@ -1014,7 +1018,7 @@ export function createCursorLanguageModel(
         retryBudget.hostRetryPending = true
         throw hostRetryError(failure, true)
       } catch (terminal) {
-        throw hostFacingError(terminal)
+        throw hostFacingError(terminal, { modelId })
       }
     }
   }
@@ -1348,7 +1352,7 @@ async function doStreamImpl(
             sessionManager.close(activeSession)
           }
           try {
-            controller.error(hostFacingError(e))
+            controller.error(hostFacingError(e, { modelId }))
           } catch {
             /* controller already errored/closed */
           }

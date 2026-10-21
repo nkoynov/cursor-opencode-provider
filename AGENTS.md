@@ -154,6 +154,13 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   retry triggers (`src/errors.ts`); the Connect code stays on `cause`. A
   `hostRetryable` failure is the exception: an `APICallError` with
   `isRetryable: true`, `x-should-retry: true` and no status, so both hosts retry.
+- Fork: a final failure's status comes from Cursor's `ErrorDetails` enum where it
+  names the cause (`cursorFailureKind`): login and API-key errors 401, usage,
+  spend and plan limits 402, account rate limits 429, High Load
+  (`ERROR_RESOURCE_EXHAUSTED`) and `ERROR_PROVIDER_ERROR` 400 with a message
+  saying it is not the user's key. OpenCode 2 reads 429 as `provider.rate-limit`
+  and T3 titles that "Usage limit reached", so only real limits keep it. Those
+  enums are never capacity refusals, whatever the Connect code.
 - Fork: a capacity refusal without a final verdict (`isCapacityFailure`) gets six
   attempts per turn with a longer backoff, counted apart from the shared CLI retry
   budget, before it ends as final; an explicit `retry.maxAttempts` caps both
