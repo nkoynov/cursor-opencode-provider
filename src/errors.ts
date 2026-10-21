@@ -175,17 +175,8 @@ const CURSOR_AUTH_ERRORS = new Set([1, 2, 3, 11, 12, 18, 38, 42])
 const CURSOR_USAGE_LIMIT_ERRORS = new Set([9, 10, 23, 44, 45])
 // FREE/PRO_USER_RATE_LIMIT_EXCEEDED, GENERIC_RATE_LIMIT_EXCEEDED, API_KEY_RATE_LIMIT, RATE_LIMITED(_CHANGEABLE)
 const CURSOR_RATE_LIMIT_ERRORS = new Set([7, 8, 22, 34, 50, 51])
-const CURSOR_ERROR_CUSTOM_MESSAGE = 29
 const CURSOR_ERROR_RESOURCE_EXHAUSTED = 41
 const CURSOR_ERROR_PROVIDER_ERROR = 57
-/** Details that name a cause other than Cursor's capacity, whatever the Connect code. */
-const CURSOR_NOT_CAPACITY_ERRORS = new Set([
-  ...CURSOR_AUTH_ERRORS,
-  ...CURSOR_USAGE_LIMIT_ERRORS,
-  ...CURSOR_RATE_LIMIT_ERRORS,
-  CURSOR_ERROR_CUSTOM_MESSAGE,
-  CURSOR_ERROR_PROVIDER_ERROR,
-])
 
 export type CursorFailureKind = "auth" | "usage-limit" | "rate-limit" | "capacity" | "provider"
 
@@ -455,12 +446,12 @@ export function isTransientGrpcStatus(status: number | string): boolean {
 const CAPACITY_CODES = new Set(["resource_exhausted", "unavailable", "8", "14"])
 
 /**
- * Cursor refused the Run for capacity: gRPC resource_exhausted or unavailable, HTTP 429 or 503,
- * unless its `ErrorDetails` name another cause (a provider error, a limit, a login).
+ * Cursor refused the Run for capacity: High Load (`ERROR_RESOURCE_EXHAUSTED`), or with no
+ * `ErrorDetails` enum gRPC resource_exhausted or unavailable, HTTP 429 or 503.
  */
 export function isCapacityFailure(error: CursorProviderError): boolean {
   const details = cursorDetailsOf(error)
-  if (details && CURSOR_NOT_CAPACITY_ERRORS.has(details.error)) return false
+  if (details && details.error !== 0) return details.error === CURSOR_ERROR_RESOURCE_EXHAUSTED
   if (error.statusCode === 429 || error.statusCode === 503) return true
   return [error.code, error.grpcStatus].some((value) =>
     value !== undefined && CAPACITY_CODES.has(String(value).toLowerCase().replaceAll("-", "_")))

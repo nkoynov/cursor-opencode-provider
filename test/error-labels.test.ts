@@ -256,4 +256,15 @@ describe("host labels for Cursor's ErrorDetails", () => {
     const other = forHost(connectFrameError(detailsFrame("resource_exhausted", 63, { title: "Slow pool", retryable: false })))
     expect(other.statusCode).toBe(429)
   })
+
+  it("spends capacity attempts only on High Load among Cursor's named errors", () => {
+    for (const error of [63, 25, 59, 29]) {
+      const failure = connectFrameError(detailsFrame("resource_exhausted", error, { title: "Busy", retryable: true }))
+      expect(failure).toMatchObject({ transient: true, retryable: true })
+      expect(isCapacityFailure(failure)).toBe(false)
+      expect(new CursorRetryExhaustedError(4, failure).message).not.toContain("no capacity")
+    }
+    expect(isCapacityFailure(connectFrameError(detailsFrame("resource_exhausted", 41, { title: "High Load", retryable: true })))).toBe(true)
+    expect(isCapacityFailure(connectFrameError(detailsFrame("resource_exhausted", 0, { title: "Busy", retryable: true })))).toBe(true)
+  })
 })
