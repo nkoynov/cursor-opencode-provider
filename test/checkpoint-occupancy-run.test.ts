@@ -3,6 +3,7 @@ import fs from "node:fs/promises"
 import http2 from "node:http2"
 import os from "node:os"
 import path from "node:path"
+import { gunzipSync } from "node:zlib"
 import { createCursor } from "../src/index.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { resetTurnStateForTests, settleRunSavesForTests } from "../src/language-model.js"
@@ -62,8 +63,9 @@ beforeAll(async () => {
       while (pending.length >= 5) {
         const length = pending.readUInt32BE(1)
         if (pending.length < 5 + length) break
+        const body = pending.subarray(5, 5 + length)
         const message = decodeMessage<{ run_request?: { conversation_state?: Uint8Array } }>(
-          "AgentClientMessage", pending.subarray(5, 5 + length),
+          "AgentClientMessage", pending[0]! & 1 ? gunzipSync(body) : body,
         )
         pending = pending.subarray(5 + length)
         if (!message.run_request) continue

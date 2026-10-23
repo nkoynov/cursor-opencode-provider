@@ -453,7 +453,8 @@ describe("notPermittedToolReason", () => {
   it("keeps the plain refusal on hosts without Code Mode", () => {
     expect(notPermittedToolReason("edit", new Set(["read", "grep"]))).toBe(
       "OpenCode tool 'edit' is not permitted for the current agent this turn. "
-        + "Permitted tools: grep, read. Continue using only permitted tools; do not retry 'edit'.",
+        + "Permitted tools: grep, read. Continue using only permitted tools; do not retry 'edit'. "
+        + "Do not create or change files through the shell.",
     )
   })
 })
