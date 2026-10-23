@@ -3,6 +3,7 @@ import { tmpdir } from "node:os"
 import { basename, delimiter, dirname as pathDirectory, join, resolve } from "node:path"
 import { releaseUnstartedTerminal } from "./terminal-runner.js"
 import { processShared } from "./process-shared.js"
+import { niceExecLines, niceShellAdapter, resetToolNiceAdapters, toolNiceIncrement } from "./tool-nice.js"
 
 /** Cursor agent.v1 TimeoutBehavior enum values. */
 export const CURSOR_TIMEOUT_CANCEL = 1
@@ -513,6 +514,8 @@ function canonicalDirectory(directory: string): string {
  * spawns the selected executable with [-c, command]. Preserve that command
  * and the shell basename the scanner uses. The adapter runs only after host
  * approval, and uses the host's selected executable for the actual payload.
+ * Every tool call's shell also runs at `CURSOR_PROVIDER_TOOL_NICE` (see
+ * tool-nice.ts), wrapped or not.
  * Sources: upstream packages/core/src/shell.ts:274-305 and
  * packages/core/src/tool/plugin/shell.ts:125-145 at v2.0.27.
  */
@@ -520,6 +523,7 @@ export function prepareCursorShellCreate(event: {
   command: string; cwd: string; shell: string; env: Record<string, string | undefined>
 }): void {
   if (process.platform === "win32") return
+  const nice = toolNiceIncrement()
   // The lane holder whose call now carries this command owns the create.
   // Release it even when its adapter no longer matches (a later hook changed
   // the command or cwd): the create runs unwrapped and must not hold back
@@ -527,10 +531,15 @@ export function prepareCursorShellCreate(event: {
   // apart, so none of them is wrapped and each keeps its lane.
   const owners = [...createGate.values()].map((lane) => lane.lockedBy)
     .filter((id) => callCommand(armedCalls.get(id)) === event.command)
-  if (owners.length > 1) return
+  // Only tool calls arm; a user's own shell command keeps its priority.
+  const lowerUnwrapped = () => {
+    if (owners.length > 0 && nice > 0) event.shell = niceShellAdapter(event.shell, nice)
+  }
+  if (owners.length > 1) return lowerUnwrapped()
   const owner = owners[0]
   if (owner !== undefined) disarmCursorShellCreate(owner)
-  if (owner !== undefined && !pendingEnvWraps.has(owner)) return
+  if (owner !== undefined && !pendingEnvWraps.has(owner)) return lowerUnwrapped()
+  let wrapped = false
   for (const [id, policy] of policies) {
     if (!pendingEnvWraps.has(id) || policy.command !== event.command
       || (policy.workingDirectory && canonicalDirectory(policy.workingDirectory) !== canonicalDirectory(event.cwd))) continue
@@ -546,20 +555,22 @@ export function prepareCursorShellCreate(event: {
       "#!/bin/sh",
       `if [ "$1" = -c ] && [ "$2" = ${shellQuote(event.command)} ]; then`,
       `  export CURSOR_SHELL_EXECUTABLE=${shellQuote(event.shell)}`,
-      `  exec /bin/sh ${shellQuote(wrap.wrapperPath)}`,
+      ...niceExecLines(`/bin/sh ${shellQuote(wrap.wrapperPath)}`, nice).map((line) => `  ${line}`),
       "fi",
       // A later host hook changed the command: execute exactly what the host
       // approved instead of the provider's earlier command snapshot.
-      `exec ${shellQuote(event.shell)} "$@"`,
+      ...niceExecLines(`${shellQuote(event.shell)} "$@"`, nice),
       "",
     ].join("\n")
     writeFileSync(executable, script, { mode: 0o700 })
     event.shell = executable
     pendingEnvWraps.delete(id)
+    wrapped = true
     break
   }
   // The owner's create ran, wrapped or not; no later create may take its wrap.
   if (owner !== undefined) pendingEnvWraps.delete(owner)
+  if (!wrapped) lowerUnwrapped()
 }
 
 function withoutMarker(output: string, index: number): string {
@@ -876,4 +887,5 @@ export function resetCursorShellCalls(): void {
   failures.clear()
   shellConfiguration.defaultShell = undefined
   configuredShells.clear()
+  resetToolNiceAdapters()
 }

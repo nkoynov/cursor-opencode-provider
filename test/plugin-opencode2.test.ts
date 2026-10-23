@@ -1849,7 +1849,10 @@ describe("opencode2 setup", () => {
     rewrittenCall.input = { command: "echo rewritten" }
     const rewritten = { command: "echo rewritten", cwd: "/tmp", timeout: 0, shell: "/bin/bash", env: {} as Record<string, string | undefined> }
     await hooks.get("shell.create.before")!(rewritten)
-    expect(rewritten.shell).toBe("/bin/bash")
+    // Not the call's wrapper: only the tool-nice adapter around the host's shell.
+    const adapter = readFileSync(rewritten.shell, "utf8")
+    expect(adapter).toContain(`'/bin/bash' "$@"`)
+    expect(adapter).not.toContain("CURSOR_SHELL_EXECUTABLE")
 
     const identical = await Promise.race([
       Promise.resolve(hooks.get("tool.execute.before")!(event("cursor_shell_identical", "echo original"))).then(() => "armed"),

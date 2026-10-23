@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test"
+import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { pathToFileURL } from "node:url"
 import { tmpdir } from "node:os"
@@ -26,6 +26,7 @@ import {
   setCursorShellPath,
   shellPolicyFromMetadata,
 } from "../src/shell-timeout.js"
+import { TOOL_NICE_ENV } from "../src/tool-nice.js"
 import { reapBackgroundSpawn } from "./background-spawn.js"
 
 afterEach(() => resetCursorShellCalls())
@@ -500,6 +501,9 @@ describe("Cursor shell timeout translation", () => {
 })
 
 describe("prepareCursorShellCreate correlation", () => {
+  // tool-nice.test.ts covers the nice adapter; here an unwrapped create keeps its shell.
+  beforeEach(() => { process.env[TOOL_NICE_ENV] = "0" })
+  afterEach(() => { delete process.env[TOOL_NICE_ENV] })
   const createEvent = (command: string, cwd: string) => ({ command, cwd, timeout: 0, shell: "/bin/sh", env: {} as Record<string, string | undefined> })
   const hookCall = (command: string): { input: unknown } => ({ input: { command } })
 
