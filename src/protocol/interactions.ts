@@ -17,7 +17,6 @@ import {
   type DecodedCreatePlanQuery,
   decodeCreatePlanQuery,
   createPlanApprovalQuestionInput,
-  createPlanHeldByClientReason,
   renderPlanReviewMessage,
   resolveCreatePlanBridge,
   writeOpencodePlanFile,
@@ -110,8 +109,6 @@ export type HandledInteraction = {
     /** The plan to show the user before the host review. */
     planReview?: string
   }
-  /** A plan written and answered here that the transcript must still show. */
-  planReview?: string
   /**
    * Cursor tool call id of a CreatePlan the host plan agent will record
    * instead. Nothing was written, so its display must not be mirrored as a plan.
@@ -158,8 +155,6 @@ export type HandleInteractionQueryOptions = {
   planModeActive?: boolean
   /** The host's own plan file for this session, when the host defines one. */
   hostPlanFile?: string
-  /** The session's own permission rules deny edits: the client keeps plan mode itself. */
-  hostEditsDenied?: boolean
   /**
    * Cursor unified mode currently recorded for this session. A SwitchMode to
    * the mode already in effect needs no approval, matching Cursor's own IDE
@@ -384,7 +379,6 @@ function handleSwitchModeQuery(
     advertised: options.advertisedTools ?? [],
     ...(options.activeCursorModeId ? { activeModeId: options.activeCursorModeId } : {}),
     ...(options.hostAgent ? { hostAgent: options.hostAgent } : {}),
-    hostEditsDenied: options.hostEditsDenied === true,
   })
   if (bridge.kind === "reject") return reject(bridge.reason)
 
@@ -533,7 +527,6 @@ function handleCreatePlanQuery(
     ...(options.hostAgent ? { hostAgent: options.hostAgent } : {}),
     planModeActive: options.planModeActive === true,
     ...(options.hostPlanFile ? { hostPlanFile: options.hostPlanFile } : {}),
-    hostEditsDenied: options.hostEditsDenied === true,
   })
 
   // The host's plan agent records and reviews the plan; write nothing here.
@@ -574,24 +567,6 @@ function handleCreatePlanQuery(
       outcome: "bridged",
       createPlan: { ...decoded, bridge, toolName: CURSOR_PLAN_STAGE_TOOL },
       reply: undefined,
-    }
-  }
-
-  if (bridge.kind === "hold") {
-    const workspaceRoot = options.workspaceRoot?.trim()
-    if (!workspaceRoot) {
-      return reply({
-        error: { error: "CreatePlan requires a workspace root to write the plan file" },
-        plan_uri: "",
-      })
-    }
-    const written = writeOpencodePlanFile(decoded.args, workspaceRoot, Date.now(), options.hostPlanFile)
-    if (!written.ok) {
-      return reply({ error: { error: written.error }, plan_uri: "" })
-    }
-    return {
-      ...reply({ error: { error: createPlanHeldByClientReason(written.planPath) }, plan_uri: written.planUri }),
-      planReview: renderPlanReviewMessage(written.markdown, written.planPath),
     }
   }
 
