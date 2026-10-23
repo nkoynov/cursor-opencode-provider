@@ -81,6 +81,15 @@ async function noteToolRequestsListedSeen() {
 const toolCalls = (parts: LanguageModelV3StreamPart[]) => parts.filter(p => p.type === "tool-call")
 const finishes = (parts: LanguageModelV3StreamPart[]) => parts.filter(p => p.type === "finish")
 
+async function authorizeRead(session: ReturnType<typeof fixture>["session"], parts: LanguageModelV3StreamPart[], execId: number) {
+  const read = toolCalls(parts).find(call => call.toolName === "read")!
+  expect(read).toBeDefined()
+  expect(await deliverContinuationResults(session, [{
+    sessionId: session.sessionId, execId, toolCallId: read.toolCallId,
+    toolName: "read", output: "[Partial read: host-capped content]",
+  }])).toBe(session)
+}
+
 describe("parallel tool-call pump", () => {
   beforeEach(resetTurnStateForTests)
   afterEach(() => {
@@ -183,8 +192,12 @@ describe("parallel tool-call pump", () => {
         toolCallId: bash!.toolCallId, sessionId: session.sessionId, execId: 1, toolName: "bash", output: "test",
       }])).toBe(session)
       await pump(session, controller, ids)
-      expect(toolCalls(parts).map(p => p.toolName)).toEqual(["bash", patch ? "apply_patch" : "edit"])
-      expect(finishes(parts)).toHaveLength(2)
+      // The released edit read goes to the host's permission-checked read first.
+      expect(toolCalls(parts).map(p => p.toolName)).toEqual(["bash", "read"])
+      await authorizeRead(session, parts, 2)
+      await pump(session, controller, ids)
+      expect(toolCalls(parts).map(p => p.toolName)).toEqual(["bash", "read", patch ? "apply_patch" : "edit"])
+      expect(finishes(parts)).toHaveLength(3)
       expect(session.pending.has(2)).toBe(false)
       const readReply = writes.map(frame => decodeMessage<any>("AgentClientMessage", frame).exec_client_message)
         .find(message => message?.read_result)
@@ -240,6 +253,12 @@ describe("parallel tool-call pump", () => {
     try {
       const { parts, controller } = collect()
       await pump(session, controller, ids)
+      if (existing) {
+        expect(toolCalls(parts).map(call => call.toolName)).toEqual(["read"])
+        await authorizeRead(session, parts, 1)
+        parts.length = 0
+        await pump(session, controller, ids)
+      }
       const calls = toolCalls(parts)
       expect(calls.map(p => p.toolName)).toEqual([expected.toolName])
       expect(JSON.parse((calls[0] as { input: string }).input)).toEqual(expected.input)
@@ -276,6 +295,10 @@ describe("parallel tool-call pump", () => {
       session.requestContext.env = { workspace_paths: [root] }
       try {
         const { parts, controller } = collect()
+        await pump(session, controller, ids)
+        expect(toolCalls(parts).map(call => call.toolName)).toEqual(["read"])
+        await authorizeRead(session, parts, 1)
+        parts.length = 0
         await pump(session, controller, ids)
         const replies = writes.map(bytes => decodeMessage<any>("AgentClientMessage", bytes).exec_client_message)
         expect(replies.find(message => message?.read_result)?.read_result.success.content).toBe(source)
@@ -320,6 +343,10 @@ describe("parallel tool-call pump", () => {
       session.requestContext.env = { workspace_paths: [root] }
       try {
         const { parts, controller } = collect()
+        await pump(session, controller, ids)
+        expect(toolCalls(parts).map(call => call.toolName)).toEqual(["read"])
+        await authorizeRead(session, parts, 1)
+        parts.length = 0
         await pump(session, controller, ids)
         const calls = toolCalls(parts)
         expect(calls.map(call => call.toolName)).toEqual(["edit"])

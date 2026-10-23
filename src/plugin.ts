@@ -5,6 +5,8 @@ import {
   CURSOR_COMPACTION_OPTION,
   CURSOR_HOST_AGENT_OPTION,
   CURSOR_PROVIDER_ID,
+  CURSOR_SESSION_EDITS_DENIED_OPTION,
+  CURSOR_SESSION_PERMISSIONS_UNAVAILABLE_OPTION,
   CURSOR_WEBSITE_HOST,
 } from "./shared.js"
 import { cursorApiBaseURL, cursorGetServerConfigTelemetryEnabled } from "./plugin-core.js"
@@ -39,6 +41,7 @@ import { applyHostPromptEvent, applyHostToolEvent, sessionActivity } from "./act
 import { dispatchHostEventBridge } from "./host-event-bridge.js"
 import { createPromptHostAgentModeSwitch, setHostAgentModeSwitch } from "./host-agent-mode.js"
 import { isHostPlanFileResolved, resolveHostPlanFile } from "./host-plan-file.js"
+import { loadSessionForPermissions, permissionsFromSession, sessionRulesDenyEdits } from "./protocol/session-edits.js"
 
 const MODULE_URL = new URL("./index.js", import.meta.url).href
 
@@ -421,21 +424,32 @@ export async function CursorPlugin(input: PluginInput): Promise<Hooks> {
       // Carry the canonical OpenCode id so an incompatible Cursor checkpoint
       // is rotated instead of resuming the prior agent's prompt.
       output.options[CURSOR_HOST_AGENT_OPTION] = hookInput.agent
+      delete output.options[CURSOR_SESSION_EDITS_DENIED_OPTION]
+      delete output.options[CURSOR_SESSION_PERMISSIONS_UNAVAILABLE_OPTION]
       // First Cursor request: the host now serves its API, so read its agents
       // before any Run can raise SwitchMode. Concurrent first requests share
       // the one read; later requests find it settled.
       hostAgentsLoaded ??= refreshHostAgents?.()
       await hostAgentsLoaded
-      // Know the session's own plan file (OpenCode's `Session.plan`) before the
-      // Run starts, so CreatePlan records the plan where the plan agent and
-      // plan_exit read it. It is fixed per session, so resolve it once.
-      if (hookInput.agent !== "compaction" && getSession && !isHostPlanFileResolved(hookInput.sessionID)) {
-        await resolveHostPlanFile({
-          sessionID: hookInput.sessionID,
-          getSession,
-          worktree: input.worktree || input.project?.worktree,
-          vcs: !!(input.project as { vcs?: unknown } | undefined)?.vcs,
-        })
+      // The session payload is read once per request. Its permissions, when
+      // present, say whether a session edit deny outlasts an agent switch.
+      // The plan file is fixed per session, so it is resolved only once.
+      if (hookInput.agent !== "compaction" && getSession) {
+        const loaded = await loadSessionForPermissions(() => getSession(hookInput.sessionID)).catch(() => undefined)
+        if (!loaded) {
+          output.options[CURSOR_SESSION_PERMISSIONS_UNAVAILABLE_OPTION] = true
+          return
+        }
+        output.options[CURSOR_SESSION_EDITS_DENIED_OPTION] = sessionRulesDenyEdits(permissionsFromSession(loaded))
+        if (!isHostPlanFileResolved(hookInput.sessionID)) {
+          await resolveHostPlanFile({
+            sessionID: hookInput.sessionID,
+            getSession,
+            session: loaded,
+            worktree: input.worktree || input.project?.worktree,
+            vcs: !!(input.project as { vcs?: unknown } | undefined)?.vcs,
+          })
+        }
       }
       // OpenCode's compaction pipeline invokes the LLM with agent="compaction".
       // Carry that stable runtime fact into LanguageModelV3 providerOptions so

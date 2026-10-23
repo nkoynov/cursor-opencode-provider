@@ -6,7 +6,7 @@ import {
   UnsupportedInteractionQueryError,
 } from "../src/protocol/interactions.js"
 import { pump } from "../src/language-model.js"
-import type { CursorSession, Frame } from "../src/session.js"
+import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { sessionFixture } from "./session-fixture.js"
 
 type InteractionCase = {
@@ -219,6 +219,49 @@ function fakeSession(payloads: Uint8Array[], writes: Uint8Array[]): CursorSessio
 }
 
 describe("interaction query pump regression", () => {
+  it("refuses an epoch write removed from the turn and tells Cursor not to use the shell", async () => {
+    const writes: Uint8Array[] = []
+    const parts: Array<{ type: string }> = []
+    const session = fakeSession([
+      encodeMessage("AgentServerMessage", { exec_server_message: { id: 1, write_args: { path: "guarded.txt", file_text: "blocked" } } }),
+      encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: {} } }),
+    ], writes)
+    session.allowTools = true
+    session.toolDescriptors = ["read", "write"].map(name => ({ name: `opencode-${name}`, tool_name: name, provider_identifier: "opencode" }))
+    session.permittedToolNames = new Set(["read"])
+    try {
+      await pump(session, { enqueue(part) { if (part) parts.push(part) }, error() {} } as ReadableStreamDefaultController<{ type: string }>, { textId: "text", reasoningId: "reasoning" })
+      expect(parts.some(part => part.type === "tool-call")).toBe(false)
+      const result = decodeMessage<any>("AgentClientMessage", writes[0]!).exec_client_message.write_result
+      expect(result.error.error).toContain("not permitted")
+      expect(result.error.error).toContain("Do not create or change files through the shell")
+    } finally { sessionManager.close(session, "ordinary-cleanup") }
+  })
+
+  it("does not emit a question filtered from the current turn but retained in the epoch", async () => {
+    const query = encodeMessage("AskQuestionInteractionQuery", {
+      args: { questions: [{ id: "q", prompt: "Proceed?", options: [{ id: "yes", label: "Yes" }] }] },
+      tool_call_id: "filtered-question",
+    })
+    const writes: Uint8Array[] = []
+    const parts: Array<{ type: string }> = []
+    const session = fakeSession([
+      encodeMessage("AgentServerMessage", { interaction_query: { id: 7, ask_question_interaction_query: query } }),
+      encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: {} } }),
+    ], writes)
+    session.allowTools = true
+    session.toolDescriptors = ["read", "question"].map(name => ({ name: `opencode-${name}`, tool_name: name, provider_identifier: "opencode" }))
+    session.permittedToolNames = new Set(["read"])
+    try {
+      await pump(session, { enqueue(part) { if (part) parts.push(part) }, error() {} } as ReadableStreamDefaultController<{ type: string }>, { textId: "text", reasoningId: "reasoning" })
+      expect(parts.some(part => part.type === "tool-call")).toBe(false)
+      expect(session.pending.size).toBe(0)
+      expect(decodeMessage<any>("AgentClientMessage", writes[0]!).interaction_response.ask_question_interaction_response.result.rejected).toBeDefined()
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+    }
+  })
+
   it("writes the response and continues to a later turn_ended", async () => {
     const writes: Uint8Array[] = []
     const parts: any[] = []

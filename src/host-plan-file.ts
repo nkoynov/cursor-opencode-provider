@@ -60,11 +60,13 @@ function record(value: unknown): Record<string, unknown> | undefined {
 export async function resolveHostPlanFile(input: {
   sessionID: string
   getSession: (sessionID: string) => Promise<unknown>
+  /** Already loaded session payload, so a caller that also reads permissions fetches once. */
+  session?: unknown
   worktree: string | undefined
   vcs: boolean
 }): Promise<string | undefined> {
   try {
-    const response = record(await input.getSession(input.sessionID))
+    const response = record(input.session !== undefined ? input.session : await input.getSession(input.sessionID))
     const info = record(response?.data) ?? response
     const slug = typeof info?.slug === "string" ? info.slug : ""
     const created = record(info?.time)?.created

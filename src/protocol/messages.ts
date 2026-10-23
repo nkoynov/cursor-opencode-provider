@@ -478,6 +478,12 @@ export function createMessageTypes(): protobuf.Root {
     { id: 1, name: "call_count", type: "uint32" },
   ])
 
+  // The server can append a user message after context injection. This is a
+  // conversation update, not assistant text or a request to send it again.
+  addType(root, "UserMessageAppendedUpdate", [
+    { id: 1, name: "user_message", type: "UserMessage" },
+  ])
+
   // InteractionUpdate — the core streaming update message
   addType(
     root,
@@ -519,9 +525,6 @@ export function createMessageTypes(): protobuf.Root {
     }],
   )
 
-  addType(root, "UserMessageAppendedUpdate", [
-    { id: 1, name: "user_message", type: "UserMessage" },
-  ])
   addType(root, "ContextInjectionQueued", [])
   addType(root, "ContextInjectionDelivered", [
     { id: 1, name: "step", type: "int32" },

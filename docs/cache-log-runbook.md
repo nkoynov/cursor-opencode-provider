@@ -282,13 +282,14 @@ internal model calls can process uncached text more than once.
 
 | Field | Interpretation |
 |---|---|
-| `priorContext` | Cursor `usedTokens` decoded from the checkpoint supplied at Run start. |
+| `priorContext` | Cursor `usedTokens` decoded from the checkpoint supplied at Run start. For a checkpoint reporting `usedTokens=0` after a cancelled plan handoff, usage retains the conversation's last measured occupancy, saved separately in the restart snapshot. The Run still sends the original checkpoint bytes. |
+| `turnEnded=unavailable` | The Run ended without TurnEnded, so every `raw*` field reads `unavailable` and `rawReadVsPriorContext=n/a`. Continuity and context fields still describe the Run. A plan-handoff cancellation is the common case. |
 | `currentContext` | Latest known checkpoint `usedTokens` at Run end. |
 | `contextDelta` | Current minus prior occupancy. Negative values are possible after summarization/compaction; positive values include new user/tool/output context. |
 | `rawReadVsPriorContext` | Aggregate cache-read tokens divided by prior context (`3.00x`). Values above one can reflect repeated prefix reads within a Run. Neither this multiple nor `pumpPasses` establishes the number of internal model calls or a per-call hit rate. |
 | `sameSizedCategoryTokens` | Sum of current categories whose token count exactly matches the prior checkpoint. This compares sizes only, not content identity. |
 | `categoryDelta` | Per-category token-count change (`current - prior`); `new`/`removed` indicate category appearance/disappearance. |
-| `toolsCategoryChurn` | `none`, `upstream-stable-overlay` (tools tokens moved while RequestContext overlay bytes were reused), or `client-overlay-changed` (tools moved and RequestContext was rebuilt). See `createPlanInTurn` / `switchModeInTurn` for the common in-turn trigger. |
+| `toolsCategoryChurn` | `none`, `upstream-stable-overlay` (tools tokens moved while RequestContext overlay bytes were reused), or `client-overlay-changed` (tools moved and RequestContext was rebuilt). See `createPlanInTurn` / `switchModeInTurn` for the common in-turn trigger; the turn after leaving plan mode moves it back without either flag. |
 | `checkpointUpdates` | All non-empty checkpoints seen during this held Run. |
 | `tokenDetailUpdates` | Those checkpoints that included decodable token details. Zero explains a stale `checkpoint-previous-turn` source. |
 | `pumpPasses` | Number of provider pump invocations over the held Run. More than one is normal across tool continuations; it is not a model-call count. |
@@ -333,14 +334,17 @@ outstanding) historically cratered cache even with a reused conversation_id.
 `turn_ended` first; look for `fresh turn: cancelled N pending exec(s)` and
 `drain outcome=turn-ended` rather than a bare supersede warning.
 
-### One-time upstream tools expansion (CreatePlan and friends)
+### Plan-mode tools expansion (CreatePlan and friends)
 
 - `toolsCategoryChurn=upstream-stable-overlay` with `requestContext=reused` and
   an unchanged RequestContext hash, plus `createPlanInTurn=true` (or
   `switchModeInTurn=true`) on the same diagnosis line;
-- checkpoint `tools` steps up by ~630–640 tokens once (e.g. 7774→8407) and then
-  stays flat on following turns;
-- the next ordinary turn recovers to a high `rawReadRatio` with `tools+0`.
+- checkpoint `tools` steps up by roughly 590–640 tokens on that turn and stays
+  there while the conversation remains in plan mode;
+- the first turn after the session leaves plan mode shows the same amount back
+  (`tools` −N, again `upstream-stable-overlay`, with neither interaction flag)
+  and still reads most of its input from cache;
+- later ordinary turns show `tools+0`.
 - A CreatePlan/SwitchMode turn with TurnEnded `cache_read=0` is tagged
   `turnEndedCacheRead=zero-interaction` and `cacheReuseEvidence=unavailable`.
   Checkpoint occupancy measures context size; it cannot establish a cache hit
@@ -349,11 +353,25 @@ outstanding) historically cratered cache even with a reused conversation_id.
 
 This pattern is consistent with upstream prompt expansion while the client
 keeps its overlay stable. The category shift and interaction tag do not prove
-which backend content changed, whether the effect is once per conversation,
-or which internal call missed the cache. Preserve the measured zero counter,
+which backend content changed, whether it recurs on every plan entry, or
+which internal call missed the cache. Preserve the measured zero counter,
 compare later turns, and do not remint a healthy conversation to chase a ratio.
 There is no general promise that repeated plans are free or that a fixed
 percentage of a plan turn is billed uncached.
+
+### Plan handoff cancellation
+
+- An approved SwitchMode, or a plan approval that changes the host's primary
+  agent, cancels its Run: `host-agent-mode: cancelling Run for plan handoff`,
+  then `connect error: code=canceled` and `Run cancellation acknowledged`.
+- Cursor sends no TurnEnded. That Run's `cache diagnosis:` line carries
+  `turnEnded=unavailable`. It has no measured cache ratio, and a missing ratio
+  is not a miss.
+- The cancellation's last checkpoint reports `context=0/…` and
+  `categories=unavailable`. The next Run sends it unchanged and keeps the prior
+  occupancy of the last measured checkpoint.
+- Pair each `outbound Run:` with the first diagnosis after it for the same
+  session. The diagnosis just before it closes the previous Run.
 
 ### Client-side context changed
 

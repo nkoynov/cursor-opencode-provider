@@ -654,6 +654,26 @@ describe("mapCursorArgsToOpencode", () => {
     const r = mapCursorArgsToOpencode("grep", { path: "/src" }, "grep_args")
     expect(r).toEqual({ toolName: "glob", args: { pattern: "**/*", path: "/src" } })
   })
+  it("keeps a shell command on rebuilt file-tool arguments", () => {
+    const schema = {
+      type: "object",
+      properties: { pattern: { type: "string" }, path: { type: "string" } },
+      required: ["pattern"],
+    }
+    const glob = mapCursorArgsToOpencode("glob", { command: "awk 'END { print }' extract.txt" })
+    expect(glob).toEqual({
+      toolName: "glob",
+      args: { command: "awk 'END { print }' extract.txt" },
+    })
+    expect(misplacedShellCommand({ name: "glob", inputSchema: schema }, glob.args)).toBe(true)
+    for (const name of ["read", "write", "edit"] as const) {
+      expect(mapCursorArgsToOpencode(name, { path: "/tmp/x", command: "printf hi" }).args.command)
+        .toBe("printf hi")
+    }
+    const grep = mapCursorArgsToOpencode("grep", { path: "/src", command: "pwd" }, "grep_args")
+    expect(grep).toEqual({ toolName: "grep", args: { path: "/src", command: "pwd" } })
+    expect(misplacedShellCommand({ name: "grep", inputSchema: schema }, grep.args)).toBe(true)
+  })
   it("remaps glob target_directory/glob_pattern", () => {
     const r = mapCursorArgsToOpencode("glob", {
       glob_pattern: "**/*.ts",

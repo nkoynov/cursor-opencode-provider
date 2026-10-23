@@ -8,7 +8,7 @@ import { getOrBuildRequestContext } from "../src/context/frozen.js"
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
 import { CREATE_PLAN_RESULT_FIELD } from "../src/protocol/create-plan.js"
 import { decodeMessage } from "../src/protocol/messages.js"
-import { buildMcpStateResult } from "../src/protocol/tools.js"
+import { buildMcpStateResult, editReadIdentity } from "../src/protocol/tools.js"
 import { getActiveCursorMode, setActiveCursorMode } from "../src/protocol/switch-mode.js"
 import { runHistoryImages } from "../src/protocol/sent-history-images.js"
 import {
@@ -591,6 +591,7 @@ describe("deliverContinuationResults", () => {
       sessionManager.registerPending(31, live, "read_result", "read", false, {
         path: target,
         correlatedEditCallId: "edit-call",
+        correlatedEditReadIdentity: editReadIdentity(target),
       })
 
       const kept = await deliverContinuationResults(live, [{ toolCallId: "result-290",
@@ -613,6 +614,83 @@ describe("deliverContinuationResults", () => {
       fs.rmSync(root, { recursive: true, force: true })
       fs.rmSync(externalRoot, { recursive: true, force: true })
     }
+  })
+
+  it.each(["symlink", "replacement"])("does not upgrade an authorized read after a %s swaps its target", async kind => {
+    const root = fs.mkdtempSync("/tmp/cursor-edit-swapped-")
+    try {
+      const target = path.join(root, "target.txt")
+      const secret = path.join(root, "secret.txt")
+      fs.writeFileSync(target, "authorized content")
+      fs.writeFileSync(secret, "must-not-disclose")
+      const identity = editReadIdentity(target)
+      const writes: Uint8Array[] = []
+      const live = fakeSession("swapped-correlated-read")
+      live.stream.write = frame => { writes.push(frame) }
+      live.requestContext = { env: { workspace_paths: [root] } }
+      live.editToolCalls = new Map([["edit-call", { path: target }]])
+      sessionManager.registerPending(31, live, "read_result", "read", false, {
+        path: target, correlatedEditCallId: "edit-call", correlatedEditReadIdentity: identity,
+      })
+      fs.renameSync(target, path.join(root, "original.txt"))
+      if (kind === "symlink") fs.symlinkSync(secret, target)
+      else fs.copyFileSync(secret, target)
+      expect(await deliverContinuationResults(live, [{
+        sessionId: live.sessionId, execId: 31, toolCallId: "authorized-read", toolName: "read",
+        output: "host-authorized preview",
+      }])).toBe(live)
+      const result = decodeMessage<any>("AgentClientMessage", writes[0]!).exec_client_message.read_result
+      expect(result.success.content).toBe("host-authorized preview")
+      expect(live.editToolCalls.get("edit-call")?.completeRead).not.toBe(true)
+      expect(writes.some(bytes => Buffer.from(bytes).includes(Buffer.from("must-not-disclose")))).toBe(false)
+    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+  })
+
+  it.each(["permission_denied", "rejected", "interrupted"] as const)("does not upgrade a correlated read marked %s without error text", async failure => {
+    const root = fs.mkdtempSync("/tmp/cursor-edit-read-status-")
+    const target = path.join(root, "target.txt")
+    fs.writeFileSync(target, "must-not-disclose")
+    try {
+      const writes: Uint8Array[] = []
+      const live = fakeSession("failed-read-status")
+      live.stream.write = frame => { writes.push(frame) }
+      live.requestContext = { env: { workspace_paths: [root] } }
+      live.editToolCalls = new Map([["edit-call", { path: target }]])
+      sessionManager.registerPending(31, live, "read_result", "read", false, {
+        path: target, correlatedEditCallId: "edit-call", correlatedEditReadIdentity: editReadIdentity(target),
+      })
+      expect(await deliverContinuationResults(live, [{
+        sessionId: live.sessionId, execId: 31, toolCallId: "failed-read", toolName: "read", output: "host result",
+        ...(failure === "interrupted" ? { interrupted: true } : { refusal: failure }),
+      }])).toBe(live)
+      expect(live.editToolCalls.get("edit-call")?.completeRead).not.toBe(true)
+      expect(writes.some(bytes => Buffer.from(bytes).includes(Buffer.from("must-not-disclose")))).toBe(false)
+    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+  })
+
+  it.each(["The user denied this read", "read failed", ""])("never upgrades a failed correlated workspace read (%s)", async failure => {
+    const root = fs.mkdtempSync("/tmp/cursor-edit-denied-")
+    const target = path.join(root, "secret.txt")
+    fs.writeFileSync(target, "must-not-disclose")
+    try {
+      const writes: Uint8Array[] = []
+      const live = fakeSession("denied-correlated-read")
+      live.stream.write = frame => { writes.push(frame) }
+      live.requestContext = { env: { workspace_paths: [root] } }
+      live.editToolCalls = new Map([["edit-call", { path: target }]])
+      sessionManager.registerPending(31, live, "read_result", "read", false, {
+        path: target, correlatedEditCallId: "edit-call", correlatedEditReadIdentity: editReadIdentity(target),
+      })
+      expect(await deliverContinuationResults(live, [{
+        sessionId: live.sessionId, execId: 31, toolCallId: "denied-read", toolName: "read",
+        output: failure, error: failure,
+      }])).toBe(live)
+      const result = decodeMessage<any>("AgentClientMessage", writes[0]!).exec_client_message.read_result
+      expect(result.success).toBeUndefined()
+      expect(result.error.error).toBe(failure || "OpenCode tool execution failed")
+      expect(live.editToolCalls.get("edit-call")?.completeRead).not.toBe(true)
+      expect(writes.some(bytes => Buffer.from(bytes).includes(Buffer.from("must-not-disclose")))).toBe(false)
+    } finally { fs.rmSync(root, { recursive: true, force: true }) }
   })
 
   it("carries background-shell request metadata into the typed continuation result", async () => {

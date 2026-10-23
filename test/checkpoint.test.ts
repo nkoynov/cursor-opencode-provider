@@ -3,10 +3,13 @@ import {
   setCheckpoint,
   getCheckpoint,
   clearCheckpoint,
+  checkpointTokenDetails,
+  getCheckpointOccupancy,
+  restoreCheckpointOccupancy,
   resetCheckpointsForTests,
 } from "../src/protocol/checkpoint.js"
 import { buildRunRequest } from "../src/protocol/request.js"
-import { decodeMessage } from "../src/protocol/messages.js"
+import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 
 describe("checkpoint store", () => {
   beforeEach(() => resetCheckpointsForTests())
@@ -40,6 +43,55 @@ describe("checkpoint store", () => {
     setCheckpoint("conv-1", Uint8Array.from([1]))
     clearCheckpoint("conv-1")
     expect(getCheckpoint("conv-1")).toBeUndefined()
+  })
+})
+
+describe("checkpoint token details", () => {
+  beforeEach(() => resetCheckpointsForTests())
+
+  const withTokens = (usedTokens: number) => encodeMessage("ConversationStateStructure", {
+    root_prompt_messages_json: [`state-${usedTokens}`],
+    token_details: { used_tokens: usedTokens, max_tokens: 256_000 },
+  })
+
+  it("stores only the measured token field and ignores invalid restored metadata", () => {
+    // Independent wire: opaque field #1, then #5 { used_tokens: 42, max_tokens: 256 }.
+    const tokens = Uint8Array.from([0x2a, 5, 8, 42, 16, 0x80, 2])
+    setCheckpoint("conv", Uint8Array.from([10, 1, 120, ...tokens]))
+    expect(getCheckpointOccupancy("conv")).toEqual(tokens)
+    for (const invalid of [Uint8Array.of(0x28, 1), Uint8Array.of(0x2a, 2, 8, 0)]) {
+      restoreCheckpointOccupancy("conv", invalid)
+      expect(getCheckpointOccupancy("conv")).toEqual(tokens)
+    }
+    resetCheckpointsForTests()
+    restoreCheckpointOccupancy("conv", tokens)
+    expect(checkpointTokenDetails("conv", withTokens(0))).toEqual({ usedTokens: 42, maxTokens: 256 })
+  })
+
+  it("reads the occupancy of the checkpoint being sent", () => {
+    setCheckpoint("conv-1", withTokens(30_000))
+    expect(checkpointTokenDetails("conv-1", withTokens(42_000))).toEqual({ usedTokens: 42_000, maxTokens: 256_000 })
+  })
+
+  it("keeps the last measured occupancy when the checkpoint reports zero tokens", () => {
+    setCheckpoint("conv-1", withTokens(42_000))
+    const terminal = withTokens(0)
+    setCheckpoint("conv-1", terminal)
+    expect(getCheckpoint("conv-1")).toEqual(terminal)
+    expect(checkpointTokenDetails("conv-1", terminal)).toEqual({ usedTokens: 42_000, maxTokens: 256_000 })
+    expect(checkpointTokenDetails("conv-other", terminal)).toEqual({ usedTokens: 0, maxTokens: 256_000 })
+  })
+
+  it("forgets a conversation's occupancy with its checkpoint", () => {
+    setCheckpoint("conv-1", withTokens(42_000))
+    clearCheckpoint("conv-1")
+    expect(checkpointTokenDetails("conv-1", withTokens(0))).toEqual({ usedTokens: 0, maxTokens: 256_000 })
+  })
+
+  it("leaves a checkpoint without token details undecoded", () => {
+    setCheckpoint("conv-1", withTokens(42_000))
+    expect(checkpointTokenDetails("conv-1", Uint8Array.from([0x0a, 0x01, 0x61]))).toBeUndefined()
+    expect(checkpointTokenDetails("conv-1", undefined)).toBeUndefined()
   })
 })
 

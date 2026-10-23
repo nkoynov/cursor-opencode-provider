@@ -925,14 +925,13 @@ describe("Run recovery around a mid-turn user message", () => {
     expect(followUps).toEqual(["then stop"])
   })
 
-  it("treats injection progress as control frames for replay safety", () => {
-    for (const update of [
-      { context_injection_state: { injection_id: "inj", state: { queued: {} } } },
-      { user_message_appended: { user_message: { text: "b", message_id: "inj" } } },
-    ]) {
+  it("treats injection progress as a control frame, and the appended message as a change to the conversation", () => {
+    const barrier = (update: Record<string, unknown>) => {
       const payload = encodeMessage("AgentServerMessage", { interaction_update: update })
       const decoded = decodeMessage<any>("AgentServerMessage", payload)
-      expect(analyzeReplayFrame(payload, { interactionUpdate: decoded.interaction_update }).barrier).toBeUndefined()
+      return analyzeReplayFrame(payload, { interactionUpdate: decoded.interaction_update }).barrier
     }
+    expect(barrier({ context_injection_state: { injection_id: "inj", state: { queued: {} } } })).toBeUndefined()
+    expect(barrier({ user_message_appended: { user_message: { text: "b", message_id: "inj" } } })).toBe("stateful-interaction")
   })
 })

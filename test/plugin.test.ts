@@ -12,7 +12,12 @@ import { CursorAuthError } from "../src/errors.js"
 import { CURSOR_VARIANT_PARAMETERS_KEY, readCache, writeCache, type ModelInfo } from "../src/models.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
 import { resetAgentUrlCache } from "../src/agent-url.js"
-import { CURSOR_COMPACTION_OPTION, CURSOR_HOST_AGENT_OPTION, MODEL_CACHE_SCHEMA_VERSION } from "../src/shared.js"
+import {
+  CURSOR_COMPACTION_OPTION,
+  CURSOR_HOST_AGENT_OPTION,
+  CURSOR_SESSION_EDITS_DENIED_OPTION,
+  MODEL_CACHE_SCHEMA_VERSION,
+} from "../src/shared.js"
 import {
   CURSOR_TIMEOUT_BACKGROUND,
   buildBackgroundShellCommand,
@@ -22,7 +27,7 @@ import {
 } from "../src/shell-timeout.js"
 import { RUNNING_TOOL_CAP_MS, sessionActivity } from "../src/activity.js"
 import * as rootExports from "../src/index.js"
-import { hostPlanFileFor, resetHostPlanFilesForTests } from "../src/host-plan-file.js"
+import { hostPlanFileFor, isHostPlanFileResolved, resetHostPlanFilesForTests, setHostPlanFile } from "../src/host-plan-file.js"
 import { HOST_PATH_BRIDGE } from "../src/context/paths.js"
 import {
   flushHostAgentModeSwitch,
@@ -167,11 +172,14 @@ describe("package root exports", () => {
         { sessionID, model: { providerID: "cursor" }, agent: "build" } as any,
         params as any,
       )
-      // A bridge without `planFile` defines none: one lookup, then remembered.
-      await call("flaky")
-      await call("flaky")
+      // The first read fails. Plan-file resolution retries it in the same request
+      // and remembers that this host defines none. Later requests still read the
+      // session, for its edit rule, and do not look the plan file up again.
       await call("flaky")
       expect(reads).toEqual(["flaky", "flaky"])
+      await call("flaky")
+      await call("flaky")
+      expect(reads).toEqual(["flaky", "flaky", "flaky", "flaky"])
       expect(hostPlanFileFor("flaky")).toBeUndefined()
     } finally {
       if (previous === undefined) delete (globalThis as Record<PropertyKey, unknown>)[HOST_PATH_BRIDGE]
@@ -514,6 +522,111 @@ describe("CursorPlugin compaction marker", () => {
     } as never, normal as never)
     expect(normal.options[CURSOR_COMPACTION_OPTION]).toBeUndefined()
     expect(normal.options[CURSOR_HOST_AGENT_OPTION]).toBe("build")
+  })
+
+  it("sets the session edit deny option from the classic session payload", async () => {
+    resetHostPlanFilesForTests()
+    const sessions = new Map<string, unknown>([
+      ["ses_deny", { data: { permissions: [
+        { action: "edit", resource: "*", effect: "deny" },
+        { action: "edit", resource: "/plans/*", effect: "allow" },
+      ] } }],
+      ["ses_allow", { data: { permissions: [
+        { action: "edit", resource: "*", effect: "deny" },
+        { action: "edit", resource: "*", effect: "allow" },
+      ] } }],
+      ["ses_plain", { data: { slug: "quiet-owl" } }],
+    ])
+    const plugin = await CursorPlugin({
+      directory: process.cwd(),
+      client: {
+        session: {
+          get: async ({ path }: { path: { id: string } }) => sessions.get(path.id),
+        },
+      },
+    } as never)
+    const denied = { options: {} as Record<string, unknown> }
+    await plugin["chat.params"]?.({
+      sessionID: "ses_deny",
+      agent: "plan",
+      model: { providerID: "cursor" },
+    } as never, denied as never)
+    expect(denied.options[CURSOR_SESSION_EDITS_DENIED_OPTION]).toBe(true)
+    expect(denied.options[CURSOR_HOST_AGENT_OPTION]).toBe("plan")
+
+    const allowed = { options: {} as Record<string, unknown> }
+    await plugin["chat.params"]?.({
+      sessionID: "ses_allow",
+      agent: "build",
+      model: { providerID: "cursor" },
+    } as never, allowed as never)
+    expect(allowed.options[CURSOR_SESSION_EDITS_DENIED_OPTION]).toBe(false)
+
+    const plain = { options: {} as Record<string, unknown> }
+    await plugin["chat.params"]?.({
+      sessionID: "ses_plain",
+      agent: "build",
+      model: { providerID: "cursor" },
+    } as never, plain as never)
+    expect(plain.options[CURSOR_SESSION_EDITS_DENIED_OPTION]).toBe(false)
+    expect(plain.options[CURSOR_HOST_AGENT_OPTION]).toBe("build")
+    resetHostPlanFilesForTests()
+  })
+
+  it("retries the session read before checking permissions even with a cached plan path", async () => {
+    for (const cached of [false, true]) {
+      resetHostPlanFilesForTests()
+      if (cached) setHostPlanFile("ses_retry", null)
+      let reads = 0
+      const plugin = await CursorPlugin({
+        directory: process.cwd(),
+        client: { session: { get: async () => {
+          if (++reads === 1) throw new Error("not ready")
+          return { data: { permissions: [{ action: "edit", resource: "*", effect: "deny" }] } }
+        } } },
+      } as never)
+      const params = { options: {} as Record<string, unknown> }
+      await plugin["chat.params"]!({ sessionID: "ses_retry", agent: "plan", model: { providerID: "cursor" } } as never, params as never)
+      expect(params.options[CURSOR_SESSION_EDITS_DENIED_OPTION]).toBe(true)
+      expect(reads).toBe(2)
+    }
+    resetHostPlanFilesForTests()
+  })
+
+  it("clears the edit-deny marker when native 1.x session permissions are lifted", async () => {
+    resetHostPlanFilesForTests()
+    const permission = [{ permission: "edit", pattern: "*", action: "deny" }]
+    const plugin = await CursorPlugin({
+      directory: process.cwd(),
+      client: { session: { get: async () => ({ data: { permission } }) } },
+    } as never)
+    const params = { options: {} as Record<string, unknown> }
+    const input = { sessionID: "ses_native", agent: "plan", model: { providerID: "cursor" } }
+    await plugin["chat.params"]!(input as never, params as never)
+    expect(params.options[CURSOR_SESSION_EDITS_DENIED_OPTION]).toBe(true)
+    permission.push({ permission: "edit", pattern: "*", action: "allow" })
+    await plugin["chat.params"]!(input as never, params as never)
+    expect(params.options[CURSOR_SESSION_EDITS_DENIED_OPTION]).toBe(false)
+    resetHostPlanFilesForTests()
+  })
+
+  it("keeps ordinary requests usable with unreadable permissions without caching an absent plan", async () => {
+    for (const get of [
+      async () => { throw new Error("session unavailable") },
+      async () => ({ error: { message: "session unavailable" } }),
+    ]) {
+      resetHostPlanFilesForTests()
+      const plugin = await CursorPlugin({ directory: process.cwd(), client: { session: { get } } } as never)
+      for (const agent of ["build", "plan"]) {
+        const params = { options: {} as Record<string, unknown> }
+        await plugin["chat.params"]!({
+          sessionID: "ses_failed", agent, model: { providerID: "cursor" },
+        } as never, params as never)
+        expect(params.options.opencodeSessionPermissionsUnavailable).toBe(true)
+        expect(params.options[CURSOR_SESSION_EDITS_DENIED_OPTION]).toBeUndefined()
+      }
+      expect(isHostPlanFileResolved("ses_failed")).toBe(false)
+    }
   })
 })
 

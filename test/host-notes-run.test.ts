@@ -11,8 +11,8 @@ import os from "node:os"
 import path from "node:path"
 import { APICallError, type LanguageModelV3CallOptions, type LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
-import { CURSOR_COMPACTION_OPTION } from "../src/shared.js"
 import { decodeFramePayload } from "../src/protocol/framing.js"
+import { CURSOR_COMPACTION_OPTION, CURSOR_HOST_AGENT_OPTION, CURSOR_SESSION_EDITS_DENIED_OPTION } from "../src/shared.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { encodeJsonAsValue, readAllFields } from "../src/protocol/struct.js"
 import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
@@ -21,6 +21,7 @@ import { sessionManager } from "../src/session.js"
 import { notifyHostInterrupt } from "../src/host-interrupt.js"
 import { resetTurnStateForTests, restorePersistedHostNotes, settleRunSavesForTests } from "../src/language-model.js"
 import { encodePersistedHostNotes } from "../src/protocol/host-notes.js"
+import { getActiveCursorMode, resetActiveCursorModesForTests, setActiveCursorMode, takeActiveCursorModeReminder } from "../src/protocol/switch-mode.js"
 import { peekConversationId, resetConversationBindingsForTests, sessionIdToUuid } from "../src/protocol/conversation-bind.js"
 import { getCheckpoint, resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
@@ -120,6 +121,7 @@ afterEach(() => {
   resetConversationPersistenceForTests()
   resetConversationBindingsForTests()
   resetCheckpointsForTests()
+  resetActiveCursorModesForTests()
   runs.length = 0
   onRun = () => {}
 })
@@ -130,10 +132,12 @@ function openStream(
   sessionKey: string,
   abortSignal?: AbortSignal,
   tools?: LanguageModelV3CallOptions["tools"],
+  providerOptions?: LanguageModelV3CallOptions["providerOptions"],
 ) {
   return model.doStream({
     prompt,
     abortSignal,
+    providerOptions,
     tools: tools ?? [{
       type: "function",
       name: "read",
@@ -150,8 +154,8 @@ function openStream(
 }
 
 async function collect(model: ReturnType<ReturnType<typeof createCursor>["languageModel"]>, prompt: Prompt, sessionKey: string,
-  tools?: LanguageModelV3CallOptions["tools"]) {
-  const { stream } = await openStream(model, prompt, sessionKey, undefined, tools)
+  tools?: LanguageModelV3CallOptions["tools"], providerOptions?: LanguageModelV3CallOptions["providerOptions"]) {
+  const { stream } = await openStream(model, prompt, sessionKey, undefined, tools, providerOptions)
   const parts: LanguageModelV3StreamPart[] = []
   const reader = stream.getReader()
   for (;;) {
@@ -172,6 +176,196 @@ function endTurn(run: FakeRun, text: string): void {
 }
 
 describe("seeded Runs through a full provider Run", () => {
+  it.each([false, true])("supersedes a carried deny without reacting to unrelated notes (carriedDeny=%s)", async carriedDeny => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-replayed-permissions-"))
+    cacheHttp2SessionForTests(ORIGIN, client)
+    try {
+      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      const sessionKey = "ses_replayed_permissions"
+      const options = { cursor: { [CURSOR_HOST_AGENT_OPTION]: "plan", [CURSOR_SESSION_EDITS_DENIED_OPTION]: false } }
+      onRun = (run, message) => { if (message.run_request) endTurn(run, "Done.") }
+      const prompt: Prompt = [{ role: "user", content: [{ type: "text", text: "Review the plan." }] }]
+      await collect(model, prompt, sessionKey, undefined, options)
+      const stale = takeActiveCursorModeReminder(undefined, { sessionEditsDenied: true })!
+      restorePersistedHostNotes(sessionKey, encodePersistedHostNotes([...(carriedDeny ? [stale] : []), "Keep the independent note."]))
+      await collect(model, [...prompt,
+        { role: "assistant", content: [{ type: "text", text: "Done." }] },
+        { role: "user", content: [{ type: "text", text: "Review again." }] },
+      ], sessionKey, undefined, options)
+      const request = runs[1]!.received.find(message => message.run_request)!.run_request
+      const text = request.action.user_message_action.user_message.text as string
+      expect(text).toContain("Keep the independent note.")
+      if (carriedDeny) {
+        expect(text.indexOf("The session has no global edit deny"))
+          .toBeGreaterThan(text.lastIndexOf("Execution remains blocked by the session's edit rule"))
+      } else expect(text).not.toContain("The session has no global edit deny")
+    } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
+  })
+
+  it.each([false, true])("places current permission after carried stale notes (checkpoint=%s)", async checkpoint => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-carried-permissions-"))
+    cacheHttp2SessionForTests(ORIGIN, client)
+    try {
+      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      onRun = (run, message) => { if (message.run_request) endTurn(run, "Done.") }
+      for (const denied of [false, true]) {
+        const sessionKey = `ses_carried_permissions_${denied}`
+        const options = (value: boolean) => ({ cursor: { [CURSOR_HOST_AGENT_OPTION]: "plan", [CURSOR_SESSION_EDITS_DENIED_OPTION]: value } })
+        const initial: Prompt = [{ role: "system", content: "Host plan instructions" }, { role: "user", content: [{ type: "text", text: "Review the plan." }] }]
+        const before = runs.length
+        if (checkpoint) await collect(model, initial, sessionKey, undefined, options(!denied))
+        const stale = takeActiveCursorModeReminder(undefined, { sessionEditsDenied: !denied })!
+        restorePersistedHostNotes(sessionKey, encodePersistedHostNotes([stale, "Preserve this independent host note."]))
+        const prompt: Prompt = checkpoint
+          ? [...initial, { role: "assistant", content: [{ type: "text", text: "Done." }] }, { role: "user", content: [{ type: "text", text: "The session rules changed. Review again." }] }]
+          : initial
+        await collect(model, prompt, sessionKey, undefined, options(denied))
+        const request = runs[runs.length - 1]!.received.find(message => message.run_request)!.run_request
+        const text = request.action.user_message_action.user_message.text as string
+        const current = denied ? "Execution remains blocked by the session's edit rule" : "The session has no global edit deny"
+        const old = denied ? "The session has no global edit deny" : "Execution remains blocked by the session's edit rule"
+        expect(text).toContain(old)
+        expect(text.indexOf(current)).toBeGreaterThan(text.lastIndexOf(old))
+        expect(text.indexOf(current)).toBeGreaterThan(text.indexOf("Preserve this independent host note."))
+        expect(text).toContain("required plan approval")
+        if (checkpoint) {
+          const prior = runs[before]!.received.find(message => message.run_request)!.run_request
+          expect(request.conversation_id).toBe(prior.conversation_id)
+          expect(request.conversation_state.length).toBeGreaterThan(0)
+          expect(request.action.user_message_action.request_context).toEqual(prior.action.user_message_action.request_context)
+        }
+      }
+    } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
+  })
+
+  it.each([true, false])("updates a held Run's edit rule to denied=%s after the result and before further generation", async denied => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-held-permissions-"))
+    cacheHttp2SessionForTests(ORIGIN, client)
+    try {
+      const file = path.join(root, "probe.txt")
+      fs.writeFileSync(file, "alpha")
+      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      const options = (value: boolean) => ({ cursor: { [CURSOR_SESSION_EDITS_DENIED_OPTION]: value } })
+      onRun = (run, message) => {
+        if (message.run_request) run.send({ exec_server_message: { id: 1, read_args: { path: file } } })
+        const injection = message.conversation_action?.inject_context_action
+        if (injection) {
+          run.send({ interaction_update: { context_injection_state: { injection_id: injection.injection_id, state: { delivered: {} } } } })
+          endTurn(run, "Done.")
+        }
+      }
+      const initial: Prompt = [{ role: "user", content: [{ type: "text", text: "Read probe.txt." }] }]
+      const first = await collect(model, initial, "ses_held_permissions", undefined, options(!denied))
+      const call = first.find(part => part.type === "tool-call")
+      if (call?.type !== "tool-call") throw new Error("Expected read")
+      const next: Prompt = [...initial,
+        { role: "assistant", content: [{ type: "tool-call", toolCallId: call.toolCallId, toolName: "read", input: JSON.parse(call.input) }] },
+        { role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: "read", output: { type: "text", value: "alpha" } }] },
+      ]
+      expect(textOf(await collect(model, next, "ses_held_permissions", undefined, options(denied)))).toBe("Done.")
+      expect(runs).toHaveLength(1)
+      const received = runs[0]!.received
+      const resultIndex = received.findIndex(message => message.exec_client_message?.read_result)
+      const injectionIndex = received.findIndex(message => message.conversation_action?.inject_context_action)
+      expect(resultIndex).toBeGreaterThan(0)
+      expect(injectionIndex).toBeGreaterThan(resultIndex)
+      const text = received[injectionIndex]!.conversation_action.inject_context_action.user_context.user_message.text
+      expect(text).toContain(denied ? "Execution remains blocked by the session's edit rule" : "The session has no global edit deny")
+      expect(received.filter(message => message.conversation_action?.inject_context_action)).toHaveLength(1)
+    } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
+  })
+
+  it("states no edit deny only to supersede a deny Cursor received", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-edit-guidance-"))
+    cacheHttp2SessionForTests(ORIGIN, client)
+    try {
+      const file = path.join(root, "probe.txt")
+      fs.writeFileSync(file, "alpha")
+      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      const options = (value: boolean) => ({ cursor: { [CURSOR_SESSION_EDITS_DENIED_OPTION]: value } })
+      const steps = 4
+      onRun = (run, message) => {
+        if (message.run_request) run.send({ exec_server_message: { id: 1, read_args: { path: file } } })
+        const id = message.exec_client_message?.read_result ? message.exec_client_message.id as number : undefined
+        if (id !== undefined) {
+          if (id < steps) run.send({ exec_server_message: { id: id + 1, read_args: { path: file } } })
+          else endTurn(run, "Done.")
+        }
+        const injection = message.conversation_action?.inject_context_action
+        if (injection) {
+          run.send({ interaction_update: { context_injection_state: { injection_id: injection.injection_id, state: { delivered: {} } } } })
+        }
+      }
+      let prompt: Prompt = [{ role: "user", content: [{ type: "text", text: "Read probe.txt four times." }] }]
+      let parts = await collect(model, prompt, "ses_edit_guidance", undefined, options(false))
+      // Step results carry these edit states in order: allow, deny, allow, allow.
+      for (const denied of [false, true, false, false]) {
+        const call = parts.find(part => part.type === "tool-call")
+        if (call?.type !== "tool-call") throw new Error("Expected read")
+        prompt = [...prompt,
+          { role: "assistant", content: [{ type: "tool-call", toolCallId: call.toolCallId, toolName: "read", input: JSON.parse(call.input) }] },
+          { role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: "read", output: { type: "text", value: "alpha" } }] },
+        ]
+        parts = await collect(model, prompt, "ses_edit_guidance", undefined, options(denied))
+      }
+      expect(textOf(parts)).toBe("Done.")
+      expect(runs).toHaveLength(1)
+      const received = runs[0]!.received
+      const initial = received.find(message => message.run_request)!.run_request
+      expect(initial.action.user_message_action.user_message.text).not.toContain("global edit deny")
+      // Each injection follows the step result it belongs to.
+      const notes: Array<{ afterStep: number; text: string }> = []
+      let step = 0
+      for (const message of received) {
+        if (message.exec_client_message?.read_result) step = message.exec_client_message.id
+        const injection = message.conversation_action?.inject_context_action
+        if (injection) notes.push({ afterStep: step, text: injection.user_context.user_message.text })
+      }
+      expect(notes.map(note => note.afterStep)).toEqual([2, 3])
+      expect(notes[0]!.text).toContain("Execution remains blocked by the session's edit rule")
+      expect(notes[1]!.text).toContain("The session has no global edit deny")
+    } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
+  })
+
+  it.each([true, false])("reconciles an uncorrelated plan-stage approval only when edits are allowed (denied=%s)", async denied => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-stage-permissions-"))
+    cacheHttp2SessionForTests(ORIGIN, client)
+    try {
+      setActiveCursorMode("ses_stage_permissions", "plan")
+      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      onRun = (run, message) => { if (message.run_request) endTurn(run, "Done.") }
+      await collect(model, [
+        { role: "user", content: [{ type: "text", text: "Review the plan." }] },
+        { role: "assistant", content: [{ type: "tool-call", toolCallId: "host-stage", toolName: "cursor_plan_stage", input: {} }] },
+        { role: "tool", content: [{ type: "tool-result", toolCallId: "host-stage", toolName: "cursor_plan_stage", output: { type: "text", value: "Approved" } }] },
+      ], "ses_stage_permissions", undefined, { cursor: { [CURSOR_SESSION_EDITS_DENIED_OPTION]: denied } })
+      expect(getActiveCursorMode("ses_stage_permissions")).toBe(denied ? "plan" : "agent")
+    } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
+  })
+
+  it("replaces a lifted session deny chronologically without rewriting the native plan baseline", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-plan-permissions-"))
+    cacheHttp2SessionForTests(ORIGIN, client)
+    try {
+      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      onRun = (run, message) => { if (message.run_request) endTurn(run, "Done.") }
+      const prompt: Prompt = [{ role: "system", content: "Host plan instructions" }, { role: "user", content: [{ type: "text", text: "Plan the change." }] }]
+      const options = (denied: boolean) => ({ cursor: { [CURSOR_HOST_AGENT_OPTION]: "plan", [CURSOR_SESSION_EDITS_DENIED_OPTION]: denied } })
+      await collect(model, prompt, "ses_plan_permissions", undefined, options(true))
+      await collect(model, [...prompt, { role: "assistant", content: [{ type: "text", text: "Done." }] }, { role: "user", content: [{ type: "text", text: "I lifted the session edit deny. Review the plan." }] }], "ses_plan_permissions", undefined, options(false))
+      const requests = runs.map(run => run.received.find(message => message.run_request)!.run_request)
+      expect(requests).toHaveLength(2)
+      const actions = requests.map(request => request.action.user_message_action)
+      expect(actions[0].user_message.text).toContain("Execution remains blocked by the session's edit rule")
+      expect(actions[1].user_message.text).toContain("The session has no global edit deny")
+      expect(actions[1].user_message.text).toContain("required plan approval")
+      expect(requests[1].conversation_id).toBe(requests[0].conversation_id)
+      expect(requests[1].conversation_state.length).toBeGreaterThan(0)
+      expect(actions[1].request_context).toEqual(actions[0].request_context)
+      expect(JSON.stringify(actions[0].request_context.rules)).not.toContain("Execution remains blocked")
+    } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
+  })
+
   it("rebuilds a closed Run with the history in the user text and the system-instructions rule intact", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-seed-run-"))
     cacheHttp2SessionForTests(ORIGIN, client)

@@ -86,7 +86,7 @@ export function buildDynamicCatalogRoutingInstruction(options: {
       // (built-in tools such as GenerateImage) and rejects any other name there.
       `Host tools are in namespace \`${DEFAULT_TOOL_SERVER}\`` +
       (mcpServers.length > 0 ? " and MCP tools in their server's namespace" : "") +
-      "; namespace `cursor` holds only Cursor's built-in tools.",
+      "; namespace `cursor` holds only those Cursor built-in tools that a turn does not supply directly.",
   ]
   if (hasSkill) {
     // Mirror OpenCode 1 SystemPrompt.skills / OC2 SkillInstructions.render.

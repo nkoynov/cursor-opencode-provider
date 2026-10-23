@@ -1,5 +1,6 @@
 import { encodeMessage } from "./messages.js"
 import { readAllFields } from "./struct.js"
+import { SESSION_PERMISSIONS_UNAVAILABLE_REASON } from "./session-edits.js"
 import {
   type AskQuestionResultMessage,
   type DecodedAskQuestionQuery,
@@ -15,8 +16,9 @@ import {
   CURSOR_PLAN_STAGE_TOOL,
   type CreatePlanBridge,
   type DecodedCreatePlanQuery,
-  decodeCreatePlanQuery,
   createPlanApprovalQuestionInput,
+  createPlanSessionEditsDeniedReason,
+  decodeCreatePlanQuery,
   renderPlanReviewMessage,
   resolveCreatePlanBridge,
   writeOpencodePlanFile,
@@ -30,6 +32,7 @@ import {
   MISSING_QUERY_REASON as SWITCH_MODE_MISSING_QUERY_REASON,
   resolveSwitchModeBridge,
   switchModeApprovedResult,
+  SESSION_EDITS_DENIED_SWITCH_REASON,
 } from "./switch-mode.js"
 
 const HEADLESS_REASON =
@@ -114,6 +117,14 @@ export type HandledInteraction = {
    * instead. Nothing was written, so its display must not be mirrored as a plan.
    */
   deferredCreatePlanToolCallId?: string
+  /**
+   * Plan text for the assistant transcript when the plan was written without a
+   * host review tool. A session edit deny uses this: the user still sees the
+   * plan, and Cursor receives the not-approved error.
+   */
+  planReview?: string
+  /** End the owning Run after this immediate planning refusal has been delivered. */
+  endTurn?: boolean
   /** Present when an image generation was approved: the target to expect. */
   generateImage?: DecodedGenerateImageQuery
 }
@@ -161,6 +172,10 @@ export type HandleInteractionQueryOptions = {
    * handler and keeping the host's plan review from running twice.
    */
   activeCursorModeId?: string
+  /** The session's last `edit` rule on `*` is deny. */
+  sessionEditsDenied?: boolean
+  /** Session permission evidence was unavailable; no execution approval is safe. */
+  sessionPermissionsUnavailable?: boolean
 }
 
 export class UnsupportedInteractionQueryError extends Error {
@@ -379,8 +394,14 @@ function handleSwitchModeQuery(
     advertised: options.advertisedTools ?? [],
     ...(options.activeCursorModeId ? { activeModeId: options.activeCursorModeId } : {}),
     ...(options.hostAgent ? { hostAgent: options.hostAgent } : {}),
+    ...(options.sessionEditsDenied ? { sessionEditsDenied: true } : {}),
+    sessionPermissionsUnavailable: options.sessionPermissionsUnavailable,
   })
-  if (bridge.kind === "reject") return reject(bridge.reason)
+  if (bridge.kind === "reject") return {
+    ...reject(bridge.reason),
+    ...([SESSION_PERMISSIONS_UNAVAILABLE_REASON, SESSION_EDITS_DENIED_SWITCH_REASON].includes(bridge.reason)
+      ? { endTurn: true } : {}),
+  }
 
   // Lifecycle turn: approve on the wire so the model never sees a rejection, but
   // do not attach switchMode — the real turn owns session mode.
@@ -527,6 +548,7 @@ function handleCreatePlanQuery(
     ...(options.hostAgent ? { hostAgent: options.hostAgent } : {}),
     planModeActive: options.planModeActive === true,
     ...(options.hostPlanFile ? { hostPlanFile: options.hostPlanFile } : {}),
+    ...(options.sessionEditsDenied ? { sessionEditsDenied: true } : {}),
   })
 
   // The host's plan agent records and reviews the plan; write nothing here.
@@ -534,6 +556,13 @@ function handleCreatePlanQuery(
     return {
       ...reply({ error: { error: bridge.reason }, plan_uri: "" }),
       ...(decoded.toolCallId ? { deferredCreatePlanToolCallId: decoded.toolCallId } : {}),
+    }
+  }
+
+  if (options.allowTools && options.sessionPermissionsUnavailable) {
+    return {
+      ...reply({ error: { error: SESSION_PERMISSIONS_UNAVAILABLE_REASON }, plan_uri: "" }),
+      endTurn: true,
     }
   }
 
@@ -567,6 +596,30 @@ function handleCreatePlanQuery(
       outcome: "bridged",
       createPlan: { ...decoded, bridge, toolName: CURSOR_PLAN_STAGE_TOOL },
       reply: undefined,
+    }
+  }
+
+  // The session rule still denies edits. Keep the plan and show it, and tell
+  // Cursor execution was not approved. Do not ask: the answer cannot lift it.
+  if (bridge.kind === "hold") {
+    const stop = (result: Record<string, unknown>): HandledInteraction => ({ ...reply(result), endTurn: true })
+    const workspaceRoot = options.workspaceRoot?.trim()
+    if (!workspaceRoot) {
+      return stop({
+        error: { error: "CreatePlan requires a workspace root to write the plan file" },
+        plan_uri: "",
+      })
+    }
+    const written = writeOpencodePlanFile(decoded.args, workspaceRoot, Date.now(), options.hostPlanFile)
+    if (!written.ok) {
+      return stop({ error: { error: written.error }, plan_uri: "" })
+    }
+    return {
+      ...stop({
+        error: { error: createPlanSessionEditsDeniedReason(written.planPath) },
+        plan_uri: "",
+      }),
+      planReview: renderPlanReviewMessage(written.markdown, written.planPath),
     }
   }
 

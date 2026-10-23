@@ -19,6 +19,8 @@ import {
 } from "../src/opencode2/catalog.js"
 import { applyCursorIntegration } from "../src/opencode2/integration.js"
 import { exposeDirectMcpTools, rememberDirectMcpNamespaces } from "../src/opencode2/mcp-direct.js"
+import { assertToolPermission } from "../src/opencode2/permissions.js"
+import { registerCursorImageSaveTool } from "../src/opencode2/image-save-tool.js"
 import { registerTodoTools } from "../src/opencode2/todo-tools.js"
 import { rememberHostSkillFiles } from "../src/context/skills.js"
 import type { HostModelInfo, HostPluginContext, HostProviderEditor, HostProviderInfo } from "./opencode2-host-contract.js"
@@ -80,7 +82,8 @@ void (() =>
 void (() => ctx.integration.transform(applyCursorIntegration))
 void (() =>
   ctx.tool.transform((hostEditor) => {
-    registerTodoTools(hostEditor)
+    registerTodoTools(hostEditor, ctx)
+    registerCursorImageSaveTool(hostEditor, ctx)
     exposeDirectMcpTools(hostEditor, new Set(["github"]))
   }))
 void (() =>
@@ -140,11 +143,12 @@ void (() =>
 void (async () => {
   const info = await ctx.session.get({ sessionID: "s" })
   const directory: string = info.location.directory
+  const permissions = info.permissions
   const loc: string = ctx.location.directory
   await ctx.session.switchAgent({ sessionID: "s", agent: "build" })
   await ctx.session.synthetic({ sessionID: "s", text: "go" })
   await ctx.session.prompt({ sessionID: "s", text: "go" })
-  void [directory, loc]
+  void [directory, permissions, loc]
 })
 
 void (() =>
@@ -161,3 +165,7 @@ void (() =>
       execute: async () => [],
     })
   }))
+
+void (() => assertToolPermission(ctx, {
+  sessionID: "s", agent: "plan", messageID: "m", id: "call", progress: async () => {},
+}, { action: "edit", resources: ["assets/image.png"], save: ["*"] }))

@@ -69,6 +69,48 @@ describe("interaction update analysis", () => {
   })
 })
 
+describe("user-message-appended updates", () => {
+  // Independent bytes from the shipped CLI descriptors: InteractionUpdate #6,
+  // UserMessageAppendedUpdate.user_message #1, UserMessage text #1 / id #2 / mode #4.
+  const userMessage = Uint8Array.of(0x0a, 0x02, 0x68, 0x69, 0x12, 0x02, 0x6d, 0x31, 0x20, 0x03)
+  const appended = lengthDelimited(1, userMessage)
+  const frame = updateFrame(6, appended)
+  const decoded = decodeMessage<{ interaction_update: Record<string, unknown> }>("AgentServerMessage", frame)
+
+  it("decodes the appended user message using the vendor field numbers", () => {
+    expect(decoded).toMatchObject({ interaction_update: {
+      user_message_appended: { user_message: { text: "hi", message_id: "m1", mode: 3 } },
+    } })
+  })
+
+  it("recognizes a stateful update, including the timing field seen after injection", () => {
+    expect(analyzeReplayFrame(frame, { interactionUpdate: decoded.interaction_update }).barrier)
+      .toBe("stateful-interaction")
+    const timed = Uint8Array.from(lengthDelimited(1, Uint8Array.from([
+      ...lengthDelimited(6, Uint8Array.from(appended)), 0xc8, 0x01, 0x01,
+    ])))
+    expect(describeFrameLayout(timed)).toBe("1:2{6:2{1:2},25:0}")
+    expect(analyzeReplayFrame(timed, { interactionUpdate: decoded.interaction_update }).barrier)
+      .toBe("stateful-interaction")
+  })
+
+  it("keeps missing, repeated, unknown, or mistyped appended-message fields unknown", () => {
+    for (const body of [[], [...appended, ...appended], lengthDelimited(2, userMessage), [0x08, 0x01]]) {
+      expect(analyzeReplayFrame(updateFrame(6, body), { interactionUpdate: decoded.interaction_update }).barrier)
+        .toBe("unknown-or-malformed-frame")
+    }
+    expect(analyzeReplayFrame(frame, { interactionUpdate: {} }).barrier).toBe("unknown-or-malformed-frame")
+  })
+
+  it("keeps mixed update members unknown", () => {
+    const mixed = Uint8Array.from(lengthDelimited(1, Uint8Array.from([
+      ...lengthDelimited(6, Uint8Array.from(appended)), ...lengthDelimited(13),
+    ])))
+    expect(analyzeReplayFrame(mixed, { interactionUpdate: decoded.interaction_update }).barrier)
+      .toBe("unknown-or-malformed-frame")
+  })
+})
+
 describe("frame layout", () => {
   it("names field numbers and wire types without payload bytes", () => {
     const frame = updateFrame(16, [...varint(1 << 3), 5])

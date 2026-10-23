@@ -58,6 +58,7 @@ import type {
   ModelInfo2,
   ProviderEditor,
   ProviderInfo,
+  PermissionAssertInput,
 } from "../src/opencode2/types.js"
 import type { ModelInfo } from "../src/models.js"
 
@@ -625,6 +626,7 @@ function fakeContext(events: readonly unknown[] = []) {
 
   let activeConnection: any = undefined
   const sessionLocations = new Map<string, string>()
+  const sessionPermissions = new Map<string, unknown>()
 
   const ctx: any = {
     app: { name: "opencode", version: "2.0", channel: "latest" },
@@ -650,7 +652,12 @@ function fakeContext(events: readonly unknown[] = []) {
       get: async ({ sessionID }: { sessionID: string }) => {
         const directory = sessionLocations.get(sessionID)
         if (!directory) throw new Error(`no fake location for session ${sessionID}`)
-        return { id: sessionID, location: { directory } }
+        const permissions = sessionPermissions.get(sessionID)
+        return {
+          id: sessionID,
+          location: { directory },
+          ...(permissions !== undefined ? { permissions } : {}),
+        }
       },
       switchAgent: async () => {},
       synthetic: async () => ({}),
@@ -676,7 +683,7 @@ function fakeContext(events: readonly unknown[] = []) {
     reload: async () => void reloads.push("tool"),
   }
 
-  return { ctx, registered, disposed, hooks, transforms, sessionLocations, reloads, inventory }
+  return { ctx, registered, disposed, hooks, transforms, sessionLocations, sessionPermissions, reloads, inventory }
 }
 
 describe("opencode2 setup", () => {
@@ -1040,7 +1047,7 @@ describe("opencode2 setup", () => {
     expect(tools.map((t) => t.name)).not.toContain("custom_websearch")
   })
 
-  test("cursor_image_save commits staged bytes without a permission prompt", async () => {
+  test("cursor_image_save obtains per-path native permission before committing staged bytes", async () => {
     const { ctx, transforms, sessionLocations } = fakeContext()
     await setupPlugin(ctx)
     let registered: {
@@ -1055,17 +1062,113 @@ describe("opencode2 setup", () => {
     const workspace = mkdtempSync(join(tmpdir(), "oc2-img-ws-"))
     const projectDir = mkdtempSync(join(tmpdir(), "oc2-img-proj-"))
     sessionLocations.set("ses_img", workspace)
+    const permissions: PermissionAssertInput[] = []
+    ctx.permission = { assert: async (input: PermissionAssertInput) => { permissions.push(input) } }
     try {
       const target = join(projectDir, "assets", "dot.png")
       const png = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01])
       const image_id = stageCursorImage({ path: target, projectDir, mime: "image/png", data: png })
-      const result = await registered!.execute({ image_id }, { sessionID: "ses_img" })
+      const context = { sessionID: "ses_img", agent: "build", messageID: "msg_img", id: "cursor_img" }
+      const result = await registered!.execute({ image_id }, context)
       expect(result.output.bytes).toBe(png.length)
       expect(readFileSync(target)).toEqual(Buffer.from(png))
+      expect(permissions.map(input => input.action)).toEqual(["external_directory", "edit"])
+      expect(permissions[1]).toMatchObject({
+        sessionID: "ses_img", agent: "build",
+        source: { type: "tool", messageID: "msg_img", id: "cursor_img" },
+      })
+      expect(permissions[1]!.resources[0]).not.toContain("../")
     } finally {
       rmSync(workspace, { recursive: true, force: true })
       rmSync(projectDir, { recursive: true, force: true })
     }
+  })
+
+  test.each(["plan-deny", "user-decline", "no-permission-api"] as const)(
+    "cursor_image_save writes nothing after %s", async outcome => {
+      const { ctx, transforms, sessionLocations } = fakeContext()
+      await setupPlugin(ctx)
+      let execute!: (input: { image_id: string }, context: {
+        sessionID: string; agent: string; messageID: string; id: string;
+      }) => Promise<unknown>
+      transforms.get("tool")!({ add: (tool: { execute: typeof execute }) => { execute = tool.execute } })
+      const workspace = mkdtempSync(join(tmpdir(), "oc2-img-deny-"))
+      sessionLocations.set("ses_img_deny", workspace)
+      const refusal = new Error(outcome)
+      const seen: PermissionAssertInput[] = []
+      if (outcome !== "no-permission-api") {
+        ctx.permission = { assert: async (input: PermissionAssertInput) => {
+          seen.push(input)
+          if (input.action === "edit") throw refusal
+        } }
+      }
+      const target = join(workspace, "assets", "denied.png")
+      const image_id = stageCursorImage({ path: target, projectDir: workspace,
+        mime: "image/png", data: Uint8Array.of(1, 2, 3) })
+      try {
+        const saving = execute({ image_id }, {
+          sessionID: "ses_img_deny", agent: "plan", messageID: "msg_deny", id: "cursor_deny",
+        })
+        if (outcome === "no-permission-api") await expect(saving).rejects.toThrow("permission assertion")
+        else await expect(saving).rejects.toBe(refusal)
+        expect(existsSync(join(workspace, "assets"))).toBe(false)
+        if (seen.length) expect(seen[0]).toMatchObject({
+          agent: "plan", action: "edit", resources: ["assets/denied.png"],
+        })
+      } finally {
+        rmSync(workspace, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test("cursor_image_save falls back to the tool-context ask when permission.assert is absent", async () => {
+    const { ctx, transforms, sessionLocations } = fakeContext()
+    await setupPlugin(ctx)
+    let execute!: (input: { image_id: string }, context: {
+      sessionID: string; agent: string; messageID: string; id: string;
+      ask?: (request: {
+        permission: string; patterns: string[]; always: string[]; metadata: Record<string, unknown>
+      }) => Promise<void>
+    }) => Promise<{ output: { path: string } }>
+    transforms.get("tool")!({ add: (tool: { execute: typeof execute }) => { execute = tool.execute } })
+    const workspace = mkdtempSync(join(tmpdir(), "oc2-img-ask-ws-"))
+    const projectDir = mkdtempSync(join(tmpdir(), "oc2-img-ask-proj-"))
+    sessionLocations.set("ses_img_ask", workspace)
+    const asked: Array<{ permission: string; patterns: string[] }> = []
+    const target = join(projectDir, "assets", "asked.png")
+    const png = Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10)
+    const image_id = stageCursorImage({ path: target, projectDir, mime: "image/png", data: png })
+    try {
+      const result = await execute({ image_id }, {
+        sessionID: "ses_img_ask", agent: "build", messageID: "msg_ask", id: "cursor_ask",
+        ask: async request => { asked.push({ permission: request.permission, patterns: request.patterns }) },
+      })
+      expect(asked.map(entry => entry.permission)).toEqual(["external_directory", "edit"])
+      expect(readFileSync(target)).toEqual(Buffer.from(png))
+      expect(result.output.path).toContain("asked.png")
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+      rmSync(projectDir, { recursive: true, force: true })
+    }
+  })
+
+  test("cursor_image_save retains a staging failure instead of treating it as permission denial", async () => {
+    const { ctx, transforms, sessionLocations } = fakeContext()
+    await setupPlugin(ctx)
+    let execute!: (input: { image_id: string }, context: {
+      sessionID: string; agent: string; messageID: string; id: string;
+    }) => Promise<unknown>
+    transforms.get("tool")!({ add: (tool: { execute: typeof execute }) => { execute = tool.execute } })
+    const workspace = mkdtempSync(join(tmpdir(), "oc2-img-staging-failure-"))
+    sessionLocations.set("ses_missing_image", workspace)
+    let assertions = 0
+    ctx.permission = { assert: async () => { assertions++ } }
+    try {
+      await expect(execute({ image_id: "unknown-image" }, {
+        sessionID: "ses_missing_image", agent: "plan", messageID: "msg_missing", id: "missing_image",
+      })).rejects.toThrow("No pending Cursor image")
+      expect(assertions).toBe(0)
+    } finally { rmSync(workspace, { recursive: true, force: true }) }
   })
 
   test.each(["id", "callID"] as const)("accepts the %s tool execution identifier", async (field) => {
@@ -1525,15 +1628,86 @@ describe("opencode2 setup", () => {
     }
     await hooks.get("session.context")!(event)
     expect(event.options.opencodeHostAgent).toBe("plan")
-    expect(getActiveCursorMode("s-plan-agent")).toBe("plan")
 
+    // The provider's `followHostPlanAgent` follows the agent on both
+    // generations; the hook only reports it and never changes the mode.
+    setActiveCursorMode("s-plan-agent", "debug")
+    await hooks.get("session.context")!(event)
+    expect(getActiveCursorMode("s-plan-agent")).toBe("debug")
     event.agent = "build"
+    setActiveCursorMode("s-plan-agent", "plan")
     await hooks.get("session.context")!(event)
-    expect(getActiveCursorMode("s-plan-agent")).toBe("agent")
+    expect(event.options.opencodeHostAgent).toBe("build")
+    expect(getActiveCursorMode("s-plan-agent")).toBe("plan")
+  })
 
-    setActiveCursorMode("s-plan-agent", "chat")
+  test("the session context sets the edit-deny option from session permissions", async () => {
+    const { ctx, hooks, sessionLocations, sessionPermissions } = fakeContext()
+    sessionLocations.set("s-deny", "/proj")
+    sessionLocations.set("s-allow", "/proj")
+    sessionLocations.set("s-plain", "/proj")
+    sessionPermissions.set("s-deny", [
+      { action: "edit", resource: "*", effect: "deny" },
+      { action: "edit", resource: "/plans/*", effect: "allow" },
+    ])
+    sessionPermissions.set("s-allow", [
+      { action: "edit", resource: "*", effect: "deny" },
+      { action: "edit", resource: "*", effect: "allow" },
+    ])
+    await setupPlugin(ctx)
+
+    const denied: any = { sessionID: "s-deny", agent: "plan", model: { providerID: "cursor" }, options: {} }
+    await hooks.get("session.context")!(denied)
+    expect(denied.options.opencodeSessionEditsDenied).toBe(true)
+
+    sessionPermissions.set("s-deny", [{ action: "edit", resource: "*", effect: "allow" }])
+    await hooks.get("session.context")!(denied)
+    expect(denied.options.opencodeSessionEditsDenied).toBe(false)
+
+    const allowed: any = { sessionID: "s-allow", agent: "build", model: { providerID: "cursor" }, options: {} }
+    await hooks.get("session.context")!(allowed)
+    expect(allowed.options.opencodeSessionEditsDenied).toBe(false)
+
+    const plain: any = { sessionID: "s-plain", agent: "build", model: { providerID: "cursor" }, options: {} }
+    await hooks.get("session.context")!(plain)
+    expect(plain.options.opencodeSessionEditsDenied).toBe(false)
+    expect(plain.options.opencodeHostAgent).toBe("build")
+  })
+
+  test("session context retries permissions and marks unavailable evidence without aborting requests", async () => {
+    const { ctx, hooks } = fakeContext()
+    let reads = 0
+    ctx.session.get = async () => {
+      if (++reads === 1) throw new Error("not ready")
+      return { id: "s-retry", location: { directory: "/proj" }, permissions: [{ action: "edit", resource: "*", effect: "deny" }] }
+    }
+    await setupPlugin(ctx)
+    const event = { sessionID: "s-retry", agent: "plan", options: {} as Record<string, unknown> }
     await hooks.get("session.context")!(event)
-    expect(getActiveCursorMode("s-plan-agent")).toBe("chat")
+    expect(reads).toBe(2)
+    expect(event.options.opencodeSessionEditsDenied).toBe(true)
+    ctx.session.get = async () => { throw new Error("session unavailable") }
+    await hooks.get("session.context")!(event)
+    expect(event.options.opencodeSessionPermissionsUnavailable).toBe(true)
+    expect(event.options.opencodeSessionEditsDenied).toBeUndefined()
+    ctx.session.get = async () => ({ id: "s-retry", location: { directory: "/proj" }, permissions: [] })
+    await hooks.get("session.context")!(event)
+    expect(event.options.opencodeSessionPermissionsUnavailable).toBeUndefined()
+    expect(event.options.opencodeSessionEditsDenied).toBe(false)
+  })
+
+  test("a compaction context survives an unreadable session and carries no edit-deny option", async () => {
+    const { ctx, hooks } = fakeContext()
+    ctx.session.get = async () => { throw new Error("session unavailable") }
+    await setupPlugin(ctx)
+    const event = {
+      sessionID: "s-compact",
+      agent: "compaction",
+      options: { opencodeSessionEditsDenied: true } as Record<string, unknown>,
+    }
+    await hooks.get("session.context")!(event)
+    expect(event.options.opencodeCompaction).toBe(true)
+    expect(event.options.opencodeSessionEditsDenied).toBeUndefined()
   })
 
   test("the session hook records the session's real directory, not the daemon cwd", async () => {
@@ -1693,13 +1867,15 @@ describe("opencode2 setup", () => {
     expect(getSessionDirectory("s-other")).toBeUndefined()
   })
 
-  test("a failed session lookup does not throw and leaves the directory unset", async () => {
+  test("a failed permission lookup leaves ordinary context usable and the directory unset", async () => {
     clearSessionDirectories()
     const { ctx, hooks } = fakeContext()
     await setupPlugin(ctx)
 
     const hook = hooks.get("session.context")!
-    await hook({ sessionID: "s-unknown", agent: "build", model: { providerID: "cursor" } })
+    const event = { sessionID: "s-unknown", agent: "build", model: { providerID: "cursor" }, options: {} as Record<string, unknown> }
+    await hook(event)
+    expect(event.options.opencodeSessionPermissionsUnavailable).toBe(true)
 
     expect(getSessionDirectory("s-unknown")).toBeUndefined()
   })
@@ -1743,6 +1919,104 @@ describe("opencode2 setup", () => {
 
     await cleanup()
     expect(queueHostAgentModeSwitch({ sessionID: "s-mode", targetModeID: "plan" })).toBe(false)
+  })
+
+  test("does not cancel and resume a Run for an already selected native agent", async () => {
+    const { ctx } = fakeContext()
+    const calls: string[] = []
+    ctx.session.switchAgent = async () => { calls.push("switch") }
+    ctx.session.synthetic = async () => { calls.push("continue"); return {} }
+    await setupPlugin(ctx)
+    const accepted: boolean[] = []
+    for (const [hostAgent, targetModeID] of [["plan", "plan"], ["plan", "spec"], ["build", "agent"], ["build", "debug"]]) {
+      accepted.push(queueHostAgentModeSwitch({ sessionID: "s-same-agent", hostAgent, targetModeID, cursorSessionID: "run" }))
+      await flushHostAgentModeSwitch("s-same-agent", { cursorSessionID: "run", terminal: true })
+    }
+    expect(accepted).toEqual([false, false, false, false])
+    expect(calls).toEqual([])
+  })
+
+  // A host event stream the test feeds while the plugin runs.
+  function liveEvents() {
+    const queue: unknown[] = []
+    let wake: (() => void) | undefined
+    return {
+      subscribe: ({ signal }: { signal?: AbortSignal } = {}) => (async function* () {
+        const aborted = new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }))
+        while (!signal?.aborted) {
+          while (queue.length) yield queue.shift()
+          await Promise.race([new Promise<void>((resolve) => { wake = resolve }), aborted])
+        }
+      })(),
+      push(event: unknown) {
+        queue.push(event)
+        wake?.()
+      },
+    }
+  }
+
+  test.each(["plan", "agent"])("waits for the matching switch note despite unrelated synthetic items (mode=%s)", async mode => {
+    const { ctx } = fakeContext()
+    const events = liveEvents()
+    ctx.event.subscribe = events.subscribe
+    const order: string[] = []
+    ctx.session.switchAgent = async ({ sessionID, agent }: { sessionID: string; agent: string }) => {
+      order.push(`switch:${agent}`)
+      order.push("unrelated-note")
+      const nativeNote = (target: string) => target === "plan"
+        ? "<system-reminder>\nYou are in Plan mode. Discuss the plan with the user directly in the conversation.\n</system-reminder>"
+        : "<system-reminder>\nYou are NO LONGER in Plan mode. The previous Plan restrictions no longer apply.\n</system-reminder>"
+      const pushNote = (text: string) => events.push({
+        type: "session.inbox.enqueued",
+        data: { sessionID, inboxID: "msg_note", item: { type: "synthetic", delivery: "steer", payload: { text } } },
+      })
+      pushNote("A background task completed.")
+      pushNote(nativeNote(agent === "plan" ? "build" : "plan"))
+      // OpenCode's plan agent enqueues its note from an event subscriber, after the switch returns.
+      setTimeout(() => {
+        order.push("host-note")
+        pushNote(nativeNote(agent))
+      }, 30)
+    }
+    ctx.session.synthetic = async () => {
+      order.push("continue")
+      return {}
+    }
+    await setupPlugin(ctx)
+
+    expect(queueHostAgentModeSwitch({ sessionID: "s-note", targetModeID: mode, cursorSessionID: "run" })).toBe(true)
+    expect(await flushHostAgentModeSwitch("s-note", { cursorSessionID: "run", terminal: true })).toBe(true)
+    expect(order).toEqual([`switch:${mode === "plan" ? "plan" : "build"}`, "unrelated-note", "host-note", "continue"])
+  })
+
+  test("continues a native switch when the host enqueues no note", async () => {
+    const { ctx } = fakeContext()
+    ctx.event.subscribe = liveEvents().subscribe
+    const continued: number[] = []
+    ctx.session.switchAgent = async () => {}
+    ctx.session.synthetic = async () => {
+      continued.push(Date.now())
+      return {}
+    }
+    await setupPlugin(ctx)
+
+    const started = Date.now()
+    expect(queueHostAgentModeSwitch({ sessionID: "s-quiet", targetModeID: "agent", cursorSessionID: "run" })).toBe(true)
+    expect(await flushHostAgentModeSwitch("s-quiet", { cursorSessionID: "run", terminal: true })).toBe(true)
+    expect(continued).toHaveLength(1)
+    expect(continued[0]! - started).toBeLessThan(3_000)
+  })
+
+  test("cancels its reminder wait and does not continue after a failed native switch", async () => {
+    const { ctx } = fakeContext()
+    ctx.event.subscribe = liveEvents().subscribe
+    ctx.session.switchAgent = async () => { throw new Error("switch refused") }
+    let continued = false
+    ctx.session.synthetic = async () => { continued = true; return {} }
+    await setupPlugin(ctx)
+    expect(queueHostAgentModeSwitch({ sessionID: "s-failed-switch", targetModeID: "plan", cursorSessionID: "run" })).toBe(true)
+    expect(await flushHostAgentModeSwitch("s-failed-switch", { cursorSessionID: "run", terminal: true })).toBe(false)
+    expect(continued).toBe(false)
   })
 
   test("disposing an older setup keeps the switch and Plan directory of a newer one", async () => {

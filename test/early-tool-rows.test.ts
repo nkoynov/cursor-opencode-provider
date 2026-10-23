@@ -13,14 +13,14 @@ import {
 } from "../src/protocol/tools.js"
 import {
   EARLY_ROW_CLOSED,
+  earlyRowHandoff,
   UNBOUND_EXEC_ID,
   cursorEditAnnouncement,
-  earlyRowHandoff,
   earlyRowToolCallId,
   parseEarlyRowToolCallId,
   shouldOpenEarlyRow,
 } from "../src/early-tool-rows.js"
-import { extractTrailingToolResults, findContinuationSession, pump, resetTurnStateForTests } from "../src/language-model.js"
+import { deliverContinuationResults, extractTrailingToolResults, findContinuationSession, pump, resetTurnStateForTests } from "../src/language-model.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { sessionFixture } from "./session-fixture.js"
 
@@ -38,11 +38,6 @@ function tempDir(): string {
   return dir
 }
 
-function existingFile(): string {
-  const file = path.join(tempDir(), "existing.txt")
-  fs.writeFileSync(file, "one\n")
-  return file
-}
 
 function partial(callId: string, filePath: string): Uint8Array {
   return encodeMessage("AgentServerMessage", {
@@ -86,10 +81,10 @@ const canChmod = process.platform !== "win32" && process.getuid?.() !== 0
  * an unreadable file's containment is unproven and it is treated as external.
  * Either way OpenCode's `read` answers it.
  */
-function lockedFileAnswer(locked: string): "host" | "external" {
+function lockedFileAnswer(locked: string): "host-complete" | "external" {
   try {
     fs.realpathSync(locked)
-    return "host"
+    return "host-complete"
   } catch {
     return "external"
   }
@@ -153,6 +148,18 @@ async function run(session: CursorSession, parts: any[]): Promise<void> {
   await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
 }
 
+/** Authorize the exact read through the host before the provider upgrades capped content. */
+async function authorizeEditRead(session: CursorSession, parts: any[], execId: number): Promise<void> {
+  const read = parts.find(part => part.type === "tool-call" && part.toolName === "read")
+  expect(read).toBeDefined()
+  expect(parts.some(part => part.type === "tool-input-start")).toBe(false)
+  expect(await deliverContinuationResults(session, [{
+    sessionId: session.sessionId, execId, toolCallId: read.toolCallId,
+    toolName: "read", output: "[Partial read: host-capped content]",
+  }])).toBe(session)
+  parts.length = 0
+}
+
 describe("hostToolForCursorEdit", () => {
   it("predicts edit for an existing file, write for a new or empty one, and withholds a patch that would change CRLF", () => {
     const dir = tempDir()
@@ -186,7 +193,7 @@ describe("hostToolForCursorEdit", () => {
 })
 
 describe("cursorEditReadAnswer", () => {
-  it("answers workspace files and missing targets itself, and leaves outside or ineligible files to the host", () => {
+  it("requires host authorization for existing files and answers missing targets itself", () => {
     const workspace = tempDir()
     const inside = path.join(workspace, "inside.txt")
     const empty = path.join(workspace, "empty.txt")
@@ -211,10 +218,10 @@ describe("cursorEditReadAnswer", () => {
     fs.symlinkSync(workspace, rootLink)
 
     const cases: Array<[string, string, string, ReturnType<typeof cursorEditReadAnswer>, boolean]> = [
-      ["regular workspace file", inside, workspace, "complete", false],
-      ["empty workspace file", empty, workspace, "complete", false],
-      ["workspace file through a symlinked root", path.join(rootLink, "inside.txt"), rootLink, "complete", false],
-      ["outside symlink into the workspace", linkIn, workspace, "complete", false],
+      ["regular workspace file", inside, workspace, "host-complete", true],
+      ["empty workspace file", empty, workspace, "host-complete", true],
+      ["workspace file through a symlinked root", path.join(rootLink, "inside.txt"), rootLink, "host-complete", true],
+      ["outside symlink into the workspace", linkIn, workspace, "host-complete", true],
       ["missing workspace file", path.join(workspace, "new.txt"), workspace, "empty", false],
       ["missing outside file", path.join(outsideDir, "new.txt"), workspace, "empty", false],
       ["existing outside file", outside, workspace, "external", true],
@@ -300,7 +307,6 @@ describe("early edit rows", () => {
   it("binds the announced row to the exec and routes its result", async () => {
     const dir = tempDir()
     const target = path.join(dir, "notes.txt")
-    fs.writeFileSync(target, "line one\nline two\n")
     const callId = "edit-1"
     const { session, parts } = pumpSession([
       partial(callId, target),
@@ -335,7 +341,7 @@ describe("early edit rows", () => {
 
     const start = parts.find((part) => part.type === "tool-input-start")
     const call = parts.find((part) => part.type === "tool-call" && !part.providerExecuted)
-    expect(start?.toolName).toBe("edit")
+    expect(start?.toolName).toBe("write")
     expect(call?.toolCallId).toBe(start?.id)
     expect(call?.toolCallId.startsWith("cursor-early_")).toBe(true)
     expect(parts.filter((part) => part.type === "tool-call" && !part.providerExecuted)).toHaveLength(1)
@@ -348,7 +354,7 @@ describe("early edit rows", () => {
         content: [{
           type: "tool-result",
           toolCallId: call.toolCallId,
-          toolName: "edit",
+          toolName: "write",
           output: { type: "text", value: "ok" },
         }],
       },
@@ -458,13 +464,20 @@ describe("early edit rows", () => {
     expect(parts.filter((part) => part.type === "tool-result" && part.isError)).toEqual([])
   }
 
-  function expectBoundRow(parts: any[], toolName: string | null): void {
+  function expectBoundRow(parts: any[], toolName: string | null, authorizedRead = false): void {
     expectNoFailedRow(parts)
     const starts = parts.filter((part) => part.type === "tool-input-start")
     const calls = parts.filter((part) => part.type === "tool-call")
     if (toolName === null) {
       expect(starts).toEqual([])
       expect(calls).toEqual([])
+      return
+    }
+    if (authorizedRead) {
+      expect(starts).toEqual([])
+      expect(calls).toHaveLength(1)
+      expect(calls[0]).toMatchObject({ toolName })
+      expect(calls[0].toolCallId.startsWith("cursor_")).toBe(true)
       return
     }
     expect(starts).toHaveLength(1)
@@ -480,7 +493,7 @@ describe("early edit rows", () => {
     label: string
     skip?: boolean
     setup(workspace: string): string
-    /** Only a read whose containment is unproven is upgraded once the host authorizes it. */
+    /** Eligible correlated reads are upgraded only after the host authorizes them. */
     authorizes(file: string): boolean
   }> = [
     {
@@ -512,7 +525,7 @@ describe("early edit rows", () => {
         fs.chmodSync(locked, 0o000)
         return locked
       },
-      authorizes: (file) => lockedFileAnswer(file) === "external",
+      authorizes: () => true,
     },
   ]
   for (const target of hostReadTargets) {
@@ -538,7 +551,7 @@ describe("early edit rows", () => {
     }
   }
 
-  // The provider answers each of these reads, so the row binds to the edit's mutation.
+  // Existing files require a host read; missing targets retain the early mutation row.
   const providerReadTargets: Array<{
     label: string
     setup(workspace: string): { root: string; file: string }
@@ -615,7 +628,7 @@ describe("early edit rows", () => {
   ]
   for (const target of providerReadTargets) {
     for (const catalog of catalogs) {
-      it(`keeps the row for ${target.label} and binds it to the edit (${catalog.label})`, async () => {
+      it(`routes the read and mutation of ${target.label} (${catalog.label})`, async () => {
         const { root, file } = target.setup(tempDir())
         // A refused edit keeps the step open until Cursor ends its turn.
         const { session, parts } = catalogSession(
@@ -624,8 +637,13 @@ describe("early edit rows", () => {
           root,
         )
         await run(session, parts)
+        const authorizedRead = session.pending.has(17)
+        if (authorizedRead) {
+          await authorizeEditRead(session, parts, 17)
+          await run(session, parts)
+        }
 
-        expectBoundRow(parts, target.tool[catalog.fileTool])
+        expectBoundRow(parts, target.tool[catalog.fileTool], authorizedRead)
         if (target.tool[catalog.fileTool] === null) {
           expect(parts.at(-1)).toMatchObject({ type: "finish", finishReason: { unified: "stop" } })
         }
@@ -663,7 +681,7 @@ describe("early edit rows", () => {
   // announcement may open a row while the step waits for its other calls.
   for (const order of ["outside first", "inside first"] as const) {
     for (const catalog of catalogs) {
-      it(`skips only the host-read edit's row in a parallel step, ${order} (${catalog.label})`, async () => {
+      it(`opens no edit rows before either authorized read in a parallel step, ${order} (${catalog.label})`, async () => {
         const workspace = tempDir()
         const inside = path.join(workspace, "inside.txt")
         fs.writeFileSync(inside, "one\n")
@@ -682,24 +700,16 @@ describe("early edit rows", () => {
         await run(session, parts)
 
         expectNoFailedRow(parts)
-        const starts = parts.filter((part) => part.type === "tool-input-start")
+        expect(parts.filter((part) => part.type === "tool-input-start")).toEqual([])
         const calls = parts.filter((part) => part.type === "tool-call")
-        // Fork tool-call order: the edit and the host read do not share a step, and no row opens
-        // for an edit announced behind an unfinished one, so this pass carries only the first call.
-        expect(calls).toHaveLength(1)
-        if (order === "outside first") {
-          expect(calls[0]).toMatchObject({ toolName: "read" })
-          expect(calls[0].toolCallId.startsWith("cursor_")).toBe(true)
-          expect(starts).toHaveLength(0)
-        } else {
-          expect(starts).toHaveLength(1)
-          expect(starts[0]).toMatchObject({ toolName: replacesText[catalog.fileTool] })
-          expect(calls[0]).toMatchObject({ toolCallId: starts[0].id, toolName: replacesText[catalog.fileTool] })
-        }
+        // Fork tool-call order: an edit waits for the calls written before it, so this pass
+        // carries only the first edit's authorized read.
+        expect(calls.map((call) => call.toolName)).toEqual(["read"])
+        expect(calls[0].toolCallId.startsWith("cursor_")).toBe(true)
         expect(parts.filter((part) => part.type === "finish").map((part) => part.finishReason.unified))
           .toEqual(["tool-calls"])
         sessionManager.resolve(session.sessionId, 3)
-        sessionManager.resolve(session.sessionId, 6)
+        sessionManager.resolve(session.sessionId, 5)
       })
     }
   }
@@ -717,25 +727,11 @@ describe("early edit rows", () => {
         workspace,
       )
       await run(session, parts)
-
-      if (catalog.fileTool !== "native") {
-        expectBoundRow(parts, catalog.fileTool)
-        sessionManager.resolve(session.sessionId, 18)
-        return
-      }
-      // The row cannot become `write` once started, so it completes and names the call that carries on.
-      const start = parts.find((part) => part.type === "tool-input-start")
-      const handoff = parts.find((part) => part.type === "tool-result" && part.toolCallId === start?.id)
-      const write = parts.find((part) => part.type === "tool-call" && !part.providerExecuted)
-      expect(start).toMatchObject({ toolName: "edit" })
-      expect(parts.find((part) => part.type === "tool-call" && part.providerExecuted))
-        .toMatchObject({ toolCallId: start?.id, toolName: "edit" })
-      expect(handoff).toMatchObject({ toolName: "edit", result: earlyRowHandoff("write"), isError: false })
-      expect(parts.filter((part) => part.type === "tool-result" && part.isError)).toEqual([])
-      expect(write).toMatchObject({ toolName: "write" })
-      expect(write.toolCallId.startsWith("cursor_")).toBe(true)
-      expect(JSON.parse(write.input)).toMatchObject({ content: "one\n" })
-      expect(parts.findIndex((part) => part === handoff)).toBeLessThan(parts.findIndex((part) => part === write))
+      await authorizeEditRead(session, parts, 17)
+      await run(session, parts)
+      expectBoundRow(parts, catalog.fileTool === "native" ? "write" : catalog.fileTool, true)
+      const write = parts.find(part => part.type === "tool-call")
+      if (catalog.fileTool === "native") expect(JSON.parse(write.input)).toMatchObject({ content: "one\n" })
       sessionManager.resolve(session.sessionId, 18)
     })
   }
@@ -744,7 +740,6 @@ describe("early edit rows", () => {
     const workspace = tempDir()
     const announced = path.join(workspace, "announced.txt")
     const other = path.join(workspace, "other.txt")
-    fs.writeFileSync(announced, "one\n")
     fs.writeFileSync(other, "two\n")
     const callId = "edit-other-read"
     // A read of another file under the edit's call id is not the edit's private read, so the host answers it.
@@ -758,15 +753,15 @@ describe("early edit rows", () => {
 
     const start = parts.find((part) => part.type === "tool-input-start")
     const read = parts.find((part) => part.type === "tool-call" && !part.providerExecuted)
-    expect(start).toMatchObject({ toolName: "edit" })
-    expect(parts.find((part) => part.type === "tool-result" && part.toolCallId === start?.id))
+    expect(start).toMatchObject({ toolName: "write" })
+    expect(parts.find(part => part.type === "tool-result" && part.toolCallId === start?.id))
       .toMatchObject({ result: earlyRowHandoff("read"), isError: false })
     expect(read).toMatchObject({ toolName: "read" })
     expect(read.toolCallId.startsWith("cursor_")).toBe(true)
     sessionManager.resolve(session.sessionId, 3)
   })
 
-  it("binds an empty file's announced row to its write, which the edit remap leaves a write", async () => {
+  it("sends an empty file's edit read to the host before any row opens", async () => {
     const dir = tempDir()
     const target = path.join(dir, "empty.txt")
     fs.writeFileSync(target, "")
@@ -788,12 +783,10 @@ describe("early edit rows", () => {
     session.requestContext.env = { workspace_paths: [dir] }
     await run(session, parts)
 
-    const start = parts.find((part) => part.type === "tool-input-start")
+    expect(parts.find((part) => part.type === "tool-input-start")).toBeUndefined()
     const calls = parts.filter((part) => part.type === "tool-call")
-    expect(start?.toolName).toBe("write")
-    expect(calls).toHaveLength(1)
-    expect(calls[0]).toMatchObject({ toolCallId: start?.id, toolName: "write" })
-    sessionManager.resolve(session.sessionId, 8)
+    expect(calls.map((call) => call.toolName)).toEqual(["read"])
+    sessionManager.resolve(session.sessionId, 7)
   })
 
   it("opens no row for a call announced behind another whose exec has not come", async () => {
@@ -887,13 +880,13 @@ describe("early edit rows", () => {
     const outside = path.join(tempDir(), "outside.txt")
     fs.writeFileSync(outside, "one\n")
     fs.symlinkSync(outside, path.join(workspace, "link.txt"))
-    expect(reaches(inside)).toBe(false)
-    expect(reaches("inside.txt")).toBe(false)
+    expect(reaches(inside)).toBe(true)
+    expect(reaches("inside.txt")).toBe(true)
     expect(reaches(path.join(workspace, "missing.txt"))).toBe(false)
     expect(reaches(path.join(path.dirname(outside), "missing.txt"))).toBe(false)
     expect(reaches(outside)).toBe(true)
     expect(reaches(path.join(workspace, "link.txt"))).toBe(true)
-    // An empty file outside the workspace also has its read sent to the host, so it gets no early `write` row.
+    // An empty file also has its read sent to the host, so it gets no early `write` row.
     const emptyOutside = path.join(path.dirname(outside), "empty.txt")
     fs.writeFileSync(emptyOutside, "")
     expect(reaches(emptyOutside)).toBe(true)
@@ -909,14 +902,14 @@ describe("early edit rows", () => {
   })
 
   it("closes the row when the exec is a different tool", async () => {
-    const file = existingFile()
+    const file = path.join(tempDir(), "announced.txt")
     const { session, parts } = pumpSession([
       partial("edit-1", file),
       encodeMessage("AgentServerMessage", {
         exec_server_message: { id: 4, shell_args: { command: "pwd", tool_call_id: "shell-1" } },
       }),
     ], [
-      { name: "edit", description: "Edit" },
+      { name: "write", description: "Write" },
       { name: "bash", description: "Shell" },
     ])
     session.requestContext.env = { workspace_paths: [path.dirname(file)] }
@@ -924,24 +917,23 @@ describe("early edit rows", () => {
     const start = parts.find((part) => part.type === "tool-input-start")
     const closed = parts.find((part) => part.type === "tool-call" && part.providerExecuted)
     const shell = parts.find((part) => part.type === "tool-call" && part.toolName === "bash")
-    expect(start?.toolName).toBe("edit")
+    expect(start?.toolName).toBe("write")
     expect(closed?.toolCallId).toBe(start?.id)
-    // The shell is another call; the announced edit never ran.
-    expect(parts.find((part) => part.type === "tool-result" && part.toolCallId === start?.id))
+    expect(parts.find(part => part.type === "tool-result" && part.toolCallId === start?.id))
       .toMatchObject({ result: EARLY_ROW_CLOSED, isError: true })
+    expect(parts.findIndex(part => part === closed)).toBeLessThan(parts.findIndex(part => part === shell))
     expect(shell?.toolCallId.startsWith("cursor_")).toBe(true)
-    expect(parts.findIndex((part) => part === closed)).toBeLessThan(parts.findIndex((part) => part === shell))
     expect(parts.at(-1)?.type).toBe("finish")
     sessionManager.resolve(session.sessionId, 4)
   })
 
   it("stays open across later text and closes before the step finishes", async () => {
-    const file = existingFile()
+    const file = path.join(tempDir(), "announced.txt")
     const { session, parts } = pumpSession([
       partial("edit-1", file),
       encodeMessage("AgentServerMessage", { interaction_update: { text_delta: { text: "still writing" } } }),
       turnEnded(),
-    ], [{ name: "edit", description: "Edit" }])
+    ], [{ name: "write", description: "Write" }])
     session.requestContext.env = { workspace_paths: [path.dirname(file)] }
     await run(session, parts)
     const startAt = parts.findIndex((part) => part.type === "tool-input-start")
@@ -951,7 +943,6 @@ describe("early edit rows", () => {
     const finishAt = parts.findIndex((part) => part.type === "finish")
     expect(startAt).toBeGreaterThanOrEqual(0)
     expect(textAt).toBeGreaterThan(startAt)
-    // Open text ends before the closing tool-call, as at every other tool-call.
     expect(textEndAt).toBeGreaterThan(textAt)
     expect(closedAt).toBeGreaterThan(textEndAt)
     expect(finishAt).toBeGreaterThan(closedAt)

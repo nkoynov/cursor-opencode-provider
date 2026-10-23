@@ -312,16 +312,22 @@ export function asyncResult(): AskQuestionResultMessage {
  * against commas, quotes and `"="` inside question or answer text, and against
  * duplicate questions. Returns undefined for a question whose anchor is
  * absent, which is treated as unanswered rather than guessed at.
+ * `singleChoice` requires one string in each expected JSON answer row;
+ * malformed structured results cannot become approval or refine feedback.
  */
 export function parseAnswerSegments(
   questions: readonly CursorAskQuestionItem[],
   output: string,
+  options: { singleChoice?: boolean } = {},
 ): Array<AnswerSegment | undefined> {
-  const fromJson = parseJsonAnswerSegments(output, questions.length)
+  const fromJson = parseJsonAnswerSegments(output, questions.length, options.singleChoice)
   if (fromJson) return fromJson
+  // An invalid structured approval cannot fall back to matching an echoed
+  // question inside arbitrary JSON text.
+  if (options.singleChoice && /^[{[]/.test(output.trim())) return questions.map(() => undefined)
   const answers: Array<AnswerSegment | undefined> = []
   let cursor = 0
-  for (const question of questions) {
+  for (const [index, question] of questions.entries()) {
     const anchor = `"${question.prompt}"="`
     const start = output.indexOf(anchor, cursor)
     if (start < 0) {
@@ -332,7 +338,7 @@ export function parseAnswerSegments(
     // The value ends at the last quote before the next anchor (or the trailing
     // `. You can now continue…`). Searching backwards from the next anchor
     // keeps quoted text inside an answer intact.
-    const nextAnchorStart = questions
+    const nextAnchorStart = questions.slice(index + 1)
       .map((other) => output.indexOf(`"${other.prompt}"="`, valueStart))
       .filter((index) => index > valueStart)
       .reduce((min, index) => (min < 0 || index < min ? index : min), -1)
@@ -365,7 +371,7 @@ function cellText(cell: unknown): AnswerSegment | undefined {
 }
 
 /** OpenCode 2 `question` output `{ answers: string[][] }`, or a JSON array of cells. */
-function parseJsonAnswerSegments(output: string, count: number): Array<AnswerSegment | undefined> | undefined {
+function parseJsonAnswerSegments(output: string, count: number, singleChoice = false): Array<AnswerSegment | undefined> | undefined {
   const trimmed = output.trim()
   if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return undefined
   let parsed: unknown
@@ -380,6 +386,11 @@ function parseJsonAnswerSegments(output: string, count: number): Array<AnswerSeg
       ? (parsed as { answers: unknown[] }).answers
       : undefined
   if (!cells) return undefined
+  if (singleChoice && (cells.length !== count || cells.some(cell =>
+    !Array.isArray(cell) || cell.length !== 1 || typeof cell[0] !== "string"))) {
+    return Array.from({ length: count }, () => undefined)
+  }
+  if (singleChoice) return cells.map((cell) => (cell as string[])[0])
   return Array.from({ length: count }, (_, index) => cellText(cells[index]))
 }
 

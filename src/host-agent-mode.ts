@@ -13,6 +13,12 @@
  */
 
 import { errorMessage, trace } from "./debug.js"
+import {
+  HOST_PLAN_AGENT,
+  hostAgentForCursorMode,
+  isHostPlanAgent,
+  type HostPrimaryAgent,
+} from "./protocol/cursor-mode.js"
 
 export type HostAgentModeSwitchInput = {
   sessionID: string
@@ -23,11 +29,14 @@ export type HostAgentModeSwitchInput = {
   hostAgent?: string
 }
 
+/** A queued switch with the host primary agent its Cursor mode selects. */
+export type HostAgentModeSwitchRequest = HostAgentModeSwitchInput & { agent: HostPrimaryAgent }
+
 export type HostAgentModeSwitchFn = (
-  input: HostAgentModeSwitchInput,
+  input: HostAgentModeSwitchRequest,
 ) => void | Promise<void>
 
-type PendingHostAgentModeSwitch = HostAgentModeSwitchInput & {
+type PendingHostAgentModeSwitch = HostAgentModeSwitchRequest & {
   attempts: number
 }
 
@@ -35,7 +44,7 @@ export type HostAgentModeSwitchOptions = {
   /** The switch also starts the host turn that continues the conversation. */
   resumesTurn?: boolean
   /** Queue-time filter: a request the switch would not apply stays provider-owned. */
-  accepts?: (input: HostAgentModeSwitchInput) => boolean
+  accepts?: (input: HostAgentModeSwitchRequest) => boolean
 }
 
 type HostAgentModeSwitchRegistration = { fn: HostAgentModeSwitchFn; options: HostAgentModeSwitchOptions }
@@ -52,15 +61,9 @@ const pending = new Map<string, PendingHostAgentModeSwitch>()
 const applying = new Map<string, PendingHostAgentModeSwitch>()
 const MAX_PENDING_HOST_AGENT_SWITCHES = 256
 
-/** True for Cursor mode ids served by the host's `plan` primary agent. */
-function isPlanModeID(targetModeID: string): boolean {
-  const mode = targetModeID.trim().toLowerCase()
-  return mode === "plan" || mode === "spec"
-}
-
 /** Synthetic user text that carries an OpenCode 1.x primary-agent switch. */
-export function hostAgentSwitchPromptText(agent: "plan" | "build"): string {
-  return agent === "plan"
+export function hostAgentSwitchPromptText(agent: HostPrimaryAgent): string {
+  return isHostPlanAgent(agent)
     ? "Plan mode is now active. Continue planning the request above under the plan-mode " +
         "instructions, and do not implement anything until the plan is approved."
     : "Plan mode has ended. Continue with the approved work."
@@ -78,18 +81,19 @@ export function hostAgentSwitchPromptText(agent: "plan" | "build"): string {
  * injected.
  */
 export function createPromptHostAgentModeSwitch(
-  prompt: (input: { sessionID: string; agent: "plan" | "build"; text: string }) => Promise<unknown>,
+  prompt: (input: { sessionID: string; agent: HostPrimaryAgent; text: string }) => Promise<unknown>,
   primaryAgents: () => ReadonlySet<string> | undefined,
-): { apply: HostAgentModeSwitchFn; accepts: (input: HostAgentModeSwitchInput) => boolean } {
+): { apply: HostAgentModeSwitchFn; accepts: (input: HostAgentModeSwitchRequest) => boolean } {
   return {
-    accepts: ({ targetModeID, hostAgent }) => {
+    accepts: ({ agent, hostAgent }) => {
       const agents = primaryAgents()
       const current = hostAgent?.trim()
       if (!agents || !current || !agents.has(current)) return false
-      return isPlanModeID(targetModeID) ? current !== "plan" && agents.has("plan") : current === "plan"
+      return isHostPlanAgent(agent)
+        ? !isHostPlanAgent(current) && agents.has(HOST_PLAN_AGENT)
+        : isHostPlanAgent(current)
     },
-    apply: async ({ sessionID, targetModeID }) => {
-      const agent = isPlanModeID(targetModeID) ? "plan" : "build"
+    apply: async ({ sessionID, agent }) => {
       await prompt({ sessionID, agent, text: hostAgentSwitchPromptText(agent) })
     },
   }
@@ -129,17 +133,22 @@ export function hostAgentModeSwitchKind(): "resumes" | "next-turn" | undefined {
   return active.options.resumesTurn === true ? "resumes" : "next-turn"
 }
 
-/** Queue only when this host installed a native primary-agent switch that accepts the request. */
+/**
+ * Queue only when this host installed a native primary-agent switch that
+ * accepts the request. A read-only mode selects no primary agent.
+ */
 export function queueHostAgentModeSwitch(input: HostAgentModeSwitchInput): boolean {
   const sessionID = input.sessionID.trim()
   const targetModeID = input.targetModeID.trim()
+  const agent = hostAgentForCursorMode(targetModeID)
   const active = activeSwitch()
-  if (!active || !sessionID || !targetModeID) return false
-  if (active.options.accepts && !active.options.accepts({ ...input, sessionID, targetModeID })) return false
+  if (!active || !sessionID || !agent) return false
+  if (active.options.accepts && !active.options.accepts({ ...input, sessionID, targetModeID, agent })) return false
   const hostAgent = input.hostAgent?.trim()
   pending.set(sessionID, {
     sessionID,
     targetModeID,
+    agent,
     ...(input.cursorSessionID ? { cursorSessionID: input.cursorSessionID } : {}),
     ...(hostAgent ? { hostAgent } : {}),
     attempts: 0,
@@ -157,14 +166,26 @@ export function queueHostAgentModeSwitch(input: HostAgentModeSwitchInput): boole
 }
 
 /**
+ * True while this Run owns a switch that starts a replacement host turn.
+ * Both entering plan and approving its execution must end the old Run first.
+ * A request without an owner (a failed apply waiting for a later terminal
+ * boundary) belongs to no Run: the next Run must do its work before applying it.
+ */
+export function isHostAgentHandoffPending(sessionID: string | undefined, cursorSessionID: string): boolean {
+  if (activeSwitch()?.options.resumesTurn !== true) return false
+  const key = sessionID?.trim()
+  const state = key ? pending.get(key) : undefined
+  return !!state?.cursorSessionID && state.cursorSessionID === cursorSessionID
+}
+
+/**
  * True while an approved switch into the host `plan` agent waits for its Run to
  * end and will itself start the plan-agent turn that continues the work.
  */
 export function isHostPlanEntryPending(sessionID: string | undefined): boolean {
   if (activeSwitch()?.options.resumesTurn !== true) return false
   const key = sessionID?.trim()
-  const target = key ? pending.get(key)?.targetModeID : undefined
-  return target !== undefined && isPlanModeID(target)
+  return !!key && isHostPlanAgent(pending.get(key)?.agent)
 }
 
 export function cancelHostAgentModeSwitch(sessionID: string | undefined): void {

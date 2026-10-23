@@ -1,16 +1,24 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test"
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test"
+import * as debug from "../src/debug.js"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { execFileSync } from "node:child_process"
+import type { LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { pathToFileURL } from "node:url"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
+import { readAllFields } from "../src/protocol/struct.js"
 import { handleInteractionQuery } from "../src/protocol/interactions.js"
+import { OPENCODE_1_TOOL_DIALECT, OPENCODE_2_TOOL_DIALECT } from "../src/protocol/tools.js"
 import {
   CREATE_PLAN_HOST_PLAN_PENDING_REASON,
   CREATE_PLAN_HOST_PLAN_WORKFLOW_REASON,
   CREATE_PLAN_NOT_APPROVED_REASON,
+  createPlanSessionEditsDeniedReason,
+  createPlanApprovalOutcome,
   createPlanApprovalQuestion,
   createPlanApproved,
+  createPlanRefineReason,
   createPlanStageInput,
   decodeCreatePlanQuery,
   renderOpencodePlanMarkdown,
@@ -25,7 +33,13 @@ import {
   resetActiveCursorModesForTests,
   setActiveCursorMode,
 } from "../src/protocol/switch-mode.js"
-import { deliverContinuationResults, preparePriorSessionForFreshTurn, pump } from "../src/language-model.js"
+import {
+  deliverContinuationResults,
+  preparePriorSessionForFreshTurn,
+  pump,
+  releaseHostNoteInjectionsForTests,
+  resetTurnStateForTests,
+} from "../src/language-model.js"
 import { resetHostPlanFilesForTests, setHostPlanFile } from "../src/host-plan-file.js"
 import {
   flushHostAgentModeSwitch,
@@ -33,6 +47,7 @@ import {
   setHostAgentModeSwitch,
 } from "../src/host-agent-mode.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
+import { sessionFixture } from "./session-fixture.js"
 import {
   hostGlobalDataDir,
   hostPlansDir,
@@ -289,12 +304,37 @@ describe("resolveCreatePlanBridge", () => {
       }),
     ).toEqual({ kind: "ack" })
   })
+
+  it("holds execution when a session edit deny would otherwise approve, exit, or ack", () => {
+    const denied = { allowTools: true, sessionEditsDenied: true, advertised }
+    expect(resolveCreatePlanBridge({ ...denied, planModeActive: true })).toEqual({ kind: "hold" })
+    expect(resolveCreatePlanBridge({ ...denied, hostAgent: "plan" })).toEqual({ kind: "hold" })
+    expect(resolveCreatePlanBridge({
+      ...denied,
+      hostAgent: "plan",
+      hostPlanFile: "/repo/.opencode/plans/17-x.md",
+      advertised: [...advertised, "plan_exit"],
+    })).toEqual({ kind: "hold" })
+    expect(resolveCreatePlanBridge(denied)).toEqual({ kind: "hold" })
+    // A host stage still reviews. A pending plan handoff and a lifecycle turn do not write.
+    expect(resolveCreatePlanBridge({ ...denied, canStage: true })).toEqual({ kind: "stage" })
+    expect(resolveCreatePlanBridge({ ...denied, hostPlanEntryPending: true })).toEqual({
+      kind: "defer",
+      reason: CREATE_PLAN_HOST_PLAN_PENDING_REASON,
+    })
+    expect(resolveCreatePlanBridge({ ...denied, allowTools: false })).toEqual({ kind: "ack" })
+  })
 })
 
-describe("createPlanApproved", () => {
+describe("createPlanApprovalOutcome", () => {
   const question = createPlanApprovalQuestion("/plans/42-demo.md")
 
   it("approves only on an explicit Yes", () => {
+    expect(createPlanApprovalOutcome(
+      `User has answered your questions: "${question}"="Yes". You can now continue.`,
+      false,
+      question,
+    )).toEqual({ kind: "approved" })
     expect(createPlanApproved(
       `User has answered your questions: "${question}"="Yes". You can now continue.`,
       false,
@@ -302,27 +342,73 @@ describe("createPlanApproved", () => {
     )).toBe(true)
   })
 
-  it("keeps planning on No, on a dismissed prompt, and on a failed one", () => {
+  it("declines No, unanswered, dismissed, failed, and bare Other", () => {
+    expect(createPlanApprovalOutcome(
+      `User has answered your questions: "${question}"="No". You can now continue.`,
+      false,
+      question,
+    )).toEqual({ kind: "declined" })
+    expect(createPlanApprovalOutcome("", false, question)).toEqual({ kind: "declined" })
+    expect(createPlanApprovalOutcome("permission denied", true, question)).toEqual({ kind: "declined" })
+    expect(createPlanApprovalOutcome(
+      `User has answered your questions: "${question}"="Other". You can now continue.`,
+      false,
+      question,
+    )).toEqual({ kind: "declined" })
     expect(createPlanApproved(
       `User has answered your questions: "${question}"="No". You can now continue.`,
       false,
       question,
     )).toBe(false)
-    expect(createPlanApproved("", false, question)).toBe(false)
-    expect(createPlanApproved("permission denied", true, question)).toBe(false)
+  })
+
+  it("treats typed freeform text as refine feedback", () => {
+    expect(createPlanApprovalOutcome(
+      `User has answered your questions: "${question}"="Add a rollback step". You can now continue.`,
+      false,
+      question,
+    )).toEqual({ kind: "refine", feedback: "Add a rollback step" })
+    expect(createPlanApprovalOutcome(
+      JSON.stringify({ answers: [["Please cover error handling too"]] }),
+      false,
+      question,
+    )).toEqual({ kind: "refine", feedback: "Please cover error handling too" })
+    expect(createPlanRefineReason("Add a rollback step")).toContain("Add a rollback step")
+    expect(createPlanRefineReason("Add a rollback step")).not.toContain("End this turn")
+  })
+
+  it("preserves an echoed review question inside feedback instead of approving its prefix", () => {
+    const feedback = `Yes", "${question}"="No, add rollback coverage`
+    const output = `User has answered your questions: "${question}"="${feedback}". You can now continue with the user's answers in mind.`
+    expect(createPlanApprovalOutcome(output, false, question)).toEqual({ kind: "refine", feedback })
+  })
+
+  it("fails closed on malformed or ambiguous single-choice JSON answers", () => {
+    for (const answers of [
+      [["Yes", null]], [["Yes", "No"]], [["No", "Revise"]],
+      [true], [123], [["Yes"], ["No"]], [[{ value: "Yes" }]],
+    ]) {
+      expect(createPlanApprovalOutcome(JSON.stringify({ answers }), false, question))
+        .toEqual({ kind: "declined" })
+    }
+    for (const output of ['{"answers":', JSON.stringify({ other: "feedback" }), "[null]"]) {
+      expect(createPlanApprovalOutcome(output, false, question)).toEqual({ kind: "declined" })
+    }
   })
 
   it("does not approve when the echoed prompt is not the one that was asked", () => {
-    expect(createPlanApproved(
+    expect(createPlanApprovalOutcome(
       `User has answered your questions: "${question}"="Yes". You can now continue.`,
       false,
       createPlanApprovalQuestion("/plans/99-other.md"),
-    )).toBe(false)
+    )).toEqual({ kind: "declined" })
   })
 
   it("approves an OpenCode 2 JSON Yes that does not echo the prompt", () => {
-    expect(createPlanApproved(JSON.stringify({ answers: [["Yes"]] }), false, question)).toBe(true)
-    expect(createPlanApproved(JSON.stringify({ answers: [["No"]] }), false, question)).toBe(false)
+    expect(createPlanApprovalOutcome(JSON.stringify({ answers: [["Yes"]] }), false, question))
+      .toEqual({ kind: "approved" })
+    expect(createPlanApprovalOutcome(JSON.stringify({ answers: [["No"]] }), false, question))
+      .toEqual({ kind: "declined" })
   })
 })
 
@@ -379,6 +465,27 @@ describe("resolveHostPlanPath / writeOpencodePlanFile", () => {
 })
 
 describe("CreatePlan interaction #7", () => {
+  it("returns a typed failure without a review when a denied plan cannot be saved", () => {
+    const payload = createPlanPayload({ name: "Denied Plan", plan: "Keep this plan" })
+    const query = decodeMessage<any>("AgentServerMessage", payload).interaction_query
+    const blockedParent = path.join(workspace, "not-a-directory")
+    fs.writeFileSync(blockedParent, "unchanged")
+    for (const options of [
+      { workspaceRoot: "" },
+      { workspaceRoot: workspace, hostPlanFile: path.join(blockedParent, "plan.md") },
+    ]) {
+      const handled = handleInteractionQuery(query, payload, { ...options, allowTools: true, sessionEditsDenied: true })
+      const result = decodeMessage<any>("AgentClientMessage", handled.reply!).interaction_response.create_plan_request_response.result
+      expect(handled.outcome).toBe("failed")
+      expect(handled.planReview).toBeUndefined()
+      expect(handled.createPlan).toBeUndefined()
+      expect(result.success).toBeUndefined()
+      expect(result.error.error).toContain(options.workspaceRoot ? "Failed to write plan file" : "requires a workspace root")
+    }
+    expect(fs.readFileSync(blockedParent, "utf8")).toBe("unchanged")
+    expect(fs.readdirSync(workspace)).toEqual(["not-a-directory"])
+  })
+
   it("does not write a plan file from a no-tool lifecycle turn", () => {
     // OpenCode's title-generation Run replays the same turn with allowTools
     // false; writing there produced a second, throwaway plan file per request.
@@ -541,27 +648,33 @@ describe("CreatePlan interaction #7", () => {
 
   it("writes nothing and tells the model to wait when host plan entry is pending", () => {
     setActiveCursorMode("plan-session", "plan")
-    const payload = createPlanPayload({
-      name: "Early Plan",
-      overview: "Raised before the host plan agent took over",
-      plan: "## Approach\n\nDo the work.\n",
-      todos: [],
-    })
-    const query = decodeMessage<any>("AgentServerMessage", payload).interaction_query
-    const handled = handleInteractionQuery(query, payload, {
-      workspaceRoot: workspace,
-      allowTools: true,
-      hostPlanEntryPending: true,
-      hostAgent: "build",
-      advertisedTools: ["question", "read", "write"],
-    })
-    expect(handled.outcome).toBe("failed")
-    expect(handled.createPlan).toBeUndefined()
-    const result = decodeMessage<any>("AgentClientMessage", handled.reply!)
-      .interaction_response.create_plan_request_response.result
-    expect(result.error.error).toBe(CREATE_PLAN_HOST_PLAN_PENDING_REASON)
-    expect(result.plan_uri).toBe("")
-    expect(fs.existsSync(hostPlansDir(workspace))).toBe(false)
+    for (const sessionPermissionsUnavailable of [false, true]) {
+      const payload = createPlanPayload({
+        name: "Early Plan",
+        overview: "Raised before the host plan agent took over",
+        plan: "## Approach\n\nDo the work.\n",
+        todos: [],
+        tool_call_id: "early-plan-call",
+      })
+      const query = decodeMessage<any>("AgentServerMessage", payload).interaction_query
+      const handled = handleInteractionQuery(query, payload, {
+        workspaceRoot: workspace,
+        allowTools: true,
+        hostPlanEntryPending: true,
+        hostAgent: "build",
+        sessionPermissionsUnavailable,
+        advertisedTools: ["question", "read", "write"],
+      })
+      expect(handled.outcome).toBe("failed")
+      expect(handled.endTurn).toBeUndefined()
+      expect(handled.deferredCreatePlanToolCallId).toBe("tool_plan")
+      expect(handled.createPlan).toBeUndefined()
+      const result = decodeMessage<any>("AgentClientMessage", handled.reply!)
+        .interaction_response.create_plan_request_response.result
+      expect(result.error.error).toBe(CREATE_PLAN_HOST_PLAN_PENDING_REASON)
+      expect(result.plan_uri).toBe("")
+      expect(fs.existsSync(hostPlansDir(workspace))).toBe(false)
+    }
   })
 
   it("points CreatePlan at the host plan workflow inside the host plan agent", () => {
@@ -608,7 +721,7 @@ function planSession(payloads: Uint8Array[], writes: Uint8Array[], advertised: s
       ? { done: false, value: { flags: 0, payload: payloads[index++] } }
       : { done: true, value: undefined },
   }
-  return {
+  return sessionFixture({
     sessionId: "create-plan-session",
     conversationId: "create-plan-conversation",
     openCodeSessionId: "create-plan-opencode-session",
@@ -635,7 +748,7 @@ function planSession(payloads: Uint8Array[], writes: Uint8Array[], advertised: s
     heartbeat: null,
     nextBridgedExecId: 900_000,
     billing: { key: "run:test", prefixTokens: 0 },
-  } as unknown as CursorSession
+  })
 }
 
 async function runCreatePlan(payloads: Uint8Array[], advertised: string[]) {
@@ -804,7 +917,10 @@ describe("deferred CreatePlan display", () => {
 })
 
 describe("CreatePlan execution approval over a held-open Run", () => {
-  afterEach(() => resetHostAgentModeSwitchForTests())
+  afterEach(() => {
+    resetHostAgentModeSwitchForTests()
+    resetTurnStateForTests()
+  })
 
   function startPlan() {
     fs.mkdirSync(path.join(workspace, ".git"))
@@ -821,7 +937,25 @@ describe("CreatePlan execution approval over a held-open Run", () => {
   }
 
   it("shows the plan in the transcript before asking to approve it", async () => {
-    const { session, parts } = await startPlan()
+    fs.mkdirSync(path.join(workspace, ".git"))
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const { session, parts } = await runCreatePlan(
+      [
+        encodeMessage("AgentServerMessage", {
+          interaction_update: { text_delta: { text: "Plan mode is active." } },
+        }),
+        encodeMessage("AgentServerMessage", {
+          interaction_update: { thinking_delta: { text: "CreatePlan is available." } },
+        }),
+        createPlanPayload({
+          name: "Held Plan",
+          overview: "Approve before executing",
+          plan: "## Approach\n\nImplement it.\n",
+          todos: [],
+        }),
+      ],
+      ["question", "read", "write", "todowrite"],
+    )
 
     const text = parts
       .filter((part: any) => part.type === "text-delta")
@@ -831,10 +965,22 @@ describe("CreatePlan execution approval over a held-open Run", () => {
     expect(text).toContain("Implement it.")
     expect(text).toContain("Plan saved to ")
 
-    const textIndex = parts.findIndex((part: any) => part.type === "text-delta")
+    const reasoningEnd = parts.findIndex((part: any) => part.type === "reasoning-end")
+    const planStart = parts.findIndex((part: any) => part.type === "text-start" && part.id !== "text")
+    expect(reasoningEnd).toBeGreaterThanOrEqual(0)
+    expect(planStart).toBeGreaterThan(reasoningEnd)
+    const planId = parts[planStart].id as string
+    const planDelta = parts
+      .filter((part: any) => part.type === "text-delta" && part.id === planId)
+      .map((part: any) => part.delta)
+      .join("")
+    expect(planDelta).toContain("# Held Plan")
+    expect(planDelta).toContain("Implement it.")
+    expect(planDelta).not.toContain("Plan mode is active.")
+    const planEnd = parts.findIndex((part: any) => part.type === "text-end" && part.id === planId)
     const callIndex = parts.findIndex((part: any) => part.type === "tool-call")
-    expect(textIndex).toBeGreaterThanOrEqual(0)
-    expect(textIndex).toBeLessThan(callIndex)
+    expect(planEnd).toBeGreaterThan(planStart)
+    expect(planEnd).toBeLessThan(callIndex)
     const question = JSON.parse(parts[callIndex].input).questions[0].question as string
     expect(question).not.toContain("Implement it.")
     sessionManager.close(session, "ordinary-cleanup")
@@ -914,7 +1060,127 @@ describe("CreatePlan execution approval over a held-open Run", () => {
     if (!session.closed) sessionManager.close(session, "ordinary-cleanup")
   })
 
-  it("keeps planning when the user answers No", async () => {
+  it.each([false, true])("ends the approved plan Run before the resuming build turn (canceled=%s)", async canceled => {
+    const writes: Uint8Array[] = []
+    const session = planSession([], writes, ["question", "write", "todowrite"])
+    session.hostAgent = "plan"
+    sessionManager.registerPending(900_000, session, "create_plan_request_response", "question", false, {
+      interactionId: 42, createPlanBridgeKind: "approve",
+      createPlanQuestion: "Approve this plan?", planUri: "file:///plans/review.md",
+    })
+    const switched: string[] = []
+    setHostAgentModeSwitch(({ targetModeID }) => { switched.push(targetModeID) }, { resumesTurn: true })
+    await deliverContinuationResults(session, [{
+      toolCallId: "approval", sessionId: session.sessionId, execId: 900_000,
+      toolName: "question", output: JSON.stringify({ answers: [["Yes"]] }),
+    }], { hostAgent: "plan" })
+    const frames: Frame[] = [
+      // Work generated before cancellation arrives must never reach the host.
+      ...["tool_call_started", "tool_call_completed"].map(kind => ({ flags: 0, payload: encodeMessage("AgentServerMessage", {
+        interaction_update: { [kind]: {
+          call_id: "late-plan-display",
+          tool_call: { create_plan_tool_call: { args: {
+            name: "Late plan", plan: "Work under the next agent.",
+            todos: [{ id: "late", content: "Must not mirror", status: 1 }],
+          } } },
+        } },
+      }) })),
+      { flags: 0, payload: encodeMessage("AgentServerMessage", {
+        exec_server_message: { id: 7, write_args: { path: "proof.txt", file_text: "too early" } },
+      }) },
+      canceled
+        ? { flags: 2, payload: new TextEncoder().encode('{"error":{"code":"canceled"}}') }
+        : { flags: 0, payload: encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: {} } }) },
+    ]
+    session.frames = { next: async () => frames.length ? { done: false, value: frames.shift()! } : { done: true, value: undefined } }
+    const parts: any[] = []
+    await pump(session, {
+      enqueue(part: unknown) { parts.push(part) }, error() {},
+    } as ReadableStreamDefaultController<never>, { textId: "text", reasoningId: "reasoning" })
+    expect(decodeMessage<any>("AgentClientMessage", writes[0]!).interaction_response
+      .create_plan_request_response.result.success).toBeDefined()
+    expect(decodeMessage<any>("AgentClientMessage", writes[1]!).conversation_action
+      .cancel_action.reason).toBe("host_plan_agent_handoff")
+    expect(parts.some(part => part.type === "tool-call")).toBe(false)
+    expect(session.pending.size).toBe(0)
+    expect(session.closed).toBe(true)
+    expect(parts.at(-1)?.finishReason.unified).toBe("stop")
+    expect(switched).toEqual([])
+    expect(await flushHostAgentModeSwitch(session.openCodeSessionId, {
+      cursorSessionID: session.sessionId, terminal: session.closed, pendingExecs: session.pending.size,
+    })).toBe(true)
+    expect(switched).toEqual(["agent"])
+  })
+
+  for (const bridge of ["approve", "exit", "stage"] as const) {
+    for (const canceled of [false, true]) {
+      it(`stops the turn after a declined ${bridge} review (canceled=${canceled})`, async () => {
+        setActiveCursorMode("create-plan-opencode-session", "plan")
+        const writes: Uint8Array[] = []
+        const session = planSession([], writes, ["question", "write", "shell", "cursor_image_save"])
+        session.hostAgent = "plan"
+        sessionManager.registerPending(900_000, session, "create_plan_request_response", "question", false, {
+          interactionId: 42, createPlanBridgeKind: bridge,
+          createPlanQuestion: "Approve this plan?", planUri: "file:///plans/review.md",
+        })
+        await deliverContinuationResults(session, [{
+          toolCallId: "declined-review", sessionId: session.sessionId, execId: 900_000,
+          toolName: "question", output: JSON.stringify({ answers: [["No"]] }),
+          ...(bridge === "stage" ? { error: "Plan refinement requested." } : {}),
+        }], { hostAgent: "plan" })
+        const projectDir = path.join(workspace, "runtime")
+        const spill = path.join(projectDir, "agent-tools", "12345678-1234-1234-1234-123456789abc.txt")
+        session.requestContext.env = { workspace_paths: [workspace], project_folder: projectDir }
+        const frames: Frame[] = [
+          { flags: 0, payload: encodeMessage("AgentServerMessage", {
+            exec_server_message: { id: 9, write_args: { path: spill, file_text: "must-not-spill" } },
+          }) },
+          { flags: 0, payload: encodeMessage("AgentServerMessage", {
+            exec_server_message: { id: 10, git_diff_request: { cwd: workspace } },
+          }) },
+          { flags: 0, payload: encodeMessage("AgentServerMessage", {
+            interaction_update: { text_delta: { text: "Continuing the self-test" } },
+          }) },
+          { flags: 0, payload: encodeMessage("AgentServerMessage", {
+            exec_server_message: { id: 7, shell_args: { command: "echo must-not-run" } },
+          }) },
+          { flags: 0, payload: encodeMessage("AgentServerMessage", {
+            exec_server_message: { id: 8, write_args: { path: "after-decline.txt", file_text: "must-not-write" } },
+          }) },
+          canceled
+            ? { flags: 2, payload: new TextEncoder().encode('{"error":{"code":"canceled"}}') }
+            : { flags: 0, payload: encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: {} } }) },
+        ]
+        session.frames = { next: async () => frames.length ? { done: false, value: frames.shift()! } : { done: true, value: undefined } }
+        session.reopenWithUserMessage = async () => { throw new Error("A declined turn must not continue itself") }
+        const parts: Array<{ type: string; delta?: string; finishReason?: { unified: string } }> = []
+        try {
+          await pump(session, {
+            enqueue(part: unknown) { parts.push(part as typeof parts[number]) }, error() {},
+          } as ReadableStreamDefaultController<never>, { textId: "text", reasoningId: "reasoning" })
+          expect(decodeMessage<any>("AgentClientMessage", writes[0]!).interaction_response
+            .create_plan_request_response.result.error).toBeDefined()
+          expect(decodeMessage<any>("AgentClientMessage", writes[1]!).conversation_action
+            .cancel_action.reason).toBe("plan_execution_declined")
+          expect(parts.some(part => part.type === "tool-call" || part.type === "text-delta")).toBe(false)
+          expect(parts.at(-1)?.finishReason?.unified).toBe("stop")
+          expect(session.closed).toBe(true)
+          expect(isCursorPlanModeActive("create-plan-opencode-session")).toBe(true)
+          expect(fs.existsSync(path.join(workspace, "after-decline.txt"))).toBe(false)
+          expect(fs.existsSync(spill)).toBe(false)
+          const replies = writes.map(bytes => decodeMessage<any>("AgentClientMessage", bytes))
+          expect(replies.find(reply => reply.exec_client_message?.id === 9)
+            ?.exec_client_message.write_result.error.error).toContain("End this turn")
+          expect(replies.find(reply => reply.exec_client_control_message?.throw?.id === 10)
+            ?.exec_client_control_message.throw.error).toContain("End this turn")
+        } finally {
+          sessionManager.close(session, "ordinary-cleanup")
+        }
+      })
+    }
+  }
+
+  it("keeps the plan agent selected when the user answers No", async () => {
     const { session, writes, parts } = await startPlan()
     const toolCall = parts.find((part: any) => part.type === "tool-call")
     const question = JSON.parse(toolCall.input).questions[0].question as string
@@ -932,9 +1198,463 @@ describe("CreatePlan execution approval over a held-open Run", () => {
     const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
       .interaction_response.create_plan_request_response.result
     expect(result.error.error).toBe(CREATE_PLAN_NOT_APPROVED_REASON)
+    expect(session.planReviewDeclined).toBe(true)
     expect(isCursorPlanModeActive("create-plan-opencode-session")).toBe(true)
     expect(switched).toEqual([])
     sessionManager.close(session, "ordinary-cleanup")
+  })
+
+  it("leaves native continuation to the host when an approval has no switch callback", async () => {
+    resetHostAgentModeSwitchForTests()
+    const { session, parts } = await startPlan()
+    const call = parts.find((part: { type: string }) => part.type === "tool-call")
+    using trace = spyOn(debug, "trace").mockImplementation(() => {})
+    try {
+      await deliverContinuationResults(session, [{
+        toolCallId: call.toolCallId, sessionId: session.sessionId, execId: 900_000,
+        toolName: "question", output: JSON.stringify({ answers: [["Yes"]] }),
+      }], { hostAgent: "plan" })
+      expect(getActiveCursorMode(session.openCodeSessionId)).toBe("agent")
+      expect(session.planReviewDeclined).toBeFalsy()
+      expect(await flushHostAgentModeSwitch(session.openCodeSessionId, {
+        cursorSessionID: session.sessionId, terminal: true, pendingExecs: 0,
+      })).toBe(false)
+      expect(trace.mock.calls.some(([line]) => line.includes("the host must start the build turn"))).toBe(true)
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+    }
+  })
+
+  it.each([
+    ["plan", false], ["mode", false], ["stage", false],
+    ["plan", true], ["mode", true], ["stage", true],
+  ] as const)("does not let a %s approval in the same batch override No (approval first=%s)", async (late, reverse) => {
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const writes: Uint8Array[] = []
+    const session = planSession([], writes, ["question", "write"])
+    const switched: string[] = []
+    setHostAgentModeSwitch(({ targetModeID }) => { switched.push(targetModeID) }, { resumesTurn: true })
+    for (const id of [900_000, 900_001]) {
+      const second = id === 900_001
+      sessionManager.registerPending(id, session,
+        second && late === "mode" ? "switch_mode_request_response"
+          : second && late === "stage" ? "mcp_result" : "create_plan_request_response",
+        second && late === "stage" ? "cursor_plan_stage" : "question", false, {
+        interactionId: id, createPlanBridgeKind: "approve", createPlanQuestion: "Approve?", planUri: "file:///plans/review.md",
+        switchModeTarget: "agent", switchModeBridgeKind: "native",
+      })
+    }
+    try {
+      const results = ["No", "Yes"].map((answer, index) => ({
+        toolCallId: `review-${index}`, sessionId: session.sessionId, execId: 900_000 + index,
+        toolName: index === 1 && late === "stage" ? "cursor_plan_stage" : "question",
+        output: JSON.stringify({ answers: [[answer]] }),
+      }))
+      await deliverContinuationResults(session, reverse ? results.reverse() : results, { hostAgent: "plan" })
+      expect(getActiveCursorMode(session.openCodeSessionId)).toBe("plan")
+      expect(await flushHostAgentModeSwitch(session.openCodeSessionId, {
+        cursorSessionID: session.sessionId, terminal: true, pendingExecs: 0,
+      })).toBe(false)
+      expect(switched).toEqual([])
+      let declined = false
+      for (const frame of writes) {
+        const reply = decodeMessage<{ interaction_response: {
+          create_plan_request_response?: { result: { success?: unknown; error?: unknown } }
+          switch_mode_request_response?: { rejected?: unknown }
+        } }>("AgentClientMessage", frame).interaction_response
+        if (reply?.create_plan_request_response) {
+          if (!reverse) expect(reply.create_plan_request_response.result.success).toBeUndefined()
+          declined ||= reply.create_plan_request_response.result.error !== undefined
+        } else if (reply?.switch_mode_request_response && !reverse) {
+          expect(reply.switch_mode_request_response.rejected).toBeDefined()
+        }
+      }
+      expect(declined).toBe(true)
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+    }
+  })
+
+  it.each(["prose", "json", "quoted-prose"])("continues freeform refinement in plan mode (%s)", async format => {
+    const { session, writes, parts } = await startPlan()
+    const toolCall = parts.find((part: any) => part.type === "tool-call")
+    const question = JSON.parse(toolCall.input).questions[0].question as string
+    const switched: string[] = []
+    setHostAgentModeSwitch(({ targetModeID }) => { switched.push(targetModeID) })
+    const feedback = format === "quoted-prose"
+      ? `Yes", "${question}"="No, add rollback coverage`
+      : "Add a rollback step and cover error handling"
+    using trace = spyOn(debug, "trace").mockImplementation(() => {})
+
+    await deliverContinuationResults(session, [{
+      toolCallId: toolCall.toolCallId,
+      sessionId: session.sessionId,
+      execId: 900_000,
+      toolName: "question",
+      output: format === "json" ? JSON.stringify({ answers: [[feedback]] })
+        : `User has answered your questions: "${question}"="${feedback}". You can now continue.`,
+    }] as any, { hostAgent: "plan" })
+
+    const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
+      .interaction_response.create_plan_request_response.result
+    expect(result.error.error).toBe(createPlanRefineReason(feedback))
+    expect(result.error.error).toContain(feedback)
+    expect(result.error.error).not.toContain("End this turn")
+    expect(trace.mock.calls.some(([line]) => line.includes("create_plan: emulated approval=no outcome=refine"))).toBe(true)
+    expect(session.planReviewDeclined).toBeFalsy()
+    expect(isCursorPlanModeActive("create-plan-opencode-session")).toBe(true)
+    expect(switched).toEqual([])
+    sessionManager.close(session, "ordinary-cleanup")
+  })
+
+  it("keeps a declined review's host notes for the next user turn instead of injecting them", async () => {
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const writes: Uint8Array[] = []
+    const session = planSession([], writes, ["question", "write"])
+    session.hostAgent = "plan"
+    sessionManager.registerPending(900_000, session, "create_plan_request_response", "question", false, {
+      interactionId: 42, createPlanBridgeKind: "approve",
+      createPlanQuestion: "Approve this plan?", planUri: "file:///plans/review.md",
+    })
+    try {
+      await deliverContinuationResults(session, [{
+        toolCallId: "declined-review", sessionId: session.sessionId, execId: 900_000,
+        toolName: "question", output: JSON.stringify({ answers: [["No"]] }),
+        notes: ["Background job finished."],
+      }], { hostAgent: "plan" })
+      expect(session.planReviewDeclined).toBe(true)
+      // Only the CreatePlan reply: no context injection into the declined Run.
+      expect(writes).toHaveLength(1)
+      expect(releaseHostNoteInjectionsForTests("create-plan-opencode-session").undelivered)
+        .toEqual(["Background job finished."])
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+      resetTurnStateForTests()
+    }
+  })
+
+  it("saves the plan and does not ask or switch when session edits stay denied", async () => {
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const writes: Uint8Array[] = []
+    const parts: any[] = []
+    const session = planSession(
+      [
+        createPlanPayload({
+          name: "Denied Plan",
+          overview: "Stay blocked",
+          plan: "## Approach\n\nImplement it.\n",
+          todos: [],
+        }),
+        encodeMessage("AgentServerMessage", {
+          interaction_update: { turn_ended: { input_tokens: 1, output_tokens: 1 } },
+        }),
+      ],
+      writes,
+      ["question", "read", "edit", "write", "apply_patch"],
+    )
+    session.sessionEditsDenied = true
+    const switched: string[] = []
+    setHostAgentModeSwitch(({ targetModeID }) => { switched.push(targetModeID) })
+    await pump(
+      session,
+      { enqueue(part: unknown) { parts.push(part) }, error() {} } as unknown as ReadableStreamDefaultController<any>,
+      { textId: "text", reasoningId: "reasoning" },
+    )
+    const text = parts.filter((part: any) => part.type === "text-delta").map((part: any) => part.delta).join("")
+    expect(text).toContain("# Denied Plan")
+    expect(text).toContain("Plan saved to ")
+    expect(parts.some((part: any) => part.type === "tool-call")).toBe(false)
+    const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
+      .interaction_response.create_plan_request_response.result
+    expect(result.success).toBeUndefined()
+    expect(result.plan_uri).toBe("")
+    expect(result.error.error).toContain("session's edit rule")
+    expect(result.error.error).toContain("do not write files through the shell")
+    expect(getActiveCursorMode("create-plan-opencode-session")).toBe("plan")
+    expect(switched).toEqual([])
+    sessionManager.close(session, "ordinary-cleanup")
+  })
+
+  for (const host of ["classic", "opencode2"] as const) {
+    for (const policy of ["deny", "unavailable"] as const) {
+      it(`ends an immediate held plan (${policy}) before a queued ${host} shell can write`, async () => {
+        setActiveCursorMode("create-plan-opencode-session", "plan")
+        const writes: Uint8Array[] = []
+        const session = planSession([
+          createPlanPayload({ name: "Held plan", plan: "Do not implement yet." }),
+          encodeMessage("AgentServerMessage", { interaction_update: { text_delta: { text: "Continuing anyway" } } }),
+          encodeMessage("AgentServerMessage", {
+            exec_server_message: { id: 71, shell_args: { command: "printf escaped > hold-proof.txt" } },
+          }),
+          // A known unsupported request still needs its typed refusal while
+          // cancellation drains; it must not escape as a host tool either.
+          // Independent agent.v1 fields: ASM #2, exec id #1=72,
+          // FetchArgs #20. Unsupported bodies are intentionally opaque.
+          Uint8Array.from([0x12, 0x05, 0x08, 0x48, 0xa2, 0x01, 0x00]),
+          encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: {} } }),
+        ], writes, [host === "classic" ? "bash" : "shell", "question", "read", "write"])
+        session.hostToolDialect = host === "classic" ? OPENCODE_1_TOOL_DIALECT : OPENCODE_2_TOOL_DIALECT
+        session.hostAgent = "plan"
+        session.sessionEditsDenied = policy === "deny"
+        session.sessionPermissionsUnavailable = policy === "unavailable"
+        const parts: LanguageModelV3StreamPart[] = []
+        try {
+          await pump(session, {
+            desiredSize: null,
+            close() {},
+            enqueue(part: LanguageModelV3StreamPart) {
+              parts.push(part)
+              // A host that permits shell commands can execute this even while
+              // its edit permission denies workspace mutations.
+              if (part.type === "tool-call" && (part.toolName === "bash" || part.toolName === "shell")) {
+                const input = JSON.parse(part.input) as { command: string }
+                execFileSync("/bin/sh", ["-c", input.command], { cwd: workspace })
+              }
+            },
+            error() {},
+          }, { textId: "text", reasoningId: "reasoning" })
+          expect(fs.existsSync(path.join(workspace, "hold-proof.txt"))).toBe(false)
+          expect(parts.filter(part => part.type === "tool-call")).toHaveLength(0)
+          expect(parts.flatMap(part => part.type === "text-delta" ? [part.delta] : []).join(""))
+            .not.toContain("Continuing anyway")
+          expect(fs.existsSync(hostPlansDir(workspace)) ? fs.readdirSync(hostPlansDir(workspace)) : [])
+            .toHaveLength(policy === "deny" ? 1 : 0)
+          expect(session.closed).toBe(true)
+          expect(getActiveCursorMode(session.openCodeSessionId)).toBe("plan")
+          const replies = writes.map(bytes => decodeMessage<{
+            interaction_response?: { create_plan_request_response: { result: { error: { error: string } } } }
+            conversation_action?: { cancel_action: { reason: string } }
+          }>("AgentClientMessage", bytes))
+          expect(replies[0]?.interaction_response?.create_plan_request_response.result.error.error)
+            .toContain(policy === "deny" ? "session's edit rule" : "permissions could not be read")
+          expect(replies[1]?.conversation_action?.cancel_action.reason).toBe("plan_execution_declined")
+          const fetchReply = writes.flatMap(bytes => {
+            const exec = readAllFields(bytes).find(field => field.fn === 2)?.bytes
+            return exec && readAllFields(exec).some(field => field.fn === 1 && field.varint === 72) ? [exec] : []
+          })[0]
+          const fetchResult = fetchReply && readAllFields(fetchReply).find(field => field.fn === 20)?.bytes
+          expect(fetchResult && readAllFields(fetchResult).find(field => field.fn === 2)?.wt).toBe(2)
+        } finally {
+          sessionManager.close(session, "ordinary-cleanup")
+        }
+      })
+    }
+  }
+
+  it("keeps a saved denied plan behind the stateful replay barrier after a stream drop", async () => {
+    const writes: Uint8Array[] = []
+    const session = planSession([
+      encodeMessage("AgentServerMessage", {
+        conversation_checkpoint_update: encodeMessage("ConversationStateStructure", {
+          root_prompt_messages_json: ["initial"],
+        }),
+      }),
+      createPlanPayload({ name: "Denied before EOF", plan: "Plan content" }),
+    ], writes, ["read"])
+    session.sessionEditsDenied = true
+    await expect(pump(session, {
+      enqueue() {}, error() {},
+    } as ReadableStreamDefaultController<never>, { textId: "text", reasoningId: "reasoning" }))
+      .rejects.toMatchObject({ replaySafe: false, replayBarrier: "stateful" })
+    expect(session.replaySafety?.statefulBarrier).toBe("stateful-interaction")
+    expect(session.resumeCheckpoint).toBeUndefined()
+    expect(session.checkpointRevoked).toBe(true)
+    expect(writes).toHaveLength(2)
+    expect(fs.readdirSync(hostPlansDir(workspace))).toHaveLength(1)
+    sessionManager.close(session, "ordinary-cleanup")
+  })
+
+  it("finishes an already-emitted parallel read before cancelling a held plan and refuses trailing shells", async () => {
+    fs.writeFileSync(path.join(workspace, "notes.txt"), "hello\n")
+    const writes: Uint8Array[] = []
+    const session = planSession([
+      encodeMessage("AgentServerMessage", { interaction_update: { tool_requests_listed: { call_count: 3 } } }),
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: { id: 11, call_id: "c-read", read_args: { path: "notes.txt" } },
+      }),
+      createPlanPayload({ name: "Parallel held plan", plan: "Read then hold.", tool_call_id: "c-plan" }),
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: { id: 12, call_id: "c-shell", shell_args: { command: "printf escaped > parallel-hold.txt" } },
+      }),
+      encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: {} } }),
+    ], writes, ["read", "shell", "question", "todowrite"])
+    session.permittedToolNames = new Set(["read", "shell", "question"])
+    session.sessionEditsDenied = true
+    const firstParts: LanguageModelV3StreamPart[] = []
+    try {
+      await pump(session, {
+        desiredSize: null, close() {}, error() {},
+        enqueue(part: LanguageModelV3StreamPart) { firstParts.push(part) },
+      }, { textId: "text", reasoningId: "reasoning" })
+      const calls = firstParts.filter(part => part.type === "tool-call")
+      expect(calls).toHaveLength(1)
+      expect(calls[0]).toMatchObject({ toolName: "read" })
+      expect(firstParts.at(-1)).toMatchObject({ type: "finish", finishReason: { unified: "tool-calls" } })
+      expect(session.closed).toBe(false)
+      expect(session.pending.size).toBe(1)
+
+      await deliverContinuationResults(session, [{
+        toolCallId: (calls[0] as { toolCallId: string }).toolCallId,
+        sessionId: session.sessionId,
+        execId: 11,
+        toolName: "read",
+        output: "hello\n",
+      }], { hostAgent: "plan", sessionEditsDenied: true })
+
+      const secondParts: LanguageModelV3StreamPart[] = []
+      await pump(session, {
+        desiredSize: null, close() {}, error() {},
+        enqueue(part: LanguageModelV3StreamPart) { secondParts.push(part) },
+      }, { textId: "text-2", reasoningId: "reasoning-2" })
+      expect(secondParts.filter(part => part.type === "tool-call")).toHaveLength(0)
+      expect(secondParts.at(-1)).toMatchObject({ type: "finish", finishReason: { unified: "stop" } })
+      expect(session.closed).toBe(true)
+      expect(fs.existsSync(path.join(workspace, "parallel-hold.txt"))).toBe(false)
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+    }
+  })
+
+  it("blocks direct plan_exit execs and omits unpermitted display todo mirrors", async () => {
+    const writes: Uint8Array[] = []
+    const session = planSession([
+      encodeMessage("AgentServerMessage", {
+        interaction_update: {
+          tool_call_completed: {
+            call_id: "todo-display",
+            tool_call: {
+              update_todos_tool_call: {
+                args: { todos: [{ id: "1", content: " item ", status: 1 }] },
+              },
+            },
+          },
+        },
+      }),
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: { id: 81, mcp_args: { name: "opencode-plan_exit", tool_name: "plan_exit", provider_identifier: "opencode" } },
+      }),
+      encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: {} } }),
+    ], writes, ["plan_exit", "todowrite", "read"])
+    session.permittedToolNames = new Set(["plan_exit", "read"])
+    session.sessionEditsDenied = true
+    const parts: LanguageModelV3StreamPart[] = []
+    try {
+      await pump(session, {
+        desiredSize: null, close() {}, error() {},
+        enqueue(part: LanguageModelV3StreamPart) { parts.push(part) },
+      }, { textId: "text", reasoningId: "reasoning" })
+      expect(parts.filter(part => part.type === "tool-call")).toHaveLength(0)
+      expect(session.planReviewDeclined).toBe(true)
+      expect(session.closed).toBe(true)
+      const replies = writes.map(bytes => decodeMessage<any>("AgentClientMessage", bytes))
+      expect(replies[0]?.exec_client_message?.mcp_result?.error?.error).toContain("session's edit rule")
+      expect(replies.some(reply => reply.conversation_action?.cancel_action?.reason === "plan_execution_declined")).toBe(true)
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+    }
+  })
+
+  it("refuses a direct plan_exit exec when session permissions cannot be read", async () => {
+    const writes: Uint8Array[] = []
+    const session = planSession([
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: { id: 82, mcp_args: { name: "opencode-plan_exit", tool_name: "plan_exit", provider_identifier: "opencode" } },
+      }),
+      encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: {} } }),
+    ], writes, ["plan_exit", "read"])
+    session.sessionPermissionsUnavailable = true
+    const parts: LanguageModelV3StreamPart[] = []
+    try {
+      await pump(session, {
+        desiredSize: null, close() {}, error() {},
+        enqueue(part: LanguageModelV3StreamPart) { parts.push(part) },
+      }, { textId: "text", reasoningId: "reasoning" })
+      expect(parts.filter(part => part.type === "tool-call")).toHaveLength(0)
+      expect(session.planReviewDeclined).toBe(true)
+      expect(session.closed).toBe(true)
+      const replies = writes.map(bytes => decodeMessage<any>("AgentClientMessage", bytes))
+      expect(replies[0]?.exec_client_message?.mcp_result?.error?.error).toContain("permissions could not be read")
+      expect(replies.some(reply => reply.conversation_action?.cancel_action?.reason === "plan_execution_declined")).toBe(true)
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+    }
+  })
+
+  it("bridges CreatePlan through the host plan-stage tool under bridged plan mode", async () => {
+    setActiveCursorMode("create-plan-opencode-session", "plan", { bridgedPlanEntered: true })
+    const writes: Uint8Array[] = []
+    const parts: LanguageModelV3StreamPart[] = []
+    const session = planSession([
+      createPlanPayload({ name: "Staged Plan", overview: "o", plan: "## Steps\n\n1. Stage it.\n", todos: [] }),
+      encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: {} } }),
+    ], writes, ["cursor_plan_stage", "write", "read"])
+    try {
+      await pump(session, {
+        desiredSize: null, close() {}, error() {},
+        enqueue(part: LanguageModelV3StreamPart) { parts.push(part) },
+      }, { textId: "text", reasoningId: "reasoning" })
+      const call = parts.find(part => part.type === "tool-call")
+      expect(call).toMatchObject({ toolName: "cursor_plan_stage" })
+      const input = JSON.parse((call as { input: string }).input) as {
+        title: string; plan_uri: string; content: string
+      }
+      expect(input.title).toBe("staged-plan")
+      expect(input.plan_uri).toBe("local://staged-plan-plan.md")
+      expect(input.content).toContain("1. Stage it.")
+      expect(session.pending.size).toBe(1)
+      expect(writes).toHaveLength(0)
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+    }
+  })
+
+  it("does not treat a Yes as permission to implement while session edits stay denied", async () => {
+    const { session, writes, parts } = await startPlan()
+    const toolCall = parts.find((part: any) => part.type === "tool-call")
+    const question = JSON.parse(toolCall.input).questions[0].question as string
+    const switched: string[] = []
+    setHostAgentModeSwitch(({ targetModeID }) => { switched.push(targetModeID) })
+    await deliverContinuationResults(session, [{
+      toolCallId: toolCall.toolCallId,
+      sessionId: session.sessionId,
+      execId: 900_000,
+      toolName: "question",
+      output: `User has answered your questions: "${question}"="Yes". You can now continue.`,
+    }] as any, { hostAgent: "plan", sessionEditsDenied: true })
+    const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
+      .interaction_response.create_plan_request_response.result
+    expect(result.success).toBeUndefined()
+    expect(result.plan_uri).toBe("")
+    expect(result.error.error).toContain("session's edit rule")
+    expect(isCursorPlanModeActive("create-plan-opencode-session")).toBe(true)
+    await flushHostAgentModeSwitch("create-plan-opencode-session", {
+      cursorSessionID: session.sessionId,
+      terminal: true,
+      pumpActive: false,
+      pendingExecs: 0,
+    })
+    expect(switched).toEqual([])
+    sessionManager.close(session, "ordinary-cleanup")
+  })
+
+  it("does not accept a pending review's Yes when permission lookup becomes unavailable", async () => {
+    const { session, writes, parts } = await startPlan()
+    const call = parts.find((part: { type: string }) => part.type === "tool-call")
+    try {
+      await deliverContinuationResults(session, [{
+        toolCallId: call.toolCallId, sessionId: session.sessionId, execId: 900_000,
+        toolName: "question", output: JSON.stringify({ answers: [["Yes"]] }),
+      }], { hostAgent: "plan", sessionPermissionsUnavailable: true })
+      const reply = decodeMessage<{ interaction_response: {
+        create_plan_request_response: { result: { error: { error: string }; success?: unknown } }
+      } }>("AgentClientMessage", writes[0]!).interaction_response.create_plan_request_response.result
+      expect(reply.success).toBeUndefined()
+      expect(reply.error.error).toContain("permissions could not be read")
+      expect(session.planReviewDeclined).toBe(true)
+      expect(getActiveCursorMode(session.openCodeSessionId)).toBe("plan")
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+    }
   })
 })
 
@@ -995,6 +1715,22 @@ describe("CreatePlan through a host plan-stage tool", () => {
     sessionManager.close(session, "ordinary-cleanup")
   })
 
+  it("keeps plan mode when stage success arrives under a session edit deny", async () => {
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const writes: Uint8Array[] = []
+    const session = stageSession(writes)
+    await deliverContinuationResults(session, [{
+      toolCallId: "stage-call", sessionId: session.sessionId, execId: 900_000,
+      toolName: "cursor_plan_stage", output: "Plan approved by host stage",
+    }] as any, { sessionEditsDenied: true })
+    const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
+      .interaction_response.create_plan_request_response.result
+    expect(result.success).toBeUndefined()
+    expect(result.error.error).toBe(createPlanSessionEditsDeniedReason(""))
+    expect(getActiveCursorMode("create-plan-opencode-session")).toBe("plan")
+    sessionManager.close(session, "ordinary-cleanup")
+  })
+
   it("keeps planning when delivering a successful stage reply fails", async () => {
     setActiveCursorMode("create-plan-opencode-session", "plan")
     const session = stageSession([])
@@ -1020,5 +1756,65 @@ describe("CreatePlan through a host plan-stage tool", () => {
     expect(result.error.error).toBe("Plan refinement requested.")
     expect(getActiveCursorMode("create-plan-opencode-session")).toBe("plan")
     sessionManager.close(session, "ordinary-cleanup")
+  })
+
+  it.each([
+    ["cursor_plan_stage", "deny"],
+    ["cursor_plan_stage", "unavailable"],
+    ["plan_exit", "deny"],
+    ["plan_exit", "unavailable"],
+    ["plan_exit", "declined"],
+  ] as const)("ends the turn when a direct %s exec returns under %s", async (toolName, policy) => {
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const writes: Uint8Array[] = []
+    const session = planSession([], writes, [toolName])
+    sessionManager.registerPending(44, session, "mcp_result", toolName, false)
+    try {
+      await deliverContinuationResults(session, [{
+        toolCallId: `cursor_${session.sessionId}_44`,
+        sessionId: session.sessionId,
+        execId: 44,
+        toolName,
+        output: policy === "declined" ? "User dismissed the prompt" : "approved",
+        ...(policy === "declined" ? { error: "User dismissed the prompt" } : {}),
+      }], {
+        hostAgent: policy === "declined" ? "plan" : "build",
+        sessionEditsDenied: policy === "deny",
+        sessionPermissionsUnavailable: policy === "unavailable",
+      })
+      const reply = decodeMessage<any>("AgentClientMessage", writes[0]!).exec_client_message.mcp_result
+      expect(reply.error.error).toContain(
+        policy === "unavailable"
+          ? "permissions could not be read"
+          : policy === "deny"
+            ? "session's edit rule"
+            : "User dismissed",
+      )
+      expect(session.planReviewDeclined).toBe(true)
+      expect(getActiveCursorMode("create-plan-opencode-session")).toBe("plan")
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+    }
+  })
+
+  it("ends the turn when a successful plan_exit still leaves the host on its plan agent", async () => {
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const writes: Uint8Array[] = []
+    const session = planSession([], writes, ["plan_exit"])
+    sessionManager.registerPending(45, session, "mcp_result", "plan_exit", false)
+    try {
+      await deliverContinuationResults(session, [{
+        toolCallId: `cursor_${session.sessionId}_45`,
+        sessionId: session.sessionId,
+        execId: 45,
+        toolName: "plan_exit",
+        output: "User approved switching to build agent.",
+      }], { hostAgent: "plan" })
+      expect(session.planReviewDeclined).toBe(true)
+      expect(getActiveCursorMode("create-plan-opencode-session")).toBe("plan")
+      expect(decodeMessage<any>("AgentClientMessage", writes[0]!).exec_client_message.mcp_result.error).toBeUndefined()
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+    }
   })
 })

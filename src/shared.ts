@@ -15,6 +15,13 @@ export const CURSOR_COMPACTION_OPTION = "opencodeCompaction"
 export const CURSOR_HISTORY_REWRITE_OPTION = "opencodeHistoryRewrite"
 /** Current OpenCode primary agent; used to invalidate incompatible checkpoints. */
 export const CURSOR_HOST_AGENT_OPTION = "opencodeHostAgent"
+/**
+ * The session's last `edit` rule on `*` is deny. Set by the plugin from the
+ * session payload; false when no global edit deny applies, absent without a read.
+ */
+export const CURSOR_SESSION_EDITS_DENIED_OPTION = "opencodeSessionEditsDenied"
+/** A session lookup failed twice; planning approval must fail closed, ordinary requests may proceed. */
+export const CURSOR_SESSION_PERMISSIONS_UNAVAILABLE_OPTION = "opencodeSessionPermissionsUnavailable"
 export const TOKEN_EXPIRY_THRESHOLD_S = 300
 
 export const RUN_PATH = "/agent.v1.AgentService/Run"

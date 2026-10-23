@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { pump, resetTurnStateForTests } from "../src/language-model.js"
+import { deliverContinuationResults, pump, resetTurnStateForTests } from "../src/language-model.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { toolsToDescriptors } from "../src/protocol/tools.js"
 import { sessionManager, type Frame } from "../src/session.js"
@@ -23,7 +23,7 @@ function fixture(root: string, edit: boolean, existing: boolean) {
   const frames: Frame[] = messages.map((message) => ({ flags: 0, payload: encodeMessage("AgentServerMessage", message) }))
   let reads = 0
   const writes: Uint8Array[] = []
-  const parts: Array<{ type: string }> = []
+  const parts: Array<{ type: string; toolCallId?: string }> = []
   const iterator = { next: async () => {
     reads++
     return frames.length ? { done: false as const, value: frames.shift()! } : { done: true as const, value: undefined }
@@ -58,7 +58,14 @@ describe("provider-owned read replies", () => {
         const f = fixture(root, edit, existing)
         let release!: () => void
         f.session.stream.waitForDrain = () => new Promise<void>((resolve) => { release = resolve })
-        const pumping = pump(f.session, f.controller, { textId: "t", reasoningId: "r" })
+        if (existing) await pump(f.session, f.controller, { textId: "t", reasoningId: "r" })
+        const pumping = existing
+          ? deliverContinuationResults(f.session, [{
+            sessionId: f.session.sessionId, execId: 1,
+            toolCallId: f.parts.find(part => part.type === "tool-call")!.toolCallId!,
+            toolName: "read", output: "host-authorized content",
+          }])
+          : pump(f.session, f.controller, { textId: "t", reasoningId: "r" })
         await new Promise((resolve) => setTimeout(resolve, 0))
         const whileBackpressured = { writes: f.writes.length, reads: f.reads(), waiting: typeof release === "function" }
         release?.()
@@ -66,20 +73,25 @@ describe("provider-owned read replies", () => {
         expect(whileBackpressured).toEqual({ writes: 1, reads: edit ? 2 : 1, waiting: true })
         expect(f.writes).toHaveLength(2)
         expect(decodeMessage<any>("AgentClientMessage", f.writes[1]!).exec_client_control_message.stream_close.id).toBe(1)
-        expect(f.parts.some((part) => part.type === "tool-call")).toBe(false)
+        expect(f.parts.filter((part) => part.type === "tool-call")).toHaveLength(existing ? 1 : 0)
       } finally { fs.rmSync(root, { recursive: true, force: true }) }
     })
   }
 
-  it("does not emit a host read after a buffered complete edit read fails to drain", async () => {
+  it("does not replay an authorized read after its complete reply fails to drain", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-read-failed-"))
     try {
       const f = fixture(root, true, true)
       f.session.stream.waitForDrain = async () => { throw new Error("stream closed during drain") }
-      await expect(pump(f.session, f.controller, { textId: "t", reasoningId: "r" }))
-        .rejects.toThrow("backpressure drain failed")
+      await pump(f.session, f.controller, { textId: "t", reasoningId: "r" })
+      expect(await deliverContinuationResults(f.session, [{
+        sessionId: f.session.sessionId, execId: 1,
+        toolCallId: f.parts.find(part => part.type === "tool-call")!.toolCallId!,
+        toolName: "read", output: "host-authorized content",
+      }])).toBeUndefined()
+      expect(f.session.closed).toBe(true)
       expect(f.writes).toHaveLength(1)
-      expect(f.parts.some((part) => part.type === "tool-call")).toBe(false)
+      expect(f.parts.filter((part) => part.type === "tool-call")).toHaveLength(1)
     } finally { fs.rmSync(root, { recursive: true, force: true }) }
   })
 })

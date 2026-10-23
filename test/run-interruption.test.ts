@@ -862,6 +862,43 @@ describe("interrupted Cursor Run handling", () => {
     expect(recoveries).toBe(0)
   })
 
+  for (const withOutput of [false, true]) {
+    it(`keeps an appended user message stateful without echoing it (prior output: ${withOutput})`, async () => {
+      // Shipped CLI: InteractionUpdate #6 wraps UserMessageAppendedUpdate #1.
+      const userMessage = lengthDelimitedField(1, new TextEncoder().encode("injected instructions"))
+      const appended = lengthDelimitedField(1, lengthDelimitedField(6, lengthDelimitedField(1, userMessage)))
+      const writes: Uint8Array[] = []
+      const session = fakeSession(`appended-user-${withOutput}`, [
+        ...(withOutput ? [serverFrame({ interaction_update: { text_delta: { text: "partial" } } })] : []),
+        { flags: 0, payload: appended },
+      ], writes)
+      const parts: Array<{ type: string; delta?: string }> = []
+      let recoveries = 0
+      try {
+        const failure = await pumpWithRecovery({
+          initialSession: session,
+          controller: controller(parts),
+          recover: async () => { recoveries++; return fakeSession("unused", []) },
+        }).catch((error: unknown) => error)
+
+        expect(failure).toMatchObject({ retryable: false, replaySafe: false })
+        expect((failure as { hostRetryable?: boolean }).hostRetryable).toBeUndefined()
+        expect(hostFacingError(failure)).toMatchObject({
+          isRetryable: false, responseHeaders: { "x-should-retry": "false" },
+        })
+        expect(session.replaySafety).toMatchObject({
+          statefulBarrier: "stateful-interaction", historyRebaseUnsafe: true,
+        })
+        expect(recoveries).toBe(0)
+        expect(writes).toHaveLength(0)
+        expect(parts.filter(part => part.type === "text-delta").map(part => part.delta))
+          .toEqual(withOutput ? ["partial"] : [])
+      } finally {
+        sessionManager.close(session)
+      }
+    })
+  }
+
   it("resumes the turn's latest checkpoint when a resumed attempt saved none, like Cursor CLI", async () => {
     const checkpoint = Uint8Array.from([0x0a, 0x01, 0x05])
     const sessions = [

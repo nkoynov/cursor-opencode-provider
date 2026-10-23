@@ -25,11 +25,10 @@ export type ImageSaveToolContext = {
   worktree: string
   directory: string
   /**
-   * Classic OpenCode 1.x `ToolContext.ask`. A host whose tool context has no
-   * permission prompt (OpenCode 2.0's public `ToolContext`) passes `null`
-   * explicitly: the commit then writes after containment, gated only by the
-   * tool's catalog permission. A missing `ask` is refused, never treated as
-   * permission.
+   * Classic OpenCode supplies ToolContext.ask; OpenCode 2 adapts the public
+   * plugin permission.assert API. Native entrypoints require that callback.
+   * Explicit null preserves the public API for callers that own authorization;
+   * an omitted callback is refused, never treated as permission.
    */
   ask: ((input: {
     permission: string
@@ -62,7 +61,8 @@ export function resolveContainedImagePath(
   const absolute = path.isAbsolute(target) ? path.resolve(target) : path.resolve(roots[0]!, target)
 
   // The file need not exist yet; its closest existing ancestor must still
-  // resolve inside an allowed root.
+  // resolve inside an allowed root. A dangling symlink at `probe` makes
+  // `realpathSync` throw ENOENT even though the link itself exists on disk.
   let probe = absolute
   let realProbe: string | undefined
   while (true) {
@@ -70,6 +70,9 @@ export function resolveContainedImagePath(
       realProbe = fs.realpathSync(probe)
       break
     } catch {
+      try {
+        if (fs.lstatSync(probe)) break
+      } catch { /* probe itself does not exist; inspect its parent */ }
       const parent = path.dirname(probe)
       if (parent === probe) break
       probe = parent
@@ -146,10 +149,8 @@ export async function executeCursorImageSave(
   }
 
   const workspace = ctx.worktree || ctx.directory
-  const contained = resolveContainedImagePath(
-    image.path,
-    [image.projectDir, workspace].filter((root): root is string => !!root),
-  )
+  const allowedRoots = [image.projectDir, workspace].filter((root): root is string => !!root)
+  const contained = resolveContainedImagePath(image.path, allowedRoots)
   if ("error" in contained) {
     trace(`image save: refused path=${JSON.stringify(image.path)} reason=${contained.error}`)
     throw new Error(`Refusing to save the generated image: ${contained.error}.`)
@@ -201,13 +202,26 @@ export async function executeCursorImageSave(
     throw new Error(`${IMAGE_PERMISSION_DENIED_PREFIX} ${reason}`)
   }
 
+  // Permission may wait on the user. Re-resolve afterward so a directory
+  // replaced during that wait cannot redirect the authorized write.
+  const current = resolveContainedImagePath(image.path, allowedRoots)
+  if ("error" in current || current.path !== contained.path) {
+    throw new Error(`${IMAGE_PERMISSION_DENIED_PREFIX} The image target changed while permission was pending.`)
+  }
+
   // Cursor writes generated images into an `assets/` subdirectory that will not
   // exist on a first generation, so the parent chain is created here — after
   // the permission, so a refusal leaves no directories behind.
   const directory = path.dirname(contained.path)
+  let fd: number | undefined
   try {
     fs.mkdirSync(directory, { recursive: true })
-    fs.writeFileSync(contained.path, image.data)
+    fd = fs.openSync(
+      contained.path,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | (fs.constants.O_NOFOLLOW ?? 0),
+      0o666,
+    )
+    fs.writeFileSync(fd, image.data)
   } catch (error) {
     // Most often something already occupies a path component (EEXIST/ENOTDIR).
     // Say which path is blocked; the raw errno alone tells the model nothing.
@@ -217,6 +231,8 @@ export async function executeCursorImageSave(
       `Could not save the generated image to ${contained.path}: ${reason}. `
       + `Check that ${directory} is a writable directory.`,
     )
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd)
   }
   trace(
     `image save: wrote path=${JSON.stringify(contained.path)} ` +

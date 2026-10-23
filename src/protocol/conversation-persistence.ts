@@ -23,6 +23,8 @@ export type PersistedConversation = {
   conversationId: string
   updatedAt: number
   checkpoint?: Uint8Array
+  /** Last measured occupancy, as a token-details-only checkpoint; separate from resumable state. */
+  occupancyCheckpoint?: Uint8Array
   blobs: ConversationBlobSnapshot[]
   requestContext: Record<string, unknown>
   toolCatalog: OpencodeToolDef[]
@@ -46,6 +48,8 @@ export type PersistedConversation = {
   earlySteers?: string
   /** JSON lost-request record: user text sent on a checkpoint Cursor never advanced. */
   lostRequest?: string
+  /** A session-edit-deny reminder may be in this conversation; absent means none was ever sent. */
+  sessionEditsDenySent?: boolean
 }
 
 /** Small per-session facts kept for the process; full snapshots stay on disk. */
@@ -186,6 +190,7 @@ function cloneConversation(value: PersistedConversation): PersistedConversation 
   return {
     ...value,
     checkpoint: value.checkpoint ? Uint8Array.from(value.checkpoint) : undefined,
+    ...(value.occupancyCheckpoint ? { occupancyCheckpoint: Uint8Array.from(value.occupancyCheckpoint) } : {}),
     blobs: value.blobs.map((blob) => ({ id: blob.id, data: Uint8Array.from(blob.data) })),
     requestContext: structuredClone(value.requestContext),
     toolCatalog: structuredClone(value.toolCatalog),
@@ -203,7 +208,8 @@ function cloneConversation(value: PersistedConversation): PersistedConversation 
  * post_compaction_rebase=9, host_agent=10, system_prompt_hash=11,
  * turn_provenance_json=12, host_note=13, early_steers_json=14,
  * lost_request_json=15, sent_image_hashes=16 (repeated), sent_images_checkpoint_sha256=17,
- * model_fallback_stop_json=101 (fork). Older fork builds wrote field 14 as
+ * occupancy_checkpoint=18 (token-details-only checkpoint, never Run state),
+ * session_edits_deny_sent=19, model_fallback_stop_json=101 (fork). Older fork builds wrote field 14 as
  * repeated answered-steer strings, ignored on read, and the model-fallback stop
  * as field 15, read as that stop when it is not a lost-request record.
  * Blob: id=1, data=2. Tool: name=1, description=2,
@@ -339,6 +345,8 @@ function encodeCacheFile(value: PersistedConversation): {
     writer.uint32(fieldTag(17, 2)).string(value.sentImagesCheckpoint)
   }
   if (value.modelFallbackStop) writer.uint32(fieldTag(MODEL_FALLBACK_STOP_FIELD, 2)).string(value.modelFallbackStop)
+  if (value.occupancyCheckpoint?.length) writer.uint32(fieldTag(18, 2)).bytes(value.occupancyCheckpoint)
+  if (value.sessionEditsDenySent) writer.uint32(fieldTag(19, 0)).bool(true)
   return { protobufBytes: writer.finish(), requestContextBytes: requestContext.length }
 }
 
@@ -349,6 +357,7 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
   let conversationId: string | undefined
   let updatedAt: number | undefined
   let checkpoint: Uint8Array | undefined
+  let occupancyCheckpoint: Uint8Array | undefined
   const blobs: ConversationBlobSnapshot[] = []
   let requestContextBytes: Uint8Array | undefined
   const toolCatalog: OpencodeToolDef[] = []
@@ -362,6 +371,7 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
   const sentImageHashes: string[] = []
   let sentImagesCheckpoint: string | undefined
   const earlySteerValues: string[] = []
+  let sessionEditsDenySent = false
   while (reader.pos < reader.len) {
     const tag = reader.uint32()
     const wireType = tag & 7
@@ -438,6 +448,14 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
         if (wireType !== 2) throw new Error("invalid model fallback stop")
         modelFallbackStop = reader.string()
         break
+      case 18:
+        if (wireType !== 2) throw new Error("invalid occupancy checkpoint")
+        occupancyCheckpoint = Uint8Array.from(reader.bytes())
+        break
+      case 19:
+        if (wireType !== 0) throw new Error("invalid session edits deny marker")
+        sessionEditsDenySent = reader.bool()
+        break
       default:
         reader.skipType(wireType)
     }
@@ -459,6 +477,7 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
     conversationId,
     updatedAt,
     checkpoint,
+    ...(occupancyCheckpoint ? { occupancyCheckpoint } : {}),
     blobs,
     requestContext,
     toolCatalog,
@@ -471,6 +490,7 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
     ...(sentImagesCheckpoint && sentImageHashes.length > 0 ? { sentImageHashes, sentImagesCheckpoint } : {}),
     ...(earlySteerValues.length === 1 && isEarlySteersJson(earlySteerValues[0]!) ? { earlySteers: earlySteerValues[0] } : {}),
     ...(lostRequest ? { lostRequest } : {}),
+    ...(sessionEditsDenySent ? { sessionEditsDenySent } : {}),
   }
 }
 

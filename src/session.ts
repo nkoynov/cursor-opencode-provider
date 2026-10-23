@@ -232,6 +232,8 @@ export type CursorSession = {
   resumeCheckpointAfterFrame?: number
   /** Stateful replay barriers survive host tool-step boundaries on this Run. */
   replaySafety?: ReplaySafetyState
+  /** A delivered plan result refused execution; terminate this Run without continuing. */
+  planReviewDeclined?: boolean
   /** History images this Run's checkpoints hold or may hold; absent for a Run outside an OpenCode session. */
   historyImages?: RunHistoryImages
   /** Cursor-side waits (AwaitShell) in flight, by call id. */
@@ -283,6 +285,10 @@ export type CursorSession = {
   stoppedWithSessionId?: string
   /** Host primary agent whose prompt/permissions this Run was seeded with. */
   hostAgent?: string
+  /** The session's last `edit` rule on `*` was deny when this request started. */
+  sessionEditsDenied?: boolean
+  /** The host could not provide current session permissions for this request. */
+  sessionPermissionsUnavailable?: boolean
   /** Stable host-system + provider-guidance identity for restart validation. */
   stableSystemPromptHash?: string
   /** Fresh turn resumed from a stored checkpoint; a blob miss may reseed it. */

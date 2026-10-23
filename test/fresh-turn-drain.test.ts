@@ -354,6 +354,45 @@ describe("in-session helper catalog isolation", () => {
     }
   })
 
+  it("keeps prior occupancy when a cancel checkpoint reports zero tokens", async () => {
+    const zeroCheckpoint = encodeMessage("AgentServerMessage", {
+      conversation_checkpoint_update: encodeMessage("ConversationStateStructure", {
+        root_prompt_messages_json: ["cancel"],
+        token_details: { used_tokens: 0, max_tokens: 256_000 },
+      }),
+    })
+    const session = fakeSessionWithPayloads([zeroCheckpoint])
+    session.tokenDetails = { usedTokens: 40_000, maxTokens: 256_000 }
+    session.tokenDetailsFresh = true
+    const next = session.frames.next.bind(session.frames)
+    let ended = false
+    session.frames = {
+      next: async () => {
+        const frame = await next()
+        if (!frame.done) return frame
+        if (ended) return { done: true as const, value: undefined }
+        ended = true
+        return {
+          done: false as const,
+          value: {
+            flags: 0x02,
+            payload: new TextEncoder().encode(JSON.stringify({ error: { code: "canceled" } })),
+          },
+        }
+      },
+    } as never
+    try {
+      expect(await drainSessionUntilTurnEnded(session, {
+        timeoutMs: 1_000,
+        cancelReason: "host_plan_agent_handoff",
+      })).toBe("cancelled")
+      expect(session.tokenDetails?.usedTokens).toBe(40_000)
+      expect(session.cacheDiagnostics?.tokenDetailUpdates).toBe(0)
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+    }
+  })
+
   it("finishes the drain when the terminal checkpoint cannot be saved", async () => {
     const session = fakeSessionWithPayloads([turnEndedPayload(10, 8)])
     session.conversationId = bindConversationId(session.openCodeSessionId).conversationId

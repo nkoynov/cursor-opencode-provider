@@ -2,6 +2,8 @@ import {
   CURSOR_PROVIDER_ID,
   CURSOR_COMPACTION_OPTION,
   CURSOR_HOST_AGENT_OPTION,
+  CURSOR_SESSION_EDITS_DENIED_OPTION,
+  CURSOR_SESSION_PERMISSIONS_UNAVAILABLE_OPTION,
 } from "./shared.js"
 import { createSdk, cursorApiBaseURL, cursorGetServerConfigTelemetryEnabled, isCursorPackage } from "./plugin-core.js"
 import { opencode2PlanDir, opencodeGlobalCacheDir, setNativePlansDir } from "./context/paths.js"
@@ -53,6 +55,7 @@ import { markCompactionSession } from "./compaction-marker.js"
 import { getSessionDirectory, markSessionDirectory } from "./session-directory.js"
 import { rememberHostSkillFiles } from "./context/skills.js"
 import { trace } from "./debug.js"
+import { loadSessionForPermissions, sessionRulesDenyEdits } from "./protocol/session-edits.js"
 import {
   cancelHostAgentModeSwitch,
   hostAgentSwitchPromptText,
@@ -60,10 +63,8 @@ import {
 } from "./host-agent-mode.js"
 import {
   clearActiveCursorMode,
-  getActiveCursorMode,
-  normalizeSwitchModeId,
-  setActiveCursorMode,
 } from "./protocol/switch-mode.js"
+import { isHostPlanAgent, type HostPrimaryAgent } from "./protocol/cursor-mode.js"
 import { CursorPlugin } from "./plugin.js"
 import { nativeToolRefusal, preserveNativeToolResults, type ToolRefusal } from "./opencode2/tool-results.js"
 import type { CreateCursorOptions } from "./index.js"
@@ -212,6 +213,8 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
       }
     }
 
+    // Set once the host event stream is open; a switch waits on it below.
+    let hostEventsObserved = false
     if (typeof ctx.session.switchAgent === "function") {
       const switchAgent = ctx.session.switchAgent
       const continueTurn =
@@ -221,22 +224,39 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
             ? ctx.session.prompt
             : undefined
       disposeHostAgentModeSwitch = setHostAgentModeSwitch(
-        async ({ sessionID, targetModeID }) => {
-          const agent = normalizeSwitchModeId(targetModeID) === "plan"
-            || normalizeSwitchModeId(targetModeID) === "spec"
-            ? "plan"
-            : "build"
-          await switchAgent({ sessionID, agent })
+        async ({ sessionID, agent }) => {
+          // OpenCode answers a plan/build switch with a synthetic note from an
+          // event subscriber. Continuing before that note is enqueued lets it
+          // miss the first step's promotion, so the host writes its per-request
+          // copy too and both land at the next step. Wait for the host's note.
+          const reaction = continueTurn && hostEventsObserved
+            ? waitForHostSwitchReaction(sessionID, agent, HOST_SWITCH_REACTION_TIMEOUT_MS)
+            : undefined
+          try {
+            await switchAgent({ sessionID, agent })
+          } catch (error) {
+            reaction?.cancel()
+            throw error
+          }
           // switchAgent only publishes AgentSelected and leaves the session idle.
           // Continue under the new agent the same way OpenCode 1.x promptAsync does.
           if (continueTurn) {
+            if (reaction) {
+              trace(
+                `host-agent-mode: ${await reaction.reacted ? "host enqueued its" : "no host"} switch note ` +
+                  `sessionID=${sessionID} agent=${agent}`,
+              )
+            }
             await continueTurn({
               sessionID,
               text: hostAgentSwitchPromptText(agent),
             })
           }
         },
-        continueTurn ? { resumesTurn: true } : {},
+        {
+          ...(continueTurn ? { resumesTurn: true } : {}),
+          accepts: ({ hostAgent, agent }) => hostAgent !== agent,
+        },
       )
     }
 
@@ -389,7 +409,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
         // (`CURSOR_OPENCODE2_TODOS=1`/`true` force-enables). When on, register
         // them as direct catalog tools (`codemode: false` + output schema) if
         // the host does not already own those names. When off, register none.
-        registerTodoTools(draft)
+        registerTodoTools(draft, ctx)
         registerCursorImageSaveTool(draft, ctx)
         // MCP tools default into Code Mode. Move every server that did not
         // explicitly opt in onto the direct catalog so this provider can
@@ -499,20 +519,21 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
         markCompactionAndOptions(event, event.agent === "compaction")
         event.options ??= {}
         event.options[CURSOR_HOST_AGENT_OPTION] = event.agent
-        if (event.agent !== "compaction") {
-          const activeMode = getActiveCursorMode(event.sessionID)
-          if (event.agent === "plan") {
-            if (activeMode !== "plan" && activeMode !== "spec") {
-              setActiveCursorMode(event.sessionID, "plan")
-            }
-          } else if (activeMode === "plan" || activeMode === "spec") {
-            // A direct OpenCode UI switch away from Plan is authoritative. Do
-            // not overwrite other Cursor-only modes (chat/debug/etc.) merely
-            // because their closest native primary agent is `build`.
-            setActiveCursorMode(event.sessionID, "agent")
-          }
+        delete event.options[CURSOR_SESSION_EDITS_DENIED_OPTION]
+        delete event.options[CURSOR_SESSION_PERMISSIONS_UNAVAILABLE_OPTION]
+        // Compaction cannot approve a plan; its session read stays best effort,
+        // like the classic plugin, which reads no rules for it.
+        if (event.agent === "compaction") {
+          await rememberSessionDirectory(event.sessionID)
+          return
         }
-        await rememberSessionDirectory(event.sessionID)
+        const info = await loadSessionForPermissions(() => ctx.session.get({ sessionID: event.sessionID })).catch(() => undefined)
+        if (!info) {
+          event.options[CURSOR_SESSION_PERMISSIONS_UNAVAILABLE_OPTION] = true
+          return
+        }
+        markSessionDirectory(event.sessionID, info.location.directory)
+        event.options[CURSOR_SESSION_EDITS_DENIED_OPTION] = sessionRulesDenyEdits(info.permissions)
       }),
     )
 
@@ -658,7 +679,11 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
       credentialGeneration++
     }
 
-    const unsubscribe = subscribeSessionActivity(ctx, ensureModels, onCredentialSwitch, toolLifecycle, releasePermissionCalls)
+    const unsubscribe = subscribeSessionActivity(ctx, ensureModels, onCredentialSwitch, toolLifecycle, () => {
+      hostEventsObserved = false
+      releasePermissionCalls()
+    })
+    hostEventsObserved = !!unsubscribe
 
     return async () => {
       clearInterval(retry)
@@ -691,6 +716,35 @@ async function saveOpenTurnsForShutdown(): Promise<void> {
   } finally {
     clearTimeout(timer)
   }
+}
+
+/** Upper bound on waiting for the host's note after a native agent switch. */
+const HOST_SWITCH_REACTION_TIMEOUT_MS = 1_000
+
+/** Native agent switches waiting for the matching OpenCode plan-mode reminder. */
+type SwitchReactionWaiter = { agent: HostPrimaryAgent; reacted: () => void; cancel: () => void }
+const switchReactionWaiters = new Map<string, Set<SwitchReactionWaiter>>()
+
+function waitForHostSwitchReaction(
+  sessionID: string,
+  agent: HostPrimaryAgent,
+  timeoutMs: number,
+): { reacted: Promise<boolean>; cancel(): void } {
+  let settle!: (reacted: boolean) => void
+  const reacted = new Promise<boolean>((resolve) => { settle = resolve })
+  const waiters = switchReactionWaiters.get(sessionID) ?? new Set<SwitchReactionWaiter>()
+  switchReactionWaiters.set(sessionID, waiters)
+  const done = (value: boolean) => {
+    clearTimeout(timer)
+    waiters.delete(waiter)
+    if (waiters.size === 0 && switchReactionWaiters.get(sessionID) === waiters) switchReactionWaiters.delete(sessionID)
+    settle(value)
+  }
+  const waiter: SwitchReactionWaiter = { agent, reacted: () => done(true), cancel: () => done(false) }
+  const timer = setTimeout(() => done(false), timeoutMs)
+  timer.unref?.()
+  waiters.add(waiter)
+  return { reacted, cancel: waiter.cancel }
 }
 
 function subscribeSessionActivity(
@@ -778,6 +832,7 @@ function applySessionActivity(event: any, onCredentialSwitch?: () => void): void
         forgetEarlySteers(id)
         clearActiveCursorMode(id)
         cancelHostAgentModeSwitch(id)
+        for (const waiter of [...(switchReactionWaiters.get(id) ?? [])]) waiter.cancel()
       }
       break
     }
@@ -800,6 +855,15 @@ function applySessionActivity(event: any, onCredentialSwitch?: () => void): void
     case "session.inbox.enqueued": {
       const id = payload?.sessionID
       if (id) sessionActivity.recordActivity(id)
+      if (typeof id === "string" && payload?.item?.type === "synthetic") {
+        const text = payload.item.payload?.text
+        // OpenCode's Plan plugin owns these reminders. Background notices and
+        // an older reminder for the opposite mode do not acknowledge this switch.
+        if (typeof text === "string") for (const waiter of [...(switchReactionWaiters.get(id) ?? [])]) {
+          const prefix = isHostPlanAgent(waiter.agent) ? "You are in Plan mode." : "You are NO LONGER in Plan mode."
+          if (text.startsWith(`<system-reminder>\n${prefix}`)) waiter.reacted()
+        }
+      }
       const steer = inboxSteer(id, payload?.inboxID, payload?.item)
       if (!steer) break
       if (payload.item.delivery === "steer") announceInboxSteer(steer)

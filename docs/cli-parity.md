@@ -37,7 +37,7 @@ Parity target is interactive `cursor-agent` (`Run` client: TUI and `--print`). `
 | execute_hook | Native (interactive `hookExecutor`) | ❌ | ❌ |
 | redacted_read | Worker-only inbound exec #29; registered only when `isSecretRedactionEnabled` (bridge hardcodes `true`; interactive never sets `registerRedactedReadExecutor`) | Soft-deny | ⚪ |
 | smart_mode_classifier | Native `--auto-review` (Smart Auto): client classifier ALLOW/BLOCK | Soft-deny error; OpenCode has no Auto-review mode — not planned | ⚪ |
-| git_diff_request | Native (always registered) | provider-control local `git` (`FILE_DIFFS` default; `origin/HEAD` or `origin/<main\|master\|develop>`) | ✅ |
+| git_diff_request | Native (always registered) | Typed refusal (`throw` + `stream_close`) pointing at the advertised shell, where OpenCode authorizes `git diff`; the provider never runs Git itself | 🔶 (permission parity by design) |
 | mini_swe_agent_bash (#52→#55) | Native Mini-SWE shell (same `ShellArgs` / `ShellResult` as #2, Pi-style result offset) | Soft-deny `rejected`; Mini-SWE / SWE-agent bash is not planned | ⚪ |
 | conversation_search | Native local/cloud conversation index | Soft-deny empty `{hits:[]}` | ❌ |
 | agent_store_conflict | Agent-store journal (cloud/worker-shaped) | Soft-deny typed error | ❌ |
@@ -56,7 +56,7 @@ Parity target is interactive `cursor-agent` (`Run` client: TUI and `--print`). `
 | #9 web_fetch | Native fetch UI | Rejected by design; `web_fetch_enabled=false` so Cursor prefers host `custom_webfetch` / `webfetch` | 🔶 (parity by design) |
 | #10 pr_management | Errors `PR management is only available in cloud agents` | Rejected | ⚪ |
 | #11 mcp_auth | Rejected (`MCP authentication is not supported in CLI mode`) | Rejected | ⚪ |
-| #12 generate_image | Approve → server generates → binary write exec | Approve + stage bytes + `cursor_image_save` (byte-exact verified). Classic/OCP raise `external_directory`/`edit`. Stock OpenCode 2.0 advertises the same handle-only tool (`permission: "edit"`) and commits after containment because public `ToolContext` has no `ask`. | 🔶 |
+| #12 generate_image | Approve → server generates → binary write exec | Approve + stage bytes + `cursor_image_save` (byte-exact verified). Classic/OCP raise `external_directory`/`edit`. Stock OpenCode 2.0 advertises the same handle-only tool (`permission: "edit"`) and asserts `external_directory`/`edit` on the actual target through public `ctx.permission.assert`, failing closed without it. | 🔶 |
 | #13 replace_env | Failed (`Environment replacement is not supported in CLI mode`) | Failed (`Environment replacement is not supported by the OpenCode provider.`) | ✅ |
 | #14 connect_scm | Rejected (`Connecting GitHub is not supported in CLI mode`) | Rejected | ⚪ |
 

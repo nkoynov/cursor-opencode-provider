@@ -298,6 +298,10 @@ describe("containment across both write roots", () => {
       expect(resolveContainedImagePath(
         path.join(projectDir, "link", "a.png"), [projectDir, workspace],
       )).toEqual({ error: "target path resolves outside the workspace and project folder" })
+      const dangling = path.join(projectDir, "dangling.png")
+      fs.symlinkSync(path.join(outside, "escaped.png"), dangling)
+      expect(resolveContainedImagePath(dangling, [projectDir, workspace]))
+        .toEqual({ error: "target path could not be resolved" })
     } finally {
       fs.rmSync(outside, { recursive: true, force: true })
     }
@@ -356,6 +360,26 @@ describe("committing a staged image", () => {
     await expect(executeCursorImageSave({ image_id: stage(target) }, ctx))
       .rejects.toThrow(IMAGE_PERMISSION_DENIED_PREFIX)
     expect(fs.existsSync(target)).toBe(false)
+  })
+
+  it.each(["outside", "inside"])("refuses a target redirected %s its root while approval is pending", async destination => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-image-approval-"))
+    const assets = path.join(projectDir, "assets")
+    const redirected = destination === "outside" ? outside : path.join(projectDir, "redirected")
+    fs.mkdirSync(assets)
+    if (destination === "inside") fs.mkdirSync(redirected)
+    const target = path.join(assets, "image.png")
+    try {
+      await expect(executeCursorImageSave({ image_id: stage(target) }, {
+        worktree: workspace, directory: workspace,
+        ask: async request => {
+          if (request.permission !== "edit") return
+          fs.rmdirSync(assets)
+          fs.symlinkSync(redirected, assets)
+        },
+      })).rejects.toThrow("target changed")
+      expect(fs.existsSync(path.join(redirected, "image.png"))).toBe(false)
+    } finally { fs.rmSync(outside, { recursive: true, force: true }) }
   })
 
   it("creates the assets directory chain, which never exists on a first generation", async () => {

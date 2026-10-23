@@ -227,6 +227,17 @@ export type ToolExecutionContext = {
   readonly progress: (update: Record<string, unknown>) => Promise<void>
 }
 
+/** Public plugin permission.assert: evaluate agent/session rules and await approval. */
+export type PermissionAssertInput = {
+  readonly sessionID: string
+  readonly agent?: string
+  readonly action: string
+  readonly resources: readonly string[]
+  readonly save?: readonly string[]
+  readonly metadata?: Record<string, unknown>
+  readonly source?: { readonly type: "tool"; readonly messageID: string; readonly id: string }
+}
+
 export type ToolDefinition = {
   readonly name: string
   readonly description: string
@@ -345,10 +356,19 @@ export type SessionHooks = {
   readonly retry: SessionRetry
 }
 
-/** Only the `location.directory` field we actually read. */
+/** Fields this plugin reads from `session.get`. */
 export type SessionInfo = {
   readonly id: string
   readonly location: { readonly directory: string }
+  /**
+   * Rules evaluated after the agent catalog. The last rule whose action matches
+   * `edit` and whose resource is `*` decides whether edits stay denied.
+   */
+  readonly permissions?: readonly {
+    readonly action: string
+    readonly resource: string
+    readonly effect: "allow" | "deny" | "ask"
+  }[]
 }
 
 export type SessionDomain = {
@@ -452,6 +472,7 @@ export type PluginContext = {
   readonly provider: ProviderDomain
   readonly session: SessionDomain
   readonly tool: ToolDomain
+  readonly permission?: { readonly assert: (input: PermissionAssertInput) => Promise<void> }
   readonly location?: PluginLocation
   readonly shell?: ShellDomain
   readonly websearch?: WebSearchDomain

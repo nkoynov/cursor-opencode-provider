@@ -10,8 +10,9 @@
  *
  * OpenCode 1.x mapping (advertisement-gated):
  * - plan, spec → plan_enter
- * - every other non-empty target → plan_exit (leave plan for OpenCode build),
- *   then inject the Cursor CLI-shaped mode reminder for that target
+ * - chat, ask, search (read-only Ask) → no host tool; the current agent stays
+ * - every other non-empty target → plan_exit (leave plan for OpenCode build)
+ * Each then injects the Cursor CLI-shaped mode reminder for that target.
  *
  * Upstream OpenCode's plan tools are not mode flags. Each one asks the user
  * through the Question service and, on "Yes", injects a synthetic user message
@@ -38,7 +39,15 @@
  */
 
 import { CURSOR_PLAN_STAGE_TOOL } from "./create-plan.js"
+import {
+  cursorModeRole,
+  cursorModeSpec,
+  hostAgentForCursorMode,
+  isHostPlanAgent,
+  normalizeCursorModeId,
+} from "./cursor-mode.js"
 import { decodeMessageSparse } from "./messages.js"
+import { SESSION_PERMISSIONS_UNAVAILABLE_REASON } from "./session-edits.js"
 
 /**
  * `PendingExec.resultField` for a held-open SwitchMode InteractionQuery.
@@ -80,6 +89,23 @@ export const PLAN_EXIT_VIA_CREATE_PLAN_REASON =
   "Leave plan mode by recording the finished plan with Cursor CreatePlan: the user is then " +
   "asked whether to switch to the build agent and start implementing. Do not implement before they approve."
 
+/**
+ * Leaving plan would select the host build agent. A session edit deny survives
+ * that switch, so the user changes the rule in the client instead.
+ */
+export const SESSION_EDITS_DENIED_SWITCH_REASON =
+  "The session's edit rule still denies edits, so this mode switch cannot start implementation. "
+  + "The user changes that rule in the client. Do not implement, and do not write files through the shell."
+
+/** Chronological reminder while that rule is set. It is not part of the frozen baseline. */
+export const SESSION_EDITS_DENIED_REMINDER =
+  "Execution remains blocked by the session's edit rule. This supersedes any instruction to implement. "
+  + "Do not implement, and do not write files through the shell. The user changes that rule in the client."
+
+export const SESSION_EDITS_ALLOWED_REMINDER =
+  "The session has no global edit deny. This supersedes earlier session-edit-deny reminders only; "
+  + "follow the current agent's permissions and required plan approval."
+
 export type SwitchModeHostTool = "plan_enter" | "plan_exit"
 
 /**
@@ -108,8 +134,9 @@ export type DecodedSwitchModeQuery = {
   toolCallId: string
 }
 
+/** A read-only target needs no host tool: it keeps the current primary agent. */
 export type SwitchModeMapping =
-  | { ok: true; toolName: SwitchModeHostTool }
+  | { ok: true; toolName?: SwitchModeHostTool }
   | { ok: false; reason: string }
 
 /** Active Cursor unified-mode id for an OpenCode session (after approved SwitchMode). */
@@ -137,27 +164,19 @@ function str(value: unknown): string {
   return typeof value === "string" ? value : ""
 }
 
-/** Normalize Cursor mode ids for comparison. */
-export function normalizeSwitchModeId(targetModeId: string): string {
-  return targetModeId.trim().toLowerCase()
-}
-
 /**
  * Map a Cursor unified-mode id onto an OpenCode plan enter/exit tool.
  * Does not check advertisement — callers gate on the host catalog.
  *
- * plan/spec enter plan; every other non-empty target leaves plan via plan_exit
- * (host-portable primary switch) and relies on {@link cursorModeSystemReminder}
- * for CLI-shaped behavioral guidance.
+ * plan/spec enter plan; an implementing target leaves plan via plan_exit
+ * (host-portable primary switch); a read-only target needs neither. Each
+ * relies on {@link cursorModeSystemReminder} for CLI-shaped guidance.
  */
 export function mapSwitchModeTarget(targetModeId: string): SwitchModeMapping {
-  const id = normalizeSwitchModeId(targetModeId)
-  if (!id) return { ok: false, reason: MISSING_TARGET_REASON }
-
-  if (id === "plan" || id === "spec") {
-    return { ok: true, toolName: "plan_enter" }
-  }
-  return { ok: true, toolName: "plan_exit" }
+  const role = cursorModeRole(targetModeId)
+  if (!role) return { ok: false, reason: MISSING_TARGET_REASON }
+  const agent = hostAgentForCursorMode(targetModeId)
+  return agent ? { ok: true, toolName: isHostPlanAgent(agent) ? "plan_enter" : "plan_exit" } : { ok: true }
 }
 
 /**
@@ -178,6 +197,9 @@ export function resolveSwitchModeBridge(
     activeModeId?: string
     /** Host primary agent of this Run, when the host reported it. */
     hostAgent?: string
+    /** The session's last `edit` rule on `*` is deny. Leaving plan cannot lift it. */
+    sessionEditsDenied?: boolean
+    sessionPermissionsUnavailable?: boolean
   },
 ): SwitchModeBridge {
   const mapped = mapSwitchModeTarget(targetModeId)
@@ -187,12 +209,27 @@ export function resolveSwitchModeBridge(
   // would enter the transcript and make the real turn narrate a blocked switch.
   if (!options.allowTools) return { kind: "ack" }
 
+  // A read-only mode keeps the current primary agent and starts nothing, so
+  // neither the host's plan exit nor a session edit deny applies to it.
+  if (!mapped.toolName) return { kind: "approve" }
+
+  if (options.sessionPermissionsUnavailable && mapped.toolName === "plan_exit") {
+    return { kind: "reject", reason: SESSION_PERMISSIONS_UNAVAILABLE_REASON }
+  }
+
+  // An implementing target selects the host build agent. Approving it,
+  // including a same-mode or native plan_exit approval, would start
+  // implementation the session rule still forbids.
+  if (options.sessionEditsDenied && mapped.toolName === "plan_exit") {
+    return { kind: "reject", reason: SESSION_EDITS_DENIED_SWITCH_REASON }
+  }
+
   // Already in the target mode: nothing to approve. Cursor's own IDE handler
   // auto-approves here too, and without this a model that asks to leave plan
   // mode after the plan write already prompted would ask the user twice.
   if (
     options.activeModeId
-    && normalizeSwitchModeId(options.activeModeId) === normalizeSwitchModeId(targetModeId)
+    && normalizeCursorModeId(options.activeModeId) === normalizeCursorModeId(targetModeId)
   ) {
     return { kind: "approve" }
   }
@@ -208,7 +245,7 @@ export function resolveSwitchModeBridge(
   // whole contract, exactly as Cursor CLI's own plan mode is prompt-enforced.
   if (mapped.toolName === "plan_enter") return { kind: "approve" }
 
-  if (options.hostAgent === "plan") {
+  if (isHostPlanAgent(options.hostAgent)) {
     return {
       kind: "reject",
       reason: names.has("question") ? PLAN_EXIT_VIA_CREATE_PLAN_REASON : PLAN_EXIT_BY_USER_REASON,
@@ -291,7 +328,7 @@ export function setActiveCursorMode(
   options: { bridgedPlanEntered?: boolean } = {},
 ): void {
   if (!sessionKey) return
-  const modeId = normalizeSwitchModeId(targetModeId)
+  const modeId = normalizeCursorModeId(targetModeId)
   if (!modeId) return
   activeCursorModeBySession.set(sessionKey, {
     modeId,
@@ -312,15 +349,14 @@ export function getActiveCursorMode(sessionKey: string | undefined): string | un
 
 /** True while the provider has an approved Cursor plan/spec mode for this session. */
 export function isCursorPlanModeActive(sessionKey: string | undefined): boolean {
-  const mode = getActiveCursorMode(sessionKey)
-  return mode === "plan" || mode === "spec"
+  return cursorModeRole(getActiveCursorMode(sessionKey)) === "plan"
 }
 
 /** True while Cursor plan/spec mode is one the host enforces (see `bridgedPlanEntered`). */
 export function isBridgedCursorPlanModeActive(sessionKey: string | undefined): boolean {
   if (!sessionKey) return false
   const state = activeCursorModeBySession.get(sessionKey)
-  return (state?.modeId === "plan" || state?.modeId === "spec") && state.bridgedPlanEntered
+  return !!state && cursorModeRole(state.modeId) === "plan" && state.bridgedPlanEntered
 }
 
 /**
@@ -328,7 +364,9 @@ export function isBridgedCursorPlanModeActive(sessionKey: string | undefined): b
  * mode follows its own mode switch (Shift+Tab, `/plan`).
  *
  * - A turn under the host plan agent puts Cursor in plan mode, however the
- *   host got there (its agent picker, a plan_enter approval).
+ *   host got there (its agent picker, a plan_enter approval). A read-only
+ *   mode approved while that agent already ran is kept: the agent stays
+ *   read-only, and only a transition into it re-enters plan mode.
  * - The host's own exit from that agent (a plan_exit approval, or an agent
  *   switch in its UI) ends Cursor plan mode. Only an observed `plan` → other
  *   transition counts, so Cursor-only modes (debug, ask, …) under the host's
@@ -341,35 +379,18 @@ export function followHostPlanAgent(
   hostAgent: string | undefined,
 ): "entered" | "left" | undefined {
   if (!sessionKey || !hostAgent) return undefined
-  if (hostAgent === "plan") {
+  if (isHostPlanAgent(hostAgent)) {
     if (isBridgedCursorPlanModeActive(sessionKey)) return undefined
+    if (isHostPlanAgent(previousHostAgent) && cursorModeRole(getActiveCursorMode(sessionKey)) === "read-only") {
+      return undefined
+    }
     // The host runs its own plan agent, so it enforces this plan mode.
     setActiveCursorMode(sessionKey, "plan", { bridgedPlanEntered: true })
     return "entered"
   }
-  if (previousHostAgent !== "plan" || !isCursorPlanModeActive(sessionKey)) return undefined
+  if (!isHostPlanAgent(previousHostAgent) || !isCursorPlanModeActive(sessionKey)) return undefined
   setActiveCursorMode(sessionKey, "agent")
   return "left"
-}
-
-/**
- * `agent.v1.AgentMode` for a Cursor mode id, as Cursor CLI derives
- * `UserMessage.mode` from its current mode: plan, ask, and debug are their own
- * modes; every other mode (agent, spec, triage, …) runs as agent.
- */
-export function cursorAgentModeWireValue(modeId: string | undefined): number {
-  switch (normalizeSwitchModeId(modeId ?? "")) {
-    case "plan":
-      return 3
-    case "chat":
-    case "ask":
-    case "search":
-      return 2
-    case "debug":
-      return 4
-    default:
-      return 1
-  }
 }
 
 /** Conversation that already received the host plan-exit call shape, per session. */
@@ -417,7 +438,7 @@ export function takeHostPlanAgentNote(
   } = {},
 ): string | undefined {
   if (!sessionKey) return undefined
-  if (hostAgent !== "plan") {
+  if (!isHostPlanAgent(hostAgent)) {
     hostPlanExitNoteBySession.delete(sessionKey)
     return undefined
   }
@@ -478,8 +499,8 @@ export function cursorModeSystemReminder(
     questionAdvertised?: boolean
   } = {},
 ): string | undefined {
-  const id = normalizeSwitchModeId(targetModeId)
-  if (!id) return undefined
+  const guidance = cursorModeSpec(targetModeId)?.guidance
+  if (!guidance) return undefined
   const first = options.firstTurn !== false
   // A host plan-stage tool writes the artifact and its result names the
   // follow-up that requests approval. plan_exit only leaves plan mode.
@@ -490,11 +511,11 @@ export function cursorModeSystemReminder(
     ? "record the finished plan with Cursor CreatePlan. The host stage tool waits for the host plan review and does not return until the user accepts or declines. Do not call `plan_exit` to submit or skip that review, and do not implement until the tool returns success"
     : options.planExitAdvertised === false
       ? options.questionAdvertised
-        ? "record the finished plan with Cursor CreatePlan. Writing it needs no approval; the user is then asked whether to switch to the build agent and start implementing. If they decline, refine the plan and record it again"
+        ? "record the finished plan with Cursor CreatePlan. Writing it needs no approval; the user is then asked whether to switch to the build agent and start implementing. If they decline or dismiss, end this turn without further tool calls and wait for a new user message. If they type freeform feedback instead, revise the plan in this same turn using that text"
         : "record the finished plan (Cursor CreatePlan), then tell the user it is ready: they switch to the build agent to have it implemented"
       : "record the finished plan, then leave plan mode with Cursor SwitchMode (it runs OpenCode `plan_exit`) so the user can approve leaving plan mode"
 
-  if (id === "plan" || id === "spec") {
+  if (guidance === "plan") {
     return wrapReminder(
       first
         ? `Plan mode is active. The user does not want execution yet -- you MUST NOT make edits, run non-readonly tools (including changing configs or making commits), or otherwise modify system state. This supersedes any conflicting instruction.
@@ -508,7 +529,7 @@ export function cursorModeSystemReminder(
     )
   }
 
-  if (id === "chat") {
+  if (guidance === "ask") {
     return wrapReminder(
       first
         ? `Ask mode is active. The user wants you to answer questions about their codebase or coding in general. You MUST NOT make any edits, run any non-readonly tools (including changing configs or making commits), or otherwise make any changes to the system. This supersedes any other instructions you have received (for example, to make edits).
@@ -525,7 +546,7 @@ Your role in Ask mode:
     )
   }
 
-  if (id === "debug") {
+  if (guidance === "debug") {
     return wrapReminder(
       first
         ? `You are now in **DEBUG MODE**. You must debug with **runtime evidence**.
@@ -549,7 +570,7 @@ Prefer reproduction, runtime logs, and end-to-end verification over speculative 
     )
   }
 
-  if (id === "multitask") {
+  if (guidance === "multitask") {
     return wrapReminder(
       `Multitask Mode is active. You are a coordinator who pushes meaningful work to asynchronous workers through the OpenCode \`task\` tool (prefer background=true when the host supports it).
 
@@ -561,7 +582,7 @@ Prefer reproduction, runtime logs, and end-to-end verification over speculative 
     )
   }
 
-  if (id === "triage") {
+  if (guidance === "triage") {
     return wrapReminder(
       first
         ? `Triage mode is active. Your job is to coordinate long-horizon, multi-step work by delegating to subagents and integrating their progress.
@@ -574,7 +595,7 @@ Prefer reproduction, runtime logs, and end-to-end verification over speculative 
     )
   }
 
-  if (id === "project") {
+  if (guidance === "project") {
     return wrapReminder(
       `You are Project Agent Mode: a long-running, high-level planner and orchestrator for complex software projects.
 
@@ -589,7 +610,7 @@ Your mandate is to convert user intent into a correct, high-quality implementati
     )
   }
 
-  if (id === "background") {
+  if (guidance === "background") {
     return wrapReminder(
       `Cloud / background mode intent is active. Prefer long-running and environment/browser automation work via OpenCode \`task\` subagents (background=true when advertised) rather than blocking the foreground turn.
 
@@ -599,7 +620,7 @@ Your mandate is to convert user intent into a correct, high-quality implementati
     )
   }
 
-  // agent / build / edit / unknown leave-plan targets: implementation mode.
+  // "agent" guidance: agent / build / edit / unknown targets implement.
   return wrapReminder(
     first
       ? `Agent mode is active (OpenCode build / agents). You have left plan mode and may implement: edit files, run tools, and execute the agreed approach.
@@ -623,11 +644,17 @@ export function takeActiveCursorModeReminder(
     advertisedTools?: ReadonlySet<string> | Iterable<string>
     /** Host primary agent of this request; when known it, not the catalog, says whether planning ended. */
     hostAgent?: string
+    /** The session's last `edit` rule on `*` is deny. Appended, never frozen into the baseline. */
+    sessionEditsDenied?: boolean
   } = {},
 ): string | undefined {
-  if (!sessionKey) return undefined
+  if (!sessionKey) {
+    return withSessionEditsDenied(undefined, options.sessionEditsDenied)
+  }
   const state = activeCursorModeBySession.get(sessionKey)
-  if (!state) return undefined
+  if (!state) {
+    return withSessionEditsDenied(undefined, options.sessionEditsDenied)
+  }
 
   const advertised = options.advertisedTools
     ? options.advertisedTools instanceof Set
@@ -635,11 +662,10 @@ export function takeActiveCursorModeReminder(
       : new Set(options.advertisedTools)
     : undefined
 
-  const isPlanMode = state.modeId === "plan" || state.modeId === "spec"
-  if (isPlanMode && state.bridgedPlanEntered && advertised && !options.hostAgent) {
+  if (cursorModeRole(state.modeId) === "plan" && state.bridgedPlanEntered && advertised && !options.hostAgent) {
     if (advertised.has("plan_enter")) {
       activeCursorModeBySession.delete(sessionKey)
-      return cursorModeSystemReminder("agent", { firstTurn: true })
+      return withSessionEditsDenied(cursorModeSystemReminder("agent", { firstTurn: true }), options.sessionEditsDenied)
     }
   }
 
@@ -654,5 +680,13 @@ export function takeActiveCursorModeReminder(
       : {}),
   })
   if (state.firstTurn) state.firstTurn = false
-  return reminder
+  return withSessionEditsDenied(reminder, options.sessionEditsDenied)
+}
+
+function withSessionEditsDenied(reminder: string | undefined, denied: boolean | undefined): string | undefined {
+  if (denied === undefined) return reminder
+  const permission = denied ? SESSION_EDITS_DENIED_REMINDER : SESSION_EDITS_ALLOWED_REMINDER
+  if (!reminder) return wrapReminder(permission)
+  if (reminder.includes(permission)) return reminder
+  return reminder.replace(/\n<\/system_reminder>\s*$/, `\n\n${permission}\n</system_reminder>`)
 }

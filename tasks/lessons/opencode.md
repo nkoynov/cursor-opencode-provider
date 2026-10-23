@@ -38,7 +38,9 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Preserve semantics, not names.** Similar tools can differ in merge behavior,
   required fields or execution language. Normalize before validation; a file
   tool once accepted a shell command and silently returned a listing
-  (`test/tools.test.ts`).
+  (`test/tools.test.ts`). Rebuilt file-tool arguments must still carry
+  `command`, or the misplaced-shell refusal never sees it and the model is told
+  only that `pattern` is missing (`mapCursorArgsToOpencode`).
 - **Translate from permitted capabilities.** Patch substitution and Task routing
   failed when fixed tool names outlived a model/catalog change. Read the current
   turn, preserving native operations when permitted (`remapEditToolsForCatalog`,
@@ -75,7 +77,10 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Use independent wire evidence.** The extracted proto lagged live frame
   members, request/result field numbers differ, and local round trips hid schema
   errors. Consult the shipped descriptors and canonical fixtures
-  (`src/protocol/exec-variants.ts`, `test/exec-variants.test.ts`).
+  (`src/protocol/exec-variants.ts`, `test/exec-variants.test.ts`). Recognizing a
+  member does not make it control traffic: `user_message_appended` after context
+  injection changes conversation state and must retain its replay barrier
+  (`test/replay-safety.test.ts`, `test/run-interruption.test.ts`).
 - **Apply protobuf defaults deliberately.** Omitted scalars may mean zero;
   omission assertions need sparse decoding. Fragmented varints also need a
   streaming prefix parser (`test/conversation-maintenance.test.ts`).
@@ -121,6 +126,13 @@ These are failure lessons shared by both hosts, not a replacement for
   close the actual stream so its session ref is released. Test child-process
   exit with idle and blocked requests, including end then destroy
   (`test/session-exit.test.ts`, `test/node-http2-drain.mjs`).
+  That CANCEL also fires `aborted` on Node and Bun while the request side is
+  open, so every ordinary turn-end close logged "aborted by remote" and sent a
+  self-verify run chasing a nonexistent server reset. Bun 1.3 (OpenCode 2.0's
+  runtime) also emits `error` for it while the response is open; a test run on
+  a newer Bun missed that. Stream events do not say who closed; check the
+  local-close flag, and run transport checks on the host's runtime too
+  (`test/run-close-trace.test.ts`).
 - **The shared session can reject an otherwise valid Run.** Unsent sibling DATA
   exceeded the runtime's default 10 MB memory accounting and refused new Runs
   with `ENHANCE_YOUR_CALM`; Node could also reject one large upload. Verify the
@@ -242,16 +254,92 @@ These are failure lessons shared by both hosts, not a replacement for
 
 ## Planning and file mutations
 
-- **Gate the unavoidable transition.** The model wrote a plan and stopped
-  without volunteering SwitchMode. Attach approval to CreatePlan; refinement
-  and dismissal must not return execution success (`test/create-plan.test.ts`).
+- **Gate the unavoidable transition and stop on refusal.** The model wrote a
+  plan and stopped without volunteering SwitchMode. Attach approval to
+  CreatePlan. A No answer is ordinary question data in native OpenCode, so a
+  failed CreatePlan reply alone let the model continue its self-test. Cancel
+  and drain the owning Run after No or dismissal; suppress late output,
+  refuse every new exec before runtime metadata handling, and require a fresh
+  user message. Typed freeform feedback is not refusal: continue the same turn
+  in plan mode and return that text on the CreatePlan error reply so the model
+  can revise (`createPlanApprovalOutcome`). Only remaining questions delimit
+  prose answers: matching the current question inside feedback truncated it
+  to Yes and approved execution. Single-choice review JSON must have exactly
+  one string in its one answer row; filtering invalid cells or joining
+  conflicting answers can turn malformed data into approval or refinement.
+  A No/dismissal also wins over later approvals in the same result batch;
+  clamping only the next pump left a queued build handoff alive. Keep the
+  existing `emulated approval=` log marker and append the richer outcome so
+  self-test extraction remains usable (`test/create-plan.test.ts`,
+  `test/ask-question.test.ts`). Keep the plan agent and already
+  authorized background jobs; carry host notes delivered beside a declined
+  answer to the next user turn instead of injecting them into the cancelled
+  Run. Self-verification must score post-refusal tool calls as failure, even
+  when implementation itself did not start (`test/create-plan.test.ts`).
 - **Show the plan before asking.** Putting the full plan in the question dock
   hid the conversation. Render it in the assistant transcript and match the
   exact prompt echoed by the answer (`test/create-plan.test.ts`).
 - **Approval must reach the host's next turn.** Flipping only Cursor mode did
   not start implementation. Queue the native switch after successful delivery
   and a terminal Run; serialize callbacks so an older one cannot erase a newer
-  request (`test/switch-mode.test.ts`).
+  request. An emulated CreatePlan approval kept pumping under the plan agent
+  and asked again before reaching that boundary. Cancel the old Run just as
+  for plan entry, drain its terminal acknowledgment, and refuse late host
+  calls before starting build (`test/switch-mode.test.ts`,
+  `test/create-plan.test.ts`). A failed apply keeps the request but drops its
+  owner; an owner check that matched any Run then cancelled every later Run
+  before it streamed. Only the Run that queued a handoff owns it.
+- **A read-only mode is not "leaving plan".** Five copies of "plan/spec, else
+  build" sent Cursor's Ask targets to the build agent and refused them under a
+  session edit deny. Cursor CLI maps `chat`/`ask`/`search` to Ask. Mode ids,
+  their role, wire mode and reminder, and the host plan-agent name live only in
+  `src/protocol/cursor-mode.ts`; `followHostPlanAgent` is the one follower on
+  both generations. Keep the current agent for read-only modes, including on
+  the next plan-agent step (`test/switch-mode.test.ts`).
+- **Native execution does not imply a top-level function.** After a successful
+  SwitchMode lookup, PR #111 still insisted on a direct call and prohibited
+  CallDynamicTool. The captured Run advertised dynamic invocation, never raised
+  a switch interaction, and reported planning and images unavailable. Follow
+  the supplied route; discovery does not install a function. String assertions
+  had enforced the wrong contract; require an actual invocation, interaction,
+  handoff and displayed plan (`buildOpenCodeInteractionGuidance`,
+  `test/prompt-history.test.ts`, `docs/host-compat-acceptance.md`).
+- **A session edit deny outlasts plan approval.** The last session `edit` rule
+  on `*` is read from the session payload on both entrypoints. CreatePlan still
+  writes and shows the plan, then returns the not-approved error and does not
+  ask or switch agents. That immediate hold must arm the same cancellation and
+  terminal drain as a declined bridged review: a failed wire reply alone let
+  a subsequent shell exec write a file. Set the turn-ending state only after
+  reply delivery; refuse later calls in the step immediately, finish any
+  already-emitted parallel host tool call before sending `cancel_action`, and
+  gate direct `plan_exit` / `cursor_plan_stage` execs the same way
+  (`test/create-plan.test.ts`). A plan-path allow does not clear `*`. A plan-agent
+  catalog that merely omits edit still asks (`sessionRulesDenyEdits`,
+  `resolveCreatePlanBridge`, `test/session-edits.test.ts`,
+  `test/create-plan.test.ts`, `test/plugin.test.ts`,
+  `test/plugin-opencode2.test.ts`). Read native 1.x `permission` rules as well
+  as 2.0 `permissions`; retry before evaluating and reuse that payload for the
+  plan path. A failed lookup is not an empty ruleset: carry unknown evidence
+  to CreatePlan and implementing SwitchMode instead of aborting ordinary
+  requests. Recheck pending approvals too, and clear the unavailable marker
+  when a later lookup succeeds. Lifted rules must clear a previous request's
+  deny marker. A saved denied plan is still a
+  stateful replay barrier and must revoke any earlier checkpoint in the turn
+  (`test/create-plan.test.ts`). Carry explicit deny
+  and no-deny guidance chronologically, including on held continuations:
+  merely clearing a boolean leaves an old checkpoint reminder authoritative
+  (`test/host-notes-run.test.ts`). Send no-deny guidance only when it replaces
+  a deny Cursor may hold: stating it on every request injected it after each
+  tool step of a session that never had a deny (`sessionEditsGuidance`).
+  Persist whether a deny was ever sent: treating every restart as unknown
+  history repeated the no-deny note on each conversation. Compaction cannot
+  approve a plan, so its 2.0 session read stays best effort and must not abort
+  the compaction (`test/plugin-opencode2.test.ts`). Place current permission guidance after all
+  carried notes too, even when this process already recorded no deny: queued
+  or unacknowledged injections can restore an older deny. Record suppression
+  state only after writing a real delivery, never on a skipped duplicate or
+  failed upload; bound the remembered states. Retain unrelated notes and the
+  frozen baseline (`test/host-notes-run.test.ts`, `test/session-edits.test.ts`).
 - **Lifecycle interactions must not mutate state.** Hard SwitchMode rejection
   polluted the real turn; soft-ack it without changing mode. Do not let a title
   turn write a plan (`test/switch-mode.test.ts`).
@@ -261,7 +349,7 @@ These are failure lessons shared by both hosts, not a replacement for
 - **A private edit read needs complete content.** Cursor's streamed edit is a
   read/whole-file-write handshake; a capped preview corrupted its replacement.
   Preserve correlation and edit intent, including edit-only turns and missing
-  targets; external reads need exact host authorization first
+  targets; all existing-file reads need exact host authorization first
   (`test/parallel-pump.test.ts`, `test/apply-patch.test.ts`).
 - **Test bytes after the actual patch parser.** Stripping an empty payload line
   lost blank lines; endings differed by major and by direct/native route.
@@ -275,8 +363,11 @@ These are failure lessons shared by both hosts, not a replacement for
   `encoding_hint` removed legitimate content. GenerateImage's display data is a
   preview; only its binary write exec commits bytes. Some remote generations
   omit the approval query entirely, so the save tool's edit gate and containment
-  remain essential. Default project assets intentionally stay outside the git
-  worktree (`test/generate-image.test.ts`, `src/image-save.ts`).
+  remain essential. Re-resolve the exact target after the permission wait, and
+  reject dangling symlinks and write with `O_NOFOLLOW`:
+  a directory or target swapped to a symlink during approval otherwise redirects the
+  authorized write, even to another path within an allowed root. Default
+  project assets intentionally stay outside the git worktree (`test/generate-image.test.ts`, `src/image-save.ts`).
 
 ## Context, caching and accounting
 
@@ -335,6 +426,16 @@ These are failure lessons shared by both hosts, not a replacement for
   double-counted footer token created false validations. An aggregate cache
   ratio cannot locate a miss; compare identities, hashes and categories, and
   preserve zero counters ([runbook](../../docs/cache-log-runbook.md)).
+  A plan-handoff cancel ends its Run without TurnEnded, so it logged no
+  diagnosis, and a self-verify run blamed its warm Run on the previous Run's
+  `coldReason`. Its final checkpoint reports `used_tokens=0`; the next Run
+  decoded that as prior occupancy and showed no cached prefix. Emit the
+  diagnosis with counters unavailable, and treat a zero-token checkpoint as
+  missing occupancy. Persist the last measured token field separately from
+  the zero-token resume checkpoint: an in-memory fallback alone loses the
+  cached prefix after restart. Preserve the original Run state bytes and
+  discard the fallback with its conversation (`test/switch-mode.test.ts`,
+  `test/checkpoint-occupancy-run.test.ts`, `test/conversation-persistence.test.ts`).
 
 ## Persistence and process lifetime
 

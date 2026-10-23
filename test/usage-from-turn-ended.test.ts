@@ -494,6 +494,41 @@ describe("Cursor cache diagnostics", () => {
     expect(line).toContain("systemPromptSent=true")
   })
 
+  it("keeps continuity and marks request counters unavailable for a Run without TurnEnded", () => {
+    const line = formatCursorCacheDiagnostics(undefined, current, prior, {
+      sessionKey: "ses_cache",
+      conversationId: "conversation-cache",
+      startedWithCheckpoint: true,
+      requestContextReused: true,
+      requestContextHash: "0123456789abcdef-rest",
+      checkpointUpdates: 2,
+      tokenDetailUpdates: 2,
+      pumpPasses: 1,
+      stepStarts: 1,
+      stepCompletes: 1,
+      displayToolCalls: 1,
+      execRequests: 0,
+      switchModeInTurn: true,
+    })
+    expect(line).toBe(
+      "cache diagnosis: sessionKey=ses_cache conversationId=conversation-cache " +
+      "conversationGroupId=- model=- continuity=warm coldReason=- turnEnded=unavailable " +
+      "rawInput=unavailable rawCacheRead=unavailable rawCacheWrite=unavailable " +
+      "rawUncached=unavailable rawReadRatio=unavailable rawWriteRatio=unavailable " +
+      "priorContext=40000 currentContext=45000 contextDelta=5000 " +
+      "rawReadVsPriorContext=n/a sameSizedCategoryTokens=10000 " +
+      'categoryDelta={"system_prompt":0,"tools":0,"conversation":5000} ' +
+      "toolsCategoryChurn=none " +
+      "requestContext=reused requestContextHash=0123456789abcdef " +
+      "systemPromptHash=none systemPromptSent=false " +
+      "checkpointUpdates=2 tokenDetailUpdates=2 " +
+      "pumpPasses=1 steps=1/1 displayToolCalls=1 execRequests=0 " +
+      "createPlanInTurn=false switchModeInTurn=true " +
+      "perModelCallCache=unavailable",
+    )
+    expect(readRatio(parseCacheDiagnosisLine(line))).toBeUndefined()
+  })
+
   it("flags upstream tools-category churn when the request-context overlay was reused", () => {
     const line = formatCursorCacheDiagnostics(
       {

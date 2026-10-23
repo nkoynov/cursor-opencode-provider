@@ -5,7 +5,8 @@ import {
   setSessionTodos,
   type SessionTodo,
 } from "../todo-store.js"
-import type { ToolDraft } from "./types.js"
+import type { PluginContext, ToolDraft, ToolExecutionContext } from "./types.js"
+import { assertToolPermission } from "./permissions.js"
 
 /**
  * OpenCode 2 snapshot: only `codemode === false` tools join the AI SDK catalog.
@@ -136,7 +137,7 @@ export function hostHasTool(draft: ToolDraft, name: string): boolean {
  * gate is off (default), on OpenCode 1.x (this function is not called), and
  * on any 2.x host that restores the tools.
  */
-export function registerTodoTools(draft: ToolDraft): void {
+export function registerTodoTools(draft: ToolDraft, ctx?: Pick<PluginContext, "permission">): void {
   if (!isOpenCode2TodosEnabled()) return
 
   if (!hostHasTool(draft, TODOWRITE_TOOL)) {
@@ -157,8 +158,9 @@ export function registerTodoTools(draft: ToolDraft): void {
       },
       output: TODO_OUTPUT_SCHEMA,
       options: OPENCODE2_DIRECT_TOOL_OPTIONS,
-      execute: async (input: { todos?: unknown }, context: unknown) => {
+      execute: async (input: { todos?: unknown }, context: ToolExecutionContext) => {
         const sessionID = sessionIDFromContext(context)
+        await assertToolPermission(ctx, context, { action: TODOWRITE_TOOL, resources: ["*"], save: ["*"], metadata: {} })
         const todos = setSessionTodos(sessionID, input?.todos)
         return todoResult(todos)
       },
@@ -176,8 +178,9 @@ export function registerTodoTools(draft: ToolDraft): void {
       },
       output: TODO_OUTPUT_SCHEMA,
       options: OPENCODE2_DIRECT_TOOL_OPTIONS,
-      execute: async (_input: unknown, context: unknown) => {
+      execute: async (_input: unknown, context: ToolExecutionContext) => {
         const sessionID = sessionIDFromContext(context)
+        await assertToolPermission(ctx, context, { action: TODOREAD_TOOL, resources: ["*"], save: ["*"], metadata: {} })
         return todoResult(getSessionTodos(sessionID))
       },
     })

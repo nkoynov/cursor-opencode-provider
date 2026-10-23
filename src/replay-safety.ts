@@ -113,7 +113,8 @@ export type ReplayFrameAnalysis = {
 // `context_injection_state` #23 (status of a client injection, which Cursor
 // CLI only shows for queued steers), `routed_model` #24 (display name) and
 // `tool_requests_listed` #27 (count) carry no output and no state. Other
-// members stay barriers.
+// members stay barriers. `user_message_appended` #6 is recognized but stateful:
+// the shipped CLI commits its pending turn and starts one from the user message.
 const INTERACTION_UPDATE_FIELDS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 15, 16, 17, 23, 24, 27])
 /** `InteractionUpdate.message_started_at_ms` #25: a timestamp beside the oneof member. */
 const INTERACTION_UPDATE_STARTED_AT = 25
@@ -177,6 +178,11 @@ function validInteractionUpdateWire(
   const fields = all.filter((field) => field.fn !== INTERACTION_UPDATE_STARTED_AT)
   const update = fields.length === 1 ? fields[0] : undefined
   if (!update || update.wt !== 2 || !INTERACTION_UPDATE_FIELDS.has(update.fn)) return false
+  if (update.fn === 6) {
+    const appended = update.bytes ? readAllFieldsStrict(update.bytes) : undefined
+    return !!decoded.user_message_appended && appended?.length === 1
+      && appended[0]!.fn === 1 && appended[0]!.wt === 2
+  }
   if (![1, 4].includes(update.fn)) return true
   const delta = update.bytes ? (readAllFieldsStrict(update.bytes) ?? []) : []
   const text = delta.filter((field) => field.fn === 1)
@@ -258,6 +264,8 @@ export function analyzeReplayFrame(
     if (!malformed && typeof callId === "string" && callId) displayCallId = callId
   } else if (malformed || (topLevel.fn === 4 && !validKv)) {
     barrier = "unknown-or-malformed-frame"
+  } else if (topLevel.fn === 1 && decoded.interactionUpdate?.user_message_appended) {
+    barrier = "stateful-interaction"
   } else if (topLevel.fn === 2 && !exec.exactRequestContext && !exec.exactMcpState) {
     barrier = "non-control-exec"
   }

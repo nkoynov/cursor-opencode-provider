@@ -47,8 +47,11 @@ describe("buildOpenCodeInteractionGuidance", () => {
     expect(guidance).not.toContain("opencode-todowrite")
     expect(guidance).not.toContain("TodoRead is missing")
     expect(guidance).toContain("Cursor-native CreatePlan is accepted as a Cursor interaction")
-    expect(guidance).toContain("never look either up with GetDynamicTools/GetMcpTools")
-    expect(guidance).toContain("Use their native function definitions")
+    expect(guidance).toContain("Call a supplied top-level function directly with its schema and never look it up")
+    expect(guidance).toContain("Routes are per tool and per turn: one tool's route says nothing about another's, and a mode switch can change them")
+    expect(guidance).toContain("Look up a tool only in the turn that invokes it")
+    expect(guidance).toContain("invoke it through CallDynamicTool using the discovered `namespace`, `toolName` and `arguments`")
+    expect(guidance).not.toContain("not in the OpenCode list")
     expect(guidance).toContain("Do not narrate that CreatePlan is missing")
     expect(guidance).toContain("Emit the actual tool call")
     expect(guidance).toContain("`namespace` and `toolName` FIRST, before `arguments`")
@@ -100,10 +103,15 @@ describe("buildOpenCodeInteractionGuidance", () => {
     afterEach(() => resetHostAgentModeSwitchForTests())
     const tools = [{ name: "question" }, { name: "read" }]
 
-    it("names SwitchMode as the direct way in", () => {
+    it("invokes dynamically advertised SwitchMode instead of inventing a top-level function", () => {
       const guidance = buildOpenCodeInteractionGuidance(tools, false, "/workspace/project")!
       expect(guidance).toContain("call the Cursor-native SwitchMode tool with target_mode_id `plan`")
-      expect(guidance).toContain("not in the OpenCode list or the `cursor` GetDynamicTools namespace")
+      expect(guidance).toContain("call CallDynamicTool with namespace `cursor`, toolName `SwitchMode`, and arguments containing target_mode_id `plan`")
+      expect(guidance).toContain("A returned schema does not install a new top-level function")
+      expect(guidance).toContain("Never invent a direct function call absent from the supplied definitions")
+      expect(guidance).toContain("Discovery alone does not switch modes")
+      expect(guidance).not.toContain("not in the OpenCode list")
+      expect(guidance).not.toContain("Do not send either tool through CallDynamicTool")
       expect(guidance).not.toContain("moves the session to its `plan` agent")
     })
 
@@ -125,7 +133,14 @@ describe("buildOpenCodeInteractionGuidance", () => {
       expect(guidance).toContain("will not start a later plan turn")
       expect(guidance).not.toContain("end the turn after the switch")
       expect(guidance).not.toContain("the next turn runs under the plan agent")
-      expect(guidance).not.toContain("make no further tool calls")
+      const switchInstruction = guidance.split("\n").find(line => line.startsWith("- To enter plan mode,"))
+      expect(switchInstruction).toBeDefined()
+      expect(switchInstruction).not.toContain("make no further tool calls")
+      const refusalInstruction = guidance.split("\n").find(line => line.startsWith("- An explicit No or dismissal"))
+      expect(refusalInstruction).toContain("make no further tool calls")
+      expect(refusalInstruction).toContain("wait for a new human message")
+      expect(refusalInstruction).toContain("Typed freeform feedback")
+      expect(refusalInstruction).toContain("revise the plan in this same turn")
       expect(guidance).not.toContain("Planning sequence:")
       expect(guidance).not.toContain("This completed handoff takes precedence")
     })
@@ -212,6 +227,14 @@ describe("buildOpenCodeInteractionGuidance", () => {
       { name: "bash" },
     ], false, "/workspace/project")
     expect(classic).not.toContain("take `path` as an absolute path")
+    for (const guidance of [opencode2, classic]) {
+      expect(guidance).toContain("including SwitchMode, CreatePlan and GenerateImage")
+      expect(guidance).toContain("Call a supplied top-level function directly with its schema")
+      expect(guidance).toContain("dynamically advertised Cursor tools need the same CallDynamicTool envelope")
+      expect(guidance).toContain("SwitchMode requires `target_mode_id`")
+      expect(guidance).toContain("invoke the tool and wait for its actual result instead of reporting it unavailable")
+      expect(guidance).not.toContain("Native Cursor tools use their own schemas, not the CallDynamicTool envelope")
+    }
   })
 
   it("anchors paths to the exact workspace root", () => {

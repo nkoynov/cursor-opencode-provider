@@ -100,6 +100,35 @@ without a variant retains Cursor's declared default effort for that tier.
 Saved 500k variants on the base/Fast entries remain valid after upgrading;
 reselect the dedicated 500k entry to use its full host context budget.
 
+## Planning and session edit rules
+
+Cursor tools use the route advertised for the current turn. Call a supplied
+top-level SwitchMode/CreatePlan function directly; when listed in a dynamic
+namespace, discover its schema and invoke it through CallDynamicTool with the
+discovered namespace, tool name and arguments. Discovery is not a mode switch.
+
+When the provider owns the native agent handoff, approval ends the plan Run
+before starting the build turn. Declining or dismissing the review ends the
+current turn and keeps the session in plan; a new user message is required
+before any further work, including self-test images or scoring. Typing freeform
+feedback into the provider's emulated `question` review keeps the turn open in
+plan mode and sends that text back as the CreatePlan reply so the model can revise.
+Host-owned `plan_exit` and plan-stage reviews retain their native outcomes.
+
+CreatePlan saves and shows the plan before asking whether to implement. A
+session-wide edit deny keeps the plan saved without an implementation approval
+or a build-agent handoff; allowing only the plan file does not lift that deny.
+Change the session rule in the client before approving implementation. The
+classic plugin reads native `permission` rules, retries a failed session lookup
+once, and blocks CreatePlan and implementing mode switches if the rules remain
+unreadable. Ordinary requests and native tool permission checks still work;
+lookup failure is not treated as an empty ruleset. A saved plan held by an edit
+deny ends its turn before any queued tool can execute. Compaction reads no rules.
+Rule changes reach held tool continuations too; lifting a deny replaces its
+earlier reminder without bypassing the normal plan review, including when a
+deferred note restores an older deny. Ordinary tool steps without a deny to
+supersede send no rule reminder.
+
 ## Task attachments
 
 Cursor Task attachments reach the native `task` prompt as exact, quoted file

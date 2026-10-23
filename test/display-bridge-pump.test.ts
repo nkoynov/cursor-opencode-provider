@@ -452,7 +452,7 @@ describe("display-only ToolCall pump bridge", () => {
     sessionManager.resolve(session.sessionId, 16)
   })
 
-  it("answers the private read directly and exposes a correlated existing-file write as edit", async () => {
+  it("authorizes the private read before exposing a correlated existing-file write as edit", async () => {
     const writes: Uint8Array[] = []
     const parts: any[] = []
     const callId = "edit-existing-file"
@@ -508,7 +508,15 @@ describe("display-only ToolCall pump bridge", () => {
 
     try {
       await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
-
+      expect(writes).toHaveLength(0)
+      const hostRead = parts.find(part => part.type === "tool-call")
+      expect(hostRead?.toolName).toBe("read")
+      await deliverContinuationResults(session, [{
+        sessionId: session.sessionId, execId: 17, toolCallId: hostRead.toolCallId,
+        toolName: "read", output: "host-authorized content",
+      }])
+      parts.length = 0
+      await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
       expect(writes).toHaveLength(2)
       const read = decodeMessage<any>("AgentClientMessage", writes[0]!)
         .exec_client_message.read_result.success
@@ -586,6 +594,17 @@ describe("display-only ToolCall pump bridge", () => {
         error(error: Error) { throw error },
       } as unknown as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
 
+      expect(writes).toHaveLength(0)
+      const hostRead = parts.find(part => part.type === "tool-call")
+      expect(hostRead?.toolName).toBe("read")
+      await deliverContinuationResults(session, [{
+        sessionId: session.sessionId, execId: 25, toolCallId: hostRead.toolCallId,
+        toolName: "read", output: "[Partial read: host-capped content]",
+      }])
+      parts.length = 0
+      await pump(session, {
+        enqueue(part: unknown) { parts.push(part) }, error(error: Error) { throw error },
+      } as unknown as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
       const read = decodeMessage<any>("AgentClientMessage", writes[0]!)
         .exec_client_message.read_result.success
       expect(read.content).toBe(source)
@@ -960,6 +979,34 @@ describe("display-only ToolCall pump bridge", () => {
     sessionManager.resolve(session.sessionId, 900_010)
   })
 
+  it("mirrors display tools through the turn's permitted catalog only", async () => {
+    const writes: Uint8Array[] = []
+    const parts: any[] = []
+    const callId = "plan-permitted"
+    const toolCall = {
+      create_plan_tool_call: {
+        args: {
+          name: "Ship",
+          overview: "Do the thing",
+          plan: "1. A\n2. B",
+          todos: [{ id: "t1", content: "A", status: 1 }],
+        },
+      },
+    }
+    const session = fakeSession(
+      [displayPayload("started", callId, toolCall), displayPayload("completed", callId, toolCall)],
+      writes,
+    )
+    session.permittedToolNames = new Set(["todowrite", "read"])
+    session.nextBridgedExecId = 900_011
+    await pump(session, {
+      enqueue(part: unknown) { parts.push(part) },
+      error() {},
+    } as unknown as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
+    expect(parts.find(part => part.type === "tool-call")?.toolName).toBe("todowrite")
+    sessionManager.resolve(session.sessionId, 900_011)
+  })
+
   it("bridges a todo merge only from the completed final list", async () => {
     const writes: Uint8Array[] = []
     const parts: any[] = []
@@ -1295,7 +1342,7 @@ describe("display-only ToolCall pump bridge", () => {
     expect(session.closed).toBe(true)
   })
 
-  it("answers git_diff as provider-control and throws when cwd is not a repo", async () => {
+  it("refuses private git_diff and directs it to the native shell permission path", async () => {
     const writes: Uint8Array[] = []
     const session = fakeSession([rawExecPayload(42, 44), turnEndedPayload()], writes)
     session.requestContext.env = { workspace_paths: ["/tmp"] }
@@ -1308,7 +1355,7 @@ describe("display-only ToolCall pump bridge", () => {
 
     expect(writes.length).toBeGreaterThanOrEqual(2)
     const thrown = decodeMessage<any>("AgentClientMessage", writes[0]!).exec_client_control_message.throw
-    expect(thrown.error).toMatch(/not a git repository|fatal:/i)
+    expect(thrown.error).toContain("Use the advertised shell tool")
     expect(decodeMessage<any>("AgentClientMessage", writes[1]!).exec_client_control_message.stream_close.id).toBe(42)
   })
 

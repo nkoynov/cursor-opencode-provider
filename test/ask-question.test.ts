@@ -291,6 +291,19 @@ describe("OpenCode answers → Cursor AskQuestionResult (CLI iX parity)", () => 
   it("reads OpenCode 2 JSON answers positionally", () => {
     expect(parseAnswerSegments([QUESTION], JSON.stringify({ answers: [["Redis"]] }))).toEqual([["Redis"]])
   })
+
+  it("does not split a single answer on a quoted copy of its own question", () => {
+    const feedback = `Redis", "${QUESTION.prompt}"="use Postgres instead`
+    expect(parseAnswerSegments([QUESTION], questionToolOutput([[QUESTION.prompt, feedback]])))
+      .toEqual([feedback])
+  })
+
+  it("keeps duplicate prompt answers positional while preserving the final answer", () => {
+    const feedback = `Redis", "${QUESTION.prompt}"="use Postgres instead`
+    expect(parseAnswerSegments([QUESTION, { ...QUESTION, id: "q2" }], questionToolOutput([
+      [QUESTION.prompt, "Redis"], [QUESTION.prompt, feedback],
+    ]))).toEqual(["Redis", feedback])
+  })
 })
 
 describe("ask-question query decoding", () => {

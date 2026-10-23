@@ -14,7 +14,7 @@ import {
   registerTodoTools,
   TODO_OUTPUT_SCHEMA,
 } from "../src/opencode2/todo-tools.js"
-import type { ToolDraft, ToolDefinition, ToolExecutionContext } from "../src/opencode2/types.js"
+import type { ToolDraft, ToolDefinition, ToolExecutionContext, PermissionAssertInput } from "../src/opencode2/types.js"
 
 const originalTodosGate = process.env[CURSOR_OPENCODE2_TODOS_ENV]
 
@@ -136,11 +136,12 @@ describe("registerTodoTools", () => {
 
   test("write then read through the registered execute path", async () => {
     const tools = new Map<string, ToolDefinition>()
+    const permissions: PermissionAssertInput[] = []
     registerTodoTools({
       add(tool) {
         tools.set(tool.name, tool)
       },
-    })
+    }, { permission: { assert: async input => { permissions.push(input) } } })
     const ctx: ToolExecutionContext = {
       sessionID: "ses_exec",
       agent: "build",
@@ -161,6 +162,31 @@ describe("registerTodoTools", () => {
       { id: "1", content: "ship", status: "in_progress", priority: "high" },
     ])
     expect(read.output).toEqual(written.output)
+    expect(permissions.map(input => input.action)).toEqual(["todowrite", "todoread"])
+    expect(permissions[0]).toMatchObject({ sessionID: "ses_exec", agent: "build", resources: ["*"],
+      source: { type: "tool", messageID: "msg_exec", id: "call_exec" } })
+  })
+
+  test.each(["todowrite", "todoread"])("honors native %s denial before accessing the list", async name => {
+    const tools = new Map<string, ToolDefinition>()
+    const denied = new Error("Native permission denied")
+    registerTodoTools({ add: tool => { tools.set(tool.name, tool) } }, {
+      permission: { assert: async () => { throw denied } },
+    })
+    setSessionTodos("denied", [{ content: "original" }])
+    await expect(tools.get(name)!.execute({ todos: [{ content: "replacement" }] }, {
+      sessionID: "denied", agent: "plan", messageID: "m", id: "c", progress: async () => {},
+    })).rejects.toBe(denied)
+    expect(getSessionTodos("denied")[0]?.content).toBe("original")
+  })
+
+  test("fails closed when the host has no public permission API", async () => {
+    const tools = new Map<string, ToolDefinition>()
+    registerTodoTools({ add: tool => { tools.set(tool.name, tool) } })
+    const context = { sessionID: "no-permission", agent: "plan", messageID: "m", id: "c", progress: async () => {} }
+    await expect(tools.get("todowrite")!.execute({ todos: [{ content: "must-not-save" }] }, context))
+      .rejects.toThrow("did not provide a permission assertion")
+    expect(getSessionTodos("no-permission")).toEqual([])
   })
 
   test("refuses a missing session id instead of sharing an empty-key list", async () => {
