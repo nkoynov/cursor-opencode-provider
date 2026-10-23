@@ -1,8 +1,7 @@
 import { createHash } from "node:crypto"
-import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { basename, join } from "node:path"
-import { processShared } from "./process-shared.js"
 
 /**
  * Tool processes share the OpenCode server's cgroup, so without a nice
@@ -32,23 +31,15 @@ export function niceExecLines(target: string, nice: number): string[] {
   ]
 }
 
-const adapters = processShared("shell-nice-adapters.v1", () => {
-  const state = { directory: undefined as string | undefined }
-  process.once("exit", () => {
-    try { resetToolNiceAdapters(state) } catch { /* best effort */ }
-  })
-  return state
-})
-
+// One directory per user, shared by servers and restarts: the adapters are
+// keyed by their content, so a server killed by a signal leaves nothing new.
 function adapterDirectory(): string {
-  if (adapters.directory && existsSync(adapters.directory)) return adapters.directory
-  adapters.directory = mkdtempSync(join(tmpdir(), "cursor-opencode-nice-"))
-  return adapters.directory
+  return join(tmpdir(), `cursor-opencode-nice-${process.getuid?.() ?? "user"}`)
 }
 
-export function resetToolNiceAdapters(state = adapters): void {
-  if (state.directory) rmSync(state.directory, { recursive: true, force: true })
-  state.directory = undefined
+/** Tests only: servers share the directory. */
+export function resetToolNiceAdapters(): void {
+  rmSync(adapterDirectory(), { recursive: true, force: true })
 }
 
 /**
