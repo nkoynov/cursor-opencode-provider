@@ -1086,6 +1086,66 @@ describe("early edit rows", () => {
     })
   })
 
+  it("fails a row still open when the Run ends during a held step", async () => {
+    const file = path.join(tempDir(), "created.txt")
+    const todo = { update_todos_tool_call: { args: { todos: [{ id: "todo", content: "Review", status: 1 }] } } }
+    const { session, parts } = pumpSession([
+      encodeMessage("AgentServerMessage", { interaction_update: { tool_requests_listed: { call_count: 2 } } }),
+      partial("edit-1", file),
+      encodeMessage("AgentServerMessage", { interaction_update: { tool_call_started: { call_id: "todo-call", tool_call: todo } } }),
+      encodeMessage("AgentServerMessage", { interaction_update: { tool_call_completed: { call_id: "todo-call", tool_call: todo } } }),
+    ], [{ name: "write", description: "Write" }, { name: "todowrite", description: "Todos" }])
+    session.requestContext.env = { workspace_paths: [path.dirname(file)] }
+    await run(session, parts)
+
+    const start = parts.find((part) => part.type === "tool-input-start")
+    expect(start).toMatchObject({ id: earlyRowToolCallId(session.sessionId, "edit-1") })
+    expect(parts.find((part) => part.type === "tool-call" && !part.providerExecuted)).toMatchObject({ toolName: "todowrite" })
+    expect(parts.find((part) => part.type === "tool-result" && part.toolCallId === start.id))
+      .toMatchObject({ result: EARLY_ROW_CLOSED, isError: true })
+    expect(parts.at(-1)).toMatchObject({ type: "finish", finishReason: { unified: "tool-calls" } })
+  })
+
+  it("names the patch tool on the failed row of a CRLF file the patch tool would refuse", async () => {
+    const workspace = tempDir()
+    const file = path.join(workspace, "crlf.txt")
+    fs.writeFileSync(file, "one\r\ntwo\r\n")
+    const patchOnly = catalogs.find((catalog) => catalog.label === "OpenCode 2 GPT")!
+    const { session, parts } = catalogSession([
+      ...editHandshake("edit-crlf", file, 17),
+      completedEdit("edit-crlf", file, { error: { path: file, error: "x", model_visible_error: "String not found." } }),
+      turnEnded(),
+    ], patchOnly, workspace)
+    await run(session, parts)
+    await authorizeEditRead(session, parts, 17)
+    await run(session, parts)
+
+    expect(parts.find((part) => part.type === "tool-input-start")).toMatchObject({ toolName: "patch" })
+    expect(parts.find((part) => part.type === "tool-result"))
+      .toMatchObject({ result: `Cursor's edit of ${file} failed: String not found.`, isError: true })
+  })
+
+  it("shows the failure of an edit whose write the provider refused before the host ran it", async () => {
+    const workspace = tempDir()
+    const file = path.join(workspace, "crlf.txt")
+    fs.writeFileSync(file, "one\r\ntwo\r\n")
+    const patchOnly = catalogs.find((catalog) => catalog.label === "OpenCode 2 GPT")!
+    const { session, parts } = catalogSession([
+      ...editHandshake("edit-refused", file, 17, "one\r\nTWO\r\n"),
+      completedEdit("edit-refused", file, { error: { path: file, error: "refused", model_visible_error: "The write was refused." } }),
+      turnEnded(),
+    ], patchOnly, workspace)
+    await run(session, parts)
+    await authorizeEditRead(session, parts, 17)
+    await run(session, parts)
+
+    expect(parts.filter((part) => part.type === "tool-call" && !part.providerExecuted)).toEqual([])
+    expect(parts.filter((part) => part.type === "tool-result")).toEqual([expect.objectContaining({
+      result: `Cursor's edit of ${file} failed: The write was refused.`,
+      isError: true,
+    })])
+  })
+
   it("adds no row when the host already ran the edit Cursor reports as failed", async () => {
     const workspace = tempDir()
     const file = path.join(workspace, "notes.txt")

@@ -4988,6 +4988,7 @@ export async function pump(
   const closeHeldToolStepAtRunEnd = (reason: string, failure?: CursorProviderError): void => {
     if (failure) session.closeError = failure
     session.deferredTerminalReason = failure ? "remote-error" : "remote-clean-close"
+    settleOpenEarlyRows()
     closeHeldToolStep(reason)
   }
   let planTurnCancellationRequested = false
@@ -5398,6 +5399,8 @@ export async function pump(
     closeOpenSpans()
     const { result, isError } = earlyRowResult(close)
     trace(`early row closed: toolCallId=${row.toolCallId} kind=${close.kind} isError=${isError}`)
+    // One failed row per call: Cursor's later completion of it adds no second one.
+    if (isError) session.editToolCalls?.delete(row.cursorCallId)
     safeEnqueue({ type: "tool-input-end", id: row.toolCallId } as V3Part)
     safeEnqueue({
       type: "tool-call",
@@ -5420,7 +5423,10 @@ export async function pump(
   }
   /** An edit Cursor failed after its read, with no row open: the host would show only the read. */
   const showCursorEditFailure = (callId: string, filePath: string, text: string) => {
-    const toolName = hostToolForCursorEdit(filePath, fileToolNames(), workspaceRootFromRequestContext(session.requestContext))
+    const tools = fileToolNames()
+    // Only labels the row: a file the patch tool would refuse (CRLF) still names it.
+    const toolName = hostToolForCursorEdit(filePath, tools, workspaceRootFromRequestContext(session.requestContext))
+      ?? (tools.has("edit") ? "edit" : hostPatchTool(tools) ?? (tools.has("write") ? "write" : undefined))
     if (!toolName) return
     const row: EarlyToolRow = {
       cursorCallId: callId,
@@ -6571,9 +6577,6 @@ export async function pump(
               editCall.path,
               workspaceRootFromRequestContext(session.requestContext),
             )
-            if (parsed.resultField === "write_result" && displayCallId) {
-              session.editToolCalls?.delete(displayCallId)
-            }
             if (remapped) {
               trace(
                 `exec: preserved edit intent callId=${displayCallId} ` +
@@ -6829,6 +6832,8 @@ export async function pump(
           }
           // tc.input is already a JSON string (LanguageModelV3ToolCall.input).
           trace(`exec: EMITTED tool-call toolCallId=${tc.toolCallId} toolName=${tc.toolName} inputLen=${tc.input.length}`)
+          // Kept until now so an edit whose write the provider refused still shows Cursor's failure.
+          if (parsed.resultField === "write_result" && displayCallId) session.editToolCalls?.delete(displayCallId)
           settleOpenEarlyRows(true)
           emittedHostTools++
           // Close open text/reasoning spans before tool-call (required by AI SDK V3).
