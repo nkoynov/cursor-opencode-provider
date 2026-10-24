@@ -192,7 +192,7 @@ export function rekeyConversation(
     restoreConversationBlobs(toId, snapshotConversationBlobs(fromId))
     setCheckpoint(toId, checkpoint)
     const occupancy = getCheckpointOccupancy(fromId)
-    if (occupancy) restoreCheckpointOccupancy(toId, occupancy)
+    if (occupancy && !getCheckpointOccupancy(toId)) restoreCheckpointOccupancy(toId, occupancy)
     moveSessionEditsDenySent(fromId, toId)
     // The checkpoint already holds the system context; keep its rule instead of reasserting it.
     const kept = checkpointEpoch === undefined ? epoch : checkpointEpoch

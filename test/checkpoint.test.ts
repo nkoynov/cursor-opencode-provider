@@ -93,6 +93,14 @@ describe("checkpoint token details", () => {
     expect(getCheckpointOccupancy("conv-1")).toBeUndefined()
   })
 
+  it("keeps a rolled-back checkpoint's own occupancy across a rekey", () => {
+    const rollback = withTokens(40_000)
+    setCheckpoint("conv-rollback", rollback)
+    setCheckpoint("conv-rollback", withTokens(50_000))
+    const toId = rekeyConversation("ses_rekey_rollback", "conv-rollback", rollback)
+    expect(checkpointTokenDetails(toId, withTokens(0))).toEqual({ usedTokens: 40_000, maxTokens: 256_000 })
+  })
+
   it("keeps whether an edit deny was ever sent across a rekey", () => {
     for (const denied of [false, true]) {
       const fromId = `conv-guidance-${denied}`
