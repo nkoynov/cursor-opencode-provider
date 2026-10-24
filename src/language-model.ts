@@ -1760,7 +1760,7 @@ export async function sendRunRequest(
     await writeWithBackpressure(stream, request, operation)
     return stream
   } catch (error) {
-    if (!stream.compressionRejected?.()) throw runUploadFailure(error, operation)
+    if (!stream.compressionRejected?.()) throw runUploadFailure(error, operation, await endStreamVerdict(stream))
   }
   try { stream.destroy() } catch { /* already closed */ }
   trace(`Run compression: ${operation} refused while uploading — sending it once more uncompressed`)
@@ -1769,20 +1769,47 @@ export async function sendRunRequest(
     await writeWithBackpressure(next, request, operation)
     return next
   } catch (error) {
+    const verdict = await endStreamVerdict(next)
     try { next.destroy() } catch { /* already closed */ }
-    throw runUploadFailure(error, operation)
+    throw runUploadFailure(error, operation, verdict)
+  }
+}
+
+const END_STREAM_VERDICT_WAIT_MS = 250
+
+/** The Connect error Cursor sent in the body of a stream whose upload failed, if any. Reads only what already arrived. */
+async function endStreamVerdict(stream: BidiStream): Promise<CursorProviderError | undefined> {
+  const frames = stream.frames()[Symbol.asyncIterator]()
+  const deadline = Date.now() + END_STREAM_VERDICT_WAIT_MS
+  try {
+    for (;;) {
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) return undefined
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const next = await Promise.race([
+        frames.next(),
+        new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), remaining) }),
+      ]).finally(() => clearTimeout(timer))
+      if (!next || next.done) return undefined
+      if (!(next.value.flags & 0x02)) continue
+      const text = new TextDecoder().decode(decodeFramePayload(next.value))
+      return text && (JSON.parse(text) as { error?: unknown }).error ? connectFrameError(text) : undefined
+    }
+  } catch {
+    return undefined
   }
 }
 
 /**
- * Fork: nothing reads a new Run's stream before its request is uploaded, so a cut upload ran no tool and answered
- * nothing, and the Run can go again. A failure Cursor sent keeps its own verdict.
+ * Fork: nothing answers a new Run's frames before its request is uploaded, so a cut upload ran no tool and
+ * answered nothing, and the Run can go again. A failure Cursor sent keeps its own verdict: a Connect error in the body
+ * (`verdict`) or the stream's terminal error.
  */
-export function runUploadFailure(error: unknown, operation: string): CursorProviderError {
+export function runUploadFailure(error: unknown, operation: string, verdict?: CursorProviderError): CursorProviderError {
   const failure = toCursorProviderError(error, { replaySafe: false, fallback: `Cursor ${operation} write failed` })
-  const terminal = failure instanceof StreamWriteDrainError && failure.cause instanceof CursorProviderError
+  const terminal = verdict ?? (failure instanceof StreamWriteDrainError && failure.cause instanceof CursorProviderError
     ? failure.cause
-    : undefined
+    : undefined)
   if (terminal) {
     if (terminal.transient) terminal.replaySafe = true
     trace(`Run upload cut off: ${operation} err=${failure.message} terminal=${terminal.message} transient=${terminal.transient}`)
@@ -6370,6 +6397,7 @@ export async function pump(
               true,
             )
             if (callId) replaySafety.claimBridgedCall(callId)
+            replaySafety.recordHostCall(execId, callId)
             const toolCallId = `cursor_${session.sessionId}_${execId}`
             const input = JSON.stringify(bridged.args ?? {})
             trace(
@@ -7038,6 +7066,7 @@ export async function pump(
         // ConversationAction when it was already acknowledged with `async`).
         const ask = handled.askQuestion
         const execId = session.nextBridgedExecId++
+        replaySafety.recordHostCall(execId)
         sessionManager.registerPending(
           execId,
           session,
@@ -7105,6 +7134,7 @@ export async function pump(
         const bridgeKind = sw.bridge.kind
         const toolName = sw.toolName ?? "plan_exit"
         const execId = session.nextBridgedExecId++
+        replaySafety.recordHostCall(execId)
         sessionManager.registerPending(
           execId,
           session,
@@ -7146,6 +7176,7 @@ export async function pump(
         const planUri = staged?.plan_uri ?? plan.planUri ?? ""
         const input = staged ?? plan.questionInput ?? {}
         const stageExecId = session.nextBridgedExecId++
+        replaySafety.recordHostCall(stageExecId)
         sessionManager.registerPending(
           stageExecId,
           session,

@@ -534,6 +534,85 @@ describe("checkpoint eligibility across host results", () => {
     }
   }, 30_000)
 
+  for (const todoInHistory of [true, false]) {
+    it(`rebuilds only when history holds a mirrored call's result too (in history: ${todoInHistory})`, async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-bridged-missing-"))
+      type RunRequest = { conversation_id: string; action: { user_message_action?: { user_message: { text: string } } } }
+      const requests: RunRequest[] = []
+      const todo = { update_todos_tool_call: { args: { todos: [{ id: "todo", content: "Review the logs", status: 1 }] } } }
+      let firstRun: http2.ServerHttp2Stream | undefined
+      const send = (stream: http2.ServerHttp2Stream, value: Record<string, unknown>) =>
+        stream.write(frame(encodeMessage("AgentServerMessage", value)))
+      scripted = (stream, message) => {
+        if (message.run_request) {
+          requests.push(message.run_request as RunRequest)
+          if (requests.length > 1) {
+            send(stream, { interaction_update: { turn_ended: {} } })
+            stream.end()
+            return
+          }
+          firstRun = stream
+          send(stream, { conversation_checkpoint_update: Uint8Array.of(10, 1, 7) })
+          send(stream, { interaction_update: { tool_call_started: { call_id: "todo-call", tool_call: todo } } })
+          send(stream, { interaction_update: { tool_call_completed: { call_id: "todo-call", tool_call: todo } } })
+          return
+        }
+        const reply = message.exec_client_message as { id?: number; shell_stream?: { exit?: unknown } } | undefined
+        // The Run drops after the shell's result, before any checkpoint.
+        if (reply?.id === 1 && reply.shell_stream?.exit) setTimeout(() => firstRun?.end(), 20)
+      }
+      cacheHttp2SessionForTests(ORIGIN, client)
+      try {
+        const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN,
+          workspaceRoot: root, cacheDir: root, retry: { baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
+        const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Plan the review" }] }]
+        const options = { prompt, headers: { "x-opencode-session-id": `ses_bridged_missing_${todoInHistory}` }, tools: [
+          { type: "function" as const, name: "bash", inputSchema: { type: "object", properties: { command: { type: "string" } } } },
+          { type: "function" as const, name: "todowrite", inputSchema: { type: "object", properties: { todos: { type: "array" } } } },
+        ] }
+        const read = async (afterStart?: () => void) => {
+          const parts: LanguageModelV3StreamPart[] = []
+          const { stream } = await model.doStream(options)
+          afterStart?.()
+          const reader = stream.getReader()
+          for (;;) {
+            const { done, value } = await reader.read()
+            if (done) break
+            parts.push(value)
+          }
+          return parts
+        }
+        const push = (parts: LanguageModelV3StreamPart[], output: string) => {
+          const call = parts.find(part => part.type === "tool-call")
+          if (!call || call.type !== "tool-call") throw new Error("Expected a host call")
+          prompt.push({ role: "assistant", content: [{ type: "tool-call", toolCallId: call.toolCallId, toolName: call.toolName, input: JSON.parse(call.input) }] })
+          prompt.push({ role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName, output: { type: "text", value: output } }] })
+          return call
+        }
+        expect(push(await read(), "todos updated").toolName).toBe("todowrite")
+        const shell = await read(() => setTimeout(() => send(firstRun!, {
+          exec_server_message: { id: 1, shell_stream_args: { command: "echo done", tool_call_id: "shell-call" } },
+        }), 20))
+        expect(push(shell, "done").toolName).toBe("bash")
+        // A rewritten history that lost the mirrored call's result.
+        if (!todoInHistory) prompt.splice(1, 2)
+        if (todoInHistory) {
+          expect((await read()).some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
+          expect(requests).toHaveLength(2)
+          expect(requests[1]!.action.user_message_action!.user_message.text).toContain("todos updated")
+        } else {
+          expect(await read().catch((error: unknown) => error)).toMatchObject({ isRetryable: false })
+          expect(requests).toHaveLength(1)
+        }
+      } finally {
+        sessionManager.dispose()
+        await settleRunSavesForTests()
+        setHostCacheDirOverride(undefined)
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    }, 30_000)
+  }
+
   it("reports a foreign-history rebase that cannot fit as a context overflow, not a setup failure", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-rebase-overflow-"))
     let requests = 0

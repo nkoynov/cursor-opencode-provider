@@ -274,6 +274,21 @@ describe("display tool lifecycle", () => {
     expect(state.statefulBarrier).toBe("non-control-exec")
   })
 
+  it("records the provider's own host calls under their exec ids", () => {
+    const state: ReplaySafetyState = {}
+    const step = new AttemptReplaySafety("run-1", state)
+    step.claimBridgedCall("todo-1")
+    step.recordHostCall(900_000, "todo-1")
+    step.recordHostCall(900_001)
+    expect(hostExecs(state)).toEqual([
+      { sessionId: "run-1", id: 900_000, callId: "todo-1", host: true },
+      { sessionId: "run-1", id: 900_001, host: true },
+    ])
+    expect(state.attempt?.unrepresentable).toBe(true)
+    step.recordHostCall(900_001)
+    expect(state.historyRebaseUnsafe).toBe(true)
+  })
+
   it("marks an attempt unrepresentable for bridges, stateful interactions, unknown frames and unrecorded host execs", () => {
     const cases: Array<[string, (safety: AttemptReplaySafety) => void, boolean]> = [
       ["bridge", (safety) => safety.claimBridgedCall("todo-1"), false],

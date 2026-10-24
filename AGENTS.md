@@ -125,9 +125,10 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   no disk memo or legacy-host fallback. GetServerConfig telemetry defaults off.
 - Serialize every response-required write and await drain. A buffered failure
   is ambiguous delivery and cannot be replayed. Fork: a new Run's own request
-  upload is the exception: nothing reads that stream before it is sent, so a
-  cut upload is transient and replay-safe unless the stream's terminal error is
-  Cursor's final verdict (`runUploadFailure`). There is no upload deadline;
+  upload is the exception: nothing answers that stream's frames before it is
+  sent, so a cut upload is transient and replay-safe unless Cursor's verdict (a
+  Connect error already in the body, else the stream's terminal error) is final
+  (`runUploadFailure`). There is no upload deadline;
   errors, Run termination and the 120 s inbound read-idle watchdog settle waits.
 - Initial and replacement uploads own temporary abort/host-Stop listeners;
   continuation delivery and the active pump use their current call's signal.
@@ -306,8 +307,10 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   exec has a completed result and no opaque activity occurred. Include all
   completed tool steps; never resume their earlier checkpoint. Other barriers
   stay final.
-- Fork (CB-10): only execs handed to a host tool (`recordHostExec`) need a
-  result in history; the provider's own answers change nothing outside it. The
+- Fork (CB-10): only execs handed to a host tool (`recordHostExec`) and the
+  host calls the provider makes up (`recordHostCall`: mirrored display calls,
+  AskQuestion, SwitchMode, CreatePlan) need a result in history, each by its
+  exec id; the provider's own answers change nothing outside it. The
   interrupted pump pass (`ReplaySafetyState.attempt`) does not bar the rebuild
   with its output, its announced calls nothing claimed or completed, or its
   provider-answered execs; it does with a host exec, a bridge or a stateful or

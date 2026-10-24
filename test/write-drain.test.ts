@@ -34,7 +34,10 @@ const ORIGIN = "https://agentn.drain-test.cursor.sh"
  * `bytesPerSecond`, or nothing once stalled. The server answers each Run with
  * one frame and then stays silent.
  */
-async function startSlowCursor(bytesPerSecond: number, options: { endWithoutReading?: boolean | number; refuseGzip?: boolean } = {}) {
+async function startSlowCursor(
+  bytesPerSecond: number,
+  options: { endWithoutReading?: boolean | number; refuseGzip?: boolean; refuseWith?: string } = {},
+) {
   const received: number[] = []
   const bodies: Buffer[][] = []
   const serverStreams: http2.ServerHttp2Stream[] = []
@@ -56,6 +59,11 @@ async function startSlowCursor(bytesPerSecond: number, options: { endWithoutRead
     }
     stream.write(encodeFrame(0x00, encodeMessage("AgentServerMessage", { interaction_update: { heartbeat: {} } })))
     stream.on("error", () => {})
+    // A Connect error in an HTTP 200 body while the request is still uploading.
+    if (options.refuseWith) {
+      const refusal = encodeFrame(0x02, new TextEncoder().encode(JSON.stringify({ error: { code: options.refuseWith } })))
+      return void setTimeout(() => stream.end(refusal), 100)
+    }
     // A number ends only that many first Runs.
     const endEarly = options.endWithoutReading === true
       || (typeof options.endWithoutReading === "number" && index < options.endWithoutReading)
@@ -265,6 +273,33 @@ describe("Run write drain", () => {
       expect(APICallError.isInstance(error)).toBe(true)
       expect(error).toMatchObject({ isRetryable: true, responseHeaders: { "x-should-retry": "true" } })
       expect((error as Error).message).not.toContain("automatic retry unsafe")
+    } finally {
+      closeCachedHttp2SessionsForTests()
+      setHostCacheDirOverride(previousCache)
+      await fs.rm(cacheDir, { recursive: true, force: true })
+    }
+  }, 15_000)
+
+  it.each([
+    ["permission_denied", false],
+    ["unavailable", true],
+  ] as const)("keeps Cursor's own verdict for a Run it refuses in the body during the upload (%s)", async (code, retryable) => {
+    fake = await startSlowCursor(200_000, { refuseWith: code })
+    const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-upload-refused-"))
+    const previousCache = getHostCacheDirOverride()
+    try {
+      const model = createCursor({ name: "cursor", accessToken: "token", agentBaseURL: ORIGIN,
+        workspaceRoot: cacheDir, cacheDir }).languageModel("composer-2.5")
+      const error = await failureOf(Promise.resolve(model.doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "x".repeat(3_000_000) }] }],
+        tools: [{ type: "function", name: "read", description: "Read", inputSchema: { type: "object", properties: {} } }],
+        headers: { "x-opencode-session-id": `ses_upload_refused_${code}` },
+      } as LanguageModelV3CallOptions)))
+
+      expect(APICallError.isInstance(error)).toBe(true)
+      expect(error).toMatchObject({ isRetryable: retryable, responseHeaders: { "x-should-retry": String(retryable) } })
+      expect((error as Error).message).not.toContain("automatic retry unsafe")
+      if (!retryable) expect((error as Error).message).toContain(code)
     } finally {
       closeCachedHttp2SessionsForTests()
       setHostCacheDirOverride(previousCache)

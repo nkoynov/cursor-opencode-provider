@@ -138,6 +138,17 @@ export class AttemptReplaySafety {
     this.state.attempt!.unrepresentable = true
   }
 
+  /**
+   * Fork: a host tool call the provider made up (a mirrored display call, AskQuestion, SwitchMode, CreatePlan)
+   * under its own exec id; its result must reach host history before a rebuild too.
+   */
+  recordHostCall(id: number, callId?: string): void {
+    const execs = this.state.execs ??= []
+    if (execs.some((exec) => exec.sessionId === this.sessionId && exec.id === id)) this.state.historyRebaseUnsafe = true
+    else execs.push({ sessionId: this.sessionId, id, ...(callId ? { callId } : {}), host: true })
+    this.state.attempt!.unrepresentable = true
+  }
+
   /** Fork: text the host shows, which a rebuilt step must continue rather than repeat. */
   recordShownText(text: string): void {
     this.state.attempt!.shownText = (this.state.attempt!.shownText ?? "") + text
