@@ -438,6 +438,19 @@ describe("OpenCode stored tool media", () => {
     expect(result.hashes).toEqual([hash])
   })
 
+  it("omits a stored image whose content no longer matches its name, on both delivery paths", async () => {
+    const named = createHash("sha256").update("original").digest("hex")
+    writeFileSync(path.join(store, `${named}.png`), png)
+    const history = await extractCursorHistoryImages(stored(`${named}.png`), { supportsImages: true })
+    expect(history.images).toHaveLength(0)
+    expect(history.omittedCount).toBe(1)
+    const held = await extractCursorToolResultImages([
+      { type: "file", mediaType: "image/png", data: pathToFileURL(path.join(store, `${named}.png`)) },
+    ])
+    expect(held.images).toHaveLength(0)
+    expect(held.omittedCount).toBe(1)
+  })
+
   it("omits a stored image whose file is gone", async () => {
     const gone = createHash("sha256").update("gone").digest("hex")
     const result = await extractCursorHistoryImages(stored(`${gone}.png`), { supportsImages: true })

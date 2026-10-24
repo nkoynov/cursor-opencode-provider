@@ -252,6 +252,10 @@ async function decodeCursorImagePart(
     signal,
   )
   assertImageSize(resolved.data.length, remaining)
+  const stored = storedToolMediaHash(file.data)
+  if (stored && imageContentHash(resolved.data) !== stored) {
+    return unsupported("image input", "Cursor provider found a stored tool image whose content no longer matches its name")
+  }
   const declaredMimeType = file.mediaType
   const mimeType = declaredMimeType === "image/*"
     ? (resolved.mimeType?.startsWith("image/") ? resolved.mimeType : inferImageMimeType(resolved.data))
