@@ -635,6 +635,25 @@ The plan-mode restriction is over. An earlier reminder that forbade edits no lon
 }
 
 /**
+ * Fork: what `takeActiveCursorModeReminder` and `takeHostPlanAgentNote` consume for this session, and a function
+ * that hands it back, for a Run whose request never reached Cursor.
+ */
+export function snapshotModeDelivery(sessionKey: string | undefined): () => void {
+  if (!sessionKey) return () => {}
+  const mode = activeCursorModeBySession.get(sessionKey)
+  const firstTurn = mode?.firstTurn
+  const note = hostPlanExitNoteBySession.get(sessionKey)
+  return () => {
+    const current = activeCursorModeBySession.get(sessionKey)
+    if (mode && current === mode) mode.firstTurn = firstTurn!
+    else if (mode && !current) activeCursorModeBySession.set(sessionKey, mode)
+    if (hostPlanExitNoteBySession.get(sessionKey) === note) return
+    if (note === undefined) hostPlanExitNoteBySession.delete(sessionKey)
+    else hostPlanExitNoteBySession.set(sessionKey, note)
+  }
+}
+
+/**
  * Consume the active-mode reminder for this OpenCode session.
  * Marks the mode as no longer first-turn after the first successful read.
  */

@@ -4,6 +4,7 @@ import {
   checkpointBlobGraphConcern,
   checkpointBlobGraphRequiresRebase,
   extractPromptHistory,
+  interruptedReplyNote,
   MAX_CHECKPOINT_BLOB_GRAPH_BYTES,
   pump,
   pumpWithRecovery,
@@ -957,6 +958,33 @@ describe("interrupted Cursor Run handling", () => {
     for (const recovery of recoveries) {
       expect(Buffer.from((recovery as { checkpoint: Uint8Array }).checkpoint)).toEqual(Buffer.from(checkpoint))
     }
+  })
+
+  it("rebuilds a rebuilt Run that dropped before doing anything the same way, still holding the shown reply", async () => {
+    const first = fakeSession("shown-first", [serverFrame({ interaction_update: { text_delta: { text: "Fixing the test next." } } })])
+    const recoveries: CursorRunRecovery[] = []
+    const finalSession = await pumpWithRecovery({
+      initialSession: first,
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 4, baseDelayMs: 0, maxDelayMs: 0 },
+      canRebaseFromHistory: (failed) => failed === first,
+      recover: async (recovery) => {
+        recoveries.push(recovery)
+        return recoveries.length === 1 ? fakeSession("shown-rebuilt", []) : fakeSession("shown-final", [turnEnded()])
+      },
+    })
+
+    expect(finalSession.sessionId).toBe("shown-final")
+    expect(recoveries).toHaveLength(2)
+    for (const recovery of recoveries) {
+      expect(recovery).toMatchObject({ kind: "rebase", reason: "completed-tool-results", shownText: "Fixing the test next." })
+      expect((recovery as { callAnnounced?: boolean }).callAnnounced).toBeUndefined()
+    }
+  })
+
+  it("mentions an unfinished tool call only when the interrupted step began one", () => {
+    expect(interruptedReplyNote("Reading the file.")).not.toContain("tool call")
+    expect(interruptedReplyNote("Reading the file.", true)).toContain("A tool call you had started after it did not run")
   })
 
   it("keeps a refusal Cursor sent during the replacement upload final", async () => {

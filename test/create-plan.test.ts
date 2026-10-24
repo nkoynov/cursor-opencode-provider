@@ -915,6 +915,8 @@ describe("deferred CreatePlan display", () => {
     expect(result.error.error).toBe(CREATE_PLAN_HOST_PLAN_WORKFLOW_REASON)
     expect(parts.some((part) => part.type === "tool-call")).toBe(false)
     expect(session.deferredCreatePlanCalls?.size ?? 0).toBe(0)
+    // A failed CreatePlan may have written part of a plan file; a rebuild must not ask for it again.
+    expect(session.replaySafety?.historyRebaseUnsafe).toBe(true)
     sessionManager.close(session, "ordinary-cleanup")
   })
 })

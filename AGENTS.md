@@ -317,6 +317,16 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   provider-answered execs; it does with a host exec, a bridge or a stateful or
   unknown frame. Its shown text goes to the rebuilt Run as `<interrupted_reply>`
   to be continued. A final retry-unsafe error tells the user to send "continue".
+  A rebuilt Run that drops before doing anything is rebuilt with the same
+  recovery (`historyRebuild`), shown reply included. An approved SwitchMode (its
+  queued host-agent switch belongs to the Run) and a failed CreatePlan (its write
+  may have happened in part) are stateful barriers. A Run whose request never
+  went out hands back the one-shot mode reminder and plan-agent note
+  (`snapshotModeDelivery`). Accepted on purpose: a resent Run whose first upload
+  Cursor may have received runs inference twice, as Cursor CLI's resend after
+  text does, but the dead stream's execs, KV writes and checkpoints are never
+  answered or kept; a provider runtime spill file of the interrupted pass may be
+  written again under a new name.
   Missing-blob recovery is limited to the initial control-only checkpoint path
   (`isSoleControlFrame`); unknown/mixed frames keep the normal replay barrier.
 - Carry an uncheckpointed request only on its unchanged checkpoint; persist it

@@ -14,6 +14,7 @@ import {
   resetActiveCursorModesForTests,
   resolveSwitchModeBridge,
   setActiveCursorMode,
+  snapshotModeDelivery,
   switchModeResultFromToolOutput,
   switchModeToolInput,
   takeActiveCursorModeReminder,
@@ -716,6 +717,8 @@ describe("SwitchMode over a held-open Run without host plan tools", () => {
     // No host tool is involved, so nothing is pending and the turn ran to its end.
     expect(session.pending.size).toBe(0)
     expect(parts.some((part) => part.type === "tool-call")).toBe(false)
+    // The queued host-agent switch belongs to this Run, so a rebuild from history would lose it.
+    expect(session.replaySafety?.historyRebaseUnsafe).toBe(true)
 
     // The mode is recorded, so the next Run carries the plan contract, and it
     // points at the reachable way to ask for execution.
@@ -1077,6 +1080,24 @@ describe("display switch_mode_tool_call mapping", () => {
     expect(display?.preferredToolName).toBe("plan_exit")
     expect(display?.bridgeable).toBe(true)
     expect(resolveBridgedOpenCodeToolCall(display!, ["plan_enter", "plan_exit"])).toBeUndefined()
+  })
+})
+
+describe("snapshotModeDelivery", () => {
+  beforeEach(() => resetActiveCursorModesForTests())
+
+  it("hands back the first-turn reminder and the plan-agent note of a request that never went out", () => {
+    setActiveCursorMode("resend", "plan")
+    const tools = [{ name: "plan_exit", inputSchema: { type: "object", properties: {} } }]
+    const restore = snapshotModeDelivery("resend")
+    expect(takeActiveCursorModeReminder("resend")).toContain("Plan mode is active")
+    expect(takeHostPlanAgentNote("resend", "conv-resend", "plan", tools)).toBeDefined()
+    restore()
+    expect(takeActiveCursorModeReminder("resend")).toContain("Plan mode is active")
+    expect(takeHostPlanAgentNote("resend", "conv-resend", "plan", tools)).toBeDefined()
+    // A request that went out keeps them consumed.
+    expect(takeActiveCursorModeReminder("resend")).toContain("Plan mode is still active")
+    expect(takeHostPlanAgentNote("resend", "conv-resend", "plan", tools)).toBeUndefined()
   })
 })
 

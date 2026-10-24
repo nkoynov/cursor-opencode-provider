@@ -150,6 +150,7 @@ import {
   SESSION_EDITS_DENIED_SWITCH_REASON,
   SESSION_EDITS_DENIED_REMINDER,
   setActiveCursorMode,
+  snapshotModeDelivery,
   switchModeRejectedResult,
   switchModeResultFromToolOutput,
   switchModeToolInput,
@@ -1489,6 +1490,7 @@ export async function pumpWithRecovery(input: {
   let resumedAttempt = false
   let noProgressResumes = 0
   let openingFailure: CursorProviderError | undefined
+  let historyRebuild: Extract<CursorRunRecovery, { kind: "rebase" }> | undefined
   input.onSession?.(session)
 
   const resumableCheckpoint = (pumpedSession: CursorSession) =>
@@ -1501,7 +1503,11 @@ export async function pumpWithRecovery(input: {
   ) => {
     const toolCallIds = pumpedSession.resultsAfterCheckpoint?.toolCallIds
     const fromHistory = !failure.checkpointUnusable && !checkpoint && !!input.canRebaseFromHistory?.(pumpedSession)
-    const shownText = fromHistory ? pumpedSession.replaySafety?.attempt?.shownText?.trim() : undefined
+    const attempt = pumpedSession.replaySafety?.attempt
+    const shownText = fromHistory ? attempt?.shownText?.trim() : undefined
+    // A rebuilt Run that dropped before doing anything is rebuilt the same way, still holding the shown reply.
+    const repeatRebuild = !fromHistory && !checkpoint && !failure.checkpointUnusable && failure.replaySafe
+      && !pumpedSession.checkpointRevoked && historyRebuild !== undefined
     const recovery: CursorRunRecovery = failure.checkpointUnusable
       ? { kind: "rebase", reason: "checkpoint-unusable" }
       : checkpoint
@@ -1510,13 +1516,17 @@ export async function pumpWithRecovery(input: {
             conversationId: pumpedSession.conversationId,
             checkpoint: Uint8Array.from(checkpoint),
           }
-        : {
-            kind: "rebase",
-            ...(fromHistory ? { reason: "completed-tool-results" as const } : {}),
-            ...(shownText ? { shownText } : {}),
-            ...(input.steer ? { steer: true } : {}),
-            ...(toolCallIds?.size ? { toolCallIds: new Set(toolCallIds) } : {}),
-          }
+        : repeatRebuild
+          ? historyRebuild!
+          : {
+              kind: "rebase",
+              ...(fromHistory ? { reason: "completed-tool-results" as const } : {}),
+              ...(shownText ? { shownText } : {}),
+              ...(shownText && attempt?.announcedCalls?.length ? { callAnnounced: true } : {}),
+              ...(input.steer ? { steer: true } : {}),
+              ...(toolCallIds?.size ? { toolCallIds: new Set(toolCallIds) } : {}),
+            }
+    historyRebuild = recovery.kind === "rebase" && recovery.reason === "completed-tool-results" ? recovery : undefined
     resumedAttempt = recovery.kind === "resume"
     // A rebase opens another conversation; its checkpoints start over.
     if (!resumedAttempt) turnCheckpoint = undefined
@@ -1907,6 +1917,7 @@ export type CursorRunRecovery =
    * `steer`: the prompt ends with mid-turn user messages after the step's results.
    * `toolCallIds`: earlier results of this step that no checkpoint holds.
    * `shownText`: what the interrupted step already showed, for a rebuild to continue.
+   * `callAnnounced`: the interrupted step had begun a tool call that never ran.
    */
   | {
     kind: "rebase"
@@ -1914,20 +1925,21 @@ export type CursorRunRecovery =
     steer?: boolean
     toolCallIds?: ReadonlySet<string>
     shownText?: string
+    callAnnounced?: boolean
   }
   | { kind: "resume"; conversationId: string; checkpoint: Uint8Array }
 
 const INTERRUPTED_REPLY_MAX_CHARS = 16_000
 
 /** A rebuilt step continues the reply the user already sees instead of writing it again. */
-export function interruptedReplyNote(shownText: string): string {
+export function interruptedReplyNote(shownText: string, callAnnounced = false): string {
   const shown = shownText.length > INTERRUPTED_REPLY_MAX_CHARS
     ? `[…]${shownText.slice(-INTERRUPTED_REPLY_MAX_CHARS)}`
     : shownText
   return "\n\nThe connection dropped while you were replying. The user already sees this part of your reply:\n"
     + `<interrupted_reply>\n${shown}\n</interrupted_reply>\n`
-    + "Continue from where it ends without repeating it. A tool call you had started after it did not complete; "
-    + "make it again if you still need it."
+    + "Continue from where it ends without repeating it."
+    + (callAnnounced ? " A tool call you had started after it did not run; make it again if you still need it." : "")
 }
 
 const heartbeatWritePendingBySession = new WeakMap<CursorSession, boolean>()
@@ -2298,7 +2310,7 @@ async function startSession(
   const liveTurn = allowTools && !isCompaction && !isolateHelper ? liveUserTurn(prompt) : undefined
   let userText = recovery?.kind === "rebase" && !checkpointUnusable && !unfinishedPriorRun
     ? "Continue the interrupted turn from the conversation history above. Do not repeat completed work."
-      + (recovery.shownText ? interruptedReplyNote(recovery.shownText) : "")
+      + (recovery.shownText ? interruptedReplyNote(recovery.shownText, recovery.callAnnounced) : "")
     : ((liveTurn ? liveTurn.text : extractUserText(lastUser)) || ".")
   // The reply to a turn stopped on a model switch. That stop already bound the
   // conversation to the checkpoint before the switch, so only the request changes.
@@ -2414,6 +2426,7 @@ async function startSession(
         carriesEditDeny: userTurnHostNotes.carriedNotes.some(batch =>
           batch.notes.some(note => note.includes(SESSION_EDITS_DENIED_REMINDER))),
       })
+  const restoreModeDelivery = snapshotModeDelivery(sessionKey)
   const modeReminder = isCompaction || lifecycle || resuming
     ? undefined
     : nativePlanPromptOwnsMode
@@ -2703,13 +2716,20 @@ async function startSession(
   trace(`hash requestContext sha256=${requestContextHash}`)
   if (conversationState) trace(`hash checkpoint sha256=${sha(conversationState)}`)
 
-  const stream = await openRunWithRequest(token, {
-    baseURL: agentBaseUrl, headers: options.headers,
-  }, reqBytes, "initial Run request", {
-    signal: callOptions.abortSignal,
-    stoppedWithSessionId: lifecycle ? undefined : sessionKey,
-    requestedAt: startOptions?.requestedAt ?? Date.now(),
-  })
+  let stream: BidiStream
+  try {
+    stream = await openRunWithRequest(token, {
+      baseURL: agentBaseUrl, headers: options.headers,
+    }, reqBytes, "initial Run request", {
+      signal: callOptions.abortSignal,
+      stoppedWithSessionId: lifecycle ? undefined : sessionKey,
+      requestedAt: startOptions?.requestedAt ?? Date.now(),
+    })
+  } catch (error) {
+    // A resend of this Run must carry the same one-shot guidance.
+    restoreModeDelivery()
+    throw error
+  }
   userTurnHostNotes.sent()
   if (sessionKey && fallbackReply) forgetModelFallbackStop(sessionKey, fallbackReply.stop)
   if (!isCompaction && !lifecycle && !resuming) recordSessionEditsGuidance(conversationId, sessionEditsDenied)
@@ -7039,7 +7059,11 @@ export async function pump(
         }
       })()
       try {
-        if (handled.outcome === "acknowledged" || handled.planReview || handled.endTurn) {
+        // Fork: an approved SwitchMode queues a host-agent switch this Run owns, and a failed CreatePlan may have
+        // written part of a plan file; a Run rebuilt from history would lose the one and repeat the other.
+        if (handled.outcome === "acknowledged" || handled.planReview || handled.endTurn
+          || (handled.outcome === "approved" && handled.switchMode)
+          || (handled.outcome === "failed" && handled.variantName === "create_plan_request_query")) {
           replaySafety.markBarrier("stateful-interaction")
           invalidateResumeCheckpoint(session)
         }

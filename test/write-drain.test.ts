@@ -11,6 +11,7 @@ import { notifyHostInterrupt } from "../src/host-interrupt.js"
 import { CursorLocalCancellationError, CursorProviderError, CursorServerError } from "../src/errors.js"
 import { pump, resetTurnStateForTests, runUploadFailure, sendRunRequest, settleRunSavesForTests } from "../src/language-model.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
+import { resetActiveCursorModesForTests, setActiveCursorMode } from "../src/protocol/switch-mode.js"
 import { encodeFrame } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { sessionManager, type Frame } from "../src/session.js"
@@ -347,13 +348,21 @@ describe("Run write drain", () => {
       headers: { "x-opencode-session-id": sessionKey },
     }) as LanguageModelV3CallOptions
 
-    it("renews the token once and opens the first Run again", async () => {
-      await run((index) => index === 0 ? "unauthenticated" : undefined, async (model, renewals) => {
-        const result = await model.doStream(call("ses_upload_auth_initial"))
-        expect(renewals()).toBe(1)
-        expect(fake!.received).toHaveLength(2)
-        await failureOf(result.stream.cancel())
-      })
+    it("renews the token once and opens the first Run again with the same one-shot guidance", async () => {
+      setActiveCursorMode("ses_upload_auth_initial", "plan")
+      try {
+        await run((index) => index === 0 ? "unauthenticated" : undefined, async (model, renewals) => {
+          const result = await model.doStream(call("ses_upload_auth_initial"))
+          expect(renewals()).toBe(1)
+          expect(fake!.received).toHaveLength(2)
+          await waitUntil(() => fake!.body(1).includes("Plan mode is"))
+          expect(fake!.body(1).includes("Plan mode is active")).toBe(true)
+          expect(fake!.body(1).includes("Plan mode is still active")).toBe(false)
+          await failureOf(result.stream.cancel())
+        })
+      } finally {
+        resetActiveCursorModesForTests()
+      }
     }, 20_000)
 
     it("ends the turn when the renewed token is rejected too", async () => {
