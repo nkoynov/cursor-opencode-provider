@@ -5647,7 +5647,10 @@ export async function pump(
 
   while (true) {
     if (session.hostInterrupted) stopForHostInterrupt()
-    if (session.modelSwitch && await takeModelSwitch()) return
+    // A declined review or a plan handoff ends this Run with its own cancellation.
+    if (session.modelSwitch && !session.planReviewDeclined
+      && !isHostAgentHandoffPending(session.openCodeSessionId, session.sessionId)
+      && await takeModelSwitch()) return
     // Consumer cancelled / closed the ReadableStream. Stop reading Cursor
     // frames so a continuation doStream can resume the same iterator —
     // keeping the loop alive would discard frames the next pump needs.

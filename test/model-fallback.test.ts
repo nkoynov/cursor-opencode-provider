@@ -514,6 +514,28 @@ describe("stopping a Run at the first switched step", () => {
     expect(finishes(parts)).toEqual(["stop"])
   })
 
+  it("leaves a declined plan review to its own cancellation", async () => {
+    const script = scriptedFrames([])
+    const session = fakeRun(script.frames)
+    session.planReviewDeclined = true
+    session.modelSwitch = {
+      ...FALLBACK,
+      source: "fallback-block",
+      rollback: undefined,
+      holdsTurn: false,
+      toolsKept: [],
+      toolsSwitched: [],
+    }
+    script.push({ flags: 2, payload: new TextEncoder().encode('{"error":{"code":"canceled"}}') })
+
+    const parts = await pass(session)
+
+    const reasons = writes.map((w) => decodeMessage<any>("AgentClientMessage", w).conversation_action?.cancel_action?.reason)
+    expect(reasons.filter(Boolean)).toEqual(["plan_execution_declined"])
+    expect(visibleText(parts)).not.toContain("**Stopped:**")
+    expect(finishes(parts)).toEqual(["stop"])
+  })
+
   it("stops on Cursor's notice alone and rolls back to the turn's start when no step was marked", async () => {
     const turnBase = encodeMessage("ConversationStateStructure", { token_details: { used_tokens: 50, max_tokens: 1_000_000 } })
     const script = scriptedFrames([textFrame("answer"), kvSet(1, blob(assistantMessage({ text: "answer", native: "" }))), checkpointFrame(90), textFrame(NOTICE), turnEnded])
