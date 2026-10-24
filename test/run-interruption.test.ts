@@ -8,6 +8,7 @@ import {
   pump,
   pumpWithRecovery,
   rememberMirroredTodos,
+  runUploadFailure,
   type CursorRunRecovery,
   snapshotMirroredTodosBySession,
 } from "../src/language-model.js"
@@ -16,7 +17,7 @@ import { sessionManager, type CursorSession, type Frame } from "../src/session.j
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
 import { CursorAuthError, CursorRetryExhaustedError, CursorServerError, CursorTransportError, hostFacingError } from "../src/errors.js"
 import { billingLedger } from "../src/billing.js"
-import { writeStreamMessage } from "../src/stream-write.js"
+import { StreamWriteDrainError, writeStreamMessage } from "../src/stream-write.js"
 import { sessionFixture } from "./session-fixture.js"
 
 function fakeSession(id: string, frames: Frame[], writes: Uint8Array[] = []): CursorSession {
@@ -930,6 +931,49 @@ describe("interrupted Cursor Run handling", () => {
       expect(Buffer.from((recovery as { checkpoint: Uint8Array }).checkpoint)).toEqual(Buffer.from(checkpoint))
     }
     expect(parts.filter((part) => part.type === "finish")).toHaveLength(1)
+  })
+
+  it("sends the replacement Run again when its upload is cut off", async () => {
+    const checkpoint = Uint8Array.from([0x0a, 0x01, 0x09])
+    const recoveries: CursorRunRecovery[] = []
+    const cut = () => runUploadFailure(new StreamWriteDrainError("Cursor initial Run request backpressure drain failed",
+      new CursorRunInterruptedError("Cursor Run stream ended before drain")), "initial Run request")
+    const finalSession = await pumpWithRecovery({
+      initialSession: fakeSession("upload-first", [
+        serverFrame({ interaction_update: { text_delta: { text: "partial" } } }),
+        serverFrame({ conversation_checkpoint_update: checkpoint }),
+      ]),
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 4, baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async (recovery) => {
+        recoveries.push(recovery)
+        if (recoveries.length < 3) throw cut()
+        return fakeSession("upload-replacement", [turnEnded()])
+      },
+    })
+
+    expect(finalSession.sessionId).toBe("upload-replacement")
+    expect(recoveries.map((recovery) => recovery.kind)).toEqual(["resume", "resume", "resume"])
+    for (const recovery of recoveries) {
+      expect(Buffer.from((recovery as { checkpoint: Uint8Array }).checkpoint)).toEqual(Buffer.from(checkpoint))
+    }
+  })
+
+  it("keeps a refusal Cursor sent during the replacement upload final", async () => {
+    const refused = new CursorServerError("Cursor refused the Run", { code: "permission_denied", transient: false, replaySafe: false })
+    let recoveries = 0
+    const failure = await pumpWithRecovery({
+      initialSession: fakeSession("refused-first", [serverFrame({ conversation_checkpoint_update: Uint8Array.from([0x0a, 0x01, 0x0a]) })]),
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 4, baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async () => {
+        recoveries++
+        throw runUploadFailure(new StreamWriteDrainError("Cursor initial Run request backpressure drain failed", refused), "initial Run request")
+      },
+    }).catch((error: unknown) => error)
+
+    expect(failure).toBe(refused)
+    expect(recoveries).toBe(1)
   })
 
   it("does not count a prior tool-step barrier as streaming from a silent resumed attempt", async () => {

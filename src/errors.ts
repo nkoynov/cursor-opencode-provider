@@ -631,7 +631,8 @@ export function retrySuppressedError(
     cause.message.replace(/^Cursor Run stream /, "Cursor stream "),
   )
   return new CursorProviderError(
-    `${subject} ${reason}; automatic retry unsafe (attempt ${attempt}/${maxAttempts})`,
+    `${subject} ${reason}; automatic retry unsafe (attempt ${attempt}/${maxAttempts}). ` +
+      `Send a message such as "continue" to resume from the last saved state`,
     {
       origin: cause.origin,
       transient: false,

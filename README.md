@@ -345,12 +345,18 @@ transport retry budget and the 180-second consecutive-stall window. The separate
 120-second transport read-idle watchdog remains a backstop. Direct SDK callers
 can override `continuation.semanticIdleMs` (or its `softHealthMs` alias).
 
-If a Run drops immediately after completed tool results, before new output,
-the provider can rebuild from host history containing every observed exec's
-result. It sends the completed results once and asks Cursor to continue. A
-checkpoint predating those results is never resumed. Missing results, unknown
-activity, a tool call Cursor ran itself or a new interaction keep the failure
-final. If the rebuilt history would fill more than 80% of the model's context,
+If a Run drops after completed tool results, before Cursor saves a checkpoint,
+the provider can rebuild from host history containing the result of every exec
+a host tool ran. It sends the completed results once and asks Cursor to
+continue. A checkpoint predating those results is never resumed. The step that
+was interrupted does not stop the rebuild while nothing of it ran on the host:
+its text (which the rebuilt step is told it already wrote, so it continues
+rather than repeats), its reasoning, calls it had only announced, and execs the
+provider answered itself (refusals, its own runtime files). Missing results,
+unknown activity, a tool call Cursor ran itself, a host tool started in the
+interrupted step or a stateful interaction keep the failure final, and the
+error says to send a message such as "continue". A Run whose request upload is
+cut off had nothing read from it, so it is sent again within the retry budget. If the rebuilt history would fill more than 80% of the model's context,
 the provider reports a context overflow so the host compacts first.
 A checkpoint received while the completed result drains remains eligible.
 History recovery retains completed results from earlier resumed Runs too.

@@ -21,9 +21,11 @@ export type ReplaySafetyState = {
   statefulBarrier?: ReplayBarrierReason
   /**
    * Every exec needs its owner's host result; ids can restart on a resumed Run.
-   * `callId` is the display call the exec claims.
+   * `callId` is the display call the exec claims. Fork: `host` marks an exec
+   * handed to a host tool; the provider answers the others itself (refusals,
+   * its own runtime files, placeholders), and they change nothing outside it.
    */
-  execs?: Array<{ sessionId: string; id: number; callId?: string }>
+  execs?: Array<{ sessionId: string; id: number; callId?: string; host?: true }>
   /** Display calls Cursor announced; history holds one only through the host exec that claims it. */
   announcedCalls?: string[]
   /** History cannot represent opaque interactions, unknown frames or unclaimed display work. */
@@ -32,14 +34,36 @@ export type ReplaySafetyState = {
   bridgedCalls?: string[]
   /** Fork: calls Cursor completed without an exec; history holds one only once it is bridged. */
   completedCalls?: string[]
+  /** Fork: the latest pump pass, which a history rebuild generates again. */
+  attempt?: {
+    /** Calls it announced: nothing ran them unless an exec claimed them or Cursor completed them. */
+    announcedCalls?: string[]
+    /** It handed work to the host or did something history cannot hold. */
+    unrepresentable?: boolean
+    /** Text the host already shows from it. */
+    shownText?: string
+  }
 }
 
-/** Whether a host exec or bridge claimed every display call Cursor announced, so history holds each one. */
-export function announcedCallsClaimed(state: ReplaySafetyState | undefined): boolean {
+/**
+ * Whether a host exec or bridge claimed every display call Cursor announced, so history holds each one.
+ * `unfinished`: calls of the interrupted step that nothing ran, which a rebuild may leave out.
+ */
+export function announcedCallsClaimed(state: ReplaySafetyState | undefined, unfinished: readonly string[] = []): boolean {
   const bridged = new Set(state?.bridgedCalls)
-  const claimed = new Set([...bridged, ...state?.execs?.flatMap((exec) => exec.callId ? [exec.callId] : []) ?? []])
+  const completed = new Set(state?.completedCalls)
+  const claimed = new Set([
+    ...bridged,
+    ...state?.execs?.flatMap((exec) => exec.callId ? [exec.callId] : []) ?? [],
+    ...unfinished.filter((callId) => !completed.has(callId)),
+  ])
   return (state?.announcedCalls ?? []).every((callId) => claimed.has(callId))
     && (state?.completedCalls ?? []).every((callId) => bridged.has(callId))
+}
+
+/** Fork: execs a host tool ran, each of which needs its result in host history. */
+export function hostExecs(state: ReplaySafetyState | undefined): NonNullable<ReplaySafetyState["execs"]> {
+  return state?.execs?.filter((exec) => exec.host) ?? []
 }
 
 export class AttemptReplaySafety {
@@ -51,6 +75,7 @@ export class AttemptReplaySafety {
     private readonly state: ReplaySafetyState = {},
   ) {
     this.stateful = state.statefulBarrier !== undefined
+    state.attempt = {}
   }
 
   markBarrier(reason: ReplayBarrierReason): void {
@@ -73,6 +98,8 @@ export class AttemptReplaySafety {
     if (lifecycle?.kind === "started" && !claimed) {
       const announced = this.state.announcedCalls ??= []
       if (!announced.includes(lifecycle.callId)) announced.push(lifecycle.callId)
+      const attempt = this.state.attempt!.announcedCalls ??= []
+      if (!attempt.includes(lifecycle.callId)) attempt.push(lifecycle.callId)
       this.mark("display-tool-lifecycle", true)
       return
     }
@@ -90,6 +117,7 @@ export class AttemptReplaySafety {
   claimBridgedCall(callId: string): void {
     const bridged = this.state.bridgedCalls ??= []
     if (!bridged.includes(callId)) bridged.push(callId)
+    this.state.attempt!.unrepresentable = true
   }
 
   recordExec(id: unknown, callId?: string): void {
@@ -102,11 +130,25 @@ export class AttemptReplaySafety {
     execs.push({ sessionId: this.sessionId, id, ...(callId ? { callId } : {}) })
   }
 
+  /** Fork: a recorded exec goes to a host tool, so its result must reach host history before a rebuild. */
+  recordHostExec(id: number): void {
+    const exec = this.state.execs?.find((entry) => entry.sessionId === this.sessionId && entry.id === id)
+    if (exec) exec.host = true
+    else this.state.historyRebaseUnsafe = true
+    this.state.attempt!.unrepresentable = true
+  }
+
+  /** Fork: text the host shows, which a rebuilt step must continue rather than repeat. */
+  recordShownText(text: string): void {
+    this.state.attempt!.shownText = (this.state.attempt!.shownText ?? "") + text
+  }
+
   private mark(reason: ReplayBarrierReason, historyRepresentable: boolean): void {
     if (!OUTPUT_ONLY_BARRIERS.has(reason)) {
       this.stateful = true
       this.state.statefulBarrier ??= reason
       if (!historyRepresentable) this.state.historyRebaseUnsafe = true
+      if (reason !== "non-control-exec" && reason !== "display-tool-lifecycle") this.state.attempt!.unrepresentable = true
     }
     if (this.barrierReason) return
     this.barrierReason = reason

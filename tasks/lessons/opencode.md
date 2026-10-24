@@ -197,7 +197,16 @@ These are failure lessons shared by both hosts, not a replacement for
   lose earlier completed results (`test/run-error-host.test.ts`, `test/session.test.ts`).
   Reject an unsafe replacement upload before consulting the preceding Run's
   checkpoint: that checkpoint says nothing about work the replacement may have
-  started. Failed drains must also project as terminal to both hosts, including
+  started. Fork (CB-10): a cut upload of a new Run's own request is not unsafe.
+  Nothing reads that stream until the request is sent, so the replacement
+  answered no exec or KV request and Cursor's state reached no checkpoint we
+  hold; sending it again equals a Run that died before its first frame. Five
+  host turns failed on this in one connection burst (2026-10-22). Likewise the
+  history rebuild was blocked by things that never ran on the host: provider
+  answers anywhere in the Run (they were counted as execs owed a result) and the
+  interrupted step's own output. Count only host execs, and judge the
+  interrupted pass apart from the Run (`ReplaySafetyState.attempt`).
+  Failed drains must also project as terminal to both hosts, including
   during credential renewal and endless mode (`test/run-interruption.test.ts`).
   Endless mode bypasses counts only, preserving replay guards and CLI's 180 s
   consecutive-stall retry window (`src/retry-budget.ts`,

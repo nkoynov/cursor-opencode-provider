@@ -4,21 +4,22 @@ import net from "node:net"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
+import { APICallError, type LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
 import { getHostCacheDirOverride, setHostCacheDirOverride } from "../src/context/paths.js"
 import { notifyHostInterrupt } from "../src/host-interrupt.js"
-import { CursorLocalCancellationError, CursorProviderError } from "../src/errors.js"
-import { pump, resetTurnStateForTests, settleRunSavesForTests } from "../src/language-model.js"
+import { CursorLocalCancellationError, CursorProviderError, CursorServerError } from "../src/errors.js"
+import { pump, resetTurnStateForTests, runUploadFailure, settleRunSavesForTests } from "../src/language-model.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
 import { encodeFrame } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { sessionManager, type Frame } from "../src/session.js"
-import { writeStreamMessage } from "../src/stream-write.js"
+import { StreamWriteDrainError, writeStreamMessage } from "../src/stream-write.js"
 import {
   bidiRunStream,
   cacheHttp2SessionForTests,
   closeCachedHttp2SessionsForTests,
+  CursorRunInterruptedError,
   resetRunCompressionForTests,
   routeHttp2ConnectionsForTests,
 } from "../src/transport/connect.js"
@@ -33,7 +34,7 @@ const ORIGIN = "https://agentn.drain-test.cursor.sh"
  * `bytesPerSecond`, or nothing once stalled. The server answers each Run with
  * one frame and then stays silent.
  */
-async function startSlowCursor(bytesPerSecond: number, options: { endWithoutReading?: boolean; refuseGzip?: boolean } = {}) {
+async function startSlowCursor(bytesPerSecond: number, options: { endWithoutReading?: boolean | number; refuseGzip?: boolean } = {}) {
   const received: number[] = []
   const bodies: Buffer[][] = []
   const serverStreams: http2.ServerHttp2Stream[] = []
@@ -55,7 +56,10 @@ async function startSlowCursor(bytesPerSecond: number, options: { endWithoutRead
     }
     stream.write(encodeFrame(0x00, encodeMessage("AgentServerMessage", { interaction_update: { heartbeat: {} } })))
     stream.on("error", () => {})
-    if (options.endWithoutReading) return void setTimeout(() => stream.end(), 100)
+    // A number ends only that many first Runs.
+    const endEarly = options.endWithoutReading === true
+      || (typeof options.endWithoutReading === "number" && index < options.endWithoutReading)
+    if (endEarly) return void setTimeout(() => stream.end(), 100)
     stream.on("data", (chunk: Buffer) => {
       received[index]! += chunk.length
       bodies[index]!.push(chunk)
@@ -243,6 +247,46 @@ describe("Run write drain", () => {
     expect(error).not.toBeInstanceOf(CursorLocalCancellationError)
     expect(await failureOf(run.waitForDrain!())).toBeInstanceOf(CursorProviderError)
   }, 5_000)
+
+  it("lets the host send a Run again whose upload Cursor cut off", async () => {
+    fake = await startSlowCursor(200_000, { endWithoutReading: 1 })
+    const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-upload-cut-"))
+    const previousCache = getHostCacheDirOverride()
+    try {
+      const model = createCursor({ name: "cursor", accessToken: "token", agentBaseURL: ORIGIN,
+        workspaceRoot: cacheDir, cacheDir }).languageModel("composer-2.5")
+      const error = await failureOf(Promise.resolve(model.doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "x".repeat(3_000_000) }] }],
+        tools: [{ type: "function", name: "read", description: "Read", inputSchema: { type: "object", properties: {} } }],
+        headers: { "x-opencode-session-id": "ses_upload_cut" },
+      } as LanguageModelV3CallOptions)))
+
+      // Nothing read the stream, so nothing ran: the host may send the turn again.
+      expect(APICallError.isInstance(error)).toBe(true)
+      expect(error).toMatchObject({ isRetryable: true, responseHeaders: { "x-should-retry": "true" } })
+      expect((error as Error).message).not.toContain("automatic retry unsafe")
+    } finally {
+      closeCachedHttp2SessionsForTests()
+      setHostCacheDirOverride(previousCache)
+      await fs.rm(cacheDir, { recursive: true, force: true })
+    }
+  }, 15_000)
+
+  it("keeps a cut upload replay-safe and a refusal Cursor sent final", () => {
+    const ended = new CursorRunInterruptedError("Cursor Run stream ended before drain")
+    const cut = runUploadFailure(new StreamWriteDrainError("Cursor initial Run request backpressure drain failed", ended), "initial Run request")
+    expect(cut).toBe(ended)
+    expect(cut).toMatchObject({ transient: true, replaySafe: true })
+
+    const refused = new CursorServerError("Cursor refused the Run", { code: "permission_denied", transient: false, replaySafe: false })
+    const final = runUploadFailure(new StreamWriteDrainError("Cursor initial Run request backpressure drain failed", refused), "initial Run request")
+    expect(final).toBe(refused)
+    expect(final).toMatchObject({ transient: false })
+
+    const raw = runUploadFailure(new Error("write after end"), "initial Run request")
+    expect(raw).toBeInstanceOf(CursorProviderError)
+    expect(raw).toMatchObject({ transient: true, replaySafe: true, origin: "transport" })
+  })
 
   it("leaves a stalled write to the read-idle watchdog", async () => {
     fake = await startSlowCursor(200_000)

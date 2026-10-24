@@ -369,7 +369,7 @@ import {
   hostNoteText,
   wrapHostNotesForCursor,
 } from "./protocol/host-notes.js"
-import { analyzeReplayFrame, announcedCallsClaimed, AttemptReplaySafety, describeFrameLayout } from "./replay-safety.js"
+import { analyzeReplayFrame, announcedCallsClaimed, AttemptReplaySafety, describeFrameLayout, hostExecs } from "./replay-safety.js"
 import { noteCursorWaitEnded, noteCursorWaitStarted } from "./cursor-waits.js"
 import {
   deferToolExec,
@@ -1338,14 +1338,15 @@ async function doStreamImpl(
               retryPolicy,
               retryBudget,
               canRebaseFromHistory: (failed) => {
+                const replay = failed.replaySafety
                 if (failed !== session || trailingToolResults.length === 0
                   || !failed.checkpointRevokedByHostResult || failed.pending.size > 0
-                  || failed.replaySafety?.historyRebaseUnsafe
-                  || !announcedCallsClaimed(failed.replaySafety)) return false
+                  || replay?.historyRebaseUnsafe || replay?.attempt?.unrepresentable
+                  || !announcedCallsClaimed(replay, replay?.attempt?.announcedCalls)) return false
                 const completed = new Set(extractToolResults(prompt)
                   .map(result => `${result.sessionId}:${result.execId}`))
-                const execs = failed.replaySafety?.execs ?? []
-                if (!execs.length && !failed.replaySafety?.bridgedCalls?.length) return false
+                const execs = hostExecs(replay)
+                if (!execs.length && !replay?.bridgedCalls?.length) return false
                 return execs.every(exec => completed.has(`${exec.sessionId}:${exec.id}`))
               },
               recover: (recovery) => openSession({ recovery }),
@@ -1479,6 +1480,8 @@ export async function pumpWithRecovery(input: {
     checkpoint: Uint8Array | undefined,
   ) => {
     const toolCallIds = pumpedSession.resultsAfterCheckpoint?.toolCallIds
+    const fromHistory = !failure.checkpointUnusable && !checkpoint && !!input.canRebaseFromHistory?.(pumpedSession)
+    const shownText = fromHistory ? pumpedSession.replaySafety?.attempt?.shownText?.trim() : undefined
     const recovery: CursorRunRecovery = failure.checkpointUnusable
       ? { kind: "rebase", reason: "checkpoint-unusable" }
       : checkpoint
@@ -1489,7 +1492,8 @@ export async function pumpWithRecovery(input: {
           }
         : {
             kind: "rebase",
-            ...(input.canRebaseFromHistory?.(pumpedSession) ? { reason: "completed-tool-results" as const } : {}),
+            ...(fromHistory ? { reason: "completed-tool-results" as const } : {}),
+            ...(shownText ? { shownText } : {}),
             ...(input.steer ? { steer: true } : {}),
             ...(toolCallIds?.size ? { toolCallIds: new Set(toolCallIds) } : {}),
           }
@@ -1687,7 +1691,8 @@ export async function pumpWithRecovery(input: {
           throw noProgressResumeError(failure, noProgressResumes)
         }
       }
-      const historyRecovery = failure.replayBarrier === undefined && input.canRebaseFromHistory?.(pumpedSession)
+      // The interrupted step's own output and provider-answered execs do not bar it: the rebuild generates them again.
+      const historyRecovery = input.canRebaseFromHistory?.(pumpedSession)
       if (!failure.replaySafe && !checkpoint && !historyRecovery) {
         // Cursor CLI sends the same action again. Shown output keeps the
         // provider from doing so; the host can, unless a side effect would repeat.
@@ -1755,7 +1760,7 @@ export async function sendRunRequest(
     await writeWithBackpressure(stream, request, operation)
     return stream
   } catch (error) {
-    if (!stream.compressionRejected?.()) throw error
+    if (!stream.compressionRejected?.()) throw runUploadFailure(error, operation)
   }
   try { stream.destroy() } catch { /* already closed */ }
   trace(`Run compression: ${operation} refused while uploading — sending it once more uncompressed`)
@@ -1765,8 +1770,31 @@ export async function sendRunRequest(
     return next
   } catch (error) {
     try { next.destroy() } catch { /* already closed */ }
-    throw error
+    throw runUploadFailure(error, operation)
   }
+}
+
+/**
+ * Fork: nothing reads a new Run's stream before its request is uploaded, so a cut upload ran no tool and answered
+ * nothing, and the Run can go again. A failure Cursor sent keeps its own verdict.
+ */
+export function runUploadFailure(error: unknown, operation: string): CursorProviderError {
+  const failure = toCursorProviderError(error, { replaySafe: false, fallback: `Cursor ${operation} write failed` })
+  const terminal = failure instanceof StreamWriteDrainError && failure.cause instanceof CursorProviderError
+    ? failure.cause
+    : undefined
+  if (terminal) {
+    if (terminal.transient) terminal.replaySafe = true
+    trace(`Run upload cut off: ${operation} err=${failure.message} terminal=${terminal.message} transient=${terminal.transient}`)
+    return terminal
+  }
+  trace(`Run upload cut off: ${operation} err=${failure.message}`)
+  return new CursorTransportError(failure.message, {
+    transient: true,
+    replaySafe: true,
+    code: failure.code ?? "CURSOR_RUN_UPLOAD_FAILED",
+    cause: error,
+  })
 }
 
 /** A recovery Run continues the same turn: same request, same tools run so far, same acceptance of a switch. */
@@ -1824,14 +1852,29 @@ export type CursorRunRecovery =
   /**
    * `steer`: the prompt ends with mid-turn user messages after the step's results.
    * `toolCallIds`: earlier results of this step that no checkpoint holds.
+   * `shownText`: what the interrupted step already showed, for a rebuild to continue.
    */
   | {
     kind: "rebase"
     reason?: "checkpoint-unusable" | "unfinished-prior-run" | "completed-tool-results"
     steer?: boolean
     toolCallIds?: ReadonlySet<string>
+    shownText?: string
   }
   | { kind: "resume"; conversationId: string; checkpoint: Uint8Array }
+
+const INTERRUPTED_REPLY_MAX_CHARS = 16_000
+
+/** A rebuilt step continues the reply the user already sees instead of writing it again. */
+export function interruptedReplyNote(shownText: string): string {
+  const shown = shownText.length > INTERRUPTED_REPLY_MAX_CHARS
+    ? `[…]${shownText.slice(-INTERRUPTED_REPLY_MAX_CHARS)}`
+    : shownText
+  return "\n\nThe connection dropped while you were replying. The user already sees this part of your reply:\n"
+    + `<interrupted_reply>\n${shown}\n</interrupted_reply>\n`
+    + "Continue from where it ends without repeating it. A tool call you had started after it did not complete; "
+    + "make it again if you still need it."
+}
 
 const heartbeatWritePendingBySession = new WeakMap<CursorSession, boolean>()
 /** Runs whose first current category breakdown was checked for missing rules. */
@@ -2201,6 +2244,7 @@ async function startSession(
   const liveTurn = allowTools && !isCompaction && !isolateHelper ? liveUserTurn(prompt) : undefined
   let userText = recovery?.kind === "rebase" && !checkpointUnusable && !unfinishedPriorRun
     ? "Continue the interrupted turn from the conversation history above. Do not repeat completed work."
+      + (recovery.shownText ? interruptedReplyNote(recovery.shownText) : "")
     : ((liveTurn ? liveTurn.text : extractUserText(lastUser)) || ".")
   // The reply to a turn stopped on a model switch. That stop already bound the
   // conversation to the checkpoint before the switch, so only the request changes.
@@ -5344,6 +5388,7 @@ export async function pump(
     textSeparator = ""
     assistantText += text
     replaySafety.markBarrier("visible-text")
+    replaySafety.recordShownText(text)
     // Close reasoning before text (hosts expect reasoning-end before text-start).
     if (reasoningStarted && !textStarted) {
       safeEnqueue({ type: "reasoning-end", id: reasoningId } as V3Part)
@@ -6665,6 +6710,7 @@ export async function pump(
               continue
             }
             if (displayCallId) session.displayToolCalls.delete(displayCallId)
+            replaySafety.recordHostExec(parsed.id)
             sessionManager.registerPending(
               parsed.id,
               session,
@@ -6810,6 +6856,7 @@ export async function pump(
             registerCursorShellCall(tc.toolCallId, parsed.resultMetadata)
           }
           // Keep the stream open; the result arrives on the next doStream call.
+          replaySafety.recordHostExec(parsed.id)
           sessionManager.registerPending(
             parsed.id,
             session,

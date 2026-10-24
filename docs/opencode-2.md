@@ -217,9 +217,12 @@ if no exec or started tool lifecycle arrived; it closes without execution.
 Stateful activity stays a replay barrier. Like Cursor CLI, an active Run with no
 pending host work fails after 30 s without an inbound frame; heartbeats and
 partial inputs renew that deadline, while client heartbeats do not. The 120 s
-transport read-idle watchdog remains a backstop. A drop immediately after
-completed tool results can rebuild from complete host history
-before new output; missing results or unrepresented activity remain final.
+transport read-idle watchdog remains a backstop. A drop after completed tool
+results, before a new checkpoint, can rebuild from complete host history; the
+interrupted step's output, announced calls and provider-answered execs do not
+prevent it, and its shown text is passed on to be continued. Missing results,
+a host tool started in that step or unrepresented activity remain final. A Run
+whose request upload is cut off is sent again.
 A rebuild too large for the model's context is reported as a context overflow
 (413), so OpenCode compacts instead of retrying. Recovery retains the latest eligible checkpoint across token renewal, including
 a rejected credential on an untouched resumed attempt. Checkpoints received

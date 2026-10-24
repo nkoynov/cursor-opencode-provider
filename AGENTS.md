@@ -124,7 +124,10 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   once per process in memory, validate HTTPS `*.cursor.sh`, and fail closed;
   no disk memo or legacy-host fallback. GetServerConfig telemetry defaults off.
 - Serialize every response-required write and await drain. A buffered failure
-  is ambiguous delivery and cannot be replayed. There is no upload deadline;
+  is ambiguous delivery and cannot be replayed. Fork: a new Run's own request
+  upload is the exception: nothing reads that stream before it is sent, so a
+  cut upload is transient and replay-safe unless the stream's terminal error is
+  Cursor's final verdict (`runUploadFailure`). There is no upload deadline;
   errors, Run termination and the 120 s inbound read-idle watchdog settle waits.
 - Initial and replacement uploads own temporary abort/host-Stop listeners;
   continuation delivery and the active pump use their current call's signal.
@@ -303,6 +306,13 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   exec has a completed result and no opaque activity occurred. Include all
   completed tool steps; never resume their earlier checkpoint. Other barriers
   stay final.
+- Fork (CB-10): only execs handed to a host tool (`recordHostExec`) need a
+  result in history; the provider's own answers change nothing outside it. The
+  interrupted pump pass (`ReplaySafetyState.attempt`) does not bar the rebuild
+  with its output, its announced calls nothing claimed or completed, or its
+  provider-answered execs; it does with a host exec, a bridge or a stateful or
+  unknown frame. Its shown text goes to the rebuilt Run as `<interrupted_reply>`
+  to be continued. A final retry-unsafe error tells the user to send "continue".
   Missing-blob recovery is limited to the initial control-only checkpoint path
   (`isSoleControlFrame`); unknown/mixed frames keep the normal replay barrier.
 - Carry an uncheckpointed request only on its unchanged checkpoint; persist it

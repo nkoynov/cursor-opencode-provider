@@ -5,6 +5,7 @@ import {
   announcedCallsClaimed,
   AttemptReplaySafety,
   describeFrameLayout,
+  hostExecs,
   type ReplaySafetyState,
 } from "../src/replay-safety.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
@@ -228,6 +229,69 @@ describe("display tool lifecycle", () => {
       expect(state.historyRebaseUnsafe).toBe(true)
       expect(safety.applyTo(failure()).replayBarrier).toBe("stateful")
     }
+  })
+
+  it("lets a rebuild leave out calls the interrupted step announced but nothing ran", () => {
+    const state: ReplaySafetyState = {}
+    const earlier = new AttemptReplaySafety("run-1", state)
+    earlier.recordToolLifecycle(analyze(2, "earlier").toolLifecycle)
+    const step = new AttemptReplaySafety("run-1", state)
+    step.recordToolLifecycle(analyze(2, "next-edit").toolLifecycle)
+    expect(state.attempt).toEqual({ announcedCalls: ["next-edit"] })
+    // An earlier step's call might be one Cursor ran itself.
+    expect(announcedCallsClaimed(state, state.attempt!.announcedCalls)).toBe(false)
+
+    const fresh: ReplaySafetyState = {}
+    const only = new AttemptReplaySafety("run-1", fresh)
+    only.recordToolLifecycle(analyze(2, "next-edit").toolLifecycle)
+    expect(announcedCallsClaimed(fresh)).toBe(false)
+    expect(announcedCallsClaimed(fresh, fresh.attempt!.announcedCalls)).toBe(true)
+    // Cursor completed it, so it ran on Cursor's side and history lacks it.
+    only.recordToolLifecycle(analyze(3, "next-edit").toolLifecycle)
+    expect(announcedCallsClaimed(fresh, fresh.attempt!.announcedCalls)).toBe(false)
+  })
+
+  it("tells host execs from execs the provider answered, per attempt", () => {
+    const state: ReplaySafetyState = {}
+    const step = new AttemptReplaySafety("run-1", state)
+    step.markBarrier("non-control-exec")
+    step.recordExec(1, "read-1")
+    step.markBarrier("visible-text")
+    step.recordShownText("Reading the file.")
+    expect(state.attempt).toEqual({ shownText: "Reading the file." })
+    expect(hostExecs(state)).toEqual([])
+
+    step.markBarrier("non-control-exec")
+    step.recordExec(2, "shell-1")
+    step.recordHostExec(2)
+    expect(hostExecs(state)).toEqual([{ sessionId: "run-1", id: 2, callId: "shell-1", host: true }])
+    expect(state.attempt?.unrepresentable).toBe(true)
+
+    // The next pass starts clean; the Run-wide record stays.
+    new AttemptReplaySafety("run-1", state)
+    expect(state.attempt).toEqual({})
+    expect(hostExecs(state)).toHaveLength(1)
+    expect(state.statefulBarrier).toBe("non-control-exec")
+  })
+
+  it("marks an attempt unrepresentable for bridges, stateful interactions, unknown frames and unrecorded host execs", () => {
+    const cases: Array<[string, (safety: AttemptReplaySafety) => void, boolean]> = [
+      ["bridge", (safety) => safety.claimBridgedCall("todo-1"), false],
+      ["unknown frame", (safety) => safety.markBarrier("unknown-or-malformed-frame"), true],
+      ["appended user message", (safety) => safety.markBarrier("stateful-interaction"), true],
+      ["unrecorded host exec", (safety) => safety.recordHostExec(7), true],
+    ]
+    for (const [, record, unsafe] of cases) {
+      const state: ReplaySafetyState = {}
+      record(new AttemptReplaySafety("run-1", state))
+      expect(state.attempt?.unrepresentable).toBe(true)
+      expect(state.historyRebaseUnsafe).toBe(unsafe ? true : undefined)
+    }
+    const output: ReplaySafetyState = {}
+    const shown = new AttemptReplaySafety("run-1", output)
+    for (const reason of ["visible-text", "visible-reasoning", "visible-tool-row", "non-control-exec"] as const) shown.markBarrier(reason)
+    shown.recordToolLifecycle(analyze(2, "call-1").toolLifecycle)
+    expect(output.attempt?.unrepresentable).toBeUndefined()
   })
 })
 

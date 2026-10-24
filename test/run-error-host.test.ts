@@ -226,8 +226,10 @@ describe("checkpoint eligibility across host results", () => {
           expect(resumedState).toEqual(checkpoint)
           expect(runs).toBe(2)
         } else {
-          expect(await readParts(model, options).catch((error: unknown) => error)).toMatchObject({ isRetryable: false })
-          expect(runs).toBe(1)
+          // The checkpoint predates the delivered result, so the turn is rebuilt from history instead.
+          expect((await readParts(model, options)).some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
+          expect(resumed).toBe(false)
+          expect(runs).toBe(2)
         }
         expect(checkpointArrivedDuringDrain).toBe(true)
       } finally {
@@ -323,9 +325,10 @@ describe("checkpoint eligibility across host results", () => {
   }
 
   for (const scenario of [
-    "complete", "announced", "announced-shell", "missing-history", "unknown", "unrepresented-exec", "duplicate-exec",
+    "complete", "announced", "announced-shell", "missing-history", "unknown", "provider-answered-exec", "duplicate-exec",
     "followup-before-result", "new-output", "final-error", "cursor-run-call", "unannounced-completion", "oversized",
     "malformed-completion", "repeated-completion-id", "announced-open",
+    "next-call-announced", "provider-exec-after-result", "edit-in-progress", "interaction-after-result",
   ] as const) {
     it(`recovers a post-result drop only from represented completed work (${scenario})`, async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-result-history-"))
@@ -360,7 +363,7 @@ describe("checkpoint eligibility across host results", () => {
             return
           }
           if (scenario === "unknown") stream.write(frame(Uint8Array.of(0xa2, 0x06, 0))) // unknown field 100
-          if (scenario === "unrepresented-exec") send({ exec_server_message: { id: 90, list_mcp_resources_exec_args: {} } })
+          if (scenario === "provider-answered-exec") send({ exec_server_message: { id: 90, list_mcp_resources_exec_args: {} } })
           if (scenario === "duplicate-exec") send({ exec_server_message: { id: 1, list_mcp_resources_exec_args: {} } })
           // A call Cursor runs itself: announced, never claimed by a host exec.
           if (scenario === "cursor-run-call") send({ interaction_update: { tool_call_started: { call_id: "cursor-internal" } } })
@@ -388,6 +391,15 @@ describe("checkpoint eligibility across host results", () => {
             }
             if (scenario === "unannounced-completion") send({ interaction_update: { tool_call_completed: { call_id: "never-started" } } })
             if (scenario === "new-output") send({ interaction_update: { text_delta: { text: "new output" } } })
+            // The next step had begun when the Run dropped; nothing of it ran on the host.
+            if (scenario === "edit-in-progress") send({ interaction_update: { text_delta: { text: "Fixing the test next." } } })
+            if (scenario === "next-call-announced" || scenario === "edit-in-progress") {
+              send({ interaction_update: { tool_call_started: { call_id: "third", tool_call: shell("third", "echo third") } } })
+            }
+            if (scenario === "provider-exec-after-result" || scenario === "edit-in-progress") {
+              send({ exec_server_message: { id: 3, list_mcp_resources_exec_args: {} } })
+            }
+            if (scenario === "interaction-after-result") send({ interaction_query: { id: 4, web_search_request_query: new Uint8Array() } })
             if (scenario === "final-error") stream.end(frame(Buffer.from('{"error":{"code":"permission_denied"}}'), 2))
             else stream.end() // no checkpoint after either completed result
           }
@@ -421,7 +433,9 @@ describe("checkpoint eligibility across host results", () => {
           prompt.push({ role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName, output: { type: "text", value: output } }] })
         }
         if (scenario === "missing-history") prompt.splice(1, 2)
-        if (scenario === "complete" || scenario === "announced" || scenario === "announced-shell" || scenario === "announced-open") {
+        if (scenario === "complete" || scenario === "announced" || scenario === "announced-shell" || scenario === "announced-open"
+          || scenario === "provider-answered-exec" || scenario === "new-output" || scenario === "next-call-announced"
+          || scenario === "provider-exec-after-result" || scenario === "edit-in-progress" || scenario === "interaction-after-result") {
           const parts = await read()
           expect(parts.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
           expect(parts.some(part => part.type === "tool-call")).toBe(false)
@@ -432,6 +446,10 @@ describe("checkpoint eligibility across host results", () => {
           expect(text.match(/first completed/g)).toHaveLength(1)
           expect(text.match(/second completed/g)).toHaveLength(1)
           expect(text).toContain("Do not repeat completed work")
+          // Shown output stays on screen; the rebuilt step continues it.
+          if (scenario === "new-output") expect(text).toContain("<interrupted_reply>\nnew output\n</interrupted_reply>")
+          else if (scenario === "edit-in-progress") expect(text).toContain("<interrupted_reply>\nFixing the test next.\n</interrupted_reply>")
+          else expect(text).not.toContain("<interrupted_reply>")
         } else if (scenario === "oversized") {
           // The host compacts on this context overflow instead of retrying.
           const error = await read().catch((caught: unknown) => caught)
@@ -572,6 +590,10 @@ describe("checkpoint eligibility across host results", () => {
             }
             send({ interaction_update: { turn_ended: {} } })
             stream.end()
+          } else if (runs > 1) {
+            // A Run rebuilt from history, which already holds the command's result.
+            send({ interaction_update: { turn_ended: {} } })
+            stream.end()
           } else {
             send({ exec_server_message: { id: 1, shell_stream_args: { command: "echo done", tool_call_id: "command" } } })
             // This frame arrives while the host tool is outstanding. The held
@@ -624,10 +646,11 @@ describe("checkpoint eligibility across host results", () => {
           expect(runs).toBe(rejectReplacement ? 3 : 2)
           expect(renewals).toBe(rejectReplacement ? 1 : 0)
         } else {
-          const error = await read(options).catch((error: unknown) => error)
-          expect(error).toMatchObject({ isRetryable: false, responseHeaders: { "x-should-retry": "false" } })
+          // The checkpoint predates the delivered result, so the turn is rebuilt from history instead.
+          const parts = await read(options)
+          expect(parts.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
           expect(resumed).toBe(false)
-          expect(runs).toBe(1)
+          expect(runs).toBe(2)
         }
       } finally {
         await settleRunSavesForTests()
