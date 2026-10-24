@@ -53,13 +53,13 @@ function softBackgroundWindow(policy: CursorShellPolicy, shellId: number): strin
     '  if [ -f "$cursor_job/timedout" ]; then',
     `    printf '\\n__CURSOR_SHELL_TIMEOUT__%s\\n' ${policy.hardTimeoutMs ?? 0}; exit ${TIMEOUT_EXIT_CODE}`,
     "  fi",
-    // The host records this status; the marker alone reaches only the live turn.
-    // `done` can be seen between its creation and its write.
-    "  cursor_settle=0",
-    '  while [ ! -s "$cursor_job/done" ] && [ "$cursor_settle" -lt 20 ]; do sleep 0.05; cursor_settle=$((cursor_settle + 1)); done',
+    // `done` exists before the supervisor's single write fills it; once that
+    // supervisor is gone, whatever it wrote is all there is.
+    '  while [ ! -s "$cursor_job/done" ] && is_ours "$cursor_supervisor" "$cursor_job/runner.sh"; do', `    sleep ${LAUNCHER_POLL_SECONDS}`, "  done",
     '  cursor_code=$(cat "$cursor_job/done")',
+    '  case "$cursor_code" in ""|*[!0-9]*) printf "\\nTerminal record has no valid exit status\\n"; cursor_code=1 ;; esac',
     '  printf "\\n__CURSOR_SHELL_EXIT__%s\\n" "$cursor_code"',
-    '  case "$cursor_code" in ""|*[!0-9]*) exit 1 ;; esac',
+    // The host records this status; the marker alone reaches only the live turn.
     '  exit "$cursor_code"',
     'elif [ -f "$cursor_job/timedout" ]; then',
     ...capturedOutput('$(( $(wc -c <"$cursor_terminal") - cursor_header ))'),

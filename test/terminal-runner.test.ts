@@ -314,6 +314,21 @@ fs.createReadStream(job + "/pipe").on("data", chunk => fs.writeSync(fd, chunk))
     expect(await waitDone(terminal)).toContain(`exit_code: ${code}`)
   })
 
+  const publish = `printf '%s\\n' "$code" >"$job/done"`
+  const invalid = "done\nTerminal record has no valid exit status\n\n__CURSOR_SHELL_EXIT__1\n"
+  it.each([
+    ["filled late", `: >"$job/done"; sleep 1; ${publish}`, "done\n__CURSOR_SHELL_EXIT__7\n", 7],
+    ["malformed", `printf 'lost\\n' >"$job/done"`, invalid, 1],
+    ["never filled", `: >"$job/done"; exit 0`, invalid, 1],
+  ] as const)("reads a %s exit status only once it is complete and valid", async (_, replacement, stdout, code) => {
+    const terminal = job("printf done; exit 7")
+    const runner = path.join(terminal.directory, "runner.sh")
+    const script = fs.readFileSync(runner, "utf8")
+    expect(script.split(publish)).toHaveLength(2)
+    fs.writeFileSync(runner, script.replace(publish, replacement))
+    expect(await launch(terminal)).toMatchObject({ stdout, code })
+  }, 15_000)
+
   it("initializes explicit background records before returning a distinct shell id and pid", async () => {
     const terminal = job("sleep 0.5; printf later", { backgroundSpawn: true })
     const launched = await launch(terminal)
