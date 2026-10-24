@@ -344,6 +344,7 @@ import {
   assertCursorUserImageSupport,
   extractCursorPromptImages,
   extractCursorToolResultImages,
+  CURSOR_SUPPORTED_URLS,
   MAX_CURSOR_IMAGE_INPUT_BYTES,
   type CursorImageInput,
 } from "./image-input.js"
@@ -1049,7 +1050,7 @@ export function createCursorLanguageModel(
     specificationVersion: "v3",
     provider: providerId,
     modelId,
-    supportedUrls: {},
+    supportedUrls: CURSOR_SUPPORTED_URLS,
 
     doStream,
 

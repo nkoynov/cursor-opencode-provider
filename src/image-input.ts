@@ -6,6 +6,19 @@ import { UnsupportedFunctionalityError } from "@ai-sdk/provider"
 
 export const MAX_CURSOR_IMAGE_INPUT_BYTES = 20 * 1024 * 1024
 
+/** Local image files are read here, so hosts may pass `file:` URLs (OpenCode's stored tool media) instead of bytes. */
+export const CURSOR_SUPPORTED_URLS: Record<string, RegExp[]> = { "image/*": [/^file:\/\//i] }
+
+const STORED_TOOL_MEDIA = /^([0-9a-f]{64})\.(?:png|jpg|gif|webp)$/
+
+/** OpenCode names stored tool media `tool-media/<sha256>.<ext>`: the content hash, known without reading the file. */
+function storedToolMediaHash(data: unknown): string | undefined {
+  if (!(data instanceof URL) || data.protocol !== "file:") return undefined
+  const segments = data.pathname.split("/")
+  if (segments.at(-2) !== "tool-media") return undefined
+  return STORED_TOOL_MEDIA.exec(decodeURIComponent(segments.at(-1) ?? ""))?.[1]
+}
+
 export type CursorImageInput = {
   data: Uint8Array
   filename: string
@@ -376,6 +389,11 @@ export async function extractCursorHistoryImages(
   let omittedCount = 0
   let totalBytes = 0
   for (const { file, toolResult } of candidates) {
+    const stored = storedToolMediaHash(file.data)
+    if (stored && (options.seenHashes?.has(stored) || hashesThisTurn.has(stored))) {
+      duplicateCount++
+      continue
+    }
     // Resolve against the per-image cap first so a previously sent duplicate
     // does not fail merely because little combined budget remains this turn.
     let image: CursorImageInput

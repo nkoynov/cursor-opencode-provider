@@ -1,8 +1,13 @@
-import { describe, expect, it } from "bun:test"
+import { afterAll, describe, expect, it } from "bun:test"
+import { createHash } from "node:crypto"
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { UnsupportedFunctionalityError } from "@ai-sdk/provider"
 import {
   assertCursorUserImageSupport,
+  CURSOR_SUPPORTED_URLS,
   extractCursorHistoryImages,
   extractCursorPromptImages,
   extractCursorToolResultImages,
@@ -399,5 +404,44 @@ describe("Cursor image input", () => {
       supportsImages: true,
       maxBytes: 3,
     })).rejects.toBeInstanceOf(UnsupportedFunctionalityError)
+  })
+})
+
+describe("OpenCode stored tool media", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "cursor-tool-media-"))
+  const store = path.join(root, "tool-media")
+  mkdirSync(store)
+  afterAll(() => rmSync(root, { recursive: true, force: true }))
+  const png = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3])
+  const hash = createHash("sha256").update(png).digest("hex")
+  const stored = (name: string) => [{ role: "user", content: [
+    { type: "text", text: "Attached media from tool result:" },
+    { type: "file", mediaType: "image/png", data: pathToFileURL(path.join(store, name)), filename: "shot.png" },
+  ] }, { role: "user", content: [{ type: "text", text: "continue" }] }]
+
+  it("declares file URLs for images, so OpenCode passes the reference instead of the bytes", () => {
+    expect(CURSOR_SUPPORTED_URLS["image/*"]?.some((pattern) => pattern.test(pathToFileURL(path.join(store, `${hash}.png`)).href))).toBe(true)
+  })
+
+  it("skips a held image by the hash in its name, without reading the file", async () => {
+    const missing = createHash("sha256").update("never written").digest("hex")
+    const result = await extractCursorHistoryImages(stored(`${missing}.png`), { supportsImages: true, seenHashes: new Set([missing]) })
+    expect(result.images).toHaveLength(0)
+    expect(result.duplicateCount).toBe(1)
+    expect(result.omittedCount).toBeUndefined()
+  })
+
+  it("reads an image the conversation does not hold yet", async () => {
+    writeFileSync(path.join(store, `${hash}.png`), png)
+    const result = await extractCursorHistoryImages(stored(`${hash}.png`), { supportsImages: true })
+    expect(result.images.map((image) => [image.filename, [...image.data]])).toEqual([["shot.png", [...png]]])
+    expect(result.hashes).toEqual([hash])
+  })
+
+  it("omits a stored image whose file is gone", async () => {
+    const gone = createHash("sha256").update("gone").digest("hex")
+    const result = await extractCursorHistoryImages(stored(`${gone}.png`), { supportsImages: true })
+    expect(result.images).toHaveLength(0)
+    expect(result.omittedCount).toBe(1)
   })
 })
