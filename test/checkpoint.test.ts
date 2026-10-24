@@ -9,6 +9,7 @@ import {
   resetCheckpointsForTests,
 } from "../src/protocol/checkpoint.js"
 import { rekeyConversation } from "../src/protocol/conversation-state.js"
+import { recordSessionEditsGuidance, sessionEditsDenySent, sessionEditsGuidance } from "../src/protocol/session-edits.js"
 import { buildRunRequest } from "../src/protocol/request.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 
@@ -90,6 +91,17 @@ describe("checkpoint token details", () => {
     const toId = rekeyConversation("ses_rekey_occupancy", "conv-1", terminal)
     expect(checkpointTokenDetails(toId, terminal)).toEqual({ usedTokens: 40_000, maxTokens: 256_000 })
     expect(getCheckpointOccupancy("conv-1")).toBeUndefined()
+  })
+
+  it("keeps whether an edit deny was ever sent across a rekey", () => {
+    for (const denied of [false, true]) {
+      const fromId = `conv-guidance-${denied}`
+      recordSessionEditsGuidance(fromId, denied)
+      setCheckpoint(fromId, withTokens(1_000))
+      const toId = rekeyConversation(`ses_rekey_guidance_${denied}`, fromId, getCheckpoint(fromId))
+      expect(sessionEditsDenySent(toId)).toBe(denied)
+      expect(sessionEditsGuidance(toId, false, { carriesEarlierState: true })).toBe(denied ? false : undefined)
+    }
   })
 
   it("forgets a conversation's occupancy with its checkpoint", () => {

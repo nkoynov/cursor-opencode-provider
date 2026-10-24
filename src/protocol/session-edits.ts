@@ -134,6 +134,13 @@ export function restoreSessionEditsDenySent(conversationId: string, denySent: bo
   setEditGuidance(conversationId, { denySent })
 }
 
+/** A rekey may resume an older checkpoint, so only whether a deny was ever sent carries over. */
+export function moveSessionEditsDenySent(fromId: string, toId: string): void {
+  const state = editGuidanceByConversation.get(fromId)
+  editGuidanceByConversation.delete(fromId)
+  if (state) setEditGuidance(toId, { denySent: state.denySent })
+}
+
 function setEditGuidance(conversationId: string, state: { last?: boolean; denySent: boolean }): void {
   editGuidanceByConversation.delete(conversationId)
   editGuidanceByConversation.set(conversationId, state)

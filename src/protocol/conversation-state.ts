@@ -32,7 +32,7 @@ import {
   rebindHeldHistoryImages,
   restoreHeldHistoryImages,
 } from "./sent-history-images.js"
-import { restoreSessionEditsDenySent, sessionEditsDenySent } from "./session-edits.js"
+import { moveSessionEditsDenySent, restoreSessionEditsDenySent, sessionEditsDenySent } from "./session-edits.js"
 import {
   deletePersistedConversation,
   getPersistedTurnProvenance,
@@ -193,6 +193,7 @@ export function rekeyConversation(
     setCheckpoint(toId, checkpoint)
     const occupancy = getCheckpointOccupancy(fromId)
     if (occupancy) restoreCheckpointOccupancy(toId, occupancy)
+    moveSessionEditsDenySent(fromId, toId)
     // The checkpoint already holds the system context; keep its rule instead of reasserting it.
     const kept = checkpointEpoch === undefined ? epoch : checkpointEpoch
     if (kept) attachContextEpoch(toId, kept)
