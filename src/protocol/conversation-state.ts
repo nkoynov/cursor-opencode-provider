@@ -191,6 +191,8 @@ export function rekeyConversation(
   if (checkpoint?.length) {
     restoreConversationBlobs(toId, snapshotConversationBlobs(fromId))
     setCheckpoint(toId, checkpoint)
+    const occupancy = getCheckpointOccupancy(fromId)
+    if (occupancy) restoreCheckpointOccupancy(toId, occupancy)
     // The checkpoint already holds the system context; keep its rule instead of reasserting it.
     const kept = checkpointEpoch === undefined ? epoch : checkpointEpoch
     if (kept) attachContextEpoch(toId, kept)

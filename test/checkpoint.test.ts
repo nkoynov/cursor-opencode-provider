@@ -8,6 +8,7 @@ import {
   restoreCheckpointOccupancy,
   resetCheckpointsForTests,
 } from "../src/protocol/checkpoint.js"
+import { rekeyConversation } from "../src/protocol/conversation-state.js"
 import { buildRunRequest } from "../src/protocol/request.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 
@@ -80,6 +81,15 @@ describe("checkpoint token details", () => {
     expect(getCheckpoint("conv-1")).toEqual(terminal)
     expect(checkpointTokenDetails("conv-1", terminal)).toEqual({ usedTokens: 42_000, maxTokens: 256_000 })
     expect(checkpointTokenDetails("conv-other", terminal)).toEqual({ usedTokens: 0, maxTokens: 256_000 })
+  })
+
+  it("carries the measured occupancy to a rekeyed conversation", () => {
+    setCheckpoint("conv-1", withTokens(40_000))
+    const terminal = withTokens(0)
+    setCheckpoint("conv-1", terminal)
+    const toId = rekeyConversation("ses_rekey_occupancy", "conv-1", terminal)
+    expect(checkpointTokenDetails(toId, terminal)).toEqual({ usedTokens: 40_000, maxTokens: 256_000 })
+    expect(getCheckpointOccupancy("conv-1")).toBeUndefined()
   })
 
   it("forgets a conversation's occupancy with its checkpoint", () => {
