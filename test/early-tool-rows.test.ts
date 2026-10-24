@@ -13,14 +13,23 @@ import {
 } from "../src/protocol/tools.js"
 import {
   EARLY_ROW_CLOSED,
+  EARLY_ROW_DEFERRED,
   earlyRowHandoff,
   UNBOUND_EXEC_ID,
   cursorEditAnnouncement,
+  cursorEditFailureToolCallId,
   earlyRowToolCallId,
   parseEarlyRowToolCallId,
   shouldOpenEarlyRow,
 } from "../src/early-tool-rows.js"
-import { deliverContinuationResults, extractTrailingToolResults, findContinuationSession, pump, resetTurnStateForTests } from "../src/language-model.js"
+import {
+  deliverContinuationResults,
+  extractPromptHistory,
+  extractTrailingToolResults,
+  findContinuationSession,
+  pump,
+  resetTurnStateForTests,
+} from "../src/language-model.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { sessionFixture } from "./session-fixture.js"
 
@@ -45,6 +54,26 @@ function partial(callId: string, filePath: string): Uint8Array {
       partial_tool_call: {
         call_id: callId,
         tool_call: { edit_tool_call: { args: { path: filePath } } },
+      },
+    },
+  })
+}
+
+function started(callId: string, filePath: string): Uint8Array {
+  return encodeMessage("AgentServerMessage", {
+    interaction_update: {
+      tool_call_started: { call_id: callId, tool_call: { edit_tool_call: { args: { path: filePath } } } },
+    },
+  })
+}
+
+/** Cursor finishing an edit itself, with its outcome when given. */
+function completedEdit(callId: string, filePath: string, result?: Record<string, unknown>): Uint8Array {
+  return encodeMessage("AgentServerMessage", {
+    interaction_update: {
+      tool_call_completed: {
+        call_id: callId,
+        tool_call: { edit_tool_call: { args: { path: filePath }, ...(result ? { result } : {}) } },
       },
     },
   })
@@ -901,7 +930,7 @@ describe("early edit rows", () => {
     fs.chmodSync(locked, 0o600)
   })
 
-  it("closes the row when the exec is a different tool", async () => {
+  it("leaves the row unfailed when another call's exec ends the step", async () => {
     const file = path.join(tempDir(), "announced.txt")
     const { session, parts } = pumpSession([
       partial("edit-1", file),
@@ -919,8 +948,9 @@ describe("early edit rows", () => {
     const shell = parts.find((part) => part.type === "tool-call" && part.toolName === "bash")
     expect(start?.toolName).toBe("write")
     expect(closed?.toolCallId).toBe(start?.id)
+    // Cursor still runs edit-1; its exec comes in a later step under its own id.
     expect(parts.find(part => part.type === "tool-result" && part.toolCallId === start?.id))
-      .toMatchObject({ result: EARLY_ROW_CLOSED, isError: true })
+      .toMatchObject({ result: EARLY_ROW_DEFERRED, isError: false })
     expect(parts.findIndex(part => part === closed)).toBeLessThan(parts.findIndex(part => part === shell))
     expect(shell?.toolCallId.startsWith("cursor_")).toBe(true)
     expect(parts.at(-1)?.type).toBe("finish")
@@ -946,6 +976,157 @@ describe("early edit rows", () => {
     expect(textEndAt).toBeGreaterThan(textAt)
     expect(closedAt).toBeGreaterThan(textEndAt)
     expect(finishAt).toBeGreaterThan(closedAt)
+    expect(parts.find((part) => part.type === "tool-result" && part.toolCallId === parts[startAt].id))
+      .toMatchObject({ result: EARLY_ROW_CLOSED, isError: true })
+  })
+
+  it("shows Cursor's own failure on the row of an edit it finished without a write", async () => {
+    const file = path.join(tempDir(), "created.txt")
+    const { session, parts } = pumpSession([
+      partial("edit-1", file),
+      started("edit-1", file),
+      completedEdit("edit-1", file, {
+        error: { path: file, error: "internal", model_visible_error: "The string to replace was not found in the file." },
+      }),
+      turnEnded(),
+    ], [{ name: "edit", description: "Edit" }, { name: "write", description: "Write" }])
+    session.requestContext.env = { workspace_paths: [path.dirname(file)] }
+    await run(session, parts)
+
+    const start = parts.find((part) => part.type === "tool-input-start")
+    expect(start?.toolName).toBe("write")
+    expect(parts.filter((part) => part.type === "tool-result")).toEqual([expect.objectContaining({
+      toolCallId: start.id,
+      result: `Cursor's edit of ${file} failed: The string to replace was not found in the file.`,
+      isError: true,
+    })])
+  })
+
+  it("closes each internally failed edit with Cursor's outcome and binds the one that writes", async () => {
+    const dir = tempDir()
+    const file = path.join(dir, "created.txt")
+    const { session, parts } = pumpSession([
+      partial("edit-1", file),
+      started("edit-1", file),
+      completedEdit("edit-1", file, { error: { path: file, error: "no match" } }),
+      partial("edit-2", file),
+      started("edit-2", file),
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: { id: 5, write_args: { path: file, file_text: "created\n", tool_call_id: "edit-2" } },
+      }),
+    ], [{ name: "edit", description: "Edit" }, { name: "write", description: "Write" }])
+    session.requestContext.env = { workspace_paths: [dir] }
+    await run(session, parts)
+
+    const [first, second] = parts.filter((part) => part.type === "tool-input-start")
+    expect(first.id).toBe(earlyRowToolCallId(session.sessionId, "edit-1"))
+    expect(second.id).toBe(earlyRowToolCallId(session.sessionId, "edit-2"))
+    expect(parts.find((part) => part.type === "tool-result" && part.toolCallId === first.id))
+      .toMatchObject({ result: `Cursor's edit of ${file} failed: no match`, isError: true })
+    const write = parts.find((part) => part.type === "tool-call" && !part.providerExecuted)
+    expect(write).toMatchObject({ toolCallId: second.id, toolName: "write" })
+    expect(parts.some((part) => part.type === "tool-result" && part.result === EARLY_ROW_CLOSED)).toBe(false)
+    sessionManager.resolve(session.sessionId, 5)
+  })
+
+  it("completes the row of an edit Cursor finished without changing the file", async () => {
+    const file = path.join(tempDir(), "created.txt")
+    const { session, parts } = pumpSession([
+      partial("edit-1", file),
+      started("edit-1", file),
+      completedEdit("edit-1", file, { success: { path: file } }),
+      turnEnded(),
+    ], [{ name: "write", description: "Write" }])
+    session.requestContext.env = { workspace_paths: [path.dirname(file)] }
+    await run(session, parts)
+
+    expect(parts.find((part) => part.type === "tool-result")).toMatchObject({
+      result: `Cursor finished this edit of ${file} without changing the file.`,
+      isError: false,
+    })
+  })
+
+  it("still fails the row when Cursor finishes the call without an outcome", async () => {
+    const file = path.join(tempDir(), "created.txt")
+    const { session, parts } = pumpSession([
+      partial("edit-1", file),
+      started("edit-1", file),
+      completedEdit("edit-1", file),
+      turnEnded(),
+    ], [{ name: "write", description: "Write" }])
+    session.requestContext.env = { workspace_paths: [path.dirname(file)] }
+    await run(session, parts)
+
+    expect(parts.find((part) => part.type === "tool-result")).toMatchObject({ result: EARLY_ROW_CLOSED, isError: true })
+  })
+
+  it("shows a failed edit Cursor finished after the host read, with no row open", async () => {
+    const workspace = tempDir()
+    const file = path.join(workspace, "notes.txt")
+    fs.writeFileSync(file, "one\n")
+    const { session, parts } = catalogSession([
+      ...editHandshake("edit-missing", file, 17),
+      completedEdit("edit-missing", file, {
+        error: { path: file, error: "x", model_visible_error: "String not found." },
+      }),
+      turnEnded(),
+    ], catalogs[0]!, workspace)
+    await run(session, parts)
+    await authorizeEditRead(session, parts, 17)
+    await run(session, parts)
+
+    const start = parts.find((part) => part.type === "tool-input-start")
+    expect(start).toMatchObject({ toolName: "edit", id: cursorEditFailureToolCallId(session.sessionId, "edit-missing") })
+    expect(start.id).not.toBe(earlyRowToolCallId(session.sessionId, "edit-missing"))
+    expect(parts.find((part) => part.type === "tool-call")).toMatchObject({ toolCallId: start.id, providerExecuted: true, input: "{}" })
+    expect(parts.find((part) => part.type === "tool-result")).toMatchObject({
+      toolCallId: start.id,
+      result: `Cursor's edit of ${file} failed: String not found.`,
+      isError: true,
+    })
+  })
+
+  it("adds no row when the host already ran the edit Cursor reports as failed", async () => {
+    const workspace = tempDir()
+    const file = path.join(workspace, "notes.txt")
+    fs.writeFileSync(file, "one\n")
+    const { session, parts } = catalogSession([
+      ...editHandshake("edit-host", file, 17, "two\n"),
+      completedEdit("edit-host", file, { write_permission_denied: { path: file, error: "denied" } }),
+      turnEnded(),
+    ], catalogs[0]!, workspace)
+    await run(session, parts)
+    await authorizeEditRead(session, parts, 17)
+    await run(session, parts)
+    const edit = parts.find((part) => part.type === "tool-call")
+    expect(edit).toMatchObject({ toolName: "edit" })
+    parts.length = 0
+    expect(await deliverContinuationResults(session, [{
+      sessionId: session.sessionId, execId: 18, toolCallId: edit.toolCallId, toolName: "edit", output: "denied", error: "denied",
+    }])).toBe(session)
+    await run(session, parts)
+
+    expect(parts.filter((part) => part.type === "tool-input-start" || part.type === "tool-call")).toEqual([])
+  })
+
+  it("leaves a closed row out of a rebuilt history, keeping the real calls", () => {
+    const closedId = earlyRowToolCallId("sess", "edit-1")
+    const history = extractPromptHistory([
+      { role: "user", content: [{ type: "text", text: "edit it" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Editing." },
+          { type: "tool-call", toolCallId: closedId, toolName: "edit", input: {}, providerExecuted: true },
+          { type: "tool-result", toolCallId: closedId, toolName: "edit", output: { type: "error-text", value: EARLY_ROW_CLOSED }, providerExecuted: true },
+          { type: "tool-call", toolCallId: earlyRowToolCallId("sess", "edit-2"), toolName: "edit", input: { filePath: "a.txt" } },
+        ],
+      },
+      { role: "user", content: [{ type: "text", text: "next" }] },
+    ] as never, { toolResults: "transcript" })
+
+    const assistant = history.find((message) => message.role === "assistant")
+    expect(assistant?.content).toBe('Editing.\n[called edit] {"filePath":"a.txt"}')
   })
 
   it("does not open a row a patch conversion would refuse, or on a tool-less turn", async () => {

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 
-/** Shown when an announced edit never becomes a host tool call. */
+/** Shown when an announced edit ends with its Run, never becoming a host tool call. */
 export const EARLY_ROW_CLOSED = "Cursor did not finish this tool call."
 
 /**
@@ -11,6 +11,61 @@ export const EARLY_ROW_CLOSED = "Cursor did not finish this tool call."
  */
 export function earlyRowHandoff(toolName: string): string {
   return `Cursor continued this call as \`${toolName}\`.`
+}
+
+/**
+ * Shown when the step ends on another call's exec while this one is still
+ * running in Cursor: its exec, if any, comes in a later step under its own id.
+ */
+export const EARLY_ROW_DEFERRED = "Cursor runs this call after the step's other tool calls."
+
+export type EarlyRowClose =
+  | { kind: "abandoned" }
+  | { kind: "deferred" }
+  | { kind: "handoff"; toolName: string }
+  | { kind: "outcome"; text: string; isError: boolean }
+
+export function earlyRowResult(close: EarlyRowClose): { result: string; isError: boolean } {
+  switch (close.kind) {
+    case "abandoned": return { result: EARLY_ROW_CLOSED, isError: true }
+    case "deferred": return { result: EARLY_ROW_DEFERRED, isError: false }
+    case "handoff": return { result: earlyRowHandoff(close.toolName), isError: false }
+    case "outcome": return { result: close.text, isError: close.isError }
+  }
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined
+}
+
+function text(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
+}
+
+/**
+ * The outcome Cursor reports for an edit it finished without a write exec,
+ * such as an `old_string` it could not find. The model saw this result.
+ */
+export function cursorEditOutcome(
+  toolCall: unknown,
+  filePath: string,
+): { text: string; isError: boolean } | undefined {
+  const result = record(record(record(toolCall)?.edit_tool_call)?.result)
+  if (!result) return undefined
+  const failed = (detail: string) => ({ text: `Cursor's edit of ${filePath} failed: ${detail}`, isError: true })
+  const success = record(result.success)
+  if (success) {
+    return { text: text(success.message) ?? `Cursor finished this edit of ${filePath} without changing the file.`, isError: false }
+  }
+  if (record(result.file_not_found)) return failed("file not found.")
+  if (record(result.read_permission_denied)) return failed("permission denied reading the file.")
+  const writeDenied = record(result.write_permission_denied)
+  if (writeDenied) return failed(text(writeDenied.error) ?? "permission denied writing the file.")
+  const rejected = record(result.rejected)
+  if (rejected) return failed(text(rejected.reason) ?? "rejected.")
+  const error = record(result.error)
+  if (error) return failed(text(error.model_visible_error) ?? text(error.error) ?? "unknown error.")
+  return undefined
 }
 
 export type EarlyToolRow = {
@@ -31,6 +86,11 @@ const EARLY_ROW_PREFIX = "cursor-early_"
 export function earlyRowToolCallId(sessionId: string, cursorCallId: string): string {
   const digest = createHash("sha256").update(cursorCallId).digest("hex").slice(0, 12)
   return `${EARLY_ROW_PREFIX}${sessionId}_${digest}`
+}
+
+/** Distinct from the call's early row, which an earlier step may have closed. */
+export function cursorEditFailureToolCallId(sessionId: string, cursorCallId: string): string {
+  return earlyRowToolCallId(sessionId, `${cursorCallId}\nfailed`)
 }
 
 /** No exec has this id: the result is this provider's, but its exec is unknown. */

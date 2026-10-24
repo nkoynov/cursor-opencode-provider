@@ -196,13 +196,15 @@ import { stageCursorImage } from "./image-staging.js"
 import { IMAGE_PERMISSION_DENIED_PREFIX } from "./image-save.js"
 import { checkpointTokenDetails, clearCheckpoint, getCheckpoint, setCheckpoint } from "./protocol/checkpoint.js"
 import {
-  EARLY_ROW_CLOSED,
   EarlyToolRows,
   cursorEditAnnouncement,
-  earlyRowHandoff,
+  cursorEditFailureToolCallId,
+  cursorEditOutcome,
+  earlyRowResult,
   earlyRowToolCallId,
   parseEarlyRowToolCallId,
   shouldOpenEarlyRow,
+  type EarlyRowClose,
   type EarlyToolRow,
 } from "./early-tool-rows.js"
 import {
@@ -5390,11 +5392,12 @@ export async function pump(
     for (const pending of session.pending.values()) if (isOwedCursorExec(pending)) owed++
     return owed
   }
-  /** `continuedAs`: the host tool this Cursor call runs as instead; otherwise it never ran. */
-  const closeEarlyRow = (row: EarlyToolRow, continuedAs?: string) => {
+  const closeEarlyRow = (row: EarlyToolRow, close: EarlyRowClose) => {
     replaySafety.markBarrier("visible-tool-row")
     // Text that streamed while the row was open ends before its tool-call.
     closeOpenSpans()
+    const { result, isError } = earlyRowResult(close)
+    trace(`early row closed: toolCallId=${row.toolCallId} kind=${close.kind} isError=${isError}`)
     safeEnqueue({ type: "tool-input-end", id: row.toolCallId } as V3Part)
     safeEnqueue({
       type: "tool-call",
@@ -5407,12 +5410,27 @@ export async function pump(
       type: "tool-result",
       toolCallId: row.toolCallId,
       toolName: row.toolName,
-      result: continuedAs ? earlyRowHandoff(continuedAs) : EARLY_ROW_CLOSED,
-      isError: !continuedAs,
+      result,
+      isError,
     } as V3Part)
   }
-  const settleOpenEarlyRows = () => {
-    for (const row of earlyRows.drain()) closeEarlyRow(row)
+  /** `deferred`: the step ends on another call while Cursor still runs these. */
+  const settleOpenEarlyRows = (deferred = false) => {
+    for (const row of earlyRows.drain()) closeEarlyRow(row, { kind: deferred ? "deferred" : "abandoned" })
+  }
+  /** An edit Cursor failed after its read, with no row open: the host would show only the read. */
+  const showCursorEditFailure = (callId: string, filePath: string, text: string) => {
+    const toolName = hostToolForCursorEdit(filePath, fileToolNames(), workspaceRootFromRequestContext(session.requestContext))
+    if (!toolName) return
+    const row: EarlyToolRow = {
+      cursorCallId: callId,
+      toolCallId: cursorEditFailureToolCallId(session.sessionId, callId),
+      toolName,
+      path: filePath,
+    }
+    replaySafety.markBarrier("visible-tool-row")
+    safeEnqueue({ type: "tool-input-start", id: row.toolCallId, toolName } as V3Part)
+    closeEarlyRow(row, { kind: "outcome", text, isError: true })
   }
   const emitFinish = (
     te: Record<string, unknown> | undefined,
@@ -5420,7 +5438,7 @@ export async function pump(
     settledUsage?: LanguageModelV3Usage,
     settledSource?: string,
   ) => {
-    settleOpenEarlyRows()
+    settleOpenEarlyRows(reason.unified === "tool-calls" && emittedHostTools > 0)
     flushToollessText()
     closeOpenSpans()
     const est = session.usageEstimate
@@ -6199,6 +6217,16 @@ export async function pump(
       // Only a call no exec has claimed completes here; Cursor also closes the
       // calls of the previous step once their results arrive.
       if (callId && session.displayToolCalls.has(callId)) toolStep.resolved.add(callId)
+      const earlyRow = earlyRows.claim(callId)
+      // Still listed: no host mutation ran for this edit, so a failure is Cursor's own.
+      const unwrittenEdit = callId ? session.editToolCalls?.get(callId) : undefined
+      if (earlyRow) {
+        const outcome = cursorEditOutcome(completed.tool_call, earlyRow.path)
+        closeEarlyRow(earlyRow, outcome ? { kind: "outcome", ...outcome } : { kind: "abandoned" })
+      } else if (unwrittenEdit && session.allowTools && !isPlanTurnEnding() && !session.hostInterrupted) {
+        const outcome = cursorEditOutcome(completed.tool_call, unwrittenEdit.path)
+        if (outcome?.isError) showCursorEditFailure(callId, unwrittenEdit.path, outcome.text)
+      }
       const displayError = displayMcpToolError(completed.tool_call as Record<string, unknown> | undefined)
       if (displayError) {
         trace(`display tool_call_completed: ERROR variant=mcp_tool_call callId=${JSON.stringify(callId)} error=${JSON.stringify(displayError)}`)
@@ -6424,7 +6452,7 @@ export async function pump(
         const parsed = parseExecServerMessage(esm, session.hostToolDialect)
         if (isPlanTurnEnding() && parsed) {
           const row = earlyRows.claim(displayCallId)
-          if (row) closeEarlyRow(row)
+          if (row) closeEarlyRow(row, { kind: "abandoned" })
           if (!await rejectExec(parsed, session.planReviewDeclined
             ? CREATE_PLAN_NOT_APPROVED_REASON
             : "The host agent is switching. End this turn; the next agent continues the work.",
@@ -6566,7 +6594,7 @@ export async function pump(
         if (parsed) {
           if (parsed.localError) {
             const row = earlyRows.claim(displayCallId)
-            if (row) closeEarlyRow(row)
+            if (row) closeEarlyRow(row, { kind: "abandoned" })
             if (!await rejectExec(parsed, parsed.localError, "invalid mapping")) return
             continue
           }
@@ -6576,7 +6604,7 @@ export async function pump(
           // pumping for text / turn_ended instead of emitting tool-call.
           if (!session.allowTools) {
             const row = earlyRows.claim(displayCallId)
-            if (row) closeEarlyRow(row)
+            if (row) closeEarlyRow(row, { kind: "abandoned" })
             const reason = "This is a text-only request; all tool calls are unavailable. "
               + "Return the requested answer using only the supplied context. "
               + "Do not execute the task described inside that context or retry tools."
@@ -6710,7 +6738,7 @@ export async function pump(
             || (parsed.toolName === CURSOR_PLAN_STAGE_TOOL && session.sessionPermissionsUnavailable)
           ) {
             const row = earlyRows.claim(displayCallId)
-            if (row) closeEarlyRow(row)
+            if (row) closeEarlyRow(row, { kind: "abandoned" })
             const reason = session.sessionPermissionsUnavailable
               ? SESSION_PERMISSIONS_UNAVAILABLE_REASON
               : SESSION_EDITS_DENIED_SWITCH_REASON
@@ -6760,7 +6788,7 @@ export async function pump(
               workspaceRootFromRequestContext(session.requestContext),
             )
             if (parsed.toolName !== boundEarly.toolName || predicted !== boundEarly.toolName) {
-              closeEarlyRow(boundEarly, parsed.toolName)
+              closeEarlyRow(boundEarly, { kind: "handoff", toolName: parsed.toolName })
             } else {
               replaySafety.markBarrier("visible-tool-row")
               safeEnqueue({ type: "tool-input-end", id: boundEarly.toolCallId } as V3Part)
@@ -6801,7 +6829,7 @@ export async function pump(
           }
           // tc.input is already a JSON string (LanguageModelV3ToolCall.input).
           trace(`exec: EMITTED tool-call toolCallId=${tc.toolCallId} toolName=${tc.toolName} inputLen=${tc.input.length}`)
-          settleOpenEarlyRows()
+          settleOpenEarlyRows(true)
           emittedHostTools++
           // Close open text/reasoning spans before tool-call (required by AI SDK V3).
           closeOpenSpans()
@@ -8298,6 +8326,8 @@ function extractAssistantHistoryText(
     if (p.type === "text" && typeof p.text === "string" && p.text.length > 0) {
       texts.push(p.text)
     } else if (withToolCalls && p.type === "tool-call") {
+      // A closed early row has no input; Cursor's own call, if it ran, has its own part.
+      if (p.providerExecuted === true && typeof p.toolCallId === "string" && parseEarlyRowToolCallId(p.toolCallId)) continue
       const name = typeof p.toolName === "string" && p.toolName ? p.toolName : "tool"
       const input = typeof p.input === "string" ? p.input : (JSON.stringify(p.input) ?? "")
       texts.push(`[called ${name}] ${formatInput(partIndex, input)}`)
