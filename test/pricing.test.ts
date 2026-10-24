@@ -58,11 +58,12 @@ describe("pricing", () => {
         cache_write: 7.5,
       },
     })
-    expect(getCursorModelCost("gpt-5.5")?.context_over_200k).toEqual({
-      input: 10,
+    expect(getCursorModelCost("gpt-5.5")).toEqual({
+      input: 5,
       output: 30,
-      cache_read: 1,
+      cache_read: 0.5,
     })
+    expect(getCursorModelCost("gpt-5.5")?.context_over_200k).toBeUndefined()
   })
 
   it("maps Cursor Models pool rates, including Fast variants", () => {
