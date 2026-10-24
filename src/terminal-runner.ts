@@ -17,6 +17,8 @@ const LAUNCHER_POLL_SECONDS = 0.05
  * own timeout adds to the window.
  */
 const TIMEOUT_SETTLE_SECONDS = 4
+/** Host-visible status of a launcher that reports a hard timeout, as timeout(1) uses. */
+export const TIMEOUT_EXIT_CODE = 124
 
 export type ManagedTerminal = { command: string; directory: string; file: string; shellId: number }
 
@@ -49,11 +51,19 @@ function softBackgroundWindow(policy: CursorShellPolicy, shellId: number): strin
     'if [ -f "$cursor_job/done" ]; then',
     ...capturedOutput('$(cat "$cursor_job/output-bytes")'),
     '  if [ -f "$cursor_job/timedout" ]; then',
-    `    printf '\\n__CURSOR_SHELL_TIMEOUT__%s\\n' ${policy.hardTimeoutMs ?? 0}`,
-    '  else printf "\\n__CURSOR_SHELL_EXIT__%s\\n" "$(cat "$cursor_job/done")"; fi',
+    `    printf '\\n__CURSOR_SHELL_TIMEOUT__%s\\n' ${policy.hardTimeoutMs ?? 0}; exit ${TIMEOUT_EXIT_CODE}`,
+    "  fi",
+    // The host records this status; the marker alone reaches only the live turn.
+    // `done` can be seen between its creation and its write.
+    "  cursor_settle=0",
+    '  while [ ! -s "$cursor_job/done" ] && [ "$cursor_settle" -lt 20 ]; do sleep 0.05; cursor_settle=$((cursor_settle + 1)); done',
+    '  cursor_code=$(cat "$cursor_job/done")',
+    '  printf "\\n__CURSOR_SHELL_EXIT__%s\\n" "$cursor_code"',
+    '  case "$cursor_code" in ""|*[!0-9]*) exit 1 ;; esac',
+    '  exit "$cursor_code"',
     'elif [ -f "$cursor_job/timedout" ]; then',
     ...capturedOutput('$(( $(wc -c <"$cursor_terminal") - cursor_header ))'),
-    `  printf '\\n__CURSOR_SHELL_TIMEOUT__%s\\n' ${policy.hardTimeoutMs ?? 0}`,
+    `  printf '\\n__CURSOR_SHELL_TIMEOUT__%s\\n' ${policy.hardTimeoutMs ?? 0}; exit ${TIMEOUT_EXIT_CODE}`,
     "else",
     '  if ! kill -0 "$cursor_supervisor" 2>/dev/null || [ -f "$cursor_job/error" ]; then cat "$cursor_job/error" 2>/dev/null; printf "\\n__CURSOR_SHELL_EXIT__1\\n"; exit 1; fi',
     // A soft handoff returns what the foreground window produced, as the

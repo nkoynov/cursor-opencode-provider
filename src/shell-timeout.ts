@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { basename, delimiter, dirname as pathDirectory, join, resolve } from "node:path"
-import { releaseUnstartedTerminal } from "./terminal-runner.js"
+import { releaseUnstartedTerminal, TIMEOUT_EXIT_CODE } from "./terminal-runner.js"
 import { processShared } from "./process-shared.js"
 import { niceExecLines, niceShellAdapter, resetToolNiceAdapters, toolNiceIncrement } from "./tool-nice.js"
 
@@ -330,6 +330,7 @@ export function buildSoftBackgroundCommand(policy: CursorShellPolicy): string {
     // reach a reused PID; while the payload lives, that KILL is still due.
     '  if [ -n "$cursor_shell_watchdog_pid" ] && ! kill -0 "$cursor_shell_pid" 2>/dev/null; then kill "$cursor_shell_watchdog_pid" 2>/dev/null || true; wait "$cursor_shell_watchdog_pid" 2>/dev/null || true; fi',
     `  printf '\n${TIMEOUT_MARKER}%s\n' ${policy.hardTimeoutMs ?? policy.timeoutMs}`,
+    `  cursor_shell_code=${TIMEOUT_EXIT_CODE}`,
     "else",
     // Only an exited payload reaches here, so this wait cannot block.
     '  wait "$cursor_shell_pid" 2>/dev/null',
@@ -339,6 +340,8 @@ export function buildSoftBackgroundCommand(policy: CursorShellPolicy): string {
     "fi",
     'rm -f -- "$cursor_shell_log"',
     'if [ -n "$cursor_shell_status" ]; then rm -f -- "$cursor_shell_status"; fi',
+    // The host records this status; the marker alone reaches only the live turn.
+    'exit "$cursor_shell_code"',
   )
   return lines.join("\n")
 }
@@ -847,6 +850,24 @@ export function captureCursorShellFailure(toolCallId: string, error: unknown): v
 
 export function capturedCursorShellOutcome(toolCallId: string): CursorShellOutcome | undefined {
   return outcomes.get(toolCallId)
+}
+
+/**
+ * OpenCode 2 appends `Exited with code N` as the result's last text block
+ * (packages/core/src/shell/result.ts `notice`, v2.1.4). Cursor gets the code
+ * structurally and its stdout is only what the command printed, so the live
+ * result drops that block when it matches the captured exit. Stored history
+ * keeps it: a rebuilt transcript has no other record of the code.
+ */
+export function withoutHostShellExitNotice(toolCallId: string, output: unknown): unknown {
+  const outcome = outcomes.get(toolCallId)
+  const code = outcome?.kind === "exit" ? outcome.code : outcome?.kind === "timeout" ? TIMEOUT_EXIT_CODE : undefined
+  if (!code || !output || typeof output !== "object") return output
+  const { type, value } = output as { type?: unknown; value?: unknown }
+  if (type !== "content" || !Array.isArray(value) || value.length < 2) return output
+  const last = value.at(-1) as { type?: unknown; text?: unknown } | undefined
+  if (last?.type !== "text" || last.text !== `Exited with code ${code}`) return output
+  return { ...output, value: value.slice(0, -1) }
 }
 
 /** Consume the structured result, with an inline fallback when no plugin hook ran. */
