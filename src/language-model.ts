@@ -1108,20 +1108,33 @@ async function doStreamImpl(
   // pumpWithRecovery owns the complete per-turn attempt budget.  Opening a
   // replacement session here must be a single attempt; otherwise setup retry
   // loops nest inside recovery and `maxAttempts` no longer caps total Runs.
+  // One forced renewal per call, whether Cursor rejects the token while a Run opens or while it pumps.
+  let credentialRenewed = false
   const openSession = async (startOptions?: { recovery?: CursorRunRecovery; isolate?: boolean }) => {
-    const forceRefresh = forceCredentialRefresh
-    forceCredentialRefresh = false
-    const prefetched = prefetchedToken
-    prefetchedToken = undefined
-    const token = prefetched !== undefined && !forceRefresh
-      ? prefetched
-      : await resolveRunBearerToken(options, forceRefresh)
-    const opened = await startSession(modelId, token, callOptions, options, {
-      ...startOptions,
-      requestedAt,
-    })
-    cancelIfHostStoppedSince(opened)
-    return opened
+    for (;;) {
+      const forceRefresh = forceCredentialRefresh
+      forceCredentialRefresh = false
+      const prefetched = prefetchedToken
+      prefetchedToken = undefined
+      const token = prefetched !== undefined && !forceRefresh
+        ? prefetched
+        : await resolveRunBearerToken(options, forceRefresh)
+      try {
+        const opened = await startSession(modelId, token, callOptions, options, {
+          ...startOptions,
+          requestedAt,
+        })
+        cancelIfHostStoppedSince(opened)
+        return opened
+      } catch (error) {
+        // A rejection that reaches the open (a long upload) means Cursor took no Run.
+        if (!credentialRenewable || credentialRenewed || callOptions.abortSignal?.aborted
+          || !isRejectedCredentialError(error) || !error.replaySafe) throw error
+        credentialRenewed = true
+        forceCredentialRefresh = true
+        trace(`Run credential rejected while opening: err=${error.message} — renewing the token and opening once more`)
+      }
+    }
   }
 
   // ── Continuation vs fresh turn ──
@@ -1353,7 +1366,13 @@ async function doStreamImpl(
               onSession: (next) => { activeSession = next },
               ...(steeredPrompt ? { steer: true } : {}),
               ...(credentialRenewable
-                ? { renewRejectedCredential: () => { forceCredentialRefresh = true } }
+                ? {
+                    renewRejectedCredential: () => {
+                      if (credentialRenewed) return false
+                      credentialRenewed = true
+                      forceCredentialRefresh = true
+                    },
+                  }
                 : {}),
             })
           } finally {
@@ -1446,9 +1465,10 @@ export async function pumpWithRecovery(input: {
    * Set when the credential source can renew: called once per turn after
    * Cursor rejects the token (401 / unauthenticated) before the attempt did
    * anything, so the reopened Run uses a force-renewed token. This retry does
-   * not count against the transient-failure budget.
+   * not count against the transient-failure budget. Returns false when the
+   * caller already renewed this turn (while a Run opened).
    */
-  renewRejectedCredential?: () => void
+  renewRejectedCredential?: () => boolean | void
 }): Promise<CursorSession> {
   let session = input.initialSession
   const retryPolicy = input.retryPolicy ?? {
@@ -1651,6 +1671,7 @@ export async function pumpWithRecovery(input: {
         && !credentialRenewed
         && isRejectedCredentialError(failure)
         && (failure.replaySafe || untouchedCheckpointResume)
+        && input.renewRejectedCredential() !== false
       ) {
         credentialRenewed = true
         trace(
@@ -1658,7 +1679,6 @@ export async function pumpWithRecovery(input: {
             `— renewing the token and reopening once`,
         )
         sessionManager.close(pumpedSession, "remote-error", failure)
-        input.renewRejectedCredential()
         await reopenAttempt(
           pumpedSession,
           failure,

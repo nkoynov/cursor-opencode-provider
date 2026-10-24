@@ -128,7 +128,8 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   upload is the exception: nothing answers that stream's frames before it is
   sent, so a cut upload is transient and replay-safe unless Cursor's verdict (a
   Connect error already in the body, else the stream's terminal error) is final
-  (`runUploadFailure`). There is no upload deadline;
+  (`runUploadFailure`). A bare credential rejection there gets the call's one
+  forced renewal, shared with the pump's (`openSession`). There is no upload deadline;
   errors, Run termination and the 120 s inbound read-idle watchdog settle waits.
 - Initial and replacement uploads own temporary abort/host-Stop listeners;
   continuation delivery and the active pump use their current call's signal.

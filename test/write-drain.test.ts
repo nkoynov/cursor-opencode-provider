@@ -36,7 +36,12 @@ const ORIGIN = "https://agentn.drain-test.cursor.sh"
  */
 async function startSlowCursor(
   bytesPerSecond: number,
-  options: { endWithoutReading?: boolean | number; refuseGzip?: boolean; refuseWith?: string } = {},
+  options: {
+    endWithoutReading?: boolean | number
+    refuseGzip?: boolean
+    /** A Connect error code for every Run, or per Run index (undefined accepts that Run). */
+    refuseWith?: string | ((index: number) => string | undefined)
+  } = {},
 ) {
   const received: number[] = []
   const bodies: Buffer[][] = []
@@ -60,8 +65,9 @@ async function startSlowCursor(
     stream.write(encodeFrame(0x00, encodeMessage("AgentServerMessage", { interaction_update: { heartbeat: {} } })))
     stream.on("error", () => {})
     // A Connect error in an HTTP 200 body while the request is still uploading.
-    if (options.refuseWith) {
-      const refusal = encodeFrame(0x02, new TextEncoder().encode(JSON.stringify({ error: { code: options.refuseWith } })))
+    const refuseCode = typeof options.refuseWith === "function" ? options.refuseWith(index) : options.refuseWith
+    if (refuseCode) {
+      const refusal = encodeFrame(0x02, new TextEncoder().encode(JSON.stringify({ error: { code: refuseCode } })))
       return void setTimeout(() => stream.end(refusal), 100)
     }
     // A number ends only that many first Runs.
@@ -112,13 +118,16 @@ async function startSlowCursor(
   })
   cacheHttp2SessionForTests(ORIGIN, client)
   // A refused Run's remote close retires the connection, so its resend opens a new one.
-  if (options.refuseGzip) routeHttp2ConnectionsForTests(() => net.connect(relayPort, "127.0.0.1"))
+  if (options.refuseGzip || options.refuseWith) routeHttp2ConnectionsForTests(() => net.connect(relayPort, "127.0.0.1"))
 
   return {
     received,
     body: (index: number) => Buffer.concat(bodies[index] ?? []),
     send(index: number, message: Record<string, unknown>) {
       serverStreams[index]!.write(encodeFrame(0, encodeMessage("AgentServerMessage", message)))
+    },
+    fail(index: number, code: string) {
+      serverStreams[index]!.end(encodeFrame(0x02, new TextEncoder().encode(JSON.stringify({ error: { code } }))))
     },
     stall() { stalled = true },
     async close() {
@@ -306,6 +315,88 @@ describe("Run write drain", () => {
       await fs.rm(cacheDir, { recursive: true, force: true })
     }
   }, 15_000)
+
+  describe("a credential Cursor rejects during the upload", () => {
+    const run = async (refuse: (index: number) => string | undefined, drive: (model: ReturnType<typeof languageModel>, renewals: () => number) => Promise<void>) => {
+      fake = await startSlowCursor(2_000_000, { refuseWith: refuse })
+      const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-upload-auth-"))
+      const previousCache = getHostCacheDirOverride()
+      let renewals = 0
+      try {
+        const model = languageModel(cacheDir, async (request) => {
+          if (request?.forceRefresh) renewals++
+          return renewals ? "renewed-token" : "token"
+        })
+        await drive(model, () => renewals)
+      } finally {
+        sessionManager.dispose()
+        closeCachedHttp2SessionsForTests()
+        await settleRunSavesForTests()
+        setHostCacheDirOverride(previousCache)
+        await fs.rm(cacheDir, { recursive: true, force: true })
+      }
+    }
+    function languageModel(cacheDir: string, getAccessToken: (request?: { forceRefresh?: boolean }) => Promise<string>) {
+      return createCursor({ name: "cursor", agentBaseURL: ORIGIN, workspaceRoot: cacheDir, cacheDir, getAccessToken,
+        retry: { baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
+    }
+    // Past the refused stream's 64 KiB window, and small enough for a rebuild to fit the context.
+    const call = (sessionKey: string) => ({
+      prompt: [{ role: "user", content: [{ type: "text", text: "x".repeat(250_000) }] }],
+      tools: [{ type: "function", name: "read", description: "Read", inputSchema: { type: "object", properties: {} } }],
+      headers: { "x-opencode-session-id": sessionKey },
+    }) as LanguageModelV3CallOptions
+
+    it("renews the token once and opens the first Run again", async () => {
+      await run((index) => index === 0 ? "unauthenticated" : undefined, async (model, renewals) => {
+        const result = await model.doStream(call("ses_upload_auth_initial"))
+        expect(renewals()).toBe(1)
+        expect(fake!.received).toHaveLength(2)
+        await failureOf(result.stream.cancel())
+      })
+    }, 20_000)
+
+    it("ends the turn when the renewed token is rejected too", async () => {
+      await run(() => "unauthenticated", async (model, renewals) => {
+        const error = await failureOf(Promise.resolve(model.doStream(call("ses_upload_auth_twice"))))
+        expect(APICallError.isInstance(error)).toBe(true)
+        expect(error).toMatchObject({ isRetryable: false })
+        expect(renewals()).toBe(1)
+        expect(fake!.received).toHaveLength(2)
+      })
+    }, 20_000)
+
+    it("does not renew a second time when the reopened Run is rejected while it pumps", async () => {
+      await run((index) => index === 0 ? "unauthenticated" : undefined, async (model, renewals) => {
+        const result = await model.doStream(call("ses_upload_auth_pump"))
+        const reader = result.stream.getReader()
+        const outcome = failureOf((async () => { while (!(await reader.read()).done) { /* consume */ } })())
+        fake!.fail(1, "unauthenticated")
+        expect(await outcome).toMatchObject({ isRetryable: false })
+        expect(renewals()).toBe(1)
+        expect(fake!.received).toHaveLength(2)
+      })
+    }, 20_000)
+
+    it("renews the token once for a replacement Run and finishes the turn", async () => {
+      await run((index) => index === 1 ? "unauthenticated" : undefined, async (model, renewals) => {
+        const result = await model.doStream(call("ses_upload_auth_replacement"))
+        const reader = result.stream.getReader()
+        const parts: Array<{ type: string; finishReason?: { unified: string } }> = []
+        const consumed = (async () => {
+          for (let next = await reader.read(); !next.done; next = await reader.read()) parts.push(next.value as typeof parts[number])
+        })()
+        // The first Run drops before any output, so the turn reopens from the start.
+        fake!.fail(0, "unavailable")
+        await waitUntil(() => fake!.received.length === 3, 15_000)
+        fake!.send(2, { interaction_update: { turn_ended: {} } })
+        await consumed
+        expect(parts.at(-1)?.finishReason?.unified).toBe("stop")
+        expect(renewals()).toBe(1)
+        expect(fake!.received).toHaveLength(3)
+      })
+    }, 30_000)
+  })
 
   it("keeps a cut upload replay-safe and a refusal Cursor sent final", () => {
     const ended = new CursorRunInterruptedError("Cursor Run stream ended before drain")
