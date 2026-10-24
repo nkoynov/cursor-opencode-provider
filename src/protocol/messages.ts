@@ -100,7 +100,46 @@ export function createMessageTypes(): protobuf.Root {
     { id: 1, name: "path", type: "string" },
     { id: 6, name: "stream_content", type: "string" },
   ])
-  addType(root, "EditToolCall", [{ id: 1, name: "args", type: "EditToolArgs" }])
+  // Cursor's own outcome of an edit; the file contents fields are left undecoded.
+  addType(root, "EditSuccess", [
+    { id: 1, name: "path", type: "string" },
+    { id: 8, name: "message", type: "string" },
+  ])
+  addType(root, "EditFileNotFound", [{ id: 1, name: "path", type: "string" }])
+  addType(root, "EditReadPermissionDenied", [{ id: 1, name: "path", type: "string" }])
+  addType(root, "EditWritePermissionDenied", [
+    { id: 1, name: "path", type: "string" },
+    { id: 2, name: "error", type: "string" },
+  ])
+  addType(root, "EditRejected", [
+    { id: 1, name: "path", type: "string" },
+    { id: 2, name: "reason", type: "string" },
+  ])
+  addType(root, "EditError", [
+    { id: 1, name: "path", type: "string" },
+    { id: 2, name: "error", type: "string" },
+    { id: 5, name: "model_visible_error", type: "string" },
+  ])
+  addType(
+    root,
+    "EditResult",
+    [
+      { id: 1, name: "success", type: "EditSuccess" },
+      { id: 2, name: "file_not_found", type: "EditFileNotFound" },
+      { id: 3, name: "read_permission_denied", type: "EditReadPermissionDenied" },
+      { id: 4, name: "write_permission_denied", type: "EditWritePermissionDenied" },
+      { id: 6, name: "rejected", type: "EditRejected" },
+      { id: 7, name: "error", type: "EditError" },
+    ],
+    [{
+      name: "result",
+      fields: ["success", "file_not_found", "read_permission_denied", "write_permission_denied", "rejected", "error"],
+    }],
+  )
+  addType(root, "EditToolCall", [
+    { id: 1, name: "args", type: "EditToolArgs" },
+    { id: 2, name: "result", type: "EditResult" },
+  ])
   addType(root, "LsToolCall", [{ id: 1, name: "args", type: "LsArgs" }])
   addType(root, "McpToolCall", [
     { id: 1, name: "args", type: "McpArgs" },

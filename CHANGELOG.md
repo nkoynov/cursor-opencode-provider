@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- An early edit row no longer shows "Cursor did not finish this tool call." for a call that did finish. When Cursor ends an edit itself without a write (for example a string it could not find), the row now shows Cursor's own result, the one the model saw, and fails only if that result is an error. When another call of the step runs first, the row completes with a note that Cursor runs this call afterwards, and the call shows up again when it runs. A row still fails as unfinished when its Run ends without the call or its exec is refused. An edit Cursor fails after its permission-checked read, which opens no early row, now shows as a failed edit with Cursor's error instead of only the read.
+
 ## [0.8.4] - 2026-10-24
 
 ### Changed

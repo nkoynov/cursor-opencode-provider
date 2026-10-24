@@ -201,8 +201,12 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
 - Respect `tool_requests_listed` when emitting parallel calls. Early edit rows
   predict the remapped host tool, open none when the edit's private read goes
   to the host, complete with a hand-off note when the call runs as another
-  host tool, close as unfinished if no exec arrives, and retain routing after
-  Run closure/restart so a late result can rebuild from history.
+  host tool, take Cursor's own `EditResult` when Cursor finishes the edit
+  without a write, complete unfailed when another call's exec ends the step
+  first, close as unfinished only when the Run ends or the exec is refused,
+  and retain routing after Run closure/restart so a late result can rebuild
+  from history. An edit Cursor fails after its host read, with no row open,
+  gets a failed row with Cursor's error.
 - Drain a held Run before a fresh user turn. Rebuild late tool results from
   host history; checkpoint resume would request the tool again. Never replay
   side effects after the replay barrier or treat EOF as successful `stop`.
