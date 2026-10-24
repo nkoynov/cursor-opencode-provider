@@ -1189,6 +1189,23 @@ describe("early edit rows", () => {
     expect(assistant?.content).toBe('Editing.\n[called edit] {"filePath":"a.txt"}')
   })
 
+  it("still counts a turn answered only by a closed row as answered", () => {
+    const closedId = earlyRowToolCallId("sess", "edit-1")
+    const history = extractPromptHistory([
+      { role: "user", content: [{ type: "text", text: "edit it" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "tool-call", toolCallId: closedId, toolName: "write", input: {}, providerExecuted: true },
+          { type: "tool-result", toolCallId: closedId, toolName: "write", output: { type: "text", value: "done" }, providerExecuted: true },
+        ],
+      },
+      { role: "user", content: [{ type: "text", text: "next" }] },
+    ] as never, { toolResults: "transcript" })
+
+    expect(history[0]).toEqual({ role: "user", content: "edit it" })
+  })
+
   it("does not open a row a patch conversion would refuse, or on a tool-less turn", async () => {
     const dir = tempDir()
     const crlf = path.join(dir, "crlf.txt")

@@ -8241,6 +8241,8 @@ function repliedAfter(prompt: LanguageModelV3CallOptions["prompt"], index: numbe
     if (m.role === "tool") return true
     if (m.role !== "assistant") return false
     if (extractAssistantHistoryText(m as unknown as Record<string, unknown>, true)) return true
+    // A closed early row is left out of the text but is still the model acting on the request.
+    if (Array.isArray(m.content) && m.content.some((part) => part.type === "tool-call")) return true
   }
   return false
 }
