@@ -167,7 +167,7 @@ describe("ordered tool calls", () => {
 
     const first = await pumpOnce(session)
     expect(calls(first)).toEqual(["read#1"])
-    expect(session.replaySafety?.hostCalls ?? []).not.toContain("edit")
+    expect(session.replaySafety?.execs?.find((exec) => exec.id === 1)?.callId).toBe("edit")
 
     await deliverAll(session)
     const pumping = pumpOnce(session)
@@ -175,7 +175,7 @@ describe("ordered tool calls", () => {
     script.push(editWrite(3, "edit", target))
     const second = await pumping
     expect(calls(second)).toEqual(["edit#3"])
-    expect(session.replaySafety?.hostCalls).toContain("edit")
+    expect(session.replaySafety?.execs?.find((exec) => exec.id === 3)?.callId).toBe("edit")
 
     await deliverAll(session)
     const third = await pumpOnce(session)

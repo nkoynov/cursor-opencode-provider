@@ -180,12 +180,14 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   as a follow-up Run (`continuationAfterEarlySteers`). A checkpoint or
   `tool_call_completed` that arrived before a result write confirms no steer
   result (`arrivedBeforeResultWrite`).
-- Fork: a `tool_call_started` / `tool_call_completed` frame still sets the
-  stateful replay barrier, but blocks the completed-tool-results rebuild only
-  while no host exec (or bridged host row) has claimed its call
-  (`historyRepresentsRun`), and adds no barrier once claimed; upstream blocked
-  it for every announced call, so the rebuild never ran on real Cursor. A host
-  result for an exec Cursor withdrew still revokes the checkpoint before it.
+- Lifecycle frames follow upstream #114: a host exec claims its display call
+  (`ReplaySafetyState.execs[].callId`), and the completed-tool-results rebuild
+  needs every announced call claimed (`announcedCallsClaimed`). Fork: a display
+  call the provider bridges to a host tool (a todo mirror) is claimed too
+  (`bridgedCalls`); Cursor's completion of a call no exec claimed waits in
+  `completedCalls` and blocks the rebuild unless that call is bridged, and a
+  step of bridged rows alone can rebuild. A host result for an exec Cursor
+  withdrew still revokes the checkpoint before it.
 
 ## Context, identity and persistence
 
@@ -223,7 +225,8 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
 - Compaction/rebase discards old checkpoints/blobs, transfers stable workspace
   context/comparison state and admits a new baseline. Direct Cursor model
   switches keep the conversation. Foreign-provider history rebuilds with every
-  tool result; oversized foreign seeds fail before opening so the host compacts.
+  tool result; oversized foreign or completed-result seeds fail before opening
+  with a host-shaped 413 so the host compacts.
 - Persist atomic per-session gzip protobuf snapshots under the native/bridged
   host cache: checkpoint, reachable blobs, baseline, catalogs, provenance, notes,
   lost requests and steer receipts. Keep all blobs if reachability is uncertain.

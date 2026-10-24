@@ -1,6 +1,12 @@
 import { describe, expect, it } from "bun:test"
-import { analyzeReplayFrame, AttemptReplaySafety, describeFrameLayout, historyRepresentsRun, type ReplaySafetyState } from "../src/replay-safety.js"
 import { CursorTransportError } from "../src/errors.js"
+import {
+  analyzeReplayFrame,
+  announcedCallsClaimed,
+  AttemptReplaySafety,
+  describeFrameLayout,
+  type ReplaySafetyState,
+} from "../src/replay-safety.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 
 function varint(value: number): number[] {
@@ -111,6 +117,120 @@ describe("user-message-appended updates", () => {
   })
 })
 
+describe("display tool lifecycle", () => {
+  // Independent bytes from the shipped CLI descriptors: InteractionUpdate
+  // tool_call_started #2 / tool_call_completed #3; both updates carry call_id #1.
+  const lifecycleFrame = (field: 2 | 3, callId?: string) =>
+    updateFrame(field, callId === undefined ? [] : lengthDelimited(1, new TextEncoder().encode(callId)))
+  const analyze = (field: 2 | 3, callId?: string) => {
+    const frame = lifecycleFrame(field, callId)
+    const decoded = decodeMessage<{ interaction_update: Record<string, unknown> }>("AgentServerMessage", frame)
+    return analyzeReplayFrame(frame, { interactionUpdate: decoded.interaction_update })
+  }
+  const failure = () => new CursorTransportError("Cursor Run transport interrupted", { transient: true, replaySafe: true })
+
+  it("correlates started and completed frames by call id", () => {
+    expect(analyze(2, "call-1")).toEqual({
+      barrier: "display-tool-lifecycle", toolLifecycle: { kind: "started", callId: "call-1" },
+    })
+    expect(analyze(3, "call-1")).toEqual({
+      barrier: "display-tool-lifecycle", toolLifecycle: { kind: "completed", callId: "call-1" },
+    })
+  })
+
+  it("does not correlate a frame without a call id or with another member", () => {
+    expect(analyze(2)).toEqual({ barrier: "display-tool-lifecycle" })
+    const frame = lifecycleFrame(2, "call-1")
+    const decoded = decodeMessage<{ interaction_update: Record<string, unknown> }>("AgentServerMessage", frame)
+    const mixed = Uint8Array.from(lengthDelimited(1, Uint8Array.from([
+      ...lengthDelimited(2, Uint8Array.from(lengthDelimited(1, new TextEncoder().encode("call-1")))),
+      ...lengthDelimited(13),
+    ])))
+    expect(analyzeReplayFrame(mixed, { interactionUpdate: decoded.interaction_update }))
+      .toEqual({ barrier: "display-tool-lifecycle" })
+  })
+
+  it("lets history represent a call its host exec claimed", () => {
+    const state: ReplaySafetyState = {}
+    const toolStep = new AttemptReplaySafety("run-1", state)
+    toolStep.recordToolLifecycle(analyze(2, "call-1").toolLifecycle)
+    expect(announcedCallsClaimed(state)).toBe(false)
+    toolStep.markBarrier("non-control-exec")
+    toolStep.recordExec(1, "call-1")
+    expect(toolStep.applyTo(failure())).toMatchObject({ replaySafe: false, replayBarrier: "stateful" })
+    expect(state.historyRebaseUnsafe).toBeUndefined()
+    expect(announcedCallsClaimed(state)).toBe(true)
+
+    // The completion Cursor sends after the delivered result marks nothing.
+    const continuation = new AttemptReplaySafety("run-1", state)
+    continuation.recordToolLifecycle(analyze(3, "call-1").toolLifecycle)
+    const continued = continuation.applyTo(failure())
+    expect(continued.replayBarrier).toBeUndefined()
+    expect(continued.replaySafe).toBe(false)
+    expect(state.historyRebaseUnsafe).toBeUndefined()
+  })
+
+  it("retains a preceding Run's display claim across resume", () => {
+    const state: ReplaySafetyState = {}
+    const previous = new AttemptReplaySafety("run-1", state)
+    previous.recordToolLifecycle(analyze(2, "call-1").toolLifecycle)
+    previous.markBarrier("non-control-exec")
+    previous.recordExec(1, "call-1")
+    previous.recordToolLifecycle(analyze(3, "call-1").toolLifecycle)
+
+    const resumed = new AttemptReplaySafety("run-2", state)
+    resumed.recordToolLifecycle(analyze(3, "call-1").toolLifecycle)
+    expect(state.historyRebaseUnsafe).toBeUndefined()
+    expect(announcedCallsClaimed(state)).toBe(true)
+    expect(resumed.applyTo(failure()).replayBarrier).toBeUndefined()
+  })
+
+  it("keeps malformed nested lifecycle fields from claiming completed work", () => {
+    const callId = lengthDelimited(1, new TextEncoder().encode("call-1"))
+    for (const body of [
+      [...callId, ...callId],
+      [...callId, ...lengthDelimited(99)],
+      [...callId, ...varint(3 << 3), 0],
+    ]) {
+      const frame = updateFrame(3, body)
+      const decoded = decodeMessage<{ interaction_update: Record<string, unknown> }>("AgentServerMessage", frame)
+      expect(analyzeReplayFrame(frame, { interactionUpdate: decoded.interaction_update }))
+        .toEqual({ barrier: "display-tool-lifecycle" })
+    }
+  })
+
+  it("keeps blocking calls no host exec claimed and unknown lifecycle frames", () => {
+    const cursorRun: ReplaySafetyState = {}
+    const run = new AttemptReplaySafety("run-1", cursorRun)
+    run.recordToolLifecycle(analyze(2, "web-1").toolLifecycle)
+    expect(announcedCallsClaimed(cursorRun)).toBe(false)
+    run.recordToolLifecycle(analyze(3, "web-1").toolLifecycle)
+    // Fork: a completion no exec claimed blocks through the claim check, which only a bridge satisfies.
+    expect(announcedCallsClaimed(cursorRun)).toBe(false)
+    expect(run.applyTo(failure()).replayBarrier).toBe("stateful")
+
+    const unknown: ReplaySafetyState = {}
+    const unknownRun = new AttemptReplaySafety("run-1", unknown)
+    unknownRun.recordToolLifecycle(analyze(3, "never-started").toolLifecycle)
+    expect(announcedCallsClaimed(unknown)).toBe(false)
+    expect(unknownRun.applyTo(failure()).replayBarrier).toBe("stateful")
+
+    for (const record of [
+      (safety: AttemptReplaySafety) => safety.recordToolLifecycle(analyze(2).toolLifecycle),
+      (safety: AttemptReplaySafety) => {
+        safety.recordExec(1, "call-1")
+        safety.recordToolLifecycle(analyze(2, "call-1").toolLifecycle)
+      },
+    ]) {
+      const state: ReplaySafetyState = {}
+      const safety = new AttemptReplaySafety("run-1", state)
+      record(safety)
+      expect(state.historyRebaseUnsafe).toBe(true)
+      expect(safety.applyTo(failure()).replayBarrier).toBe("stateful")
+    }
+  })
+})
+
 describe("frame layout", () => {
   it("names field numbers and wire types without payload bytes", () => {
     const frame = updateFrame(16, [...varint(1 << 3), 5])
@@ -173,26 +293,42 @@ describe("Cursor CLI 2026.09.28 frame shapes", () => {
   })
 })
 
-describe("history across announced calls", () => {
-  it("represents a Run only once host execs claimed every announced call", () => {
+describe("display calls bridged to host tools", () => {
+  it("counts a bridged call as claimed whether Cursor announced or completed it", () => {
     const state: ReplaySafetyState = {}
     const attempt = new AttemptReplaySafety("run", state)
-    attempt.markBarrier("display-tool-lifecycle", "host")
-    attempt.markBarrier("display-tool-lifecycle", "cursor-side")
-    attempt.claimDisplayCall("host")
-    expect(historyRepresentsRun(state)).toBe(false)
-    attempt.claimDisplayCall("cursor-side")
-    expect(historyRepresentsRun(state)).toBe(true)
-    attempt.markBarrier("display-tool-lifecycle")
-    expect(historyRepresentsRun(state)).toBe(false)
+    attempt.recordToolLifecycle({ kind: "started", callId: "todo" })
+    attempt.recordToolLifecycle({ kind: "completed", callId: "todo" })
+    expect(state.historyRebaseUnsafe).toBeFalsy()
+    expect(announcedCallsClaimed(state)).toBe(false)
+    attempt.claimBridgedCall("todo")
+    expect(announcedCallsClaimed(state)).toBe(true)
   })
 
-  it("adds no barrier for Cursor closing a call a host exec already ran", () => {
-    const state: ReplaySafetyState = { statefulBarrier: "non-control-exec", hostCalls: ["host"] }
+  it("keeps a completion no exec claimed blocking unless that call is bridged", () => {
+    const state: ReplaySafetyState = {}
+    const attempt = new AttemptReplaySafety("run", state)
+    attempt.recordExec(1, "shell")
+    attempt.recordToolLifecycle({ kind: "completed", callId: "cursor-side" })
+    expect(announcedCallsClaimed(state)).toBe(false)
+    attempt.recordExec(2, "cursor-side")
+    expect(announcedCallsClaimed(state)).toBe(false)
+    attempt.claimBridgedCall("cursor-side")
+    expect(announcedCallsClaimed(state)).toBe(true)
+  })
+
+  it("ignores Cursor's completion of a call it already bridged", () => {
+    const state: ReplaySafetyState = { statefulBarrier: "non-control-exec", bridgedCalls: ["todo"] }
     const closing = new AttemptReplaySafety("run", state)
-    closing.markBarrier("display-tool-lifecycle", "host")
+    closing.recordToolLifecycle({ kind: "completed", callId: "todo" })
     expect(closing.applyTo(new CursorTransportError("drop", { transient: true, replaySafe: true })).replayBarrier).toBeUndefined()
-    closing.markBarrier("display-tool-lifecycle", "other")
-    expect(closing.applyTo(new CursorTransportError("drop", { transient: true, replaySafe: true })).replayBarrier).toBe("stateful")
+    expect(state.completedCalls).toBeUndefined()
+  })
+
+  it("still treats a lifecycle frame without a call id as unrepresentable", () => {
+    const state: ReplaySafetyState = {}
+    const attempt = new AttemptReplaySafety("run", state)
+    attempt.recordToolLifecycle(undefined)
+    expect(state.historyRebaseUnsafe).toBe(true)
   })
 })

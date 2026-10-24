@@ -19,19 +19,27 @@ const OUTPUT_ONLY_BARRIERS: ReadonlySet<ReplayBarrierReason> = new Set([
 /** Plain Run-owned state retained across host tool-step pump calls. */
 export type ReplaySafetyState = {
   statefulBarrier?: ReplayBarrierReason
-  /** Every exec needs its owner's host result; ids can restart on a resumed Run. */
-  execs?: Array<{ sessionId: string; id: number }>
-  /** History cannot represent opaque interactions, unknown frames or started display work. */
+  /**
+   * Every exec needs its owner's host result; ids can restart on a resumed Run.
+   * `callId` is the display call the exec claims.
+   */
+  execs?: Array<{ sessionId: string; id: number; callId?: string }>
+  /** Display calls Cursor announced; history holds one only through the host exec that claims it. */
+  announcedCalls?: string[]
+  /** History cannot represent opaque interactions, unknown frames or unclaimed display work. */
   historyRebaseUnsafe?: boolean
-  /** Fork: display calls whose lifecycle frames history represents only once a host exec claimed them. */
-  displayCalls?: string[]
-  hostCalls?: string[]
+  /** Fork: display calls the provider bridged to a host tool; the host result stands for each. */
+  bridgedCalls?: string[]
+  /** Fork: calls Cursor completed without an exec; history holds one only once it is bridged. */
+  completedCalls?: string[]
 }
 
-/** Host history holds every call this Run started, so a rebuilt Run repeats none of them. */
-export function historyRepresentsRun(state: ReplaySafetyState | undefined): boolean {
-  if (state?.historyRebaseUnsafe) return false
-  return (state?.displayCalls ?? []).every((callId) => state?.hostCalls?.includes(callId))
+/** Whether a host exec or bridge claimed every display call Cursor announced, so history holds each one. */
+export function announcedCallsClaimed(state: ReplaySafetyState | undefined): boolean {
+  const bridged = new Set(state?.bridgedCalls)
+  const claimed = new Set([...bridged, ...state?.execs?.flatMap((exec) => exec.callId ? [exec.callId] : []) ?? []])
+  return (state?.announcedCalls ?? []).every((callId) => claimed.has(callId))
+    && (state?.completedCalls ?? []).every((callId) => bridged.has(callId))
 }
 
 export class AttemptReplaySafety {
@@ -45,38 +53,64 @@ export class AttemptReplaySafety {
     this.stateful = state.statefulBarrier !== undefined
   }
 
-  markBarrier(reason: ReplayBarrierReason, displayCallId?: string): void {
-    // Cursor closing a call a host exec already ran adds nothing the exec's barrier and result do not hold.
-    if (reason === "display-tool-lifecycle" && displayCallId && this.state.hostCalls?.includes(displayCallId)) return
-    if (!OUTPUT_ONLY_BARRIERS.has(reason)) {
-      this.stateful = true
-      this.state.statefulBarrier ??= reason
-      if (reason === "display-tool-lifecycle" && displayCallId) {
-        const calls = this.state.displayCalls ??= []
-        if (!calls.includes(displayCallId)) calls.push(displayCallId)
-      } else if (reason !== "non-control-exec") {
-        this.state.historyRebaseUnsafe = true
-      }
+  markBarrier(reason: ReplayBarrierReason): void {
+    this.mark(reason, reason === "non-control-exec")
+  }
+
+  /**
+   * A display lifecycle frame. A started call stays a stateful barrier but
+   * blocks a history rebuild only until a host exec claims it; completion of a
+   * claimed call adds nothing history lacks. Calls Cursor runs itself, and
+   * frames without a call id, cannot be rebuilt.
+   */
+  recordToolLifecycle(lifecycle: ReplayToolLifecycle | undefined): void {
+    const claimed = !!lifecycle && (!!this.state.execs?.some((exec) => exec.callId === lifecycle.callId)
+      || !!this.state.bridgedCalls?.includes(lifecycle.callId))
+    if (lifecycle?.kind === "completed" && claimed) {
+      trace(`replay: display completion of claimed callId=${lifecycle.callId} sessionId=${this.sessionId}`)
+      return
     }
-    if (this.barrierReason) return
-    this.barrierReason = reason
-    trace(`replay barrier: reason=${reason} sessionId=${this.sessionId}`)
+    if (lifecycle?.kind === "started" && !claimed) {
+      const announced = this.state.announcedCalls ??= []
+      if (!announced.includes(lifecycle.callId)) announced.push(lifecycle.callId)
+      this.mark("display-tool-lifecycle", true)
+      return
+    }
+    // The provider may bridge this completion to a host tool while handling the same frame.
+    if (lifecycle?.kind === "completed") {
+      const completed = this.state.completedCalls ??= []
+      if (!completed.includes(lifecycle.callId)) completed.push(lifecycle.callId)
+      this.mark("display-tool-lifecycle", true)
+      return
+    }
+    this.mark("display-tool-lifecycle", false)
   }
 
-  /** A host exec took over the display call; its result in host history stands for the call. */
-  claimDisplayCall(callId: string): void {
-    const calls = this.state.hostCalls ??= []
-    if (!calls.includes(callId)) calls.push(callId)
+  /** Fork: a display call handed to a host tool; its result in host history stands for the call. */
+  claimBridgedCall(callId: string): void {
+    const bridged = this.state.bridgedCalls ??= []
+    if (!bridged.includes(callId)) bridged.push(callId)
   }
 
-  recordExec(id: unknown): void {
+  recordExec(id: unknown, callId?: string): void {
     const execs = this.state.execs ??= []
     if (typeof id !== "number" || !Number.isSafeInteger(id)
       || execs.some(exec => exec.sessionId === this.sessionId && exec.id === id)) {
       this.state.historyRebaseUnsafe = true
       return
     }
-    execs.push({ sessionId: this.sessionId, id })
+    execs.push({ sessionId: this.sessionId, id, ...(callId ? { callId } : {}) })
+  }
+
+  private mark(reason: ReplayBarrierReason, historyRepresentable: boolean): void {
+    if (!OUTPUT_ONLY_BARRIERS.has(reason)) {
+      this.stateful = true
+      this.state.statefulBarrier ??= reason
+      if (!historyRepresentable) this.state.historyRebaseUnsafe = true
+    }
+    if (this.barrierReason) return
+    this.barrierReason = reason
+    trace(`replay barrier: reason=${reason} sessionId=${this.sessionId}`)
   }
 
   applyTo(failure: CursorProviderError): CursorProviderError {
@@ -100,9 +134,12 @@ export type DecodedReplayFrame = {
   interactionQuery?: Record<string, unknown>
 }
 
+export type ReplayToolLifecycle = { kind: "started" | "completed"; callId: string }
+
 export type ReplayFrameAnalysis = {
   barrier?: ReplayBarrierReason
-  displayCallId?: string
+  /** Set for a well-formed lifecycle frame with a call id. */
+  toolLifecycle?: ReplayToolLifecycle
 }
 
 // Field numbers follow Cursor CLI 2026.09.28 `agent.v1`; the extracted
@@ -183,6 +220,14 @@ function validInteractionUpdateWire(
     return !!decoded.user_message_appended && appended?.length === 1
       && appended[0]!.fn === 1 && appended[0]!.wt === 2
   }
+  if (update.fn === 2 || update.fn === 3) {
+    // ToolCallStarted / ToolCallCompleted: call_id #1, tool_call #2,
+    // model_call_id #3. A decoder can discard unknown or repeated fields;
+    // those bytes must not authorize a history rebuild.
+    const lifecycle = update.bytes ? readAllFieldsStrict(update.bytes) : undefined
+    return !!lifecycle && lifecycle.every((field) => [1, 2, 3].includes(field.fn))
+      && [1, 2, 3].every((field) => optionalField(lifecycle, field, 2))
+  }
   if (![1, 4].includes(update.fn)) return true
   const delta = update.bytes ? (readAllFieldsStrict(update.bytes) ?? []) : []
   const text = delta.filter((field) => field.fn === 1)
@@ -255,14 +300,19 @@ export function analyzeReplayFrame(
     || !decodedMatchesWire(topLevel, decoded)
     || !!decoded.execControl
 
+  const started = decoded.interactionUpdate?.tool_call_started as Record<string, unknown> | undefined
+  const completed = decoded.interactionUpdate?.tool_call_completed as Record<string, unknown> | undefined
+  if (started || completed) {
+    const callId = (started ?? completed)?.call_id
+    return {
+      barrier: "display-tool-lifecycle",
+      ...(!malformed && typeof callId === "string" && callId.length > 0
+        ? { toolLifecycle: { kind: started ? "started" : "completed", callId } }
+        : {}),
+    }
+  }
   let barrier: ReplayBarrierReason | undefined
-  let displayCallId: string | undefined
-  const lifecycle = decoded.interactionUpdate?.tool_call_started ?? decoded.interactionUpdate?.tool_call_completed
-  if (lifecycle) {
-    barrier = "display-tool-lifecycle"
-    const callId = (lifecycle as { call_id?: unknown }).call_id
-    if (!malformed && typeof callId === "string" && callId) displayCallId = callId
-  } else if (malformed || (topLevel.fn === 4 && !validKv)) {
+  if (malformed || (topLevel.fn === 4 && !validKv)) {
     barrier = "unknown-or-malformed-frame"
   } else if (topLevel.fn === 1 && decoded.interactionUpdate?.user_message_appended) {
     barrier = "stateful-interaction"
@@ -270,5 +320,5 @@ export function analyzeReplayFrame(
     barrier = "non-control-exec"
   }
 
-  return { barrier, ...(displayCallId ? { displayCallId } : {}) }
+  return { barrier }
 }

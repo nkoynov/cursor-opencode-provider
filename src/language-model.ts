@@ -365,7 +365,7 @@ import {
   hostNoteText,
   wrapHostNotesForCursor,
 } from "./protocol/host-notes.js"
-import { analyzeReplayFrame, AttemptReplaySafety, describeFrameLayout, historyRepresentsRun } from "./replay-safety.js"
+import { analyzeReplayFrame, announcedCallsClaimed, AttemptReplaySafety, describeFrameLayout } from "./replay-safety.js"
 import { noteCursorWaitEnded, noteCursorWaitStarted } from "./cursor-waits.js"
 import {
   deferToolExec,
@@ -1024,14 +1024,15 @@ export function createCursorLanguageModel(
     try {
       return await doStreamImpl(modelId, options, callOptions, retryPolicy, retryBudget)
     } catch (error) {
-      // Already shaped for the host, such as the 413 that makes it compact.
-      if (APICallError.isInstance(error)) throw error
-      const failure = toCursorProviderError(error, { replaySafe: true, fallback: "Cursor Run setup failed" })
       try {
         if (callOptions.abortSignal?.aborted) {
           forgetRetryBudget(opencodeSessionKey(callOptions), retryBudget)
           throw new CursorLocalCancellationError("Cursor Run setup cancelled", error)
         }
+        // Already shaped for the host: a context-overflow 413 must keep its
+        // status so the host compacts instead of retrying.
+        if (APICallError.isInstance(error)) throw error
+        const failure = toCursorProviderError(error, { replaySafe: true, fallback: "Cursor Run setup failed" })
         if (!failure.replaySafe && (failure.transient || failure.origin === "transport")) {
           throw retrySuppressedError(failure, "while opening the Run", retryBudget.retries + 1, retryPolicy.maxAttempts ?? 14)
         }
@@ -1335,11 +1336,12 @@ async function doStreamImpl(
               canRebaseFromHistory: (failed) => {
                 if (failed !== session || trailingToolResults.length === 0
                   || !failed.checkpointRevokedByHostResult || failed.pending.size > 0
-                  || !historyRepresentsRun(failed.replaySafety)) return false
+                  || failed.replaySafety?.historyRebaseUnsafe
+                  || !announcedCallsClaimed(failed.replaySafety)) return false
                 const completed = new Set(extractToolResults(prompt)
                   .map(result => `${result.sessionId}:${result.execId}`))
                 const execs = failed.replaySafety?.execs ?? []
-                if (!execs.length && !failed.replaySafety?.hostCalls?.length) return false
+                if (!execs.length && !failed.replaySafety?.bridgedCalls?.length) return false
                 return execs.every(exec => completed.has(`${exec.sessionId}:${exec.id}`))
               },
               recover: (recovery) => openSession({ recovery }),
@@ -1521,8 +1523,9 @@ export async function pumpWithRecovery(input: {
       next.replaySafety = {
         ...pumpedSession.replaySafety,
         execs: pumpedSession.replaySafety?.execs?.slice(),
-        displayCalls: pumpedSession.replaySafety?.displayCalls?.slice(),
-        hostCalls: pumpedSession.replaySafety?.hostCalls?.slice(),
+        announcedCalls: pumpedSession.replaySafety?.announcedCalls?.slice(),
+        bridgedCalls: pumpedSession.replaySafety?.bridgedCalls?.slice(),
+        completedCalls: pumpedSession.replaySafety?.completedCalls?.slice(),
       }
       next.userTurnHostNotes = pumpedSession.userTurnHostNotes
       next.usageEstimate = { ...pumpedSession.usageEstimate }
@@ -2121,6 +2124,9 @@ async function startSession(
   // Cursor could not restore the stored checkpoint (missing blobs) before this
   // turn produced anything: reseed from the full host history as a new turn.
   const checkpointUnusable = recovery?.kind === "rebase" && recovery.reason === "checkpoint-unusable"
+  // The Run dropped right after completed host results: reseed the turn from
+  // the full history, every tool result included.
+  const completedResultsRebase = recovery?.kind === "rebase" && recovery.reason === "completed-tool-results"
   // Another model (other provider or a local model) answered since this
   // conversation's last checkpoint: resuming it would hide that work from Cursor.
   // A Cursor-to-Cursor model switch resumes the same conversation, as in the CLI.
@@ -2470,7 +2476,7 @@ async function startSession(
   }
 
   if (
-    foreignHistory || checkpointUnusable || unfinishedPriorRun
+    foreignHistory || checkpointUnusable || unfinishedPriorRun || completedResultsRebase
     || (!conversationState && !ephemeralRun && history.some((entry) => entry.role !== "system"))
   ) {
     assertForeignHistoryRebaseFits({
@@ -5863,7 +5869,8 @@ export async function pump(
         trace(`replay frame unknown: layout=${layout} bytes=${payload.length}`)
       }
     }
-    if (replayFrame.barrier) replaySafety.markBarrier(replayFrame.barrier, replayFrame.displayCallId)
+    if (replayFrame.barrier === "display-tool-lifecycle") replaySafety.recordToolLifecycle(replayFrame.toolLifecycle)
+    else if (replayFrame.barrier) replaySafety.markBarrier(replayFrame.barrier)
     // The provider answers some queries itself (a plan file, an image approval); resuming a checkpoint
     // from before one would repeat it, so only a later checkpoint is resumed.
     if (interactionQuery) {
@@ -5871,7 +5878,9 @@ export async function pump(
       session.sideEffectAfterCheckpoint = true
     }
     // A held exec was recorded when it first arrived.
-    if (replayFrame.barrier === "non-control-exec" && !released) replaySafety.recordExec(esm?.id)
+    if (replayFrame.barrier === "non-control-exec" && !released) {
+      replaySafety.recordExec(esm?.id, esm ? extractExecDisplayCallId(esm) : undefined)
+    }
     // Reseeding is allowed only while every frame so far was positively a
     // control frame. Anything else, including unknown top-level fields, may have
     // carried output or stateful activity.
@@ -6279,7 +6288,7 @@ export async function pump(
               bridged.toolName,
               true,
             )
-            if (callId) replaySafety.claimDisplayCall(callId)
+            if (callId) replaySafety.claimBridgedCall(callId)
             const toolCallId = `cursor_${session.sessionId}_${execId}`
             const input = JSON.stringify(bridged.args ?? {})
             trace(
@@ -6737,10 +6746,6 @@ export async function pump(
           }
           if (displayCallId) {
             session.displayToolCalls.delete(displayCallId)
-            // An edit's private read leaves its write, the call's own work, still to come.
-            if (resultFinishesToolCall(session, { resultField: parsed.resultField, displayCallId })) {
-              replaySafety.claimDisplayCall(displayCallId)
-            }
             trace(`exec: claimed display callId=${displayCallId}`)
           }
           if (execMutates) session.sideEffectAfterCheckpoint = true
