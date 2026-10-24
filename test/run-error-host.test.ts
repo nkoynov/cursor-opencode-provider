@@ -325,7 +325,7 @@ describe("checkpoint eligibility across host results", () => {
   for (const scenario of [
     "complete", "announced", "announced-shell", "missing-history", "unknown", "unrepresented-exec", "duplicate-exec",
     "followup-before-result", "new-output", "final-error", "cursor-run-call", "unannounced-completion", "oversized",
-    "malformed-completion", "repeated-completion-id",
+    "malformed-completion", "repeated-completion-id", "announced-open",
   ] as const) {
     it(`recovers a post-result drop only from represented completed work (${scenario})`, async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-result-history-"))
@@ -335,7 +335,7 @@ describe("checkpoint eligibility across host results", () => {
       // Cursor announces each host call before its exec and closes it after the result.
       const lifecycle = scenario === "announced" || scenario === "announced-shell" || scenario === "cursor-run-call"
         || scenario === "unannounced-completion" || scenario === "oversized"
-        || scenario === "malformed-completion" || scenario === "repeated-completion-id"
+        || scenario === "malformed-completion" || scenario === "repeated-completion-id" || scenario === "announced-open"
       const shellVariant = scenario === "announced-shell" ? "shell_args" : "shell_stream_args"
       scripted = (stream, message) => {
         const send = (value: Record<string, unknown>) => stream.write(frame(encodeMessage("AgentServerMessage", value)))
@@ -377,7 +377,8 @@ describe("checkpoint eligibility across host results", () => {
             started("second", "echo second")
             send({ exec_server_message: { id: 2, [shellVariant]: { command: "echo second", tool_call_id: "second" } } })
           } else {
-            completed("second", "echo second")
+            // The Run can drop before Cursor closes the last call.
+            if (scenario !== "announced-open") completed("second", "echo second")
             if (scenario === "malformed-completion" || scenario === "repeated-completion-id") {
               // Independent lifecycle wire: completion #3, call_id #1.
               // The decoder discards the unknown field or duplicate call id.
@@ -420,7 +421,7 @@ describe("checkpoint eligibility across host results", () => {
           prompt.push({ role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName, output: { type: "text", value: output } }] })
         }
         if (scenario === "missing-history") prompt.splice(1, 2)
-        if (scenario === "complete" || scenario === "announced" || scenario === "announced-shell") {
+        if (scenario === "complete" || scenario === "announced" || scenario === "announced-shell" || scenario === "announced-open") {
           const parts = await read()
           expect(parts.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
           expect(parts.some(part => part.type === "tool-call")).toBe(false)
