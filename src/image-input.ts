@@ -483,12 +483,18 @@ export async function extractCursorPromptImages(
 ): Promise<CursorPromptImageExtraction> {
   const maxBytes = cursorImageBudget(options.maxBytes ?? MAX_CURSOR_IMAGE_INPUT_BYTES)
   const toolCaption = isToolMediaCaption(lastUser)
-  const caption = toolCaption && options.supportsImages
-    ? await extractCursorToolResultImages(lastUser!.content as unknown[], { signal: options.signal, maxBytes })
-    : undefined
-  const captionHashes: string[] = []
   const seenHashes = new Set(options.seenHistoryHashes)
   let captionDuplicates = 0
+  const captionParts = toolCaption ? (lastUser!.content as unknown[]).filter((part) => {
+    const stored = storedToolMediaHash(toolImagePart(part)?.data)
+    if (!stored || !seenHashes.has(stored)) return true
+    captionDuplicates++
+    return false
+  }) : []
+  const caption = toolCaption && options.supportsImages
+    ? await extractCursorToolResultImages(captionParts, { signal: options.signal, maxBytes })
+    : undefined
+  const captionHashes: string[] = []
   const userImages = toolCaption ? (caption?.images ?? []).filter((_image, index) => {
     const hash = caption!.hashes[index]!
     if (seenHashes.has(hash)) {

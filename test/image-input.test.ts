@@ -451,6 +451,15 @@ describe("OpenCode stored tool media", () => {
     expect(held.omittedCount).toBe(1)
   })
 
+  it("skips a held image of the trailing tool-result caption without reading it", async () => {
+    const missing = createHash("sha256").update("held caption").digest("hex")
+    const caption = stored(`${missing}.png`)[0]!
+    const result = await extractCursorPromptImages([caption], caption, { supportsImages: true, seenHistoryHashes: new Set([missing]) })
+    expect(result.images).toHaveLength(0)
+    expect(result.duplicateCount).toBe(1)
+    expect(result.omittedCount).toBeUndefined()
+  })
+
   it("omits a stored image whose file is gone", async () => {
     const gone = createHash("sha256").update("gone").digest("hex")
     const result = await extractCursorHistoryImages(stored(`${gone}.png`), { supportsImages: true })
