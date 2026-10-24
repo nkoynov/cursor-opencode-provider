@@ -41,6 +41,7 @@ import {
   resetTurnStateForTests,
 } from "../src/language-model.js"
 import { resetHostPlanFilesForTests, setHostPlanFile } from "../src/host-plan-file.js"
+import { hostExecs } from "../src/replay-safety.js"
 import {
   flushHostAgentModeSwitch,
   resetHostAgentModeSwitchForTests,
@@ -839,6 +840,8 @@ describe("CreatePlan through the host plan agent's plan_exit review", () => {
     // Cursor waits on the host review.
     expect(writes).toHaveLength(0)
     expect(session.pending.size).toBe(1)
+    // A rebuild from history needs the review's answer there.
+    expect(hostExecs(session.replaySafety)).toEqual([{ sessionId: session.sessionId, id: 900_000, host: true }])
     sessionManager.close(session, "ordinary-cleanup")
   })
 

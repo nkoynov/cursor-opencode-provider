@@ -33,6 +33,7 @@ import {
 } from "../src/protocol/cursor-mode.js"
 import { parseDisplayToolCall, resolveBridgedOpenCodeToolCall } from "../src/protocol/tool-call-bridge.js"
 import { deliverContinuationResults, pump } from "../src/language-model.js"
+import { hostExecs } from "../src/replay-safety.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { sessionFixture } from "./session-fixture.js"
 import {
@@ -1076,5 +1077,23 @@ describe("display switch_mode_tool_call mapping", () => {
     expect(display?.preferredToolName).toBe("plan_exit")
     expect(display?.bridgeable).toBe(true)
     expect(resolveBridgedOpenCodeToolCall(display!, ["plan_enter", "plan_exit"])).toBeUndefined()
+  })
+})
+
+describe("SwitchMode through the host's plan_exit", () => {
+  beforeEach(() => {
+    resetActiveCursorModesForTests()
+    resetHostAgentModeSwitchForTests()
+  })
+  afterEach(() => resetHostAgentModeSwitchForTests())
+
+  it("records the host call, so a rebuild from history needs its answer there", async () => {
+    const { session, parts } = await runSwitchMode(
+      [switchModePayload(switchModeArgs({ target_mode_id: "agent" }))], ["plan_exit", "read"],
+    )
+    const call = parts.find((part) => part.type === "tool-call")
+    expect(call?.toolName).toBe("plan_exit")
+    expect(hostExecs(session.replaySafety)).toEqual([{ sessionId: session.sessionId, id: 900_000, host: true }])
+    sessionManager.close(session, "ordinary-cleanup")
   })
 })

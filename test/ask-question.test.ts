@@ -12,6 +12,7 @@ import {
 } from "../src/protocol/ask-question.js"
 import { handleInteractionQuery } from "../src/protocol/interactions.js"
 import { deliverContinuationResults, pump } from "../src/language-model.js"
+import { hostExecs } from "../src/replay-safety.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
@@ -420,6 +421,8 @@ describe("bridged ask-question over a held-open Run", () => {
     expect(toolCall.toolName).toBe("question")
     expect(JSON.parse(toolCall.input).questions[0].question).toBe("Which cache should we use?")
     expect(session.pending.size).toBe(1)
+    // A rebuild from history needs this answer there.
+    expect(hostExecs(session.replaySafety)).toEqual([{ sessionId: session.sessionId, id: 900_000, host: true }])
 
     const delivered = await deliverContinuationResults(session, [{
       toolCallId: toolCall.toolCallId,

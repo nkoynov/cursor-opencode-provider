@@ -9,7 +9,7 @@ import { createCursor } from "../src/index.js"
 import { getHostCacheDirOverride, setHostCacheDirOverride } from "../src/context/paths.js"
 import { notifyHostInterrupt } from "../src/host-interrupt.js"
 import { CursorLocalCancellationError, CursorProviderError, CursorServerError } from "../src/errors.js"
-import { pump, resetTurnStateForTests, runUploadFailure, settleRunSavesForTests } from "../src/language-model.js"
+import { pump, resetTurnStateForTests, runUploadFailure, sendRunRequest, settleRunSavesForTests } from "../src/language-model.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
 import { encodeFrame } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
@@ -321,6 +321,30 @@ describe("Run write drain", () => {
     const raw = runUploadFailure(new Error("write after end"), "initial Run request")
     expect(raw).toBeInstanceOf(CursorProviderError)
     expect(raw).toMatchObject({ transient: true, replaySafe: true, origin: "transport" })
+
+    // The transport throws Cursor's HTTP or gRPC status from the write itself.
+    const status = new CursorServerError("Cursor Run HTTP 403", { code: "permission_denied", transient: false, replaySafe: false })
+    expect(runUploadFailure(status, "initial Run request")).toBe(status)
+    const busy = new CursorServerError("Cursor Run HTTP 503", { code: "unavailable", transient: true, replaySafe: false })
+    expect(runUploadFailure(busy, "initial Run request")).toMatchObject({ transient: true, replaySafe: true, origin: "server" })
+    const stopped = new CursorLocalCancellationError("Cursor initial Run request cancelled")
+    expect(runUploadFailure(stopped, "initial Run request")).toBe(stopped)
+  })
+
+  it("keeps a status Cursor sent before the request write final through sendRunRequest", async () => {
+    const refused = new CursorServerError("Cursor Run HTTP 403", { code: "permission_denied", transient: false, replaySafe: false })
+    const stream = {
+      write() { throw refused },
+      end() {},
+      destroy() {},
+      isClosed: () => true,
+      onTerminal: () => () => {},
+      frames: () => ({ async *[Symbol.asyncIterator]() { throw refused } }),
+    }
+    const failure = await failureOf(sendRunRequest(stream, new Uint8Array(10), "initial Run request",
+      async () => { throw new Error("must not reopen") }))
+    expect(failure).toBe(refused)
+    expect(failure).toMatchObject({ transient: false })
   })
 
   it("leaves a stalled write to the read-idle watchdog", async () => {

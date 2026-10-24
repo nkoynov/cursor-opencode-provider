@@ -1795,21 +1795,28 @@ async function endStreamVerdict(stream: BidiStream): Promise<CursorProviderError
       const text = new TextDecoder().decode(decodeFramePayload(next.value))
       return text && (JSON.parse(text) as { error?: unknown }).error ? connectFrameError(text) : undefined
     }
-  } catch {
-    return undefined
+  } catch (error) {
+    return error instanceof CursorProviderError && isCursorVerdict(error) ? error : undefined
   }
+}
+
+/** Cursor answered the Run (HTTP status, gRPC status or Connect error), as opposed to the connection failing. */
+function isCursorVerdict(error: CursorProviderError): boolean {
+  return error.origin === "server" || error.origin === "auth"
 }
 
 /**
  * Fork: nothing answers a new Run's frames before its request is uploaded, so a cut upload ran no tool and
  * answered nothing, and the Run can go again. A failure Cursor sent keeps its own verdict: a Connect error in the body
- * (`verdict`) or the stream's terminal error.
+ * (`verdict`), the stream's terminal error, or Cursor's status the write itself threw.
  */
 export function runUploadFailure(error: unknown, operation: string, verdict?: CursorProviderError): CursorProviderError {
   const failure = toCursorProviderError(error, { replaySafe: false, fallback: `Cursor ${operation} write failed` })
-  const terminal = verdict ?? (failure instanceof StreamWriteDrainError && failure.cause instanceof CursorProviderError
+  if (failure.origin === "local-cancel") return failure
+  const drained = failure instanceof StreamWriteDrainError && failure.cause instanceof CursorProviderError
     ? failure.cause
-    : undefined)
+    : undefined
+  const terminal = verdict ?? drained ?? (isCursorVerdict(failure) ? failure : undefined)
   if (terminal) {
     if (terminal.transient) terminal.replaySafe = true
     trace(`Run upload cut off: ${operation} err=${failure.message} terminal=${terminal.message} transient=${terminal.transient}`)
