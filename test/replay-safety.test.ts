@@ -274,6 +274,15 @@ describe("display tool lifecycle", () => {
     expect(state.statefulBarrier).toBe("non-control-exec")
   })
 
+  it("marks only the attempt for provider state a rebuild cannot carry", () => {
+    const state: ReplaySafetyState = {}
+    new AttemptReplaySafety("run-1", state).recordUnrepresentable("background-shell-end-read")
+    expect(state.attempt?.unrepresentable).toBe(true)
+    expect(state.historyRebaseUnsafe).toBeUndefined()
+    new AttemptReplaySafety("run-1", state)
+    expect(state.attempt).toEqual({})
+  })
+
   it("records the provider's own host calls under their exec ids", () => {
     const state: ReplaySafetyState = {}
     const step = new AttemptReplaySafety("run-1", state)

@@ -124,16 +124,17 @@ export function recordBackgroundShellRead(
   file: string,
   sessionID: string | undefined,
   read: { offset?: number; limit?: number; now?: number } = {},
-): void {
+): boolean {
   const watch = state.watches.get(resolve(file))
-  if (!watch || !sessionID || watch.sessionID !== sessionID) return
+  if (!watch || !sessionID || watch.sessionID !== sessionID) return false
   watch.lastReadAt = read.now ?? Date.now()
-  if (watch.observed) return
+  if (watch.observed) return false
   const shown = readShowsEnd(watch.file, read)
   trace(`background shell: read of shell=${watch.shellId} offset=${read.offset ?? "-"} limit=${read.limit ?? "-"} shows end=${shown}`)
-  if (!shown) return
+  if (!shown) return false
   watch.observed = true
   trace(`background shell: shell=${watch.shellId} end read by the model; no note`)
+  return true
 }
 
 export function noteSessionExecution(sessionID: string, event: "started" | "succeeded" | "failed" | "interrupted"): void {

@@ -1120,6 +1120,7 @@ async function doStreamImpl(
       const token = prefetched !== undefined && !forceRefresh
         ? prefetched
         : await resolveRunBearerToken(options, forceRefresh)
+      const restoreModeDelivery = snapshotModeDelivery(opencodeSessionKey(callOptions))
       try {
         const opened = await startSession(modelId, token, callOptions, options, {
           ...startOptions,
@@ -1128,6 +1129,8 @@ async function doStreamImpl(
         cancelIfHostStoppedSince(opened)
         return opened
       } catch (error) {
+        // No Run took this request, so whatever sends the turn next carries the same one-shot guidance.
+        restoreModeDelivery()
         // A rejection that reaches the open (a long upload) means Cursor took no Run.
         if (!credentialRenewable || credentialRenewed || callOptions.abortSignal?.aborted
           || !isRejectedCredentialError(error) || !error.replaySafe) throw error
@@ -2426,7 +2429,6 @@ async function startSession(
         carriesEditDeny: userTurnHostNotes.carriedNotes.some(batch =>
           batch.notes.some(note => note.includes(SESSION_EDITS_DENIED_REMINDER))),
       })
-  const restoreModeDelivery = snapshotModeDelivery(sessionKey)
   const modeReminder = isCompaction || lifecycle || resuming
     ? undefined
     : nativePlanPromptOwnsMode
@@ -2716,20 +2718,13 @@ async function startSession(
   trace(`hash requestContext sha256=${requestContextHash}`)
   if (conversationState) trace(`hash checkpoint sha256=${sha(conversationState)}`)
 
-  let stream: BidiStream
-  try {
-    stream = await openRunWithRequest(token, {
-      baseURL: agentBaseUrl, headers: options.headers,
-    }, reqBytes, "initial Run request", {
-      signal: callOptions.abortSignal,
-      stoppedWithSessionId: lifecycle ? undefined : sessionKey,
-      requestedAt: startOptions?.requestedAt ?? Date.now(),
-    })
-  } catch (error) {
-    // A resend of this Run must carry the same one-shot guidance.
-    restoreModeDelivery()
-    throw error
-  }
+  const stream = await openRunWithRequest(token, {
+    baseURL: agentBaseUrl, headers: options.headers,
+  }, reqBytes, "initial Run request", {
+    signal: callOptions.abortSignal,
+    stoppedWithSessionId: lifecycle ? undefined : sessionKey,
+    requestedAt: startOptions?.requestedAt ?? Date.now(),
+  })
   userTurnHostNotes.sent()
   if (sessionKey && fallbackReply) forgetModelFallbackStop(sessionKey, fallbackReply.stop)
   if (!isCompaction && !lifecycle && !resuming) recordSessionEditsGuidance(conversationId, sessionEditsDenied)
@@ -5321,10 +5316,12 @@ export async function pump(
     const requested = opencodePathArg(parsed.args)
     if (!requested || isUriReadTarget(requested)) return
     const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
-    recordBackgroundShellRead(resolveReadTargetPath(requested, workspaceRoot), session.openCodeSessionId, {
+    const endRead = recordBackgroundShellRead(resolveReadTargetPath(requested, workspaceRoot), session.openCodeSessionId, {
       offset: typeof parsed.args.offset === "number" ? parsed.args.offset : undefined,
       limit: typeof parsed.args.limit === "number" ? parsed.args.limit : undefined,
     })
+    // That read stands in for the shell's completion note, which a rebuild from history would lose.
+    if (endRead) replaySafety.recordUnrepresentable("background-shell-end-read")
   }
 
   /**

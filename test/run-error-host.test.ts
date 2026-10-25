@@ -17,6 +17,7 @@ import { resetConversationBindingsForTests } from "../src/protocol/conversation-
 import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
 import { notifyHostInterrupt } from "../src/host-interrupt.js"
+import { resetActiveCursorModesForTests, setActiveCursorMode, takeActiveCursorModeReminder } from "../src/protocol/switch-mode.js"
 
 const ORIGIN = "https://agentn.run-error-test.cursor.sh"
 const PROXY_KEYS = ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"] as const
@@ -634,6 +635,7 @@ describe("checkpoint eligibility across host results", () => {
       const tools = [{ type: "function" as const, name: "bash", inputSchema: { type: "object", properties: { command: { type: "string" } } } }]
       const first = await model.doStream({ headers, tools, prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }] })
       for (const reader = first.stream.getReader(); !(await reader.read()).done;) { /* drain */ }
+      setActiveCursorMode("ses_rebase_overflow", "plan")
       // Another model answered since, at a length the 200k window cannot hold.
       const error = await Promise.resolve(model.doStream({ headers, tools, prompt: [
         { role: "user", content: [{ type: "text", text: "Hello" }] },
@@ -644,7 +646,10 @@ describe("checkpoint eligibility across host results", () => {
       expect(error).toMatchObject({ statusCode: 413, isRetryable: false })
       expect((error as APICallError).message).toMatch(/^prompt is too long/)
       expect(requests).toBe(1)
+      // No Run took that request, so the turn after compaction still gets the first-turn mode reminder.
+      expect(takeActiveCursorModeReminder("ses_rebase_overflow")).toContain("Plan mode is active")
     } finally {
+      resetActiveCursorModesForTests()
       sessionManager.dispose()
       await settleRunSavesForTests()
       setHostCacheDirOverride(undefined)

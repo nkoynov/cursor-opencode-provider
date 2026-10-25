@@ -322,7 +322,9 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   queued host-agent switch belongs to the Run) and a failed CreatePlan (its write
   may have happened in part) are stateful barriers. A Run whose request never
   went out hands back the one-shot mode reminder and plan-agent note
-  (`snapshotModeDelivery`). Accepted on purpose: a resent Run whose first upload
+  (`snapshotModeDelivery` around `startSession` in `openSession`). A provider
+  read that shows a finished background shell's end replaces its completion
+  note, so it makes the interrupted pass not rebuildable. Accepted on purpose: a resent Run whose first upload
   Cursor may have received runs inference twice, as Cursor CLI's resend after
   text does, but the dead stream's execs, KV writes and checkpoints are never
   answered or kept; a provider runtime spill file of the interrupted pass may be

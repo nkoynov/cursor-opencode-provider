@@ -195,8 +195,10 @@ describe("background shell notices", () => {
   test("drops the note when the session read the finished record", () => {
     const file = terminalFile(LIVE_PID, { status: "succeeded" })
     watch(LIVE_PID, file)
-    recordBackgroundShellRead(file, "ses_other", { now: 500 })
-    recordBackgroundShellRead(file, "ses_a", { now: 500 })
+    expect(recordBackgroundShellRead(file, "ses_other", { now: 500 })).toBe(false)
+    // Only the read that replaces the note says so: a history rebuild would lose it.
+    expect(recordBackgroundShellRead(file, "ses_a", { now: 500 })).toBe(true)
+    expect(recordBackgroundShellRead(file, "ses_a", { now: 600 })).toBe(false)
     noteSessionExecution("ses_a", "succeeded")
     pollBackgroundShells(MAX_HOLD_MS * 2)
     expect(notes).toEqual([])
@@ -222,9 +224,9 @@ describe("background shell notices", () => {
       notes.length = 0
       watch(LIVE_PID, file)
       noteSessionExecution("ses_a", "succeeded")
-      recordBackgroundShellRead(file, "ses_a", { ...range, now: 0 })
+      const endRead = recordBackgroundShellRead(file, "ses_a", { ...range, now: 0 })
       pollBackgroundShells(AWAIT_GRACE_MS)
-      expect({ range, notes: notes.length }).toEqual({ range, notes: shown ? 0 : 1 })
+      expect({ range, notes: notes.length, endRead }).toEqual({ range, notes: shown ? 0 : 1, endRead: shown })
     }
   })
 

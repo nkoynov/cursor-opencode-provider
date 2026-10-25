@@ -149,6 +149,12 @@ export class AttemptReplaySafety {
     this.state.attempt!.unrepresentable = true
   }
 
+  /** Fork: the interrupted pass changed provider state that a history rebuild cannot carry. */
+  recordUnrepresentable(why: string): void {
+    this.state.attempt!.unrepresentable = true
+    trace(`replay: attempt not rebuildable from history (${why}) sessionId=${this.sessionId}`)
+  }
+
   /** Fork: text the host shows, which a rebuilt step must continue rather than repeat. */
   recordShownText(text: string): void {
     this.state.attempt!.shownText = (this.state.attempt!.shownText ?? "") + text
