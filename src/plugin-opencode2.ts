@@ -55,6 +55,7 @@ import { markCompactionSession } from "./compaction-marker.js"
 import { getSessionDirectory, markSessionDirectory } from "./session-directory.js"
 import { rememberHostSkillFiles } from "./context/skills.js"
 import { trace } from "./debug.js"
+import { processShared } from "./process-shared.js"
 import { loadSessionForPermissions, sessionRulesDenyEdits } from "./protocol/session-edits.js"
 import {
   cancelHostAgentModeSwitch,
@@ -150,6 +151,14 @@ function markCompactionAndOptions(
   event.options[CURSOR_COMPACTION_OPTION] = isCompaction
 }
 
+type PendingPermissionCall = { sessionID: string; callID: string }
+
+/** Every setup sees every Location's asks, so only the last observer releases them on dispose. */
+const sharedPermissionCalls = processShared("opencode2-permission-calls.v1", () => ({
+  calls: new Map<string, PendingPermissionCall>(),
+  observers: 0,
+}))
+
 const plugin: Plugin2 & { server: typeof CursorPlugin } = {
   id: "cursor.provider",
   server: CursorPlugin,
@@ -169,26 +178,42 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
     const shellNotifier: BackgroundShellNotifier | undefined = synthetic ? (note) => synthetic(note) : undefined
     const disposeShellNotifier = shellNotifier && registerBackgroundShellNotifier(shellNotifier)
     const refusals = new Map<string, ToolRefusal>()
-    const permissionCalls = new Map<string, { sessionID: string; callID: string }>()
+    const permissionCalls = new Map<string, PendingPermissionCall>()
     const rememberRefusal = (id: string, refusal: ToolRefusal) => {
       refusals.delete(id)
       refusals.set(id, refusal)
       while (refusals.size > 512) refusals.delete(refusals.keys().next().value!)
     }
+    let observingPermissions = false
+    const observePermissionCalls = () => {
+      observingPermissions = true
+      sharedPermissionCalls.observers++
+      for (const [id, call] of sharedPermissionCalls.calls) permissionCalls.set(id, call)
+    }
     const releasePermissionCalls = () => {
-      for (const call of permissionCalls.values()) releaseCursorShellEnv(call.callID)
       permissionCalls.clear()
+      if (!observingPermissions) return
+      observingPermissions = false
+      if (--sharedPermissionCalls.observers > 0) return
+      for (const call of sharedPermissionCalls.calls.values()) releaseCursorShellEnv(call.callID)
+      sharedPermissionCalls.calls.clear()
+    }
+    const forgetPermissionCall = (id: string) => {
+      permissionCalls.delete(id)
+      sharedPermissionCalls.calls.delete(id)
     }
     const toolLifecycle = (event: any) => {
       const payload = eventPayload(event)
       if (event?.type === "permission.asked" && payload?.source?.type === "tool"
         && typeof payload.source.id === "string" && payload.source.id.startsWith("cursor_")
         && typeof payload.id === "string" && typeof payload.sessionID === "string") {
-        permissionCalls.set(payload.id, { sessionID: payload.sessionID, callID: payload.source.id })
+        const call = { sessionID: payload.sessionID, callID: payload.source.id }
+        permissionCalls.set(payload.id, call)
+        sharedPermissionCalls.calls.set(payload.id, call)
       } else if (event?.type === "permission.replied") {
         const call = permissionCalls.get(payload?.requestID)
         if (!call || call.sessionID !== payload?.sessionID) return
-        permissionCalls.delete(payload.requestID)
+        forgetPermissionCall(payload.requestID)
         if (payload.reply === "reject") {
           rememberRefusal(call.callID, "rejected")
           releaseCursorShellEnv(call.callID)
@@ -196,19 +221,19 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
           for (const [id, pending] of permissionCalls) if (pending.sessionID === call.sessionID) {
             rememberRefusal(pending.callID, "rejected")
             releaseCursorShellEnv(pending.callID)
-            permissionCalls.delete(id)
+            forgetPermissionCall(id)
           }
         }
       } else if ((event?.type === "session.tool.failed" || event?.type === "session.tool.success")
         && typeof payload?.id === "string") {
         if (event.type === "session.tool.failed") releaseCursorShellEnv(payload.id)
         for (const [id, call] of permissionCalls) if (call.callID === payload.id && call.sessionID === payload.sessionID) {
-          permissionCalls.delete(id)
+          forgetPermissionCall(id)
         }
       } else if (event?.type === "session.deleted") {
         for (const [id, call] of permissionCalls) if (call.sessionID === payload?.sessionID) {
           releaseCursorShellEnv(call.callID)
-          permissionCalls.delete(id)
+          forgetPermissionCall(id)
         }
       }
     }
@@ -684,6 +709,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
       releasePermissionCalls()
     })
     hostEventsObserved = !!unsubscribe
+    if (unsubscribe) observePermissionCalls()
 
     return async () => {
       clearInterval(retry)

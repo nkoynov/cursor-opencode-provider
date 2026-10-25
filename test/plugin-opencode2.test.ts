@@ -686,6 +686,34 @@ function fakeContext(events: readonly unknown[] = []) {
   return { ctx, registered, disposed, hooks, transforms, sessionLocations, sessionPermissions, reloads, inventory }
 }
 
+/** OpenCode's process-wide event stream: every subscriber gets every Location's events until it aborts. */
+function fakeEventBus() {
+  const subscribers = new Set<(event: unknown) => void>()
+  const subscribe = ({ signal }: { signal?: AbortSignal } = {}) => {
+    const queue: unknown[] = []
+    let wake: (() => void) | undefined
+    const push = (event: unknown) => { queue.push(event); wake?.() }
+    subscribers.add(push)
+    return (async function* () {
+      try {
+        while (!signal?.aborted) {
+          if (queue.length) { yield queue.shift(); continue }
+          await new Promise<void>((resolve) => {
+            wake = resolve
+            signal?.addEventListener("abort", () => resolve(), { once: true })
+          })
+          wake = undefined
+        }
+      } finally { subscribers.delete(push) }
+    })()
+  }
+  const publish = async (event: unknown) => {
+    for (const push of subscribers) push(event)
+    await Bun.sleep(5)
+  }
+  return { subscribe, publish }
+}
+
 describe("opencode2 setup", () => {
   beforeEach(() => {
     resetHostAgentModeSwitchForTests()
@@ -2216,6 +2244,79 @@ describe("opencode2 setup", () => {
       expect(existsSync(first.file)).toBe(false)
       expect(existsSync(second.file)).toBe(false)
     } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+
+  describe("pending shell asks across Locations", () => {
+    const setupAt = async (bus: ReturnType<typeof fakeEventBus>, directory: string) => {
+      const fake = fakeContext()
+      fake.ctx.location = { directory }
+      fake.ctx.event.subscribe = bus.subscribe
+      return { ...fake, cleanup: await setupPlugin(fake.ctx) }
+    }
+    const askShell = async (
+      bus: ReturnType<typeof fakeEventBus>,
+      hooks: Map<string, (input: any) => any>,
+      callID: string,
+      cwd: string,
+    ) => {
+      const command = `echo ran-${callID}`
+      registerCursorShellCall(callID, {
+        shell_stream: true, command, working_directory: cwd, timeout_ms: 5_000, timeout_behavior: CURSOR_TIMEOUT_BACKGROUND,
+      })
+      await hooks.get("tool.execute.before")!({ tool: "shell", sessionID: `ses_${callID}`, agent: "build", messageID: "m", id: callID, input: { command } })
+      const create = { command, cwd, timeout: 0, shell: "/bin/sh", env: {} as Record<string, string | undefined> }
+      await hooks.get("shell.create.before")!(create)
+      expect(create.shell).not.toBe("/bin/sh")
+      await bus.publish({ type: "permission.asked", data: { id: `per_${callID}`, sessionID: `ses_${callID}`, source: { type: "tool", id: callID, messageID: "m" } } })
+      return { command, shell: create.shell, sessionID: `ses_${callID}`, requestID: `per_${callID}` }
+    }
+
+    test("disposing another Location's setup keeps a pending ask's shell, which runs once approved", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "cursor-pending-ask-"))
+      try {
+        const bus = fakeEventBus()
+        const a = await setupAt(bus, "/project-a")
+        const b = await setupAt(bus, "/project-b")
+        const ask = await askShell(bus, a.hooks, "cursor_pending_a", cwd)
+
+        await b.cleanup()
+        await bus.publish({ type: "permission.replied", data: { requestID: ask.requestID, sessionID: ask.sessionID, reply: "once" } })
+
+        expect(existsSync(ask.shell)).toBe(true)
+        const ran = Bun.spawnSync([ask.shell, "-c", ask.command], { cwd })
+        expect(ran.exitCode).toBe(0)
+        expect(ran.stdout.toString()).toContain("ran-cursor_pending_a")
+        await a.hooks.get("tool.execute.after")!({ tool: "shell", id: "cursor_pending_a", status: "completed", input: { command: ask.command }, result: { output: ran.stdout.toString(), metadata: {} } })
+        expect(existsSync(ask.shell)).toBe(false)
+      } finally { rmSync(cwd, { recursive: true, force: true }) }
+    })
+
+    test("a setup reloaded while another Location stays open takes over pending asks, and the last setup to go releases them", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "cursor-pending-reload-"))
+      try {
+        const bus = fakeEventBus()
+        const first = await setupAt(bus, "/project")
+        const other = await setupAt(bus, "/project-other")
+        const rejected = await askShell(bus, first.hooks, "cursor_reload_rejected", cwd)
+        // OpenCode closes the old activation before it loads the replacement.
+        await first.cleanup()
+        const reloaded = await setupAt(bus, "/project")
+        expect(existsSync(rejected.shell)).toBe(true)
+
+        await bus.publish({ type: "permission.replied", data: { requestID: rejected.requestID, sessionID: rejected.sessionID, reply: "reject" } })
+        expect(existsSync(rejected.shell)).toBe(false)
+        const event: any = { sessionID: rejected.sessionID, agent: "build", model: { providerID: "cursor" }, options: {}, messages: [{ role: "tool", content: [{ type: "tool-result", id: "cursor_reload_rejected", name: "shell", result: { type: "error", value: { error: { type: "aborted", message: "Interrupted" }, content: [] } } }] }] }
+        reloaded.sessionLocations.set(rejected.sessionID, "/project")
+        await reloaded.hooks.get("session.context")!(event)
+        expect(toolResultFailure(event.messages[0].content[0].providerMetadata, "cursor_reload_rejected")?.refusal).toBe("rejected")
+
+        const abandoned = await askShell(bus, reloaded.hooks, "cursor_reload_abandoned", cwd)
+        await other.cleanup()
+        expect(existsSync(abandoned.shell)).toBe(true)
+        await reloaded.cleanup()
+        expect(existsSync(abandoned.shell)).toBe(false)
+      } finally { rmSync(cwd, { recursive: true, force: true }) }
+    })
   })
 
   test.each(["context", "compaction", "generate", "title"])("%s preserves authoritative non-shell status and the typed denial", async hook => {
