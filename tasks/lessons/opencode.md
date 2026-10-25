@@ -265,7 +265,22 @@ These are failure lessons shared by both hosts, not a replacement for
   unchanged content stays a `write`. OpenCode 2 rejects a renamed call and
   both hosts reject an identical `edit`, so such a row completes as a hand-off
   naming the real call, never as a failure (`hostToolForCursorEdit`,
-  `cursorEditReadReachesHost`, `earlyRowHandoff`, `test/early-tool-rows.test.ts`).
+  `cursorEditReadReachesHost`, `earlyRowHandoff`, `test/early-tool-rows.test.ts`). Cursor can
+  complete an edit with its own result and no write (#117). A tool-step finish
+  alone does not establish that an open edit will run later: `turn_ended` can
+  arrive while other host results remain owed, and every correlated refusal
+  must settle its own row before another tool ends the step, as failed with
+  that refusal reason. A later Cursor completion must not replace the reason
+  or add a second row. Every path that
+  emits the edit's write, including a binary write staged for the image save
+  tool, hands off its row and releases the edit. Cover those boundaries and
+  decode outcome fixtures independently of the local encoder.
+  Predicting a completed failure label through the mutation remapper read CRLF
+  content before host authorization. Display-only failures choose a permitted tool
+  without filesystem inspection; execution prediction remains on the authorized path.
+  A synthetic image-save refusal left its staged bytes in the process registry;
+  execute the save tool's denial path and release the owned handle in fixture cleanup
+  (`test/early-tool-rows.test.ts`).
 - **Silence of model text is not inactivity.** A large tool input arrived as
   heartbeats/token counts for minutes; renew semantic liveness on every inbound
   frame. Pending real execs also need the CLI's three-second client heartbeats,
@@ -507,7 +522,13 @@ These are failure lessons shared by both hosts, not a replacement for
   payload text resembled storage-failure records. Teardown collector exit must
   not replace native cancellation (`test/runtime-files.test.ts`).
 - **Spawn success differs from payload success.** An already-finished fast
-  command still needs a valid handle and its actual final exit.
+  command still needs a valid handle and its actual final exit. Wrapper markers alone did not
+  preserve the host's status (#115); validate terminal codes in the shell's
+  0-255 range before exiting. Separate the host's final exit, signal or timeout
+  notice block without inserting bytes between unrelated text blocks, including
+  split CRLF. OpenCode 2 sends a lone block as a text result, so a silent failed
+  command's notice is the whole value
+  (`test/terminal-runner.test.ts`, `test/opencode2-tool-results.test.ts`).
 
 ## Auth, models and delivery process
 

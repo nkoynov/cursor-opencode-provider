@@ -273,10 +273,11 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   to the host, complete with a hand-off note when the call runs as another
   host tool, take Cursor's own `EditResult` when Cursor finishes the edit
   without a write, complete unfailed when another call's exec ends the step
-  first, close as unfinished only when the Run ends or the exec is refused,
-  and retain routing after Run closure/restart so a late result can rebuild
+  first, close as unfinished only when the Run ends and as failed with the
+  refusal reason when the exec is refused, and retain routing after Run
+  closure/restart so a late result can rebuild
   from history. An edit Cursor fails after its host read, with no row open,
-  gets a failed row with Cursor's error; transcripts leave closed rows out.
+  gets a failed row with Cursor's error. Fork: transcripts leave closed rows out.
 - Fork: until this process has seen `tool_requests_listed`, every host call
   ends its own AI SDK step. After that, `pump` keeps the step open after a host
   tool-call until every listed call has reached it (its exec, or its display

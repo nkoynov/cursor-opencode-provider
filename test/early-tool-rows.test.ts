@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, it } from "bun:test"
+import { afterEach, describe, expect, it, spyOn } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { encodeMessage } from "../src/protocol/messages.js"
+import { decodeMessageSparse, encodeMessage } from "../src/protocol/messages.js"
 import {
   cursorEditReadAnswer,
   cursorEditReadReachesHost,
@@ -17,6 +17,7 @@ import {
   earlyRowHandoff,
   UNBOUND_EXEC_ID,
   cursorEditAnnouncement,
+  cursorEditOutcome,
   cursorEditFailureToolCallId,
   earlyRowToolCallId,
   parseEarlyRowToolCallId,
@@ -32,6 +33,9 @@ import {
 } from "../src/language-model.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { sessionFixture } from "./session-fixture.js"
+import { getHostCacheDirOverride, setHostCacheDirOverride } from "../src/context/paths.js"
+import { discardPendingCursorImage, MAX_STAGED_IMAGE_BYTES, pendingCursorImageCount } from "../src/image-staging.js"
+import { executeCursorImageSave, IMAGE_PERMISSION_DENIED_PREFIX } from "../src/image-save.js"
 
 const tempDirs: string[] = []
 
@@ -188,6 +192,38 @@ async function authorizeEditRead(session: CursorSession, parts: any[], execId: n
   }])).toBe(session)
   parts.length = 0
 }
+
+describe("Cursor edit outcomes", () => {
+  // Independent bytes from agent.v1.EditToolCall.result=2 and EditResult's
+  // oneof in the decompiled Cursor CLI descriptors (2026.10.22), cross-checked
+  // against the extracted agent.v1 proto. These never use the local encoder.
+  it.each([
+    ["12080a064204646f6e65", "done", false],
+    ["12021200", "Cursor's edit of file.txt failed: file not found.", true],
+    ["12021a00", "Cursor's edit of file.txt failed: permission denied reading the file.", true],
+    ["120a2208120664656e696564", "Cursor's edit of file.txt failed: denied", true],
+    ["1206320412026e6f", "Cursor's edit of file.txt failed: no", true],
+    ["120b3a0912037261772a027569", "Cursor's edit of file.txt failed: ui", true],
+  ] as const)("decodes independent EditToolCall bytes %s", (hex, text, isError) => {
+    const edit = decodeMessageSparse("EditToolCall", Buffer.from(hex, "hex"))
+    expect(cursorEditOutcome({ edit_tool_call: edit }, "file.txt")).toEqual({ text, isError })
+  })
+
+  it.each([
+    [{ write_permission_denied: {} }, "permission denied writing the file."],
+    [{ rejected: {} }, "rejected."],
+    [{ error: {} }, "unknown error."],
+    [{ error: { error: " raw ", model_visible_error: "  " } }, "raw"],
+  ])("retains a failure without optional detail: %p", (result, detail) => {
+    expect(cursorEditOutcome({ edit_tool_call: { result } }, "file.txt"))
+      .toEqual({ text: `Cursor's edit of file.txt failed: ${detail}`, isError: true })
+  })
+
+  it.each([null, [], {}, { edit_tool_call: { result: {} } }, { edit_tool_call: { result: { success: [] } } }].map(value => [value]))
+    ("does not invent an outcome from %p", value => {
+      expect(cursorEditOutcome(value, "file.txt")).toBeUndefined()
+    })
+})
 
 describe("hostToolForCursorEdit", () => {
   it("predicts edit for an existing file, write for a new or empty one, and withholds a patch that would change CRLF", () => {
@@ -980,112 +1016,6 @@ describe("early edit rows", () => {
       .toMatchObject({ result: EARLY_ROW_CLOSED, isError: true })
   })
 
-  it("shows Cursor's own failure on the row of an edit it finished without a write", async () => {
-    const file = path.join(tempDir(), "created.txt")
-    const { session, parts } = pumpSession([
-      partial("edit-1", file),
-      started("edit-1", file),
-      completedEdit("edit-1", file, {
-        error: { path: file, error: "internal", model_visible_error: "The string to replace was not found in the file." },
-      }),
-      turnEnded(),
-    ], [{ name: "edit", description: "Edit" }, { name: "write", description: "Write" }])
-    session.requestContext.env = { workspace_paths: [path.dirname(file)] }
-    await run(session, parts)
-
-    const start = parts.find((part) => part.type === "tool-input-start")
-    expect(start?.toolName).toBe("write")
-    expect(parts.filter((part) => part.type === "tool-result")).toEqual([expect.objectContaining({
-      toolCallId: start.id,
-      result: `Cursor's edit of ${file} failed: The string to replace was not found in the file.`,
-      isError: true,
-    })])
-  })
-
-  it("closes each internally failed edit with Cursor's outcome and binds the one that writes", async () => {
-    const dir = tempDir()
-    const file = path.join(dir, "created.txt")
-    const { session, parts } = pumpSession([
-      partial("edit-1", file),
-      started("edit-1", file),
-      completedEdit("edit-1", file, { error: { path: file, error: "no match" } }),
-      partial("edit-2", file),
-      started("edit-2", file),
-      encodeMessage("AgentServerMessage", {
-        exec_server_message: { id: 5, write_args: { path: file, file_text: "created\n", tool_call_id: "edit-2" } },
-      }),
-    ], [{ name: "edit", description: "Edit" }, { name: "write", description: "Write" }])
-    session.requestContext.env = { workspace_paths: [dir] }
-    await run(session, parts)
-
-    const [first, second] = parts.filter((part) => part.type === "tool-input-start")
-    expect(first.id).toBe(earlyRowToolCallId(session.sessionId, "edit-1"))
-    expect(second.id).toBe(earlyRowToolCallId(session.sessionId, "edit-2"))
-    expect(parts.find((part) => part.type === "tool-result" && part.toolCallId === first.id))
-      .toMatchObject({ result: `Cursor's edit of ${file} failed: no match`, isError: true })
-    const write = parts.find((part) => part.type === "tool-call" && !part.providerExecuted)
-    expect(write).toMatchObject({ toolCallId: second.id, toolName: "write" })
-    expect(parts.some((part) => part.type === "tool-result" && part.result === EARLY_ROW_CLOSED)).toBe(false)
-    sessionManager.resolve(session.sessionId, 5)
-  })
-
-  it("completes the row of an edit Cursor finished without changing the file", async () => {
-    const file = path.join(tempDir(), "created.txt")
-    const { session, parts } = pumpSession([
-      partial("edit-1", file),
-      started("edit-1", file),
-      completedEdit("edit-1", file, { success: { path: file } }),
-      turnEnded(),
-    ], [{ name: "write", description: "Write" }])
-    session.requestContext.env = { workspace_paths: [path.dirname(file)] }
-    await run(session, parts)
-
-    expect(parts.find((part) => part.type === "tool-result")).toMatchObject({
-      result: `Cursor finished this edit of ${file} without changing the file.`,
-      isError: false,
-    })
-  })
-
-  it("still fails the row when Cursor finishes the call without an outcome", async () => {
-    const file = path.join(tempDir(), "created.txt")
-    const { session, parts } = pumpSession([
-      partial("edit-1", file),
-      started("edit-1", file),
-      completedEdit("edit-1", file),
-      turnEnded(),
-    ], [{ name: "write", description: "Write" }])
-    session.requestContext.env = { workspace_paths: [path.dirname(file)] }
-    await run(session, parts)
-
-    expect(parts.find((part) => part.type === "tool-result")).toMatchObject({ result: EARLY_ROW_CLOSED, isError: true })
-  })
-
-  it("shows a failed edit Cursor finished after the host read, with no row open", async () => {
-    const workspace = tempDir()
-    const file = path.join(workspace, "notes.txt")
-    fs.writeFileSync(file, "one\n")
-    const { session, parts } = catalogSession([
-      ...editHandshake("edit-missing", file, 17),
-      completedEdit("edit-missing", file, {
-        error: { path: file, error: "x", model_visible_error: "String not found." },
-      }),
-      turnEnded(),
-    ], catalogs[0]!, workspace)
-    await run(session, parts)
-    await authorizeEditRead(session, parts, 17)
-    await run(session, parts)
-
-    const start = parts.find((part) => part.type === "tool-input-start")
-    expect(start).toMatchObject({ toolName: "edit", id: cursorEditFailureToolCallId(session.sessionId, "edit-missing") })
-    expect(start.id).not.toBe(earlyRowToolCallId(session.sessionId, "edit-missing"))
-    expect(parts.find((part) => part.type === "tool-call")).toMatchObject({ toolCallId: start.id, providerExecuted: true, input: "{}" })
-    expect(parts.find((part) => part.type === "tool-result")).toMatchObject({
-      toolCallId: start.id,
-      result: `Cursor's edit of ${file} failed: String not found.`,
-      isError: true,
-    })
-  })
-
   it("fails a row still open when the Run ends during a held step", async () => {
     const file = path.join(tempDir(), "created.txt")
     const todo = { update_todos_tool_call: { args: { todos: [{ id: "todo", content: "Review", status: 1 }] } } }
@@ -1104,69 +1034,6 @@ describe("early edit rows", () => {
     expect(parts.find((part) => part.type === "tool-result" && part.toolCallId === start.id))
       .toMatchObject({ result: EARLY_ROW_CLOSED, isError: true })
     expect(parts.at(-1)).toMatchObject({ type: "finish", finishReason: { unified: "tool-calls" } })
-  })
-
-  it("names the patch tool on the failed row of a CRLF file the patch tool would refuse", async () => {
-    const workspace = tempDir()
-    const file = path.join(workspace, "crlf.txt")
-    fs.writeFileSync(file, "one\r\ntwo\r\n")
-    const patchOnly = catalogs.find((catalog) => catalog.label === "OpenCode 2 GPT")!
-    const { session, parts } = catalogSession([
-      ...editHandshake("edit-crlf", file, 17),
-      completedEdit("edit-crlf", file, { error: { path: file, error: "x", model_visible_error: "String not found." } }),
-      turnEnded(),
-    ], patchOnly, workspace)
-    await run(session, parts)
-    await authorizeEditRead(session, parts, 17)
-    await run(session, parts)
-
-    expect(parts.find((part) => part.type === "tool-input-start")).toMatchObject({ toolName: "patch" })
-    expect(parts.find((part) => part.type === "tool-result"))
-      .toMatchObject({ result: `Cursor's edit of ${file} failed: String not found.`, isError: true })
-  })
-
-  it("shows the failure of an edit whose write the provider refused before the host ran it", async () => {
-    const workspace = tempDir()
-    const file = path.join(workspace, "crlf.txt")
-    fs.writeFileSync(file, "one\r\ntwo\r\n")
-    const patchOnly = catalogs.find((catalog) => catalog.label === "OpenCode 2 GPT")!
-    const { session, parts } = catalogSession([
-      ...editHandshake("edit-refused", file, 17, "one\r\nTWO\r\n"),
-      completedEdit("edit-refused", file, { error: { path: file, error: "refused", model_visible_error: "The write was refused." } }),
-      turnEnded(),
-    ], patchOnly, workspace)
-    await run(session, parts)
-    await authorizeEditRead(session, parts, 17)
-    await run(session, parts)
-
-    expect(parts.filter((part) => part.type === "tool-call" && !part.providerExecuted)).toEqual([])
-    expect(parts.filter((part) => part.type === "tool-result")).toEqual([expect.objectContaining({
-      result: `Cursor's edit of ${file} failed: The write was refused.`,
-      isError: true,
-    })])
-  })
-
-  it("adds no row when the host already ran the edit Cursor reports as failed", async () => {
-    const workspace = tempDir()
-    const file = path.join(workspace, "notes.txt")
-    fs.writeFileSync(file, "one\n")
-    const { session, parts } = catalogSession([
-      ...editHandshake("edit-host", file, 17, "two\n"),
-      completedEdit("edit-host", file, { write_permission_denied: { path: file, error: "denied" } }),
-      turnEnded(),
-    ], catalogs[0]!, workspace)
-    await run(session, parts)
-    await authorizeEditRead(session, parts, 17)
-    await run(session, parts)
-    const edit = parts.find((part) => part.type === "tool-call")
-    expect(edit).toMatchObject({ toolName: "edit" })
-    parts.length = 0
-    expect(await deliverContinuationResults(session, [{
-      sessionId: session.sessionId, execId: 18, toolCallId: edit.toolCallId, toolName: "edit", output: "denied", error: "denied",
-    }])).toBe(session)
-    await run(session, parts)
-
-    expect(parts.filter((part) => part.type === "tool-input-start" || part.type === "tool-call")).toEqual([])
   })
 
   it("leaves a closed row out of a rebuilt history, keeping the real calls", () => {
@@ -1228,5 +1095,327 @@ describe("early edit rows", () => {
     lifecycle.session.allowTools = false
     await run(lifecycle.session, lifecycle.parts)
     expect(lifecycle.parts.some((part) => part.type === "tool-input-start")).toBe(false)
+  })
+
+  it.each(["unsupported", "not permitted", "too large"])("fails a binary write row refused as %s before another call ends the step", async refusal => {
+    const workspace = tempDir()
+    const file = path.join(workspace, "image.png")
+    const { session, parts } = pumpSession([
+      partial("edit-refused-binary", file),
+      started("edit-refused-binary", file),
+      encodeMessage("AgentServerMessage", { exec_server_message: {
+        id: 2, write_args: { path: file, file_bytes: Buffer.alloc(refusal === "too large" ? MAX_STAGED_IMAGE_BYTES + 1 : 3), tool_call_id: "edit-refused-binary" },
+      } }),
+      encodeMessage("AgentServerMessage", { exec_server_message: {
+        id: 3, shell_args: { command: "echo ok", tool_call_id: "shell-other" },
+      } }),
+      turnEnded(),
+    ], [
+      { name: "write", description: "Write" }, { name: "bash", description: "Shell" },
+      ...(refusal === "unsupported" ? [] : [{ name: "cursor_image_save", description: "Save an image" }]),
+    ])
+    if (refusal === "not permitted") session.permittedToolNames = new Set(["write", "bash"])
+    session.requestContext.env = { workspace_paths: [workspace] }
+    const previousCache = getHostCacheDirOverride()
+    setHostCacheDirOverride(tempDir())
+    try {
+      await run(session, parts)
+      const detail = refusal === "too large"
+        ? `Generated image is ${MAX_STAGED_IMAGE_BYTES + 1} bytes, above the ${MAX_STAGED_IMAGE_BYTES} byte limit`
+        : refusal === "not permitted"
+          ? "This OpenCode agent cannot write binary file content on this turn. Do not retry this write with the same bytes."
+          : "This OpenCode agent cannot write binary file content. Do not retry this write with the same bytes."
+      expect(parts.filter(part => part.type === "tool-result"))
+        .toEqual([expect.objectContaining({ result: `Cursor's edit of ${file} failed: ${detail}`, isError: true })])
+      expect(fs.existsSync(file)).toBe(false)
+      sessionManager.resolve(session.sessionId, 3)
+    } finally {
+      setHostCacheDirOverride(previousCache)
+    }
+  })
+
+  it("keeps the refusal reason when Cursor later reports a different failure", async () => {
+    const workspace = tempDir()
+    const file = path.join(workspace, "image.png")
+    const { session, parts } = pumpSession([
+      partial("edit-refused-completed", file),
+      started("edit-refused-completed", file),
+      encodeMessage("AgentServerMessage", { exec_server_message: {
+        id: 2, write_args: { path: file, file_bytes: Buffer.alloc(3), tool_call_id: "edit-refused-completed" },
+      } }),
+      completedEdit("edit-refused-completed", file, {
+        error: { error: "later", model_visible_error: "The string to replace was not found in the file." },
+      }),
+      turnEnded(),
+    ], [{ name: "write", description: "Write" }])
+    session.requestContext.env = { workspace_paths: [workspace] }
+    await run(session, parts)
+    expect(parts.filter(part => part.type === "tool-result")).toEqual([expect.objectContaining({
+      result: `Cursor's edit of ${file} failed: This OpenCode agent cannot write binary file content. Do not retry this write with the same bytes.`,
+      isError: true,
+    })])
+    expect(fs.existsSync(file)).toBe(false)
+  })
+
+  it("fails an unexecuted parallel row when Cursor ends the Run before a call held behind it runs", async () => {
+    const workspace = tempDir()
+    const file = path.join(workspace, "never-written.txt")
+    const { session, parts } = pumpSession([
+      encodeMessage("AgentServerMessage", { interaction_update: { tool_requests_listed: { call_count: 2 } } }),
+      partial("edit-terminal", file),
+      started("edit-terminal", file),
+      encodeMessage("AgentServerMessage", { exec_server_message: {
+        id: 3, shell_args: { command: "echo ok", tool_call_id: "shell-other" },
+      } }),
+      turnEnded(),
+    ], [{ name: "write", description: "Write" }, { name: "bash", description: "Shell" }])
+    session.requestContext.env = { workspace_paths: [workspace] }
+    await run(session, parts)
+    expect(parts.find(part => part.type === "tool-result"))
+      .toMatchObject({ result: EARLY_ROW_CLOSED, isError: true })
+    expect(parts.some(part => part.type === "tool-call" && part.toolName === "bash")).toBe(false)
+    expect(parts.at(-1)).toMatchObject({ type: "finish", finishReason: { unified: "stop" } })
+  })
+
+  it("shows Cursor's own failure on the row of an edit it finished without a write", async () => {
+    const file = path.join(tempDir(), "created.txt")
+    const { session, parts } = pumpSession([
+      partial("edit-1", file),
+      started("edit-1", file),
+      completedEdit("edit-1", file, {
+        error: { path: file, error: "internal", model_visible_error: "The string to replace was not found in the file." },
+      }),
+      turnEnded(),
+    ], [{ name: "edit", description: "Edit" }, { name: "write", description: "Write" }])
+    session.requestContext.env = { workspace_paths: [path.dirname(file)] }
+    await run(session, parts)
+
+    const start = parts.find((part) => part.type === "tool-input-start")
+    expect(start?.toolName).toBe("write")
+    expect(parts.filter((part) => part.type === "tool-result")).toEqual([expect.objectContaining({
+      toolCallId: start.id,
+      result: `Cursor's edit of ${file} failed: The string to replace was not found in the file.`,
+      isError: true,
+    })])
+  })
+
+
+  it("closes each internally failed edit with Cursor's outcome and binds the one that writes", async () => {
+    const dir = tempDir()
+    const file = path.join(dir, "created.txt")
+    const { session, parts } = pumpSession([
+      partial("edit-1", file),
+      started("edit-1", file),
+      completedEdit("edit-1", file, { error: { path: file, error: "no match" } }),
+      partial("edit-2", file),
+      started("edit-2", file),
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: { id: 5, write_args: { path: file, file_text: "created\n", tool_call_id: "edit-2" } },
+      }),
+    ], [{ name: "edit", description: "Edit" }, { name: "write", description: "Write" }])
+    session.requestContext.env = { workspace_paths: [dir] }
+    await run(session, parts)
+
+    const [first, second] = parts.filter((part) => part.type === "tool-input-start")
+    expect(first.id).toBe(earlyRowToolCallId(session.sessionId, "edit-1"))
+    expect(second.id).toBe(earlyRowToolCallId(session.sessionId, "edit-2"))
+    expect(parts.find((part) => part.type === "tool-result" && part.toolCallId === first.id))
+      .toMatchObject({ result: `Cursor's edit of ${file} failed: no match`, isError: true })
+    const write = parts.find((part) => part.type === "tool-call" && !part.providerExecuted)
+    expect(write).toMatchObject({ toolCallId: second.id, toolName: "write" })
+    expect(parts.some((part) => part.type === "tool-result" && part.result === EARLY_ROW_CLOSED)).toBe(false)
+    sessionManager.resolve(session.sessionId, 5)
+  })
+
+
+  it("completes the row of an edit Cursor finished without changing the file", async () => {
+    const file = path.join(tempDir(), "created.txt")
+    const { session, parts } = pumpSession([
+      partial("edit-1", file),
+      started("edit-1", file),
+      completedEdit("edit-1", file, { success: { path: file } }),
+      turnEnded(),
+    ], [{ name: "write", description: "Write" }])
+    session.requestContext.env = { workspace_paths: [path.dirname(file)] }
+    await run(session, parts)
+
+    expect(parts.find((part) => part.type === "tool-result")).toMatchObject({
+      result: `Cursor finished this edit of ${file} without changing the file.`,
+      isError: false,
+    })
+  })
+
+
+  it("still fails the row when Cursor finishes the call without an outcome", async () => {
+    const file = path.join(tempDir(), "created.txt")
+    const { session, parts } = pumpSession([
+      partial("edit-1", file),
+      started("edit-1", file),
+      completedEdit("edit-1", file),
+      turnEnded(),
+    ], [{ name: "write", description: "Write" }])
+    session.requestContext.env = { workspace_paths: [path.dirname(file)] }
+    await run(session, parts)
+
+    expect(parts.find((part) => part.type === "tool-result")).toMatchObject({ result: EARLY_ROW_CLOSED, isError: true })
+  })
+
+
+  it("shows a failed edit Cursor finished after the host read, with no row open", async () => {
+    const workspace = tempDir()
+    const file = path.join(workspace, "notes.txt")
+    fs.writeFileSync(file, "one\n")
+    const { session, parts } = catalogSession([
+      ...editHandshake("edit-missing", file, 17),
+      completedEdit("edit-missing", file, {
+        error: { path: file, error: "x", model_visible_error: "String not found." },
+      }),
+      turnEnded(),
+    ], catalogs[0]!, workspace)
+    await run(session, parts)
+    await authorizeEditRead(session, parts, 17)
+    await run(session, parts)
+
+    const start = parts.find((part) => part.type === "tool-input-start")
+    expect(start).toMatchObject({ toolName: "edit", id: cursorEditFailureToolCallId(session.sessionId, "edit-missing") })
+    expect(start.id).not.toBe(earlyRowToolCallId(session.sessionId, "edit-missing"))
+    expect(parts.find((part) => part.type === "tool-call")).toMatchObject({ toolCallId: start.id, providerExecuted: true, input: "{}" })
+    expect(parts.find((part) => part.type === "tool-result")).toMatchObject({
+      toolCallId: start.id,
+      result: `Cursor's edit of ${file} failed: String not found.`,
+      isError: true,
+    })
+  })
+
+
+  it("does not read file contents just to label an edit Cursor failed before host authorization", async () => {
+    const workspace = tempDir()
+    const file = path.join(tempDir(), "outside.txt")
+    fs.writeFileSync(file, "private\r\n")
+    const patchOnly = catalogs.find(catalog => catalog.label === "OpenCode 2 GPT")!
+    const { session, parts } = catalogSession([
+      started("edit-no-read", file),
+      completedEdit("edit-no-read", file, { error: { error: "failed before read" } }),
+      turnEnded(),
+    ], patchOnly, workspace)
+    const reads = spyOn(fs, "readFileSync")
+    try {
+      await run(session, parts)
+      expect(parts.find(part => part.type === "tool-result")).toMatchObject({ isError: true })
+      expect(reads.mock.calls.filter(([target]) => target === file)).toHaveLength(0)
+    } finally {
+      reads.mockRestore()
+    }
+  })
+
+  it("names the patch tool on the failed row of a CRLF file the patch tool would refuse", async () => {
+    const workspace = tempDir()
+    const file = path.join(workspace, "crlf.txt")
+    fs.writeFileSync(file, "one\r\ntwo\r\n")
+    const patchOnly = catalogs.find((catalog) => catalog.label === "OpenCode 2 GPT")!
+    const { session, parts } = catalogSession([
+      ...editHandshake("edit-crlf", file, 17),
+      completedEdit("edit-crlf", file, { error: { path: file, error: "x", model_visible_error: "String not found." } }),
+      turnEnded(),
+    ], patchOnly, workspace)
+    await run(session, parts)
+    await authorizeEditRead(session, parts, 17)
+    await run(session, parts)
+
+    expect(parts.find((part) => part.type === "tool-input-start")).toMatchObject({ toolName: "patch" })
+    expect(parts.find((part) => part.type === "tool-result"))
+      .toMatchObject({ result: `Cursor's edit of ${file} failed: String not found.`, isError: true })
+  })
+
+
+  it("shows the failure of an edit whose write the provider refused before the host ran it", async () => {
+    const workspace = tempDir()
+    const file = path.join(workspace, "crlf.txt")
+    fs.writeFileSync(file, "one\r\ntwo\r\n")
+    const patchOnly = catalogs.find((catalog) => catalog.label === "OpenCode 2 GPT")!
+    const { session, parts } = catalogSession([
+      ...editHandshake("edit-refused", file, 17, "one\r\nTWO\r\n"),
+      completedEdit("edit-refused", file, { error: { path: file, error: "refused", model_visible_error: "The write was refused." } }),
+      turnEnded(),
+    ], patchOnly, workspace)
+    await run(session, parts)
+    await authorizeEditRead(session, parts, 17)
+    await run(session, parts)
+
+    expect(parts.filter((part) => part.type === "tool-call" && !part.providerExecuted)).toEqual([])
+    expect(parts.filter((part) => part.type === "tool-result")).toEqual([expect.objectContaining({
+      result: `Cursor's edit of ${file} failed: The write was refused.`,
+      isError: true,
+    })])
+  })
+
+
+  it("adds no row when the host already ran the edit Cursor reports as failed", async () => {
+    const workspace = tempDir()
+    const file = path.join(workspace, "notes.txt")
+    fs.writeFileSync(file, "one\n")
+    const { session, parts } = catalogSession([
+      ...editHandshake("edit-host", file, 17, "two\n"),
+      completedEdit("edit-host", file, { write_permission_denied: { path: file, error: "denied" } }),
+      turnEnded(),
+    ], catalogs[0]!, workspace)
+    await run(session, parts)
+    await authorizeEditRead(session, parts, 17)
+    await run(session, parts)
+    const edit = parts.find((part) => part.type === "tool-call")
+    expect(edit).toMatchObject({ toolName: "edit" })
+    parts.length = 0
+    expect(await deliverContinuationResults(session, [{
+      sessionId: session.sessionId, execId: 18, toolCallId: edit.toolCallId, toolName: "edit", output: "denied", error: "denied",
+    }])).toBe(session)
+    await run(session, parts)
+
+    expect(parts.filter((part) => part.type === "tool-input-start" || part.type === "tool-call")).toEqual([])
+  })
+
+  it("hands a binary edit write to the image save tool and adds no row when its save is refused", async () => {
+    const pendingBefore = pendingCursorImageCount()
+    let imageId: string | undefined
+    const workspace = tempDir()
+    const file = path.join(workspace, "image.png")
+    const { session, parts } = pumpSession([
+      partial("edit-binary", file),
+      started("edit-binary", file),
+      encodeMessage("AgentServerMessage", { exec_server_message: {
+        id: 2, write_args: { path: file, file_bytes: Buffer.alloc(3), tool_call_id: "edit-binary" },
+      } }),
+      completedEdit("edit-binary", file, { write_permission_denied: { path: file, error: "denied" } }),
+      turnEnded(),
+    ], [{ name: "write", description: "Write" }, { name: "cursor_image_save", description: "Save an image" }])
+    session.requestContext.env = { workspace_paths: [workspace] }
+    const previousCache = getHostCacheDirOverride()
+    setHostCacheDirOverride(tempDir())
+    try {
+      await run(session, parts)
+      const start = parts.find((part) => part.type === "tool-input-start")
+      expect(parts.find((part) => part.type === "tool-result" && part.toolCallId === start?.id))
+        .toMatchObject({ result: earlyRowHandoff("cursor_image_save"), isError: false })
+      const save = parts.find((part) => part.type === "tool-call" && !part.providerExecuted)
+      expect(save).toMatchObject({ toolName: "cursor_image_save" })
+      const args = JSON.parse(save.input)
+      imageId = args.image_id
+      const denial = IMAGE_PERMISSION_DENIED_PREFIX + " denied"
+      await expect(executeCursorImageSave(args, {
+        worktree: workspace, directory: workspace,
+        ask: async () => { throw new Error("denied") },
+      })).rejects.toThrow(denial)
+      expect(pendingCursorImageCount()).toBe(pendingBefore)
+      expect(fs.existsSync(file)).toBe(false)
+      parts.length = 0
+      expect(await deliverContinuationResults(session, [{
+        sessionId: session.sessionId, execId: 2, toolCallId: save.toolCallId, toolName: "cursor_image_save", output: denial, error: denial,
+      }])).toBe(session)
+      await run(session, parts)
+
+      expect(parts.filter((part) => part.type === "tool-input-start" || part.type === "tool-call")).toEqual([])
+    } finally {
+      if (imageId) discardPendingCursorImage(imageId)
+      setHostCacheDirOverride(previousCache)
+    }
   })
 })

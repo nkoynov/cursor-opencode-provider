@@ -146,7 +146,21 @@ preserve existing LF/CRLF conventions; intentional whole-file writes retain
 their requested contents. See [shared patch behavior](../README.md#apply_patch--patch-on-gpt-models)
 and [1.x incident lessons](../tasks/lessons/opencode-1.md).
 
+Edit rows use Cursor's own result when an edit finishes without a host write,
+including errors after the authorized read. A row still waiting for its exec
+may close as deferred when another tool ends the step; a terminal Run closes it
+as unfinished, and a refused exec as failed with the refusal reason, including
+when other calls are pending or Cursor later reports a different completion.
+A binary write staged for the image save tool hands its row to that tool.
+Failure labels use the permitted catalog without reading target files.
+See [shared early-row behavior](../README.md#known-limitations).
+
 ## Shell failures and interruption
+
+Wrapped commands expose their real exit status to the host. A hard timeout
+exits 124; a background handoff exits 0. The request projection adds failed
+command status from `metadata.exit` for history rebuilds and removes that
+notice from live stdout while preserving command bytes.
 
 Shell output keeps path-like text, whitespace and successful timeout-shaped
 text unchanged. Internal wrapper markers are removed without trimming command

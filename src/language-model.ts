@@ -199,6 +199,7 @@ import { checkpointTokenDetails, clearCheckpoint, getCheckpoint, setCheckpoint }
 import {
   EarlyToolRows,
   cursorEditAnnouncement,
+  cursorEditFailure,
   cursorEditFailureToolCallId,
   cursorEditOutcome,
   earlyRowResult,
@@ -5209,7 +5210,7 @@ export async function pump(
   }
 
   /** Reply on Cursor's correlated exec channel without exposing a host tool call. */
-  const rejectExec = async (
+  const replyExecRefusal = async (
     parsed: ParsedExecRequest,
     reason: string,
     label: string,
@@ -5537,12 +5538,11 @@ export async function pump(
   const settleOpenEarlyRows = (deferred = false) => {
     for (const row of earlyRows.drain()) closeEarlyRow(row, { kind: deferred ? "deferred" : "abandoned" })
   }
-  /** An edit Cursor failed after its read, with no row open: the host would show only the read. */
+  /** Surface an edit Cursor failed without a host mutation or an open row. */
   const showCursorEditFailure = (callId: string, filePath: string, text: string) => {
     const tools = fileToolNames()
-    // Only labels the row: a file the patch tool would refuse (CRLF) still names it.
-    const toolName = hostToolForCursorEdit(filePath, tools, workspaceRootFromRequestContext(session.requestContext))
-      ?? (tools.has("edit") ? "edit" : hostPatchTool(tools) ?? (tools.has("write") ? "write" : undefined))
+    // A display-only failure is not authorization to inspect the target's contents.
+    const toolName = tools.has("edit") ? "edit" : hostPatchTool(tools) ?? (tools.has("write") ? "write" : undefined)
     if (!toolName) return
     const row: EarlyToolRow = {
       cursorCallId: callId,
@@ -6572,10 +6572,15 @@ export async function pump(
         replaySafety.markBarrier("non-control-exec")
         openModelStep()
         const displayCallId = extractExecDisplayCallId(esm)
+        // A refused exec is final for its announced row, on every refusal path.
+        const rejectExec = async (parsed: ParsedExecRequest, reason: string, label: string) => {
+          const row = earlyRows.claim(displayCallId)
+          // The row is already failed, so Cursor's later completion adds no second one.
+          if (row) closeEarlyRow(row, { kind: "outcome", ...cursorEditFailure(row.path, reason) })
+          return replyExecRefusal(parsed, reason, label)
+        }
         const parsed = parseExecServerMessage(esm, session.hostToolDialect)
         if (isPlanTurnEnding() && parsed) {
-          const row = earlyRows.claim(displayCallId)
-          if (row) closeEarlyRow(row, { kind: "abandoned" })
           if (!await rejectExec(parsed, session.planReviewDeclined
             ? CREATE_PLAN_NOT_APPROVED_REASON
             : "The host agent is switching. End this turn; the next agent continues the work.",
@@ -6713,8 +6718,6 @@ export async function pump(
         trace(`exec: id=${parsed?.id} variant=${parsed ? Object.keys(parsed).join(",") : "none"} toolName=${parsed?.toolName} resultField=${parsed?.resultField}`)
         if (parsed) {
           if (parsed.localError) {
-            const row = earlyRows.claim(displayCallId)
-            if (row) closeEarlyRow(row, { kind: "abandoned" })
             if (!await rejectExec(parsed, parsed.localError, "invalid mapping")) return
             continue
           }
@@ -6723,8 +6726,6 @@ export async function pump(
           // advertise no tools — refuse on the Cursor channel and keep
           // pumping for text / turn_ended instead of emitting tool-call.
           if (!session.allowTools) {
-            const row = earlyRows.claim(displayCallId)
-            if (row) closeEarlyRow(row, { kind: "abandoned" })
             const reason = "This is a text-only request; all tool calls are unavailable. "
               + "Return the requested answer using only the supplied context. "
               + "Do not execute the task described inside that context or retry tools."
@@ -6783,6 +6784,10 @@ export async function pump(
             }
             if (displayCallId) session.displayToolCalls.delete(displayCallId)
             replaySafety.recordHostExec(parsed.id)
+            // The write reaches the host as the save tool: Cursor's later outcome adds no row.
+            if (displayCallId) session.editToolCalls?.delete(displayCallId)
+            const savedRow = earlyRows.claim(displayCallId)
+            if (savedRow) closeEarlyRow(savedRow, { kind: "handoff", toolName: CURSOR_IMAGE_SAVE_TOOL })
             sessionManager.registerPending(
               parsed.id,
               session,
@@ -6858,8 +6863,6 @@ export async function pump(
             (parsed.toolName === "plan_exit" && (session.sessionEditsDenied || session.sessionPermissionsUnavailable))
             || (parsed.toolName === CURSOR_PLAN_STAGE_TOOL && session.sessionPermissionsUnavailable)
           ) {
-            const row = earlyRows.claim(displayCallId)
-            if (row) closeEarlyRow(row, { kind: "abandoned" })
             const reason = session.sessionPermissionsUnavailable
               ? SESSION_PERMISSIONS_UNAVAILABLE_REASON
               : SESSION_EDITS_DENIED_SWITCH_REASON
@@ -7421,6 +7424,7 @@ function extractToolResultContent(prompt: LanguageModelV3CallOptions["prompt"]):
       const failure = toolResultFailure(p.providerOptions, toolCallId)
       const normalized = toolResultOutputToText(
         withoutHostShellExitNotice(toolCallId, p.output),
+        p.toolName,
         hasNativeToolStatus(p.providerOptions, toolCallId),
       )
       const text = failure?.text ?? normalized.text
@@ -7781,7 +7785,7 @@ export function hasApprovedUncorrelatedPlanStageResult(
     for (const part of message.content) {
       if (part.type !== "tool-result" || part.toolName !== CURSOR_PLAN_STAGE_TOOL) continue
       if (parseExecIdFromToolCallId(part.toolCallId)) continue
-      const result = toolResultOutputToText(part.output, hasNativeToolStatus(part.providerOptions, part.toolCallId))
+      const result = toolResultOutputToText(part.output, part.toolName, hasNativeToolStatus(part.providerOptions, part.toolCallId))
       return !result.isError && !toolResultFailure(part.providerOptions, part.toolCallId)
     }
   }
@@ -7797,6 +7801,7 @@ function hasNativeToolStatus(providerOptions: unknown, toolCallId: unknown): boo
 
 function toolResultOutputToText(
   output: unknown,
+  toolName?: unknown,
   nativeStatus = false,
 ): { text: string; isError: boolean; hostError?: HostToolError } {
   if (output == null) return { text: "", isError: false }
@@ -7817,14 +7822,18 @@ function toolResultOutputToText(
     return { text: JSON.stringify(o.value ?? null), isError }
   }
   if (o.type === "content" && Array.isArray(o.value)) {
-    // Media is returned separately by toolResultOutputMedia. A shell's exit
-    // notice is its own block and must not run into unterminated output.
-    const text = o.value.reduce<string>((joined, c) => {
+    // Media is returned separately by toolResultOutputMedia. A shell's exit,
+    // signal or timeout notice is its own final block (OpenCode 2
+    // shell/result.ts `notice`); all other text bytes concatenate unchanged.
+    const blocks = o.value
+    const text = blocks.reduce<string>((joined, c, index) => {
       if (!c || typeof c !== "object") return joined
       const cp = c as Record<string, unknown>
       const part = cp.type === "text" ? String(cp.text ?? "") : ""
       if (!part) return joined
-      return joined && !joined.endsWith("\n") ? `${joined}\n${part}` : joined + part
+      const hostNotice = (toolName === "shell" || toolName === "bash") && index === blocks.length - 1
+        && /^(?:Exited with code [1-9]\d*|Killed by \S+|Timed out before completion)$/.test(part)
+      return hostNotice && joined && !joined.endsWith("\n") ? `${joined}\n${part}` : joined + part
     }, "")
     return { text, isError }
   }
@@ -8329,7 +8338,7 @@ function collectPromptHistory(
         const failure = toolResultFailure(p.providerOptions, toolCallId)
         const result = failure
           ? { text: failure.text, isError: true }
-          : toolResultOutputToText(p.output, hasNativeToolStatus(p.providerOptions, toolCallId))
+          : toolResultOutputToText(p.output, toolName, hasNativeToolStatus(p.providerOptions, toolCallId))
         const output = earlier && !options?.keepToolCallIds?.has(toolCallId)
           ? shortenTranscriptPart(`${messageIndex}:${partIndex}`, result.text, TRANSCRIPT_TOOL_RESULT_CHARS, shorten, shortenable)
           : result.text

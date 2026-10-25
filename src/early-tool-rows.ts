@@ -42,6 +42,10 @@ function text(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
 }
 
+export function cursorEditFailure(filePath: string, detail: string): { text: string; isError: true } {
+  return { text: `Cursor's edit of ${filePath} failed: ${detail}`, isError: true }
+}
+
 /**
  * The outcome Cursor reports for an edit it finished without a write exec,
  * such as an `old_string` it could not find. The model saw this result.
@@ -52,7 +56,7 @@ export function cursorEditOutcome(
 ): { text: string; isError: boolean } | undefined {
   const result = record(record(record(toolCall)?.edit_tool_call)?.result)
   if (!result) return undefined
-  const failed = (detail: string) => ({ text: `Cursor's edit of ${filePath} failed: ${detail}`, isError: true })
+  const failed = (detail: string) => cursorEditFailure(filePath, detail)
   const success = record(result.success)
   if (success) {
     return { text: text(success.message) ?? `Cursor finished this edit of ${filePath} without changing the file.`, isError: false }

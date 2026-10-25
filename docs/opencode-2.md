@@ -170,6 +170,22 @@ A prompt sent before those servers finish connecting will not see their tools. O
 | — | A Cursor background shell that ends posts OpenCode's `<shell>` completion note (as a `<system-update>`) through `session.synthetic`: the model gets it at the next step, or it starts a turn in an idle session. It is dropped when the model already read the finished terminal record |
 | Package root / `plugin` | OpenCode 2 `Host.resolve` loads `exports["./server"]` → this entry (`{ id, setup }`). The same module dual-exports `server: CursorPlugin` so OpenCode 1.18 still gets the classic plugin. |
 
+Edit rows use Cursor's own result when an edit finishes without a host write,
+including errors after the authorized read. A row still waiting for its exec
+may close as deferred when another tool ends the step; a terminal Run closes it
+as unfinished, and a refused exec as failed with the refusal reason, including
+when other calls are pending or Cursor later reports a different completion.
+A binary write staged for the image save tool hands its row to that tool.
+Failure labels use the permitted catalog without reading target files.
+See [shared early-row behavior](../README.md#known-limitations).
+
+Wrapped commands expose their real exit status to the host. A hard timeout
+exits 124; a background handoff exits 0. The native final `Exited with code N`
+block remains in history on its own line and is removed from live stdout when
+it matches the captured outcome, including when a command printed nothing and
+the notice is the whole result. Native signal and timeout notices also start on
+their own line. Other text blocks retain their exact bytes.
+
 Shell output keeps path-like text, whitespace and successful timeout-shaped
 text unchanged. Internal wrapper markers are removed without trimming command
 output, and failed shell streams retain partial output alongside their error.
