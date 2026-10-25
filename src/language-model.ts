@@ -328,6 +328,7 @@ import {
   registerCursorShellCall,
   resolveCursorShellPath,
   shellPolicyFromMetadata,
+  withoutHostShellExitNotice,
   type CursorShellPolicy,
 } from "./shell-timeout.js"
 import {
@@ -6589,7 +6590,7 @@ function extractToolResultContent(prompt: LanguageModelV3CallOptions["prompt"]):
       if (p.type !== "tool-result") continue
       const toolCallId = (p.toolCallId as string) ?? ""
       const failure = toolResultFailure(p.providerOptions, toolCallId)
-      const normalized = toolResultOutputToText(p.output)
+      const normalized = toolResultOutputToText(withoutHostShellExitNotice(toolCallId, p.output), p.toolName)
       const text = failure?.text ?? normalized.text
       const isError = failure !== undefined || normalized.isError
       const media = isError ? [] : toolResultOutputMedia(p.output)
@@ -6869,7 +6870,7 @@ export function hasApprovedUncorrelatedPlanStageResult(
   return false
 }
 
-function toolResultOutputToText(output: unknown): { text: string; isError: boolean } {
+function toolResultOutputToText(output: unknown, toolName?: unknown): { text: string; isError: boolean } {
   if (output == null) return { text: "", isError: false }
   if (typeof output === "string") return { text: output, isError: false }
   const o = output as Record<string, unknown>
@@ -6885,14 +6886,19 @@ function toolResultOutputToText(output: unknown): { text: string; isError: boole
     return { text: JSON.stringify(o.value ?? null), isError }
   }
   if (o.type === "content" && Array.isArray(o.value)) {
-    // Media is returned separately by toolResultOutputMedia.
-    const text = o.value
-      .map((c) => {
-        if (!c || typeof c !== "object") return ""
-        const cp = c as Record<string, unknown>
-        return cp.type === "text" ? String(cp.text ?? "") : ""
-      })
-      .join("")
+    // Media is returned separately by toolResultOutputMedia. A shell's exit,
+    // signal or timeout notice is its own final block (OpenCode 2
+    // shell/result.ts `notice`); all other text bytes concatenate unchanged.
+    const blocks = o.value
+    const text = blocks.reduce<string>((joined, c, index) => {
+      if (!c || typeof c !== "object") return joined
+      const cp = c as Record<string, unknown>
+      const part = cp.type === "text" ? String(cp.text ?? "") : ""
+      if (!part) return joined
+      const hostNotice = (toolName === "shell" || toolName === "bash") && index === blocks.length - 1
+        && /^(?:Exited with code [1-9]\d*|Killed by \S+|Timed out before completion)$/.test(part)
+      return hostNotice && joined && !joined.endsWith("\n") ? `${joined}\n${part}` : joined + part
+    }, "")
     return { text, isError }
   }
   return { text: JSON.stringify(output), isError }
@@ -7286,7 +7292,7 @@ export function extractPromptHistory(
         const toolName = typeof p.toolName === "string" && p.toolName ? p.toolName : "tool"
         const toolCallId = typeof p.toolCallId === "string" ? p.toolCallId : ""
         const failure = toolResultFailure(p.providerOptions, toolCallId)
-        const result = failure ? { text: failure.text, isError: true } : toolResultOutputToText(p.output)
+        const result = failure ? { text: failure.text, isError: true } : toolResultOutputToText(p.output, toolName)
         results.push(formatSeedToolObservation({
           toolName,
           toolCallId,

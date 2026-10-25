@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Wrapped shell commands retain their real exit status in OpenCode and rebuilt model history. Hard timeouts exit 124; background handoffs exit 0. Host exit notices stay out of live stdout, adjacent text blocks preserve their bytes, and invalid terminal statuses fail closed. ([#115](https://github.com/oakimov/cursor-opencode-provider/pull/115), [@nkoynov](https://github.com/nkoynov))
 - Edit rows show Cursor's own completion or error when no host write runs, including failures after an authorized read. Rows deferred to another tool step stay unfailed; a terminal Run closes them as unfinished, and a refused exec as failed with the refusal reason. A binary write staged for the image save tool hands its row to that tool. Display-only failure labels do not read target files. ([#117](https://github.com/oakimov/cursor-opencode-provider/pull/117), [@nkoynov](https://github.com/nkoynov))
 
 ## [0.8.4] - 2026-10-24

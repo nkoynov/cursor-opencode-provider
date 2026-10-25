@@ -178,6 +178,13 @@ A binary write staged for the image save tool hands its row to that tool.
 Failure labels use the permitted catalog without reading target files.
 See [shared early-row behavior](../README.md#known-limitations).
 
+Wrapped commands expose their real exit status to the host. A hard timeout
+exits 124; a background handoff exits 0. The native final `Exited with code N`
+block remains in history on its own line and is removed from live stdout when
+it matches the captured outcome, including when a command printed nothing and
+the notice is the whole result. Native signal and timeout notices also start on
+their own line. Other text blocks retain their exact bytes.
+
 Shell output keeps path-like text, whitespace and successful timeout-shaped
 text unchanged. Internal wrapper markers are removed without trimming command
 output, and failed shell streams retain partial output alongside their error.
