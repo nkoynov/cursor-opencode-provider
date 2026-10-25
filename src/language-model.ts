@@ -4932,12 +4932,11 @@ export async function pump(
   const settleOpenEarlyRows = (deferred = false) => {
     for (const row of earlyRows.drain()) closeEarlyRow(row, { kind: deferred ? "deferred" : "abandoned" })
   }
-  /** An edit Cursor failed after its read, with no row open: the host would show only the read. */
+  /** Surface an edit Cursor failed without a host mutation or an open row. */
   const showCursorEditFailure = (callId: string, filePath: string, text: string) => {
     const tools = fileToolNames()
-    // Only labels the row: a file the patch tool would refuse (CRLF) still names it.
-    const toolName = hostToolForCursorEdit(filePath, tools, workspaceRootFromRequestContext(session.requestContext))
-      ?? (tools.has("edit") ? "edit" : hostPatchTool(tools) ?? (tools.has("write") ? "write" : undefined))
+    // A display-only failure is not authorization to inspect the target's contents.
+    const toolName = tools.has("edit") ? "edit" : hostPatchTool(tools) ?? (tools.has("write") ? "write" : undefined)
     if (!toolName) return
     const row: EarlyToolRow = {
       cursorCallId: callId,
@@ -5748,6 +5747,7 @@ export async function pump(
         // A refused exec is final for its announced row, on every refusal path.
         const rejectExec = async (parsed: ParsedExecRequest, reason: string, label: string) => {
           const row = earlyRows.claim(displayCallId)
+          // The row is already failed, so Cursor's later completion adds no second one.
           if (row) closeEarlyRow(row, { kind: "outcome", ...cursorEditFailure(row.path, reason) })
           return replyExecRefusal(parsed, reason, label)
         }
@@ -5952,6 +5952,10 @@ export async function pump(
               continue
             }
             if (displayCallId) session.displayToolCalls.delete(displayCallId)
+            // The write reaches the host as the save tool: Cursor's later outcome adds no row.
+            if (displayCallId) session.editToolCalls?.delete(displayCallId)
+            const savedRow = earlyRows.claim(displayCallId)
+            if (savedRow) closeEarlyRow(savedRow, { kind: "handoff", toolName: CURSOR_IMAGE_SAVE_TOOL })
             sessionManager.registerPending(
               parsed.id,
               session,

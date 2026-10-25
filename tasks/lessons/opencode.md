@@ -260,8 +260,18 @@ These are failure lessons shared by both hosts, not a replacement for
   complete an edit with its own result and no write (#117). A tool-step finish
   alone does not establish that an open edit will run later: `turn_ended` can
   arrive while other host results remain owed, and every correlated refusal
-  must settle its own row before another tool ends the step. Cover those
-  boundaries and decode outcome fixtures independently of the local encoder.
+  must settle its own row before another tool ends the step, as failed with
+  that refusal reason. A later Cursor completion must not replace the reason
+  or add a second row. Every path that
+  emits the edit's write, including a binary write staged for the image save
+  tool, hands off its row and releases the edit. Cover those boundaries and
+  decode outcome fixtures independently of the local encoder.
+  Predicting a completed failure label through the mutation remapper read CRLF
+  content before host authorization. Display-only failures choose a permitted tool
+  without filesystem inspection; execution prediction remains on the authorized path.
+  A synthetic image-save refusal left its staged bytes in the process registry;
+  execute the save tool's denial path and release the owned handle in fixture cleanup
+  (`test/early-tool-rows.test.ts`).
 - **Silence of model text is not inactivity.** A large tool input arrived as
   heartbeats/token counts for minutes; renew semantic liveness on every inbound
   frame. Pending real execs also need the CLI's three-second client heartbeats,

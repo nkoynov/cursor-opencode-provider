@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test"
+import { afterEach, describe, expect, it, spyOn } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -28,7 +28,8 @@ import { deliverContinuationResults, extractTrailingToolResults, findContinuatio
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { sessionFixture } from "./session-fixture.js"
 import { getHostCacheDirOverride, setHostCacheDirOverride } from "../src/context/paths.js"
-import { MAX_STAGED_IMAGE_BYTES } from "../src/image-staging.js"
+import { discardPendingCursorImage, MAX_STAGED_IMAGE_BYTES, pendingCursorImageCount } from "../src/image-staging.js"
+import { executeCursorImageSave, IMAGE_PERMISSION_DENIED_PREFIX } from "../src/image-save.js"
 
 const tempDirs: string[] = []
 
@@ -916,9 +917,13 @@ describe("early edit rows", () => {
     setHostCacheDirOverride(tempDir())
     try {
       await run(session, parts)
+      const detail = refusal === "too large"
+        ? `Generated image is ${MAX_STAGED_IMAGE_BYTES + 1} bytes, above the ${MAX_STAGED_IMAGE_BYTES} byte limit`
+        : refusal === "not permitted"
+          ? "This OpenCode agent cannot write binary file content on this turn. Do not retry this write with the same bytes."
+          : "This OpenCode agent cannot write binary file content. Do not retry this write with the same bytes."
       expect(parts.filter(part => part.type === "tool-result"))
-        .toEqual([expect.objectContaining({ result: expect.stringContaining(`Cursor's edit of ${file} failed: `), isError: true })])
-      if (refusal === "too large") expect(parts.find(part => part.type === "tool-result")!.result).toContain(`${MAX_STAGED_IMAGE_BYTES + 1} bytes`)
+        .toEqual([expect.objectContaining({ result: `Cursor's edit of ${file} failed: ${detail}`, isError: true })])
       expect(fs.existsSync(file)).toBe(false)
       sessionManager.resolve(session.sessionId, 3)
     } finally {
@@ -926,23 +931,26 @@ describe("early edit rows", () => {
     }
   })
 
-  it("keeps one failed row with the refusal reason when Cursor then completes the refused write", async () => {
+  it("keeps the refusal reason when Cursor later reports a different failure", async () => {
     const workspace = tempDir()
     const file = path.join(workspace, "image.png")
-    const reason = "This OpenCode agent cannot write binary file content."
     const { session, parts } = pumpSession([
       partial("edit-refused-completed", file),
       started("edit-refused-completed", file),
       encodeMessage("AgentServerMessage", { exec_server_message: {
         id: 2, write_args: { path: file, file_bytes: Buffer.alloc(3), tool_call_id: "edit-refused-completed" },
       } }),
-      completedEdit("edit-refused-completed", file, { error: { error: reason, model_visible_error: reason } }),
+      completedEdit("edit-refused-completed", file, {
+        error: { error: "later", model_visible_error: "The string to replace was not found in the file." },
+      }),
       turnEnded(),
     ], [{ name: "write", description: "Write" }])
     session.requestContext.env = { workspace_paths: [workspace] }
     await run(session, parts)
-    expect(parts.filter(part => part.type === "tool-result"))
-      .toEqual([expect.objectContaining({ result: expect.stringContaining(`Cursor's edit of ${file} failed: `), isError: true })])
+    expect(parts.filter(part => part.type === "tool-result")).toEqual([expect.objectContaining({
+      result: `Cursor's edit of ${file} failed: This OpenCode agent cannot write binary file content. Do not retry this write with the same bytes.`,
+      isError: true,
+    })])
     expect(fs.existsSync(file)).toBe(false)
   })
 
@@ -1078,6 +1086,26 @@ describe("early edit rows", () => {
   })
 
 
+  it("does not read file contents just to label an edit Cursor failed before host authorization", async () => {
+    const workspace = tempDir()
+    const file = path.join(tempDir(), "outside.txt")
+    fs.writeFileSync(file, "private\r\n")
+    const patchOnly = catalogs.find(catalog => catalog.label === "OpenCode 2 GPT")!
+    const { session, parts } = catalogSession([
+      started("edit-no-read", file),
+      completedEdit("edit-no-read", file, { error: { error: "failed before read" } }),
+      turnEnded(),
+    ], patchOnly, workspace)
+    const reads = spyOn(fs, "readFileSync")
+    try {
+      await run(session, parts)
+      expect(parts.find(part => part.type === "tool-result")).toMatchObject({ isError: true })
+      expect(reads.mock.calls.filter(([target]) => target === file)).toHaveLength(0)
+    } finally {
+      reads.mockRestore()
+    }
+  })
+
   it("names the patch tool on the failed row of a CRLF file the patch tool would refuse", async () => {
     const workspace = tempDir()
     const file = path.join(workspace, "crlf.txt")
@@ -1141,5 +1169,51 @@ describe("early edit rows", () => {
     await run(session, parts)
 
     expect(parts.filter((part) => part.type === "tool-input-start" || part.type === "tool-call")).toEqual([])
+  })
+
+  it("hands a binary edit write to the image save tool and adds no row when its save is refused", async () => {
+    const pendingBefore = pendingCursorImageCount()
+    let imageId: string | undefined
+    const workspace = tempDir()
+    const file = path.join(workspace, "image.png")
+    const { session, parts } = pumpSession([
+      partial("edit-binary", file),
+      started("edit-binary", file),
+      encodeMessage("AgentServerMessage", { exec_server_message: {
+        id: 2, write_args: { path: file, file_bytes: Buffer.alloc(3), tool_call_id: "edit-binary" },
+      } }),
+      completedEdit("edit-binary", file, { write_permission_denied: { path: file, error: "denied" } }),
+      turnEnded(),
+    ], [{ name: "write", description: "Write" }, { name: "cursor_image_save", description: "Save an image" }])
+    session.requestContext.env = { workspace_paths: [workspace] }
+    const previousCache = getHostCacheDirOverride()
+    setHostCacheDirOverride(tempDir())
+    try {
+      await run(session, parts)
+      const start = parts.find((part) => part.type === "tool-input-start")
+      expect(parts.find((part) => part.type === "tool-result" && part.toolCallId === start?.id))
+        .toMatchObject({ result: earlyRowHandoff("cursor_image_save"), isError: false })
+      const save = parts.find((part) => part.type === "tool-call" && !part.providerExecuted)
+      expect(save).toMatchObject({ toolName: "cursor_image_save" })
+      const args = JSON.parse(save.input)
+      imageId = args.image_id
+      const denial = IMAGE_PERMISSION_DENIED_PREFIX + " denied"
+      await expect(executeCursorImageSave(args, {
+        worktree: workspace, directory: workspace,
+        ask: async () => { throw new Error("denied") },
+      })).rejects.toThrow(denial)
+      expect(pendingCursorImageCount()).toBe(pendingBefore)
+      expect(fs.existsSync(file)).toBe(false)
+      parts.length = 0
+      expect(await deliverContinuationResults(session, [{
+        sessionId: session.sessionId, execId: 2, toolCallId: save.toolCallId, toolName: "cursor_image_save", output: denial, error: denial,
+      }])).toBe(session)
+      await run(session, parts)
+
+      expect(parts.filter((part) => part.type === "tool-input-start" || part.type === "tool-call")).toEqual([])
+    } finally {
+      if (imageId) discardPendingCursorImage(imageId)
+      setHostCacheDirOverride(previousCache)
+    }
   })
 })

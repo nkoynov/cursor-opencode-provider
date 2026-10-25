@@ -149,8 +149,10 @@ and [1.x incident lessons](../tasks/lessons/opencode-1.md).
 Edit rows use Cursor's own result when an edit finishes without a host write,
 including errors after the authorized read. A row still waiting for its exec
 may close as deferred when another tool ends the step; a terminal Run closes it
-as unfinished and a refused exec as failed with the refusal reason, including
-when other calls are pending.
+as unfinished, and a refused exec as failed with the refusal reason, including
+when other calls are pending or Cursor later reports a different completion.
+A binary write staged for the image save tool hands its row to that tool.
+Failure labels use the permitted catalog without reading target files.
 See [shared early-row behavior](../README.md#known-limitations).
 
 ## Shell failures and interruption
