@@ -388,6 +388,10 @@ const _http2Sessions = new Map<string, http2.ClientHttp2Session>()
 const _http2SessionCreatedAt = new WeakMap<http2.ClientHttp2Session, number>()
 const _http2SessionLastInboundAt = new WeakMap<http2.ClientHttp2Session, number>()
 const _http2SessionGoawayLastStreamId = new WeakMap<http2.ClientHttp2Session, number>()
+// When each Run stream still waiting for Cursor's response headers was opened.
+const _http2SessionAwaitingAnswer = new WeakMap<http2.ClientHttp2Session, Map<http2.ClientHttp2Stream, number>>()
+// A Run stream on the session closed after a live window without Cursor's answer; cleared by a ping reply.
+const _http2SessionAnswerStalled = new WeakSet<http2.ClientHttp2Session>()
 const _http2SessionTransportLost = new WeakSet<http2.ClientHttp2Session>()
 const _http2SessionListenerCleanup = new WeakMap<http2.ClientHttp2Session, () => void>()
 // As in Cursor CLI's transport (@connectrpc/connect-node 1.6.1
@@ -442,6 +446,38 @@ export function receivedRecently(lastInboundAt: number | undefined, now = Date.n
 // Wall-clock time on purpose: a machine that slept counts the sleep as idle time.
 function noteSessionInbound(session: http2.ClientHttp2Session): void {
   _http2SessionLastInboundAt.set(session, Date.now())
+}
+
+function trackRunAnswer(session: http2.ClientHttp2Session, stream: http2.ClientHttp2Stream): void {
+  let awaiting = _http2SessionAwaitingAnswer.get(session)
+  if (!awaiting) {
+    awaiting = new Map()
+    _http2SessionAwaitingAnswer.set(session, awaiting)
+  }
+  const openedAt = Date.now()
+  awaiting.set(stream, openedAt)
+  const settle = (answered: boolean) => {
+    if (!awaiting.delete(stream)) return
+    if (!answered && Date.now() - openedAt >= HTTP2_SESSION_LIVE_WINDOW_MS) _http2SessionAnswerStalled.add(session)
+  }
+  stream.once("response", () => settle(true))
+  stream.once("close", () => settle(false))
+}
+
+/**
+ * Whether Cursor has left a Run on `session` without response headers for a live window. Data
+ * still arriving on its older Runs then does not show that Cursor takes new ones on it.
+ */
+export function awaitingRunAnswersForTests(session: http2.ClientHttp2Session): number {
+  return _http2SessionAwaitingAnswer.get(session)?.size ?? 0
+}
+
+function runAnswerStalled(session: http2.ClientHttp2Session, now = Date.now()): boolean {
+  if (_http2SessionAnswerStalled.has(session)) return true
+  for (const openedAt of _http2SessionAwaitingAnswer.get(session)?.values() ?? []) {
+    if (now - openedAt >= HTTP2_SESSION_LIVE_WINDOW_MS) return true
+  }
+  return false
 }
 
 let _testConnection: ((origin: string) => Duplex) | undefined
@@ -804,8 +840,11 @@ function acquireSession(
     && shouldReuseHttp2Session(cached, _http2SessionCreatedAt.get(cached) ?? 0)
     && receivedRecently(lastInboundAt)
   ) {
-    trace(`h2 cached session reused without ping: origin=${origin} idleMs=${Date.now() - lastInboundAt!}`)
-    return Promise.resolve({ session: cached, verified: false })
+    if (!runAnswerStalled(cached)) {
+      trace(`h2 cached session reused without ping: origin=${origin} idleMs=${Date.now() - lastInboundAt!}`)
+      return Promise.resolve({ session: cached, verified: false })
+    }
+    trace(`h2 cached session left a Run unanswered for ${HTTP2_SESSION_LIVE_WINDOW_MS}ms — pinging it before reuse: origin=${origin}`)
   }
 
   const promise = (async () => {
@@ -826,6 +865,7 @@ function acquireSession(
           if (_http2Sessions.get(origin) === existing && !existing.destroyed && !existing.closed) {
             trace(`h2 cached session ping ok: origin=${origin}`)
             noteSessionInbound(existing)
+            _http2SessionAnswerStalled.delete(existing)
             return existing
           }
         } catch (error) {
@@ -915,6 +955,7 @@ export async function bidiRunStream(
   const openStream = () => {
     const owner = session
     const opened = owner.request(headers as unknown as http2.OutgoingHttpHeaders, { endStream: false })
+    trackRunAnswer(owner, opened)
     holdHttp2Session(owner)
     opened.once("close", () => releaseHttp2Session(owner))
     return opened

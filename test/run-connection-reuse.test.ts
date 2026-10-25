@@ -5,6 +5,7 @@ import { CursorProviderError } from "../src/errors.js"
 import { encodeFrame } from "../src/protocol/framing.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
 import {
+  awaitingRunAnswersForTests,
   bidiRunStream,
   closeCachedHttp2SessionsForTests,
   getSession,
@@ -136,6 +137,10 @@ async function startFakeCursor() {
     /** Answers, continues or cancels the streams held so far. */
     release() {
       for (const next of held.splice(0)) next()
+    },
+    /** Answers, continues or cancels only the earliest stream still held. */
+    releaseFirst() {
+      held.shift()?.()
     },
     async close() {
       dropAll()
@@ -366,6 +371,109 @@ describe("Run connection reuse", () => {
       ["answer", 0],
       ["refuse", 1],
     ])
+  })
+})
+
+describe("Run on a connection where Cursor left a Run unanswered", () => {
+  /**
+   * One Run streams on the cached connection while Cursor leaves another without response headers
+   * for a live window; then the streaming Run receives data, so the connection received data recently.
+   */
+  async function unansweredBesideStreaming(options: { closeUnanswered: boolean; mute: boolean }) {
+    await completedRun()
+    fake.answers.push("answer-then-hold", "hold")
+    const streaming = await bidiRunStream("token", { baseURL: ORIGIN })
+    streaming.write(new Uint8Array([8]))
+    const streamingFrames = streaming.frames()[Symbol.asyncIterator]()
+    expect((await streamingFrames.next()).done).toBe(false)
+    const abandon = new AbortController()
+    const unanswered = await bidiRunStream("token", { baseURL: ORIGIN, signal: abandon.signal })
+    unanswered.write(new Uint8Array([9]))
+    await until(() => fake.streams.length === 3)
+    const connection = await getSession(ORIGIN)
+    if (options.mute) fake.muteClient(0)
+    setSystemTime(new Date(Date.now() + HTTP2_SESSION_LIVE_WINDOW_MS + 1_000))
+    if (options.closeUnanswered) {
+      abandon.abort()
+      await until(() => awaitingRunAnswersForTests(connection) === 0)
+      expect(awaitingRunAnswersForTests(connection)).toBe(0)
+    }
+    fake.releaseFirst()
+    expect((await streamingFrames.next()).done).toBe(false)
+    return { connection, streaming, unanswered }
+  }
+
+  it("pings the connection while that Run is still waiting", async () => {
+    const { connection, streaming, unanswered } = await unansweredBesideStreaming({ closeUnanswered: false, mute: false })
+    const ping = spyOn(connection, "ping")
+
+    const next = await bidiRunStream("token", { baseURL: ORIGIN })
+    next.write(new Uint8Array([10]))
+    expect((await nextFrame(next)).done).toBe(false)
+
+    expect(ping).toHaveBeenCalledTimes(1)
+    expect(fake.connections).toBe(1)
+    fake.release()
+    expect((await nextFrame(unanswered)).done).toBe(false)
+    streaming.end()
+    unanswered.end()
+    next.end()
+  })
+
+  it("opens the next Run on a new connection when that Run was given up and the ping goes unanswered", async () => {
+    const { connection, streaming } = await unansweredBesideStreaming({ closeUnanswered: true, mute: true })
+
+    const next = await bidiRunStream("token", { baseURL: ORIGIN, pingTimeoutMs: 100 })
+    next.write(new Uint8Array([10]))
+    expect((await nextFrame(next)).done).toBe(false)
+
+    expect(connection.closed).toBe(true)
+    expect(connection.destroyed).toBe(false)
+    expect(fake.connections).toBe(2)
+    expect(fake.streams.at(-1)).toMatchObject({ answer: "answer", connection: 1 })
+    streaming.end()
+    next.end()
+  })
+
+  it("reuses the connection without a ping again once it answers one", async () => {
+    const { connection, streaming } = await unansweredBesideStreaming({ closeUnanswered: true, mute: false })
+    const ping = spyOn(connection, "ping")
+
+    const first = await bidiRunStream("token", { baseURL: ORIGIN })
+    first.write(new Uint8Array([10]))
+    expect((await nextFrame(first)).done).toBe(false)
+    const second = await bidiRunStream("token", { baseURL: ORIGIN })
+    second.write(new Uint8Array([11]))
+    expect((await nextFrame(second)).done).toBe(false)
+
+    expect(ping).toHaveBeenCalledTimes(1)
+    expect(fake.connections).toBe(1)
+    streaming.end()
+    first.end()
+    second.end()
+  })
+
+  it("does not ping for an unanswered Run given up within the live window", async () => {
+    await completedRun()
+    fake.answers.push("hold")
+    const abandon = new AbortController()
+    const abandoned = await bidiRunStream("token", { baseURL: ORIGIN, signal: abandon.signal })
+    abandoned.write(new Uint8Array([8]))
+    await until(() => fake.streams.length === 2)
+    const connection = await getSession(ORIGIN)
+    abandon.abort()
+    await until(() => awaitingRunAnswersForTests(connection) === 0)
+    expect(awaitingRunAnswersForTests(connection)).toBe(0)
+    await completedRun()
+    const ping = spyOn(await getSession(ORIGIN), "ping")
+
+    const next = await bidiRunStream("token", { baseURL: ORIGIN })
+    next.write(new Uint8Array([9]))
+    expect((await nextFrame(next)).done).toBe(false)
+
+    expect(ping).not.toHaveBeenCalled()
+    expect(fake.connections).toBe(1)
+    next.end()
   })
 })
 
