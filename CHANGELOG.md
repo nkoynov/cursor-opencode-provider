@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Edit rows show Cursor's own completion or error when no host write runs, including failures after an authorized read. Rows deferred to another tool step stay unfailed; a terminal Run or refused exec closes them as unfinished. ([#117](https://github.com/oakimov/cursor-opencode-provider/pull/117), [@nkoynov](https://github.com/nkoynov))
+- Edit rows show Cursor's own completion or error when no host write runs, including failures after an authorized read. Rows deferred to another tool step stay unfailed; a terminal Run closes them as unfinished, and a refused exec as failed with the refusal reason. ([#117](https://github.com/oakimov/cursor-opencode-provider/pull/117), [@nkoynov](https://github.com/nkoynov))
 
 ## [0.8.4] - 2026-10-24
 

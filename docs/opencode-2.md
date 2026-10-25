@@ -171,8 +171,9 @@ A prompt sent before those servers finish connecting will not see their tools. O
 
 Edit rows use Cursor's own result when an edit finishes without a host write,
 including errors after the authorized read. A row still waiting for its exec
-may close as deferred when another tool ends the step; a terminal Run or a
-refused exec closes it as unfinished, including when other calls are pending.
+may close as deferred when another tool ends the step; a terminal Run closes it
+as unfinished and a refused exec as failed with the refusal reason, including
+when other calls are pending.
 See [shared early-row behavior](../README.md#known-limitations).
 
 Shell output keeps path-like text, whitespace and successful timeout-shaped

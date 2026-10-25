@@ -917,12 +917,33 @@ describe("early edit rows", () => {
     try {
       await run(session, parts)
       expect(parts.filter(part => part.type === "tool-result"))
-        .toEqual([expect.objectContaining({ result: EARLY_ROW_CLOSED, isError: true })])
+        .toEqual([expect.objectContaining({ result: expect.stringContaining(`Cursor's edit of ${file} failed: `), isError: true })])
+      if (refusal === "too large") expect(parts.find(part => part.type === "tool-result")!.result).toContain(`${MAX_STAGED_IMAGE_BYTES + 1} bytes`)
       expect(fs.existsSync(file)).toBe(false)
       sessionManager.resolve(session.sessionId, 3)
     } finally {
       setHostCacheDirOverride(previousCache)
     }
+  })
+
+  it("keeps one failed row with the refusal reason when Cursor then completes the refused write", async () => {
+    const workspace = tempDir()
+    const file = path.join(workspace, "image.png")
+    const reason = "This OpenCode agent cannot write binary file content."
+    const { session, parts } = pumpSession([
+      partial("edit-refused-completed", file),
+      started("edit-refused-completed", file),
+      encodeMessage("AgentServerMessage", { exec_server_message: {
+        id: 2, write_args: { path: file, file_bytes: Buffer.alloc(3), tool_call_id: "edit-refused-completed" },
+      } }),
+      completedEdit("edit-refused-completed", file, { error: { error: reason, model_visible_error: reason } }),
+      turnEnded(),
+    ], [{ name: "write", description: "Write" }])
+    session.requestContext.env = { workspace_paths: [workspace] }
+    await run(session, parts)
+    expect(parts.filter(part => part.type === "tool-result"))
+      .toEqual([expect.objectContaining({ result: expect.stringContaining(`Cursor's edit of ${file} failed: `), isError: true })])
+    expect(fs.existsSync(file)).toBe(false)
   })
 
   it("fails an unexecuted parallel row when Cursor ends the Run before another call returns", async () => {

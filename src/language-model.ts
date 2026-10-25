@@ -201,6 +201,7 @@ import { checkpointTokenDetails, getCheckpoint, setCheckpoint } from "./protocol
 import {
   EarlyToolRows,
   cursorEditAnnouncement,
+  cursorEditFailure,
   cursorEditFailureToolCallId,
   cursorEditOutcome,
   earlyRowResult,
@@ -5747,7 +5748,7 @@ export async function pump(
         // A refused exec is final for its announced row, on every refusal path.
         const rejectExec = async (parsed: ParsedExecRequest, reason: string, label: string) => {
           const row = earlyRows.claim(displayCallId)
-          if (row) closeEarlyRow(row, { kind: "abandoned" })
+          if (row) closeEarlyRow(row, { kind: "outcome", ...cursorEditFailure(row.path, reason) })
           return replyExecRefusal(parsed, reason, label)
         }
         if (isPlanTurnEnding()) {
