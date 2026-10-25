@@ -500,8 +500,10 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Spawn success differs from payload success.** An already-finished fast
   command still needs a valid handle and its actual final exit. Wrapper markers alone did not
   preserve the host's status (#115); validate terminal codes in the shell's
-  0-255 range before exiting. Separate the host's final exit-notice block
-  without inserting bytes between unrelated text blocks, including split CRLF
+  0-255 range before exiting. Separate the host's final exit, signal or timeout
+  notice block without inserting bytes between unrelated text blocks, including
+  split CRLF. OpenCode 2 sends a lone block as a text result, so a silent failed
+  command's notice is the whole value
   (`test/terminal-runner.test.ts`, `test/opencode2-tool-results.test.ts`).
 
 ## Auth, models and delivery process

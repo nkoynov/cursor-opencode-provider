@@ -254,8 +254,9 @@ Give one credential source. The provider uses the first present and never falls 
 
 Wrapped commands finish with their own exit code in OpenCode; hard timeouts
 finish with 124 and background handoffs with 0. Failed command status survives
-history rebuilds. The host's final exit notice is excluded from live stdout;
-other text blocks concatenate without changing their bytes.
+history rebuilds. The host's final exit notice is excluded from live stdout,
+and its final exit, signal or timeout notice starts on its own line; other text
+blocks concatenate without changing their bytes.
 
 A failed host shell call reaches Cursor once as stderr in streamed and unary
 results. Distinct partial command output remains on stdout. See the

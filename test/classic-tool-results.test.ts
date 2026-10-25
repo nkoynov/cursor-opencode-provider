@@ -97,6 +97,17 @@ describe("classic interruption projection", () => {
     expect(consumeCursorShellResult(callID, stored).outcome).toEqual({ kind: "exit", code: 2 })
   })
 
+  test("a failed shell that printed nothing sends Cursor empty stdout", () => {
+    registerCursorShellCall(callID, { shell_stream: true, timeout_behavior: 2, command: "false" })
+    const stored = captureCursorShellResult(callID, "", { exit: 1 })
+    expect(stored).toBe("")
+    const state = normalizeClassicInterruptedResults(native({ status: "completed", input: {}, output: stored, metadata: { exit: 1 } }))[0].parts[0].state
+    expect(state.output).toBe("\n\nExited with code 1")
+    const history = extractPromptHistory(lower(state), { toolResults: "all", preserveTrailingUser: true })
+    expect(history.at(-1)!.content).toEndWith("\n\nExited with code 1")
+    expect(extractTrailingToolResults(lower(state))[0]!.output).toBe("")
+  })
+
   test("a timed-out shell keeps OpenCode's timeout block instead of the wrapper's exit", () => {
     const state = normalizeClassicInterruptedResults(native({ status: "completed", input: {}, output: "Timed out after 5ms.\n", metadata: { exit: 124, cursorShellTimeoutMs: 5 } }))[0].parts[0].state
     expect(state.output).toBe("(no output)\n\n<shell_metadata>\nshell tool terminated command after exceeding timeout 5 ms.\n</shell_metadata>")

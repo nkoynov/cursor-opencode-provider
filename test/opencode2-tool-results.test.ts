@@ -51,15 +51,18 @@ describe("native OpenCode result status", () => {
     expect(extractPromptHistory(lower(messages), { toolResults: "all", preserveTrailingUser: true }).at(-1)!.content).toEndWith(output)
   })
 
-  // OpenCode 2.1.4 stores a failed shell's exit as its own text block after the
-  // output: packages/core/src/tool/plugin/shell.ts resultMessages, shell/result.ts notice.
+  // OpenCode 2.1.4 stores a failed shell's exit, signal or timeout as its own text
+  // block after the output: packages/core/src/tool/plugin/shell.ts resultMessages, shell/result.ts notice.
   test.each([
-    ["unterminated output", "partial", "partial\nExited with code 3"],
-    ["terminated output", "partial\n", "partial\nExited with code 3"],
-    ["empty output", "", "Exited with code 3"],
-  ])("keeps a shell's exit notice on its own line after %s, live and in rebuilt history", (_, output, expected) => {
+    ["unterminated output", "partial", "Exited with code 3", "partial\nExited with code 3"],
+    ["terminated output", "partial\n", "Exited with code 3", "partial\nExited with code 3"],
+    ["empty output", "", "Exited with code 3", "Exited with code 3"],
+    ["a host timeout", "partial\n\nCommand exceeded timeout of 5 ms.", "Timed out before completion",
+      "partial\n\nCommand exceeded timeout of 5 ms.\nTimed out before completion"],
+    ["a signal", "partial", "Killed by SIGKILL", "partial\nKilled by SIGKILL"],
+  ])("keeps a shell's host notice on its own line after %s, live and in rebuilt history", (_, output, notice, expected) => {
     const messages = preserveNativeToolResults([{ role: "tool", content: [{ type: "tool-result", id, name: "shell",
-      result: { type: "content", value: [{ type: "text", text: output }, { type: "text", text: "Exited with code 3" }] } }] }])
+      result: { type: "content", value: [{ type: "text", text: output }, { type: "text", text: notice }] } }] }])
     const result = extractTrailingToolResults(lower(messages))[0]!
     expect(result).toMatchObject({ output: expected })
     expect(result.error).toBeUndefined()
@@ -67,14 +70,7 @@ describe("native OpenCode result status", () => {
     expect(history.at(-1)!.content).toEndWith(`"status":"completed"}:\n${expected}`)
   })
 
-  test.each(["Killed by SIGKILL", "Timed out before completion"])("keeps a shell's %s notice on its own line, live and in rebuilt history", notice => {
-    const messages = preserveNativeToolResults([{ role: "tool", content: [{ type: "tool-result", id, name: "shell",
-      result: { type: "content", value: [{ type: "text", text: "partial" }, { type: "text", text: notice }] } }] }])
-    expect(extractTrailingToolResults(lower(messages))[0]!.output).toBe(`partial\n${notice}`)
-    expect(extractPromptHistory(lower(messages), { toolResults: "all", preserveTrailingUser: true }).at(-1)!.content).toEndWith(`partial\n${notice}`)
-  })
-
-  describe("a wrapped shell's exit notice", () => {
+  describe("a captured shell exit notice", () => {
     const shellResult = (callID: string, blocks: string[]) => preserveNativeToolResults([{ role: "tool", content: [{ type: "tool-result", id: callID, name: "shell",
       result: { type: "content", value: blocks.map(text => ({ type: "text", text })) } }] }])
     const register = (callID: string, exit: number, raw: string) => {
@@ -93,6 +89,17 @@ describe("native OpenCode result status", () => {
       expect(extractTrailingToolResults(lower(messages))[0]!.output).toBe(clean)
       const history = extractPromptHistory(lower(messages), { toolResults: "all", preserveTrailingUser: true })
       expect(history.at(-1)!.content).toEndWith(`${clean}${notice}`)
+    })
+
+    // A lone block reaches the provider as a text result: packages/core/src/session/runner/to-llm-message.ts toolResult.
+    test("leaves Cursor's stdout empty when a failed foreground command printed nothing", () => {
+      const callID = "cursor_foreground_1"
+      expect(captureCursorShellResult(callID, "", { exit: 1 })).toBe("")
+      const messages = preserveNativeToolResults([{ role: "tool", content: [{ type: "tool-result", id: callID, name: "shell",
+        result: { type: "text", value: "Exited with code 1" } }] }])
+      expect(extractTrailingToolResults(lower(messages))[0]!.output).toBe("")
+      const history = extractPromptHistory(lower(messages), { toolResults: "all", preserveTrailingUser: true })
+      expect(history.at(-1)!.content).toEndWith(`"status":"completed"}:\nExited with code 1`)
     })
 
     test("stays when it does not match the captured exit or no exit was captured", () => {

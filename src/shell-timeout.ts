@@ -839,7 +839,9 @@ export function captureCursorShellFailure(toolCallId: string, error: unknown): v
 
 /**
  * OpenCode 2 appends `Exited with code N` as the result's last text block
- * (packages/core/src/shell/result.ts `notice`, v2.1.4). Cursor gets the code
+ * (packages/core/src/shell/result.ts `notice`, v2.1.4), and sends that block
+ * alone as a text result when the command printed nothing
+ * (session/runner/to-llm-message.ts `toolResult`). Cursor gets the code
  * structurally and its stdout is only what the command printed, so the live
  * result drops that block, or the suffix the classic projection adds, when it
  * matches the captured exit. Stored history keeps it: a rebuilt transcript has
@@ -851,10 +853,12 @@ export function withoutHostShellExitNotice(toolCallId: string, output: unknown):
   if (!code || !output || typeof output !== "object") return output
   const { type, value } = output as { type?: unknown; value?: unknown }
   const notice = hostShellExitNotice(code)
-  if (type === "text" && typeof value === "string" && value.endsWith(`\n\n${notice}`)) {
-    return { ...output, value: value.slice(0, -notice.length - 2) }
+  if (type === "text" && typeof value === "string") {
+    if (value === notice) return { ...output, value: "" }
+    if (value.endsWith(`\n\n${notice}`)) return { ...output, value: value.slice(0, -notice.length - 2) }
+    return output
   }
-  if (type !== "content" || !Array.isArray(value) || value.length < 2) return output
+  if (type !== "content" || !Array.isArray(value) || value.length === 0) return output
   const last = value.at(-1) as { type?: unknown; text?: unknown } | undefined
   if (last?.type !== "text" || last.text !== notice) return output
   return { ...output, value: value.slice(0, -1) }

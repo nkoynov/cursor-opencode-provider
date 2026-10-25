@@ -6849,18 +6849,18 @@ function toolResultOutputToText(output: unknown, toolName?: unknown): { text: st
     return { text: JSON.stringify(o.value ?? null), isError }
   }
   if (o.type === "content" && Array.isArray(o.value)) {
-    // Media is returned separately by toolResultOutputMedia. A shell's exit
-    // notice is its own final block; all other text bytes concatenate unchanged.
+    // Media is returned separately by toolResultOutputMedia. A shell's exit,
+    // signal or timeout notice is its own final block (OpenCode 2
+    // shell/result.ts `notice`); all other text bytes concatenate unchanged.
     const blocks = o.value
     const text = blocks.reduce<string>((joined, c, index) => {
       if (!c || typeof c !== "object") return joined
       const cp = c as Record<string, unknown>
       const part = cp.type === "text" ? String(cp.text ?? "") : ""
       if (!part) return joined
-      const exitNotice = (toolName === "shell" || toolName === "bash")
-        && index === blocks.length - 1
+      const hostNotice = (toolName === "shell" || toolName === "bash") && index === blocks.length - 1
         && /^(?:Exited with code [1-9]\d*|Killed by \S+|Timed out before completion)$/.test(part)
-      return exitNotice && joined && !joined.endsWith("\n") ? `${joined}\n${part}` : joined + part
+      return hostNotice && joined && !joined.endsWith("\n") ? `${joined}\n${part}` : joined + part
     }, "")
     return { text, isError }
   }
