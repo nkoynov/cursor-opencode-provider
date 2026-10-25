@@ -1036,6 +1036,27 @@ describe("early edit rows", () => {
     expect(parts.at(-1)).toMatchObject({ type: "finish", finishReason: { unified: "tool-calls" } })
   })
 
+  it("fails a row still open when Cursor ends the turn during a held step", async () => {
+    const file = path.join(tempDir(), "created.txt")
+    const todo = { update_todos_tool_call: { args: { todos: [{ id: "todo", content: "Review", status: 1 }] } } }
+    const { session, parts } = pumpSession([
+      encodeMessage("AgentServerMessage", { interaction_update: { tool_requests_listed: { call_count: 2 } } }),
+      partial("edit-1", file),
+      encodeMessage("AgentServerMessage", { interaction_update: { tool_call_started: { call_id: "todo-call", tool_call: todo } } }),
+      encodeMessage("AgentServerMessage", { interaction_update: { tool_call_completed: { call_id: "todo-call", tool_call: todo } } }),
+      turnEnded(),
+    ], [{ name: "write", description: "Write" }, { name: "todowrite", description: "Todos" }])
+    session.requestContext.env = { workspace_paths: [path.dirname(file)] }
+    await run(session, parts)
+
+    const start = parts.find((part) => part.type === "tool-input-start")
+    expect(start).toMatchObject({ id: earlyRowToolCallId(session.sessionId, "edit-1") })
+    expect(parts.find((part) => part.type === "tool-call" && !part.providerExecuted)).toMatchObject({ toolName: "todowrite" })
+    expect(parts.find((part) => part.type === "tool-result" && part.toolCallId === start.id))
+      .toMatchObject({ result: EARLY_ROW_CLOSED, isError: true })
+    expect(parts.at(-1)).toMatchObject({ type: "finish", finishReason: { unified: "tool-calls" } })
+  })
+
   it("leaves a closed row out of a rebuilt history, keeping the real calls", () => {
     const closedId = earlyRowToolCallId("sess", "edit-1")
     const history = extractPromptHistory([

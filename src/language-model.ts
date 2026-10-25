@@ -5979,7 +5979,9 @@ export async function pump(
     if (!iu?.heartbeat) order.progressAt = Date.now()
     // Output after a step's tool calls belongs to the next step.
     if (toolStep.hostCalls > 0 && (iu?.text_delta || iu?.thinking_delta || iu?.turn_ended)) {
-      closeHeldToolStep("model output", next)
+      // The Run is terminal even though the host still owes the step's results.
+      if (iu?.turn_ended) settleOpenEarlyRows()
+      closeHeldToolStep(iu?.turn_ended ? "turn ended" : "model output", next)
       return
     }
     const esm = asm.exec_server_message as Record<string, unknown> | undefined
