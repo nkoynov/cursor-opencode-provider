@@ -15,7 +15,9 @@ import {
   type BidiStream,
 } from "./transport/connect.js"
 import {
+  isStreamReplyUploading,
   isStreamWriteBlocked,
+  lastStreamReplyDrainAt,
   StreamWriteDrainError,
   waitForStreamWrites,
   writeStreamMessage as writeWithBackpressure,
@@ -4885,6 +4887,24 @@ function isTruthyEnv(value: string | undefined): boolean {
   return value === "1" || value === "true"
 }
 
+/**
+ * Cursor cannot answer a reply it has not received, so the silence deadline does not run while a
+ * reply (not a heartbeat) to the Run is still uploading, and runs in full from when it finished. A
+ * reply that never drains is bounded by the transport's read-idle watchdog. Returns whether the
+ * deadline moved.
+ */
+function holdSemanticDeadlineForUpload(session: CursorSession, now = Date.now()): boolean {
+  const uploading = isStreamReplyUploading(session.stream)
+  const drainedAt = lastStreamReplyDrainAt(session.stream)
+  const heldUntil = uploading
+    ? now + session.policy.semanticIdleMs
+    : drainedAt === undefined ? 0 : drainedAt + session.policy.semanticIdleMs
+  if (heldUntil <= session.semanticDeadlineAt || heldUntil <= now) return false
+  session.semanticDeadlineAt = heldUntil
+  if (uploading) trace(`semantic idle deadline held: a write to Cursor is still uploading sessionId=${session.sessionId}`)
+  return true
+}
+
 async function nextFrameWithSemanticDeadline(
   session: CursorSession,
 ): Promise<IteratorResult<Frame>> {
@@ -4892,13 +4912,22 @@ async function nextFrameWithSemanticDeadline(
     `Cursor Run sent no frames for ${session.policy.semanticIdleMs}ms`,
     { transient: true, replaySafe: true, code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" },
   )
+  holdSemanticDeadlineForUpload(session)
   const remainingMs = session.semanticDeadlineAt - Date.now()
   if (remainingMs <= 0) throw idleTimeout()
   let timer: ReturnType<typeof setTimeout> | undefined
   let rejectCancelled: ((error: CursorProviderError) => void) | undefined
   const deadline = new Promise<never>((_, reject) => {
     rejectCancelled = reject
-    timer = setTimeout(() => reject(idleTimeout()), remainingMs)
+    const expire = () => {
+      if (holdSemanticDeadlineForUpload(session)) {
+        timer = setTimeout(expire, Math.max(1, session.semanticDeadlineAt - Date.now()))
+        timer.unref?.()
+        return
+      }
+      reject(idleTimeout())
+    }
+    timer = setTimeout(expire, remainingMs)
     timer.unref?.()
   })
   session.semanticDeadlineCancel = () => {

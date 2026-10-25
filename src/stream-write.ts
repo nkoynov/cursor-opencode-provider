@@ -24,9 +24,24 @@ const streamWriteChains = new WeakMap<BidiStream, Promise<unknown>>()
 /** Streams whose current write is buffered and waiting for `drain`. */
 const drainingStreams = new WeakSet<BidiStream>()
 
+/** Streams whose current draining write is one Cursor must receive before it can answer (not a heartbeat). */
+const drainingReplies = new WeakSet<BidiStream>()
+const lastReplyDrainAt = new WeakMap<BidiStream, number>()
+const HEARTBEAT_OPERATION = /^(exec )?heartbeat\b/
+
 /** True while a write on `stream` waits for `drain`; anything written next queues behind it. */
 export function isStreamWriteBlocked(stream: BidiStream): boolean {
   return drainingStreams.has(stream)
+}
+
+/** True while a non-heartbeat write on `stream` waits for `drain`. */
+export function isStreamReplyUploading(stream: BidiStream): boolean {
+  return drainingReplies.has(stream)
+}
+
+/** When the last backpressured non-heartbeat write on `stream` finished draining. */
+export function lastStreamReplyDrainAt(stream: BidiStream): number | undefined {
+  return lastReplyDrainAt.get(stream)
 }
 
 export async function waitForStreamWrites(stream: BidiStream): Promise<void> {
@@ -84,9 +99,12 @@ async function writeStreamMessageNow(
   // out, so a timeout here would cap the upload, not detect a stall. Cursor CLI
   // (connect-node) waits the same way; a closed or idle stream settles it.
   const startedAt = Date.now()
+  const reply = !HEARTBEAT_OPERATION.test(operation)
   drainingStreams.add(stream)
+  if (reply) drainingReplies.add(stream)
   try {
     await stream.waitForDrain()
+    if (reply) lastReplyDrainAt.set(stream, Date.now())
     trace(`stream write drained: operation=${operation} bytes=${message.length} ms=${Date.now() - startedAt}`)
   } catch (cause) {
     throw new StreamWriteDrainError(
@@ -95,5 +113,6 @@ async function writeStreamMessageNow(
     )
   } finally {
     drainingStreams.delete(stream)
+    drainingReplies.delete(stream)
   }
 }

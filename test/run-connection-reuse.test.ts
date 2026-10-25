@@ -10,7 +10,10 @@ import {
   closeCachedHttp2SessionsForTests,
   getSession,
   HTTP2_SESSION_LIVE_WINDOW_MS,
+  MAX_HTTP2_SESSIONS_PER_ORIGIN,
+  openRunStreamsForTests,
   receivedRecently,
+  RUNS_PER_HTTP2_SESSION,
   resetRunCompressionForTests,
   routeHttp2ConnectionsForTests,
   type BidiStream,
@@ -371,6 +374,70 @@ describe("Run connection reuse", () => {
       ["answer", 0],
       ["refuse", 1],
     ])
+  })
+})
+
+describe("Runs spread over connections", () => {
+  async function streamingRun() {
+    fake.answers.push("answer-then-hold")
+    const run = await bidiRunStream("token", { baseURL: ORIGIN })
+    run.write(new Uint8Array([8]))
+    expect((await nextFrame(run)).done).toBe(false)
+    return run
+  }
+
+  it("opens a new connection for a Run once the first carries its share of open Runs", async () => {
+    const first = []
+    for (let i = 0; i < RUNS_PER_HTTP2_SESSION; i++) first.push(await streamingRun())
+    const next = await streamingRun()
+
+    expect(fake.connections).toBe(2)
+    expect(fake.streams.map((stream) => stream.connection)).toEqual([
+      ...Array(RUNS_PER_HTTP2_SESSION).fill(0),
+      1,
+    ])
+    for (const run of [...first, next]) run.end()
+  })
+
+  it("spreads Runs that start together, before any connection is open", async () => {
+    const count = RUNS_PER_HTTP2_SESSION + 2
+    for (let i = 0; i < count; i++) fake.answers.push("answer-then-hold")
+    const runs = await Promise.all(Array.from({ length: count }, () => bidiRunStream("token", { baseURL: ORIGIN })))
+    for (const run of runs) run.write(new Uint8Array([8]))
+    for (const run of runs) expect((await nextFrame(run)).done).toBe(false)
+
+    expect(fake.connections).toBe(2)
+    const perConnection = fake.streams.reduce<number[]>((counts, stream) => {
+      counts[stream.connection] = (counts[stream.connection] ?? 0) + 1
+      return counts
+    }, [])
+    expect(perConnection).toEqual([RUNS_PER_HTTP2_SESSION, 2])
+    for (const run of runs) run.end()
+  })
+
+  it("goes back to the first connection once it has room again", async () => {
+    const first = [await streamingRun()]
+    const firstConnection = await getSession(ORIGIN)
+    for (let i = 1; i < RUNS_PER_HTTP2_SESSION; i++) first.push(await streamingRun())
+    const spilled = await streamingRun()
+    first[0]!.end()
+    await until(() => openRunStreamsForTests(firstConnection) === RUNS_PER_HTTP2_SESSION - 1)
+    expect(openRunStreamsForTests(firstConnection)).toBe(RUNS_PER_HTTP2_SESSION - 1)
+
+    const next = await streamingRun()
+
+    expect(fake.connections).toBe(2)
+    expect(fake.streams.at(-1)!.connection).toBe(0)
+    for (const run of [...first.slice(1), spilled, next]) run.end()
+  })
+
+  it("keeps the connection count bounded and shares the least loaded once all are full", async () => {
+    const runs = []
+    const total = RUNS_PER_HTTP2_SESSION * MAX_HTTP2_SESSIONS_PER_ORIGIN + 1
+    for (let i = 0; i < total; i++) runs.push(await streamingRun())
+
+    expect(fake.connections).toBe(MAX_HTTP2_SESSIONS_PER_ORIGIN)
+    for (const run of runs) run.end()
   })
 })
 

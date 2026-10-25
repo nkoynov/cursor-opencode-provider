@@ -4,6 +4,7 @@ import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { ASK_QUESTION_RESULT_FIELD } from "../src/protocol/ask-question.js"
 import { resolveContinuationPolicy, sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import type { CursorProviderError } from "../src/errors.js"
+import { writeStreamMessage } from "../src/stream-write.js"
 import { sessionFixture } from "./session-fixture.js"
 
 type TimedFrame = { afterMs: number; frame: Frame }
@@ -164,6 +165,60 @@ describe("Run liveness", () => {
     expect(error?.code).toBe("CURSOR_SEMANTIC_IDLE_TIMEOUT")
     expect(error?.message).toContain("Cursor Run sent no frames for 40ms")
     expect(error?.replaySafe).toBe(true)
+  })
+
+  const blobRequest = () => serverFrame({ kv_server_message: { id: 4, get_blob_args: { blob_id: Uint8Array.of(0xb1, 0x0b) } } })
+
+  /** Cursor asks for a blob whose reply takes `drainAfterMs` to upload. */
+  function slowBlobReplySession(frames: TimedFrame[], semanticIdleMs: number, drainAfterMs: number): CursorSession {
+    const session = livenessSession([{ afterMs: 0, frame: blobRequest() }, ...frames], semanticIdleMs)
+    session.blobs.set("b10b", new Uint8Array(64).fill(7))
+    const stream = session.stream as unknown as Record<string, unknown>
+    stream.write = () => false
+    stream.waitForDrain = () => Bun.sleep(drainAfterMs)
+    return session
+  }
+
+  it("starts the idle limit over when a reply to Cursor finishes uploading", async () => {
+    const parts: Array<{ type: string; delta?: string }> = []
+    const session = slowBlobReplySession([
+      { afterMs: 30, frame: serverFrame({ interaction_update: { text_delta: { text: "answer" } } }) },
+      { afterMs: 0, frame: turnEnded() },
+    ], 60, 120)
+    live.push(session)
+
+    await pump(session, collect(parts), { textId: "t", reasoningId: "r" })
+
+    expect(parts.some((part) => part.type === "text-delta" && part.delta === "answer")).toBe(true)
+  })
+
+  it("does not hold the idle limit for a heartbeat that cannot drain", async () => {
+    const session = livenessSession([], 40)
+    live.push(session)
+    const stream = session.stream as unknown as Record<string, unknown>
+    stream.write = () => false
+    stream.waitForDrain = () => Bun.sleep(400)
+    const heartbeatWrite = writeStreamMessage(session.stream, new Uint8Array(4), "heartbeat")
+    const startedAt = Date.now()
+
+    const error = await pump(session, collect([]), { textId: "t", reasoningId: "r" })
+      .then(() => undefined, (cause: unknown) => cause as CursorProviderError)
+
+    expect(error?.code).toBe("CURSOR_SEMANTIC_IDLE_TIMEOUT")
+    expect(Date.now() - startedAt).toBeLessThan(300)
+    await heartbeatWrite.catch(() => undefined)
+  })
+
+  it("fails a Run that stays silent for the idle limit after its reply finished uploading", async () => {
+    const session = slowBlobReplySession([], 40, 80)
+    live.push(session)
+    const startedAt = Date.now()
+
+    const error = await pump(session, collect([]), { textId: "t", reasoningId: "r" })
+      .then(() => undefined, (cause: unknown) => cause as CursorProviderError)
+
+    expect(error?.code).toBe("CURSOR_SEMANTIC_IDLE_TIMEOUT")
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(115)
   })
 
   it("renews the idle deadline from frames the fresh-turn drain reads", async () => {

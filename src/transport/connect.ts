@@ -412,7 +412,7 @@ const DEFAULT_READ_IDLE_MS = 120_000
 export const HTTP2_SESSION_MAX_AGE_MS = 15 * 60_000
 // Cursor CLI pings an agent connection before use only after 10 s without a response or ping reply.
 export const HTTP2_SESSION_LIVE_WINDOW_MS = 10_000
-// Every Run shares one session per origin. Node and Bun count its unsent bytes
+// Several Runs share each session. Node and Bun count its unsent bytes
 // against maxSessionMemory (10 MB by default) and, once over it, fail every new
 // stream with ENHANCE_YOUR_CALM (Bun before sending it, Node by refusing its
 // response headers); Node also fails a single write over it while the uplink
@@ -496,8 +496,71 @@ export function resolveAgentOrigin(baseURL: string): string {
   return origin
 }
 
-function dropSession(origin: string, session: http2.ClientHttp2Session): void {
-  if (_http2Sessions.get(origin) === session) _http2Sessions.delete(origin)
+// Cursor's edge throttles a whole connection once many of its Run streams upload at once
+// (tool results of 0.4–1.2 MB each drained at ~10 KB/s on one connection carrying 20 Runs while a
+// fresh connection took them at MB/s), so Runs spread over a few connections per origin, as Cursor
+// CLI processes each keep their own.
+export const RUNS_PER_HTTP2_SESSION = 4
+export const MAX_HTTP2_SESSIONS_PER_ORIGIN = 8
+const _http2SessionKey = new WeakMap<http2.ClientHttp2Session, string>()
+const _http2SessionRunStreams = new WeakMap<http2.ClientHttp2Session, number>()
+const _http2LaneReservations = new Map<string, number>()
+
+function laneKey(origin: string, lane: number): string {
+  return lane === 0 ? origin : `${origin}#lane${lane}`
+}
+
+function laneOrigin(key: string): string {
+  return key.replace(/#lane\d+$/, "")
+}
+
+function laneLoad(key: string): number {
+  const session = _http2Sessions.get(key)
+  const streams = session && !session.destroyed && !session.closed ? _http2SessionRunStreams.get(session) ?? 0 : 0
+  return streams + (_http2LaneReservations.get(key) ?? 0)
+}
+
+/** The first connection with room for another Run, or the least loaded one once all are full. */
+function pickLane(origin: string): string {
+  let best: { key: string; load: number } | undefined
+  for (let lane = 0; lane < MAX_HTTP2_SESSIONS_PER_ORIGIN; lane++) {
+    const key = laneKey(origin, lane)
+    const load = laneLoad(key)
+    if (load < RUNS_PER_HTTP2_SESSION) return key
+    if (!best || load < best.load) best = { key, load }
+  }
+  return best!.key
+}
+
+function reserveLane(key: string): () => void {
+  _http2LaneReservations.set(key, (_http2LaneReservations.get(key) ?? 0) + 1)
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    const left = (_http2LaneReservations.get(key) ?? 1) - 1
+    if (left > 0) _http2LaneReservations.set(key, left)
+    else _http2LaneReservations.delete(key)
+  }
+}
+
+export function openRunStreamsForTests(session: http2.ClientHttp2Session): number {
+  return _http2SessionRunStreams.get(session) ?? 0
+}
+
+function trackRunStream(session: http2.ClientHttp2Session, stream: http2.ClientHttp2Stream): void {
+  _http2SessionRunStreams.set(session, (_http2SessionRunStreams.get(session) ?? 0) + 1)
+  stream.once("close", () => {
+    const left = (_http2SessionRunStreams.get(session) ?? 1) - 1
+    if (left > 0) _http2SessionRunStreams.set(session, left)
+    else _http2SessionRunStreams.delete(session)
+  })
+}
+
+function dropSession(key: string, session: http2.ClientHttp2Session): void {
+  if (_http2Sessions.get(key) === session) _http2Sessions.delete(key)
+  const own = _http2SessionKey.get(session)
+  if (own !== undefined && _http2Sessions.get(own) === session) _http2Sessions.delete(own)
 }
 
 /**
@@ -528,10 +591,11 @@ function releaseHttp2Session(session: http2.ClientHttp2Session): void {
 }
 
 /** Offer a connected session for new Runs; it stays unref'd until one holds it. */
-function cacheReadySession(origin: string, session: http2.ClientHttp2Session): void {
+function cacheReadySession(key: string, session: http2.ClientHttp2Session): void {
   if (!_http2SessionHolds.has(session)) session.unref()
   _http2SessionCreatedAt.set(session, Date.now())
-  _http2Sessions.set(origin, session)
+  _http2SessionKey.set(session, key)
+  _http2Sessions.set(key, session)
 }
 
 /** Test cleanup for local HTTP/2 fixtures; production sessions stay process-cached. */
@@ -542,6 +606,7 @@ export function closeCachedHttp2SessionsForTests(): void {
   }
   _http2Sessions.clear()
   _http2Connecting.clear()
+  _http2LaneReservations.clear()
 }
 
 function timeoutMs(name: string, value: number | undefined, fallback: number): number {
@@ -702,7 +767,8 @@ function raiseSessionWindow(session: http2.ClientHttp2Session): void {
   }
 }
 
-function connectSession(origin: string): Promise<http2.ClientHttp2Session> {
+function connectSession(key: string): Promise<http2.ClientHttp2Session> {
+  const origin = laneOrigin(key)
   return new Promise((resolve, reject) => {
     let settled = false
     let session: http2.ClientHttp2Session | undefined
@@ -729,7 +795,7 @@ function connectSession(origin: string): Promise<http2.ClientHttp2Session> {
       try { abort.abort(error) } catch { /* ignore */ }
       detachSessionListeners()
       if (session) {
-        dropSession(origin, session)
+        dropSession(key, session)
         try { session.destroy() } catch { /* ignore */ }
       }
       destroyTunnel()
@@ -742,20 +808,20 @@ function connectSession(origin: string): Promise<http2.ClientHttp2Session> {
       settled = true
       clearConnectTimer()
       detachSessionListeners()
-      installSessionInvalidation(origin, session)
+      installSessionInvalidation(key, session)
       if (session.destroyed || session.closed) {
         const error = new CursorTransportError(`HTTP/2 connection to ${origin} closed while connecting`)
-        invalidateSession(origin, session)
+        invalidateSession(key, session)
         destroyTunnel()
         reject(error)
         return
       }
       // The TLS socket (if any) is owned by the HTTP/2 session from here on.
       tunnelSocket = undefined
-      cacheReadySession(origin, session)
+      cacheReadySession(key, session)
       noteSessionInbound(session)
       raiseSessionWindow(session)
-      trace(`h2 session connected: origin=${origin} localWindow=${session.state?.localWindowSize ?? "?"}`)
+      trace(`h2 session connected: origin=${key} localWindow=${session.state?.localWindowSize ?? "?"}`)
       resolve(session)
     }
     const timer = setTimeout(() => {
@@ -814,22 +880,42 @@ export function getSession(
   baseURL: string,
   options: { pingTimeoutMs?: number } = {},
 ): Promise<http2.ClientHttp2Session> {
-  return acquireSession(baseURL, options).then((lease) => lease.session)
+  return acquireSession(baseURL, options).then((lease) => {
+    lease.release()
+    return lease.session
+  })
 }
 
-/** `verified`: the session was just connected or answered a ping, rather than reused on recent traffic alone. */
-type SessionLease = { session: http2.ClientHttp2Session; verified: boolean }
+/**
+ * `verified`: the session was just connected or answered a ping, rather than reused on recent traffic alone.
+ * `release`: the Run has opened its stream (or given up), so it no longer reserves room on the session.
+ */
+type SessionLease = { session: http2.ClientHttp2Session; verified: boolean; release: () => void }
 
 function acquireSession(
   baseURL: string,
   options: { pingTimeoutMs?: number },
 ): Promise<SessionLease> {
-  const origin = resolveAgentOrigin(baseURL)
   const pingTimeoutMs = timeoutMs(
     "Cursor provider pingTimeoutMs",
     options.pingTimeoutMs,
     DEFAULT_SESSION_PING_TIMEOUT_MS,
   )
+  const origin = pickLane(resolveAgentOrigin(baseURL))
+  const release = reserveLane(origin)
+  return acquireLaneSession(origin, pingTimeoutMs).then(
+    (lease) => ({ ...lease, release }),
+    (error: unknown) => {
+      release()
+      throw error
+    },
+  )
+}
+
+function acquireLaneSession(
+  origin: string,
+  pingTimeoutMs: number,
+): Promise<{ session: http2.ClientHttp2Session; verified: boolean }> {
   const inflight = _http2Connecting.get(origin)
   if (inflight) return inflight.then((session) => ({ session, verified: true }))
 
@@ -919,9 +1005,13 @@ export async function bidiRunStream(
     DEFAULT_READ_IDLE_MS,
   )
   const sessionOptions = { pingTimeoutMs: options.pingTimeoutMs }
+  const leasing = acquireSession(options.baseURL, sessionOptions)
   const [lease, clientVersion] = await Promise.all([
-    acquireSession(options.baseURL, sessionOptions),
-    resolveClientVersion(),
+    leasing,
+    resolveClientVersion().catch((error: unknown) => {
+      leasing.then((pending) => pending.release(), () => {})
+      throw error
+    }),
   ])
   const compress = !_uncompressedRunOrigins.has(origin)
   const encodeOutbound = (msg: Uint8Array): Uint8Array => encodeRunFrame(msg, compress)
@@ -936,8 +1026,15 @@ export async function bidiRunStream(
         `sending uncompressed to ${origin} from now on`,
     )
   }
+  let baseHeaders: Record<string, string>
+  try {
+    baseHeaders = buildBaseHeaders(token, clientVersion, options.headers)
+  } catch (error) {
+    lease.release()
+    throw error
+  }
   const headers = {
-    ...buildBaseHeaders(token, clientVersion, options.headers),
+    ...baseHeaders,
     ":method": "POST",
     ":path": "/agent.v1.AgentService/Run",
     "content-type": "application/connect+proto",
@@ -956,6 +1053,7 @@ export async function bidiRunStream(
     const owner = session
     const opened = owner.request(headers as unknown as http2.OutgoingHttpHeaders, { endStream: false })
     trackRunAnswer(owner, opened)
+    trackRunStream(owner, opened)
     holdHttp2Session(owner)
     opened.once("close", () => releaseHttp2Session(owner))
     return opened
@@ -972,14 +1070,23 @@ export async function bidiRunStream(
   let connectionLost = false
   let stream: http2.ClientHttp2Stream
   try {
-    stream = openStream()
-  } catch (error) {
-    if (!unanswered) throw error
-    trace(`h2 Run stream did not open on a session reused without ping (${errorMessage(error)}) — reconnecting`)
-    dropSession(origin, session)
-    unanswered = undefined
-    session = await getSession(options.baseURL, sessionOptions)
-    stream = openStream()
+    try {
+      stream = openStream()
+    } catch (error) {
+      if (!unanswered) throw error
+      trace(`h2 Run stream did not open on a session reused without ping (${errorMessage(error)}) — reconnecting`)
+      dropSession(origin, session)
+      unanswered = undefined
+      const replacement = await acquireSession(options.baseURL, sessionOptions)
+      try {
+        session = replacement.session
+        stream = openStream()
+      } finally {
+        replacement.release()
+      }
+    }
+  } finally {
+    lease.release()
   }
 
   let writable = true
@@ -1128,8 +1235,13 @@ export async function bidiRunStream(
     connectionLost = false
     let next: http2.ClientHttp2Stream | undefined
     try {
-      session = await getSession(options.baseURL, sessionOptions)
-      if (!locallyClosed && !terminalEvent && !streamFailure) next = openStream()
+      const replacement = await acquireSession(options.baseURL, sessionOptions)
+      try {
+        session = replacement.session
+        if (!locallyClosed && !terminalEvent && !streamFailure) next = openStream()
+      } finally {
+        replacement.release()
+      }
     } catch (error) {
       rawStreamError = error
       writable = false
