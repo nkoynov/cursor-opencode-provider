@@ -146,6 +146,12 @@ preserve existing LF/CRLF conventions; intentional whole-file writes retain
 their requested contents. See [shared patch behavior](../README.md#apply_patch--patch-on-gpt-models)
 and [1.x incident lessons](../tasks/lessons/opencode-1.md).
 
+Edit rows use Cursor's own result when an edit finishes without a host write,
+including errors after the authorized read. A row still waiting for its exec
+may close as deferred when another tool ends the step; a terminal Run or a
+refused exec closes it as unfinished, including when other calls are pending.
+See [shared early-row behavior](../README.md#known-limitations).
+
 ## Shell failures and interruption
 
 Shell output keeps path-like text, whitespace and successful timeout-shaped

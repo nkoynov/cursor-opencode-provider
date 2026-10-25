@@ -256,7 +256,12 @@ These are failure lessons shared by both hosts, not a replacement for
   unchanged content stays a `write`. OpenCode 2 rejects a renamed call and
   both hosts reject an identical `edit`, so such a row completes as a hand-off
   naming the real call, never as a failure (`hostToolForCursorEdit`,
-  `cursorEditReadReachesHost`, `earlyRowHandoff`, `test/early-tool-rows.test.ts`).
+  `cursorEditReadReachesHost`, `earlyRowHandoff`, `test/early-tool-rows.test.ts`). Cursor can
+  complete an edit with its own result and no write (#117). A tool-step finish
+  alone does not establish that an open edit will run later: `turn_ended` can
+  arrive while other host results remain owed, and every correlated refusal
+  must settle its own row before another tool ends the step. Cover those
+  boundaries and decode outcome fixtures independently of the local encoder.
 - **Silence of model text is not inactivity.** A large tool input arrived as
   heartbeats/token counts for minutes; renew semantic liveness on every inbound
   frame. Pending real execs also need the CLI's three-second client heartbeats,

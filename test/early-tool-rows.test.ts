@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { encodeMessage } from "../src/protocol/messages.js"
+import { decodeMessageSparse, encodeMessage } from "../src/protocol/messages.js"
 import {
   cursorEditReadAnswer,
   cursorEditReadReachesHost,
@@ -18,6 +18,7 @@ import {
   earlyRowHandoff,
   UNBOUND_EXEC_ID,
   cursorEditAnnouncement,
+  cursorEditOutcome,
   cursorEditFailureToolCallId,
   earlyRowToolCallId,
   parseEarlyRowToolCallId,
@@ -26,6 +27,8 @@ import {
 import { deliverContinuationResults, extractTrailingToolResults, findContinuationSession, pump } from "../src/language-model.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { sessionFixture } from "./session-fixture.js"
+import { getHostCacheDirOverride, setHostCacheDirOverride } from "../src/context/paths.js"
+import { MAX_STAGED_IMAGE_BYTES } from "../src/image-staging.js"
 
 const tempDirs: string[] = []
 
@@ -182,6 +185,38 @@ async function authorizeEditRead(session: CursorSession, parts: any[], execId: n
   }])).toBe(session)
   parts.length = 0
 }
+
+describe("Cursor edit outcomes", () => {
+  // Independent bytes from agent.v1.EditToolCall.result=2 and EditResult's
+  // oneof in the decompiled Cursor CLI descriptors (2026.10.22), cross-checked
+  // against the extracted agent.v1 proto. These never use the local encoder.
+  it.each([
+    ["12080a064204646f6e65", "done", false],
+    ["12021200", "Cursor's edit of file.txt failed: file not found.", true],
+    ["12021a00", "Cursor's edit of file.txt failed: permission denied reading the file.", true],
+    ["120a2208120664656e696564", "Cursor's edit of file.txt failed: denied", true],
+    ["1206320412026e6f", "Cursor's edit of file.txt failed: no", true],
+    ["120b3a0912037261772a027569", "Cursor's edit of file.txt failed: ui", true],
+  ] as const)("decodes independent EditToolCall bytes %s", (hex, text, isError) => {
+    const edit = decodeMessageSparse("EditToolCall", Buffer.from(hex, "hex"))
+    expect(cursorEditOutcome({ edit_tool_call: edit }, "file.txt")).toEqual({ text, isError })
+  })
+
+  it.each([
+    [{ write_permission_denied: {} }, "permission denied writing the file."],
+    [{ rejected: {} }, "rejected."],
+    [{ error: {} }, "unknown error."],
+    [{ error: { error: " raw ", model_visible_error: "  " } }, "raw"],
+  ])("retains a failure without optional detail: %p", (result, detail) => {
+    expect(cursorEditOutcome({ edit_tool_call: { result } }, "file.txt"))
+      .toEqual({ text: `Cursor's edit of file.txt failed: ${detail}`, isError: true })
+  })
+
+  it.each([null, [], {}, { edit_tool_call: { result: {} } }, { edit_tool_call: { result: { success: [] } } }].map(value => [value]))
+    ("does not invent an outcome from %p", value => {
+      expect(cursorEditOutcome(value, "file.txt")).toBeUndefined()
+    })
+})
 
 describe("hostToolForCursorEdit", () => {
   it("predicts edit for an existing file, write for a new or empty one, and withholds a patch that would change CRLF", () => {
@@ -856,6 +891,59 @@ describe("early edit rows", () => {
     lifecycle.session.allowTools = false
     await run(lifecycle.session, lifecycle.parts)
     expect(lifecycle.parts.some((part) => part.type === "tool-input-start")).toBe(false)
+  })
+
+  it.each(["unsupported", "not permitted", "too large"])("fails a binary write row refused as %s before another call ends the step", async refusal => {
+    const workspace = tempDir()
+    const file = path.join(workspace, "image.png")
+    const { session, parts } = pumpSession([
+      partial("edit-refused-binary", file),
+      started("edit-refused-binary", file),
+      encodeMessage("AgentServerMessage", { exec_server_message: {
+        id: 2, write_args: { path: file, file_bytes: Buffer.alloc(refusal === "too large" ? MAX_STAGED_IMAGE_BYTES + 1 : 3), tool_call_id: "edit-refused-binary" },
+      } }),
+      encodeMessage("AgentServerMessage", { exec_server_message: {
+        id: 3, shell_args: { command: "echo ok", tool_call_id: "shell-other" },
+      } }),
+      turnEnded(),
+    ], [
+      { name: "write", description: "Write" }, { name: "bash", description: "Shell" },
+      ...(refusal === "unsupported" ? [] : [{ name: "cursor_image_save", description: "Save an image" }]),
+    ])
+    if (refusal === "not permitted") session.permittedToolNames = new Set(["write", "bash"])
+    session.requestContext.env = { workspace_paths: [workspace] }
+    const previousCache = getHostCacheDirOverride()
+    setHostCacheDirOverride(tempDir())
+    try {
+      await run(session, parts)
+      expect(parts.filter(part => part.type === "tool-result"))
+        .toEqual([expect.objectContaining({ result: EARLY_ROW_CLOSED, isError: true })])
+      expect(fs.existsSync(file)).toBe(false)
+      sessionManager.resolve(session.sessionId, 3)
+    } finally {
+      setHostCacheDirOverride(previousCache)
+    }
+  })
+
+  it("fails an unexecuted parallel row when Cursor ends the Run before another call returns", async () => {
+    noteToolRequestsListedSeen()
+    const workspace = tempDir()
+    const file = path.join(workspace, "never-written.txt")
+    const { session, parts } = pumpSession([
+      encodeMessage("AgentServerMessage", { interaction_update: { tool_requests_listed: { call_count: 2 } } }),
+      partial("edit-terminal", file),
+      started("edit-terminal", file),
+      encodeMessage("AgentServerMessage", { exec_server_message: {
+        id: 3, shell_args: { command: "echo ok", tool_call_id: "shell-other" },
+      } }),
+      turnEnded(),
+    ], [{ name: "write", description: "Write" }, { name: "bash", description: "Shell" }])
+    session.requestContext.env = { workspace_paths: [workspace] }
+    await run(session, parts)
+    expect(parts.find(part => part.type === "tool-result"))
+      .toMatchObject({ result: EARLY_ROW_CLOSED, isError: true })
+    expect(parts.at(-1)).toMatchObject({ type: "finish", finishReason: { unified: "tool-calls" } })
+    sessionManager.resolve(session.sessionId, 3)
   })
 
   it("shows Cursor's own failure on the row of an edit it finished without a write", async () => {

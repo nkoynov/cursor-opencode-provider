@@ -4530,7 +4530,7 @@ export async function pump(
   }
 
   /** Reply on Cursor's correlated exec channel without exposing a host tool call. */
-  const rejectExec = async (
+  const replyExecRefusal = async (
     parsed: ParsedExecRequest,
     reason: string,
     label: string,
@@ -5377,6 +5377,8 @@ export async function pump(
         // Cursor ended before receiving the emitted calls' results. Let the
         // host complete the step and process this terminal update next pass.
         trace(`parallel-step: turn_ended with pending=${session.pending.size}; deferring terminal frame`)
+        // The Run is terminal even though the host still owes other results.
+        settleOpenEarlyRows()
         session.pushbackFrame = frame
         clearParallelStep()
         emitFinish(undefined, { unified: "tool-calls", raw: undefined })
@@ -5742,11 +5744,15 @@ export async function pump(
       } else {
         replaySafety.markBarrier("non-control-exec")
         const displayCallId = extractExecDisplayCallId(esm)
+        // A refused exec is final for its announced row, on every refusal path.
+        const rejectExec = async (parsed: ParsedExecRequest, reason: string, label: string) => {
+          const row = earlyRows.claim(displayCallId)
+          if (row) closeEarlyRow(row, { kind: "abandoned" })
+          return replyExecRefusal(parsed, reason, label)
+        }
         if (isPlanTurnEnding()) {
           const parsed = parseExecServerMessage(esm, session.hostToolDialect)
           if (parsed) {
-            const row = earlyRows.claim(displayCallId)
-            if (row) closeEarlyRow(row, { kind: "abandoned" })
             if (!await rejectExec(parsed, session.planReviewDeclined
               ? CREATE_PLAN_NOT_APPROVED_REASON
               : "The host agent is switching. End this turn; the next agent continues the work.",
@@ -5870,8 +5876,6 @@ export async function pump(
         trace(`exec: id=${parsed?.id} variant=${parsed ? Object.keys(parsed).join(",") : "none"} toolName=${parsed?.toolName} resultField=${parsed?.resultField}`)
         if (parsed) {
           if (parsed.localError) {
-            const row = earlyRows.claim(displayCallId)
-            if (row) closeEarlyRow(row, { kind: "abandoned" })
             if (!await rejectExec(parsed, parsed.localError, "invalid mapping")) return
             disposeParallelCall(displayCallId)
             if (closeIfParallelStepComplete()) return
@@ -5882,8 +5886,6 @@ export async function pump(
           // advertise no tools — refuse on the Cursor channel and keep
           // pumping for text / turn_ended instead of emitting tool-call.
           if (!session.allowTools) {
-            const row = earlyRows.claim(displayCallId)
-            if (row) closeEarlyRow(row, { kind: "abandoned" })
             const reason = "This is a text-only request; all tool calls are unavailable. "
               + "Return the requested answer using only the supplied context. "
               + "Do not execute the task described inside that context or retry tools."
@@ -6024,8 +6026,6 @@ export async function pump(
             (parsed.toolName === "plan_exit" && (session.sessionEditsDenied || session.sessionPermissionsUnavailable))
             || (parsed.toolName === CURSOR_PLAN_STAGE_TOOL && session.sessionPermissionsUnavailable)
           ) {
-            const row = earlyRows.claim(displayCallId)
-            if (row) closeEarlyRow(row, { kind: "abandoned" })
             const reason = session.sessionPermissionsUnavailable
               ? SESSION_PERMISSIONS_UNAVAILABLE_REASON
               : SESSION_EDITS_DENIED_SWITCH_REASON
