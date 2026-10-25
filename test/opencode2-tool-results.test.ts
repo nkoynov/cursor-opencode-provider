@@ -67,6 +67,13 @@ describe("native OpenCode result status", () => {
     expect(history.at(-1)!.content).toEndWith(`"status":"completed"}:\n${expected}`)
   })
 
+  test.each(["Killed by SIGKILL", "Timed out before completion"])("keeps a shell's %s notice on its own line, live and in rebuilt history", notice => {
+    const messages = preserveNativeToolResults([{ role: "tool", content: [{ type: "tool-result", id, name: "shell",
+      result: { type: "content", value: [{ type: "text", text: "partial" }, { type: "text", text: notice }] } }] }])
+    expect(extractTrailingToolResults(lower(messages))[0]!.output).toBe(`partial\n${notice}`)
+    expect(extractPromptHistory(lower(messages), { toolResults: "all", preserveTrailingUser: true }).at(-1)!.content).toEndWith(`partial\n${notice}`)
+  })
+
   describe("a wrapped shell's exit notice", () => {
     const shellResult = (callID: string, blocks: string[]) => preserveNativeToolResults([{ role: "tool", content: [{ type: "tool-result", id: callID, name: "shell",
       result: { type: "content", value: blocks.map(text => ({ type: "text", text })) } }] }])

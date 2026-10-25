@@ -172,7 +172,9 @@ A prompt sent before those servers finish connecting will not see their tools. O
 Wrapped commands expose their real exit status to the host. A hard timeout
 exits 124; a background handoff exits 0. The native final `Exited with code N`
 block remains in history on its own line and is removed from live stdout when
-it matches the captured outcome. Other text blocks retain their exact bytes.
+it matches the captured outcome. A final `Killed by <signal>` or `Timed out
+before completion` block also starts on its own line. Other text blocks retain
+their exact bytes.
 
 Shell output keeps path-like text, whitespace and successful timeout-shaped
 text unchanged. Internal wrapper markers are removed without trimming command

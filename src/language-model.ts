@@ -6858,7 +6858,8 @@ function toolResultOutputToText(output: unknown, toolName?: unknown): { text: st
       const part = cp.type === "text" ? String(cp.text ?? "") : ""
       if (!part) return joined
       const exitNotice = (toolName === "shell" || toolName === "bash")
-        && index === blocks.length - 1 && /^Exited with code [1-9]\d*$/.test(part)
+        && index === blocks.length - 1
+        && /^(?:Exited with code [1-9]\d*|Killed by \S+|Timed out before completion)$/.test(part)
       return exitNotice && joined && !joined.endsWith("\n") ? `${joined}\n${part}` : joined + part
     }, "")
     return { text, isError }
