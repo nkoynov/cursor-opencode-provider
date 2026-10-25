@@ -205,7 +205,11 @@ permission causes to distinguish configured denials from user rejection;
 successful output that resembles an error is left successful.
 A [decline without feedback bypasses the tool after hook](https://github.com/anomalyco/opencode/blob/v2.0.27/packages/core/src/permission.ts#L244-L255).
 The permission and terminal-failure events release unstarted shell reservations
-immediately; running jobs retain their records.
+immediately; running jobs retain their records. Disposing another project's setup
+keeps pending shell approvals while an event observer remains. A replacement
+setup retains rejections received during its reload gap, including across module
+copies. Only the final live observer releases the remaining pending wrappers;
+an event subscription that fails during startup does not retain that ownership.
 
 Generated-image saving uses the same handle-only `cursor_image_save` tool on classic and OpenCode 2.0. Classic/OCP surfaces raise `external_directory` then `edit` before the write. Stock OpenCode 2.0 has no public `ask` on its tool context, so the 2.0 entrypoint advertises the tool with `permission: "edit"` (agents that deny edits do not get it) and, before writing, asserts `external_directory` and `edit` on the actual target through the plugin's `ctx.permission.assert`; without that API the save is refused. The id is opaque, so the model cannot write arbitrary files.
 

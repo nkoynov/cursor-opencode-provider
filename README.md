@@ -265,6 +265,10 @@ results. Distinct partial command output remains on stdout. See the
 [1.x shell guide](docs/opencode-1.md#shell-failures-and-interruption) and
 [2.0 tool guide](docs/opencode-2.md#feature-parity-vs-the-classic-plugin).
 
+On OpenCode 2, disposing one project's plugin setup preserves pending shell
+approvals while another event observer remains. Permission rejections survive
+setup replacement. Pending wrappers are released when the final observer ends.
+
 ### Runtime folders
 
 `agent-tools/` and `terminals/` live under the provider's per-workspace project

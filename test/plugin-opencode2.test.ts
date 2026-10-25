@@ -1,7 +1,8 @@
 import { describe, expect, test, beforeEach, afterEach, setSystemTime } from "bun:test"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
+import { pathToFileURL } from "node:url"
 import { APICallError } from "@ai-sdk/provider"
 import plugin from "../src/plugin-opencode2.js"
 import { CursorPlugin } from "../src/plugin.js"
@@ -67,8 +68,8 @@ const DAY_S = 86_400
 const setupCleanups: Array<() => Promise<void> | void> = []
 
 /** This plugin's setup always returns its cleanup; fail loudly if it stops doing so. */
-async function setupPlugin(ctx: Parameters<typeof plugin.setup>[0]): Promise<() => Promise<void>> {
-  const cleanup = await plugin.setup(ctx)
+async function setupPlugin(ctx: Parameters<typeof plugin.setup>[0], implementation = plugin): Promise<() => Promise<void>> {
+  const cleanup = await implementation.setup(ctx)
   if (typeof cleanup !== "function") throw new Error("OpenCode 2.0 plugin setup returned no cleanup")
   let settled = false
   const once = async () => {
@@ -2247,11 +2248,11 @@ describe("opencode2 setup", () => {
   })
 
   describe("pending shell asks across Locations", () => {
-    const setupAt = async (bus: ReturnType<typeof fakeEventBus>, directory: string) => {
+    const setupAt = async (bus: ReturnType<typeof fakeEventBus>, directory: string, implementation = plugin) => {
       const fake = fakeContext()
       fake.ctx.location = { directory }
       fake.ctx.event.subscribe = bus.subscribe
-      return { ...fake, cleanup: await setupPlugin(fake.ctx) }
+      return { ...fake, cleanup: await setupPlugin(fake.ctx, implementation) }
     }
     const askShell = async (
       bus: ReturnType<typeof fakeEventBus>,
@@ -2315,6 +2316,52 @@ describe("opencode2 setup", () => {
         expect(existsSync(abandoned.shell)).toBe(true)
         await reloaded.cleanup()
         expect(existsSync(abandoned.shell)).toBe(false)
+      } finally { rmSync(cwd, { recursive: true, force: true }) }
+    })
+
+    test("a replacement setup preserves a rejection received during its reload gap", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "cursor-refusal-reload-"))
+      let replacementCleanup: (() => Promise<void>) | undefined
+      try {
+        const bus = fakeEventBus()
+        const first = await setupAt(bus, "/project")
+        await setupAt(bus, "/project-other")
+        const ask = await askShell(bus, first.hooks, "cursor_reload_gap", cwd)
+        await first.cleanup()
+        await bus.publish({ type: "permission.replied", data: { requestID: ask.requestID, sessionID: ask.sessionID, reply: "reject" } })
+        const graph = mkdtempSync(join(cwd, "cursor-module-graph-"))
+        cpSync(resolve(import.meta.dir, "../src"), join(graph, "src"), { recursive: true })
+        symlinkSync(resolve(import.meta.dir, "../node_modules"), join(graph, "node_modules"), "dir")
+        const copy: typeof import("../src/plugin-opencode2.js") = await import(pathToFileURL(join(graph, "src/plugin-opencode2.ts")).href)
+        expect(copy.default.setup).not.toBe(plugin.setup)
+        const replacement = await setupAt(bus, "/project", copy.default)
+        replacementCleanup = replacement.cleanup
+        replacement.sessionLocations.set(ask.sessionID, "/project")
+        const event = { sessionID: ask.sessionID, agent: "build", model: { providerID: "cursor" }, options: {}, messages: [{ role: "tool", content: [{
+          type: "tool-result", id: "cursor_reload_gap", name: "shell", providerMetadata: {},
+          result: { type: "error", value: { error: { type: "aborted", message: "Interrupted" }, content: [] } },
+        }] }] }
+        await replacement.hooks.get("session.context")!(event)
+        expect(toolResultFailure(event.messages[0]!.content[0]!.providerMetadata, "cursor_reload_gap")?.refusal).toBe("rejected")
+      } finally {
+        await replacementCleanup?.()
+        rmSync(cwd, { recursive: true, force: true })
+      }
+    })
+
+    test("an iterator that fails synchronously does not count as a live permission observer", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "cursor-failed-observer-"))
+      try {
+        const broken = fakeContext()
+        broken.ctx.event.subscribe = () => ({
+          [Symbol.asyncIterator]() { throw new Error("event stream unavailable") },
+        })
+        await setupPlugin(broken.ctx)
+        const bus = fakeEventBus()
+        const active = await setupAt(bus, "/project")
+        const ask = await askShell(bus, active.hooks, "cursor_failed_observer", cwd)
+        await active.cleanup()
+        expect(existsSync(ask.shell)).toBe(false)
       } finally { rmSync(cwd, { recursive: true, force: true }) }
     })
   })

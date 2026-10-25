@@ -14,7 +14,13 @@ Operator setup: [OpenCode 2.0](../../docs/opencode-2.md).
   (`test/plugin-opencode2.test.ts`).
 - **Disposers own registrations, not globals.** Setup runs per location and on
   reload. Disposing an older setup erased a live agent switch and plan directory
-  (`setHostAgentModeSwitch`, `setNativePlansDir`).
+  (`setHostAgentModeSwitch`, `setNativePlansDir`). Every setup also observes
+  pending shell asks: disposing one must not release another's wrapper (#118).
+  Share observer ownership and bounded refusal evidence across complete module
+  graphs; a rejection during the reload gap must reach the replacement's result
+  projection. Register ownership before starting iteration, since a synchronous
+  iterator failure can close the stream before subscription returns
+  (`test/plugin-opencode2.test.ts`, pending shell asks across Locations).
 - **Process cwd is not session cwd.** A daemon's spawn directory and separately
   loaded modules lost workspace state. Carry the session directory and exact
   session id in request headers; affinity ids can identify a parent instead
