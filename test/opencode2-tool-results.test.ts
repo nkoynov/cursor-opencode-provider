@@ -43,6 +43,14 @@ describe("native OpenCode result status", () => {
     expect(toolResultFailure(messages[0].content[0].providerMetadata, id)).toBeUndefined()
   })
 
+  test.each(["read", "shell", "mcp_custom"])("preserves adjacent text bytes from %s in live results and rebuilt history", name => {
+    const output = "one\r\ntwo  \r\n\r\n"
+    const messages = preserveNativeToolResults([{ role: "tool", content: [{ type: "tool-result", id, name,
+      result: { type: "content", value: [{ type: "text", text: "one\r" }, { type: "text", text: "\ntwo  \r\n\r\n" }] } }] }])
+    expect(extractTrailingToolResults(lower(messages))[0]!.output).toBe(output)
+    expect(extractPromptHistory(lower(messages), { toolResults: "all", preserveTrailingUser: true }).at(-1)!.content).toEndWith(output)
+  })
+
   // OpenCode 2.1.4 stores a failed shell's exit as its own text block after the
   // output: packages/core/src/tool/plugin/shell.ts resultMessages, shell/result.ts notice.
   test.each([

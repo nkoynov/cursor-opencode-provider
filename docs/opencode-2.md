@@ -169,6 +169,11 @@ A prompt sent before those servers finish connecting will not see their tools. O
 | — | `ctx.websearch.transform` publishes Exa results as `{url,title,content,time}` for OpenCode 2's native permission-gated `websearch` tool |
 | Package root / `plugin` | OpenCode 2 `Host.resolve` loads `exports["./server"]` → this entry (`{ id, setup }`). The same module dual-exports `server: CursorPlugin` so OpenCode 1.18 still gets the classic plugin. |
 
+Wrapped commands expose their real exit status to the host. A hard timeout
+exits 124; a background handoff exits 0. The native final `Exited with code N`
+block remains in history on its own line and is removed from live stdout when
+it matches the captured outcome. Other text blocks retain their exact bytes.
+
 Shell output keeps path-like text, whitespace and successful timeout-shaped
 text unchanged. Internal wrapper markers are removed without trimming command
 output, and failed shell streams retain partial output alongside their error.

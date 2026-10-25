@@ -6553,7 +6553,7 @@ function extractToolResultContent(prompt: LanguageModelV3CallOptions["prompt"]):
       if (p.type !== "tool-result") continue
       const toolCallId = (p.toolCallId as string) ?? ""
       const failure = toolResultFailure(p.providerOptions, toolCallId)
-      const normalized = toolResultOutputToText(withoutHostShellExitNotice(toolCallId, p.output))
+      const normalized = toolResultOutputToText(withoutHostShellExitNotice(toolCallId, p.output), p.toolName)
       const text = failure?.text ?? normalized.text
       const isError = failure !== undefined || normalized.isError
       const media = isError ? [] : toolResultOutputMedia(p.output)
@@ -6833,7 +6833,7 @@ export function hasApprovedUncorrelatedPlanStageResult(
   return false
 }
 
-function toolResultOutputToText(output: unknown): { text: string; isError: boolean } {
+function toolResultOutputToText(output: unknown, toolName?: unknown): { text: string; isError: boolean } {
   if (output == null) return { text: "", isError: false }
   if (typeof output === "string") return { text: output, isError: false }
   const o = output as Record<string, unknown>
@@ -6850,13 +6850,16 @@ function toolResultOutputToText(output: unknown): { text: string; isError: boole
   }
   if (o.type === "content" && Array.isArray(o.value)) {
     // Media is returned separately by toolResultOutputMedia. A shell's exit
-    // notice is its own block and must not run into unterminated output.
-    const text = o.value.reduce<string>((joined, c) => {
+    // notice is its own final block; all other text bytes concatenate unchanged.
+    const blocks = o.value
+    const text = blocks.reduce<string>((joined, c, index) => {
       if (!c || typeof c !== "object") return joined
       const cp = c as Record<string, unknown>
       const part = cp.type === "text" ? String(cp.text ?? "") : ""
       if (!part) return joined
-      return joined && !joined.endsWith("\n") ? `${joined}\n${part}` : joined + part
+      const exitNotice = (toolName === "shell" || toolName === "bash")
+        && index === blocks.length - 1 && /^Exited with code [1-9]\d*$/.test(part)
+      return exitNotice && joined && !joined.endsWith("\n") ? `${joined}\n${part}` : joined + part
     }, "")
     return { text, isError }
   }
@@ -7251,7 +7254,7 @@ export function extractPromptHistory(
         const toolName = typeof p.toolName === "string" && p.toolName ? p.toolName : "tool"
         const toolCallId = typeof p.toolCallId === "string" ? p.toolCallId : ""
         const failure = toolResultFailure(p.providerOptions, toolCallId)
-        const result = failure ? { text: failure.text, isError: true } : toolResultOutputToText(p.output)
+        const result = failure ? { text: failure.text, isError: true } : toolResultOutputToText(p.output, toolName)
         results.push(formatSeedToolObservation({
           toolName,
           toolCallId,

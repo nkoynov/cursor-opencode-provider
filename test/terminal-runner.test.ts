@@ -319,6 +319,8 @@ fs.createReadStream(job + "/pipe").on("data", chunk => fs.writeSync(fd, chunk))
   it.each([
     ["filled late", `: >"$job/done"; sleep 1; ${publish}`, "done\n__CURSOR_SHELL_EXIT__7\n", 7],
     ["malformed", `printf 'lost\\n' >"$job/done"`, invalid, 1],
+    ["out of range", `printf '256\\n' >"$job/done"`, invalid, 1],
+    ["overflow", `printf '999999999999999999999999\\n' >"$job/done"`, invalid, 1],
     ["never filled", `: >"$job/done"; exit 0`, invalid, 1],
   ] as const)("reads a %s exit status only once it is complete and valid", async (_, replacement, stdout, code) => {
     const terminal = job("printf done; exit 7")

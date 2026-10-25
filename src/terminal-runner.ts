@@ -57,7 +57,7 @@ function softBackgroundWindow(policy: CursorShellPolicy, shellId: number): strin
     // supervisor is gone, whatever it wrote is all there is.
     '  while [ ! -s "$cursor_job/done" ] && is_ours "$cursor_supervisor" "$cursor_job/runner.sh"; do', `    sleep ${LAUNCHER_POLL_SECONDS}`, "  done",
     '  cursor_code=$(cat "$cursor_job/done")',
-    '  case "$cursor_code" in ""|*[!0-9]*) printf "\\nTerminal record has no valid exit status\\n"; cursor_code=1 ;; esac',
+    '  case "$cursor_code" in [0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5]) ;; *) printf "\\nTerminal record has no valid exit status\\n"; cursor_code=1 ;; esac',
     '  printf "\\n__CURSOR_SHELL_EXIT__%s\\n" "$cursor_code"',
     // The host records this status; the marker alone reaches only the live turn.
     '  exit "$cursor_code"',

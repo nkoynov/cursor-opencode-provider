@@ -148,6 +148,11 @@ and [1.x incident lessons](../tasks/lessons/opencode-1.md).
 
 ## Shell failures and interruption
 
+Wrapped commands expose their real exit status to the host. A hard timeout
+exits 124; a background handoff exits 0. The request projection adds failed
+command status from `metadata.exit` for history rebuilds and removes that
+notice from live stdout while preserving command bytes.
+
 Shell output keeps path-like text, whitespace and successful timeout-shaped
 text unchanged. Internal wrapper markers are removed without trimming command
 output, and failed shell streams retain partial output alongside their error.
