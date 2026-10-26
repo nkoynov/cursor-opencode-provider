@@ -107,7 +107,8 @@ export class AttemptReplaySafety {
       return
     }
     if (lifecycle?.kind === "started" && !claimed) {
-      if (this.state.catalogCalls?.[lifecycle.callId]) {
+      // Fork: the unfinished-call exemption would otherwise let a rebuild drop Cursor's own lookup.
+      if (this.state.catalogCalls?.[lifecycle.callId] || lifecycle.unverifiedCatalog) {
         this.mark("display-tool-lifecycle", false)
         return
       }
@@ -212,7 +213,14 @@ export type DecodedReplayFrame = {
   interactionQuery?: Record<string, unknown>
 }
 
-export type ReplayToolLifecycle = { kind: "started" | "completed"; callId: string; catalog?: true }
+/** Fork: `unverifiedCatalog` marks a catalog lookup frame that fails `inlineCatalog`. */
+export type ReplayToolLifecycle = { kind: "started" | "completed"; callId: string; catalog?: true; unverifiedCatalog?: true }
+
+function catalogVariant(topLevel: StrictRawField | undefined): boolean {
+  const update = nestedFields(topLevel, 1).find(field => field.fn === 2 || field.fn === 3)
+  const call = update?.bytes && readAllFieldsStrict(update.bytes)?.find(field => field.fn === 2)
+  return !!call?.bytes && !!readAllFieldsStrict(call.bytes)?.some(field => field.fn === 44)
+}
 
 /** Validate the raw oneof and its nested fields; decoding alone drops unknown bytes. */
 function inlineCatalog(topLevel: StrictRawField | undefined, completed: boolean): boolean {
@@ -418,7 +426,8 @@ export function analyzeReplayFrame(
       barrier: "display-tool-lifecycle",
       ...(!malformed && typeof callId === "string" && callId.length > 0
         ? { toolLifecycle: { kind: started ? "started" : "completed", callId,
-          ...(inlineCatalog(topLevel, !!completed) ? { catalog: true as const } : {}),
+          ...(inlineCatalog(topLevel, !!completed) ? { catalog: true as const }
+            : catalogVariant(topLevel) ? { unverifiedCatalog: true as const } : {}),
         } }
         : {}),
     }

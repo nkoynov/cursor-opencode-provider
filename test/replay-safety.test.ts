@@ -94,6 +94,19 @@ describe("inline catalog recovery", () => {
     expect(announcedCallsClaimed(state, state.attempt!.announcedCalls)).toBe(true)
   })
 
+  it.each([
+    ["unknown field", lengthDelimited(90)],
+    ["repeated args", lengthDelimited(1)],
+  ] as const)("keeps a catalog start with %s from any rebuild", (_name, extra) => {
+    const state: ReplaySafetyState = {}
+    const step = new AttemptReplaySafety("run", state)
+    const start = analyze(false, [...extra])
+    expect(start).toEqual({ kind: "started", callId: "catalog", unverifiedCatalog: true })
+    step.recordToolLifecycle(start)
+    expect(state.historyRebaseUnsafe).toBe(true)
+    expect(step.applyTo(new CursorTransportError("drop", { transient: true, replaySafe: true })).replayBarrier).toBe("stateful")
+  })
+
   it("requires the matching start and rejects duplicate starts", () => {
     const state: ReplaySafetyState = {}
     const safety = new AttemptReplaySafety("run", state)
