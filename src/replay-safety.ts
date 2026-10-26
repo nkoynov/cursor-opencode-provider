@@ -34,6 +34,9 @@ export type ReplaySafetyState = {
   bridgedCalls?: string[]
   /** Fork: calls Cursor completed without an exec; history holds one only once it is bridged. */
   completedCalls?: string[]
+  /** Fork: call ids Cursor started or completed as a `get_mcp_tools` lookup, and as anything else. */
+  lookupCalls?: string[]
+  otherCalls?: string[]
   /** Fork: the latest pump pass, which a history rebuild generates again. */
   attempt?: {
     /** Calls it announced: nothing ran them unless an exec claimed them or Cursor completed them. */
@@ -113,11 +116,21 @@ export class AttemptReplaySafety {
     this.mark("display-tool-lifecycle", false)
   }
 
+  /** Fork: what a display call Cursor started or completed was on the wire; an id is a lookup only if never anything else. */
+  noteCursorCall(callId: string, lookup: boolean): void {
+    if (!lookup) {
+      if (!this.state.otherCalls?.includes(callId)) (this.state.otherCalls ??= []).push(callId)
+    } else if (!this.state.lookupCalls?.includes(callId)) {
+      (this.state.lookupCalls ??= []).push(callId)
+    }
+  }
+
   /**
-   * Fork: a catalog lookup Cursor completed itself (`get_mcp_tools`). Its answer is the MCP catalog the provider
+   * Fork: a catalog lookup Cursor ran itself (`get_mcp_tools`). Its answer is the MCP catalog the provider
    * sent, which a rebuilt Run receives too, and it changed nothing, so history needs no record of it.
    */
   forgetCatalogLookup(callId: string): void {
+    if (!this.state.lookupCalls?.includes(callId) || this.state.otherCalls?.includes(callId)) return
     const drop = (calls: string[] | undefined) => calls?.filter((id) => id !== callId)
     this.state.announcedCalls = drop(this.state.announcedCalls)
     this.state.completedCalls = drop(this.state.completedCalls)

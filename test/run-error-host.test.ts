@@ -331,6 +331,7 @@ describe("checkpoint eligibility across host results", () => {
     "malformed-completion", "repeated-completion-id", "announced-open",
     "next-call-announced", "provider-exec-after-result", "edit-in-progress", "interaction-after-result",
     "catalog-lookup", "catalog-lookup-open", "cursor-run-completed", "catalog-lookup-mismatch",
+    "catalog-lookup-unknown-variant", "catalog-lookup-reused-id",
   ] as const) {
     it(`recovers a post-result drop only from represented completed work (${scenario})`, async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-result-history-"))
@@ -376,6 +377,25 @@ describe("checkpoint eligibility across host results", () => {
             if (scenario === "catalog-lookup") {
               send({ interaction_update: { tool_call_completed: { call_id: "lookup", tool_call: { get_mcp_tools_tool_call: {
                 ...lookup.get_mcp_tools_tool_call, result: { success: { content: "slack_read(channel: string)" } } } } } } })
+            }
+          }
+          if (scenario === "catalog-lookup-unknown-variant") {
+            // ToolCall{get_mcp_tools #44, unknown variant #99}: the decoder keeps only the lookup.
+            const lookup = encodeMessage("ToolCall", { get_mcp_tools_tool_call: { args: { server: "opencode", tool_name: "slack_read" } } })
+            const toolCall = [...lookup, 0x9a, 0x06, 0]
+            const callId = [0x0a, 6, ...Buffer.from("lookup")]
+            for (const field of [2, 3]) {
+              const update = [...callId, 0x12, toolCall.length, ...toolCall]
+              const iu = [(field << 3) | 2, update.length, ...update]
+              stream.write(frame(Uint8Array.from([0x0a, iu.length, ...iu])))
+            }
+          }
+          if (scenario === "catalog-lookup-reused-id") {
+            const fetch = { web_fetch_tool_call: { args: { url: "https://example.com" } } }
+            const lookup = { get_mcp_tools_tool_call: { args: { server: "opencode", tool_name: "slack_read" } } }
+            for (const toolCall of [fetch, lookup]) {
+              send({ interaction_update: { tool_call_started: { call_id: "reused", tool_call: toolCall } } })
+              send({ interaction_update: { tool_call_completed: { call_id: "reused", tool_call: toolCall } } })
             }
           }
           if (scenario === "cursor-run-completed" || scenario === "catalog-lookup-mismatch") {

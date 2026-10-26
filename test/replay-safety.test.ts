@@ -258,13 +258,41 @@ describe("display tool lifecycle", () => {
     earlier.recordToolLifecycle(analyze(3, "lookup").toolLifecycle)
     earlier.recordToolLifecycle(analyze(2, "fetch").toolLifecycle)
     earlier.recordToolLifecycle(analyze(3, "fetch").toolLifecycle)
+    earlier.noteCursorCall("fetch", false)
     earlier.forgetCatalogLookup("lookup")
+    expect(state.announcedCalls).toEqual(["lookup", "fetch"])
+    earlier.noteCursorCall("lookup", true)
+    earlier.forgetCatalogLookup("lookup")
+    earlier.forgetCatalogLookup("fetch")
     expect(state.announcedCalls).toEqual(["fetch"])
     expect(state.completedCalls).toEqual(["fetch"])
     expect(state.attempt!.announcedCalls).toEqual(["fetch"])
     expect(state.statefulBarrier).toBe("display-tool-lifecycle")
     // The other call Cursor ran itself still bars the rebuild.
     expect(announcedCallsClaimed(state)).toBe(false)
+  })
+
+  it("forgets an id only while Cursor has used it for nothing but lookups, across a resume", () => {
+    const state: ReplaySafetyState = {}
+    const first = new AttemptReplaySafety("run-1", state)
+    first.recordToolLifecycle(analyze(2, "lookup").toolLifecycle)
+    first.noteCursorCall("lookup", true)
+    first.forgetCatalogLookup("lookup")
+    // The resumed Run completes it bare.
+    const resumed = new AttemptReplaySafety("run-2", state)
+    resumed.recordToolLifecycle(analyze(3, "lookup").toolLifecycle)
+    resumed.forgetCatalogLookup("lookup")
+    expect(announcedCallsClaimed(state)).toBe(true)
+
+    const reused: ReplaySafetyState = {}
+    const run = new AttemptReplaySafety("run-1", reused)
+    run.recordToolLifecycle(analyze(2, "call").toolLifecycle)
+    run.noteCursorCall("call", false)
+    run.recordToolLifecycle(analyze(3, "call").toolLifecycle)
+    run.recordToolLifecycle(analyze(2, "call").toolLifecycle)
+    run.noteCursorCall("call", true)
+    run.forgetCatalogLookup("call")
+    expect(announcedCallsClaimed(reused)).toBe(false)
   })
 
   it("tells host execs from execs the provider answered, per attempt", () => {

@@ -946,10 +946,18 @@ export function promptIdentityWouldRemint(
   return false
 }
 
-/** A display call that is only Cursor's lookup in the MCP catalog the provider sent. */
-function isCatalogLookup(toolCall: Record<string, unknown>): boolean {
-  const variants = Object.keys(toolCall).filter((key) => key.endsWith("_tool_call") && toolCall[key] != null)
-  return variants.length === 1 && variants[0] === "get_mcp_tools_tool_call"
+/**
+ * Whether a lifecycle frame's `ToolCall` (`interaction_update` #1 → started #2 / completed #3 → `tool_call` #2) is,
+ * on the wire, only Cursor's lookup in the MCP catalog the provider sent: `get_mcp_tools_tool_call` #44 once, beside
+ * at most its `tool_call_id` #57. The decoder would drop a variant this client does not know.
+ */
+function catalogLookupOnWire(payload: Uint8Array, update: 2 | 3): boolean | undefined {
+  const toolCall = extractProtobufSubmessage(payload, [1, update, 2])
+  if (!toolCall) return undefined
+  const fields = listProtobufFieldNumbers(toolCall)
+  return fields.filter((field) => field === 44).length === 1
+    && fields.filter((field) => field === 57).length <= 1
+    && fields.every((field) => field === 44 || field === 57)
 }
 
 function noteRunImageCheckpoint(session: CursorSession, checkpoint: Uint8Array, frame: Frame): void {
@@ -6334,12 +6342,14 @@ export async function pump(
       const started = iu.tool_call_started as Record<string, unknown>
       const callId = typeof started.call_id === "string" ? started.call_id : ""
       const toolCall = started.tool_call as Record<string, unknown> | undefined
+      if (callId) {
+        replaySafety.noteCursorCall(callId, catalogLookupOnWire(payload, 2) === true)
+        replaySafety.forgetCatalogLookup(callId)
+      }
       if (callId && toolCall) {
-        const earlier = session.displayToolCalls.get(callId)
         session.displayToolCalls.set(callId, toolCall)
         const variant = Object.keys(toolCall).find((k) => k.endsWith("_tool_call")) ?? "?"
         const display = parseDisplayToolCall(callId, toolCall)
-        if (isCatalogLookup(toolCall) && (!earlier || isCatalogLookup(earlier))) replaySafety.forgetCatalogLookup(callId)
         const editPath = display?.variant === "edit_tool_call"
           && typeof display.args.path === "string"
           ? display.args.path
@@ -6375,10 +6385,10 @@ export async function pump(
     } else if (iu?.tool_call_completed) {
       const completed = iu.tool_call_completed as Record<string, unknown>
       const callId = typeof completed.call_id === "string" ? completed.call_id : ""
-      const startedAs = callId ? session.displayToolCalls.get(callId) : undefined
-      const completedAs = completed.tool_call as Record<string, unknown> | undefined
-      if (callId && (startedAs || completedAs) && (!startedAs || isCatalogLookup(startedAs))
-        && (!completedAs || isCatalogLookup(completedAs))) {
+      if (callId) {
+        // A completion without its ToolCall (as after a resume) is the call its id was started as.
+        const lookup = catalogLookupOnWire(payload, 3)
+        if (lookup !== undefined) replaySafety.noteCursorCall(callId, lookup)
         replaySafety.forgetCatalogLookup(callId)
       }
       // Only a call no exec has claimed completes here; Cursor also closes the
