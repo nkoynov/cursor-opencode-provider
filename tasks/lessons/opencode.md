@@ -219,8 +219,13 @@ These are failure lessons shared by both hosts, not a replacement for
   (`catalogCalls`); other calls Cursor runs itself still bar it. Judge the
   lookup from wire bytes, since the decoder drops a variant it does not know,
   and from every use of its call id in the Run, resumes included. A reply
-  that fails on a dead Run while the open step's host calls run ends the step
-  as a failed read does, so their results still reach a rebuilt Run.
+  that fails on a dead Run while the open step's host calls run leaves the
+  Run's end to the next read, so their results still reach a rebuilt Run;
+  closing the step on the write error itself skipped Cursor's final verdict.
+  The rebuild from a lost held Run's results was unconditional: it dropped a
+  final verdict queued unread behind the held step, a stateful or unknown frame
+  of the step, a call Cursor ran itself, and the Run's carried host notes
+  (`LostRun`, `heldRunLossRebuildable`).
   Failed drains must also project as terminal to both hosts, including
   during credential renewal and endless mode (`test/run-interruption.test.ts`).
   Endless mode bypasses counts only, preserving replay guards and CLI's 180 s

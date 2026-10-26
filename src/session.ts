@@ -465,6 +465,15 @@ type Tombstone = {
   expiresAt: number
 }
 
+export type LostRun = {
+  replaySafety?: ReplaySafetyState
+  userTurnHostNotes?: HostNoteBatch[]
+  closeError: CursorProviderError | null
+  /** Cursor's end-of-stream frame, which the held reader queues unread; it can carry a final verdict. */
+  endFrame?: Frame
+  expiresAt: number
+}
+
 type SessionManagerOptions = {
   now?: () => number
   setTimer?: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>
@@ -492,6 +501,8 @@ export class SessionManager {
   // of continuing the held-open one — the prior entry is stale and superseded.
   private byOpenCodeSessionId = new Map<string, CursorSession>()
   private tombstones = new Map<string, Tombstone>()
+  /** Fork: what a Run Cursor ended while host calls ran leaves for the rebuild from their results. */
+  private lostRuns = new Map<string, LostRun>()
   /** Early-row tool call id → the exec that bound it. Bounded like the tombstones. */
   private toolCallRoutes = new Map<string, { sessionId: string; execId: number }>()
   private readonly now: () => number
@@ -970,6 +981,22 @@ export class SessionManager {
     session.terminalUnsubscribe?.()
     session.terminalUnsubscribe = null
     session.deferredTerminalReason = null
+    if ((reason === "remote-error" || reason === "remote-clean-close" || reason === "reply-write-failed")
+      && session.pending.size > 0) {
+      this.lostRuns.delete(session.sessionId)
+      this.lostRuns.set(session.sessionId, {
+        replaySafety: session.replaySafety,
+        userTurnHostNotes: session.userTurnHostNotes,
+        closeError: session.closeError,
+        endFrame: session.heldFrames?.find((frame) => frame.flags & 0x02),
+        expiresAt: this.now() + this.tombstoneTtlMs,
+      })
+      while (this.lostRuns.size > this.tombstoneLimit) {
+        const oldest = this.lostRuns.keys().next().value as string | undefined
+        if (oldest === undefined) break
+        this.lostRuns.delete(oldest)
+      }
+    }
     for (const [id, pending] of session.pending) {
       const directory = pending.resultMetadata?.managed_job_directory
       if (typeof directory === "string") releaseUnstartedTerminal(directory)
@@ -1021,6 +1048,7 @@ export class SessionManager {
     for (const session of [...this.sessions]) this.close(session, "process-disposed")
     this.byExecId.clear()
     this.toolCallRoutes.clear()
+    this.lostRuns.clear()
   }
 
   sweepHardDeadlines(): void {
@@ -1124,6 +1152,15 @@ export class SessionManager {
     session.hardDeadlineTimer = timer
     const unref = (timer as unknown as { unref?: () => void }).unref
     if (typeof unref === "function") unref.call(timer)
+  }
+
+  lostRun(sessionId: string): LostRun | undefined {
+    const run = this.lostRuns.get(sessionId)
+    if (run && this.now() >= run.expiresAt) {
+      this.lostRuns.delete(sessionId)
+      return undefined
+    }
+    return run
   }
 
   private getTombstone(key: string): Tombstone | undefined {

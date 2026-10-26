@@ -291,6 +291,7 @@ import {
   stoppedWith,
   type CursorSession,
   type Frame,
+  type LostRun,
   type PendingExec,
 } from "./session.js"
 import {
@@ -378,6 +379,7 @@ import {
   announcedCallsClaimed,
   AttemptReplaySafety,
   describeFrameLayout,
+  heldRunLossRebuildable,
   hostExecs,
   type ReplayToolLifecycle,
 } from "./replay-safety.js"
@@ -1279,6 +1281,33 @@ async function doStreamImpl(
         `continuation: ${trailingToolResults.length} interrupted trailing tool result(s) [${ids}] ` +
           `heldRun=${describeHeldRunLoss(trailingToolResults)} — rebasing fresh Run`,
       )
+      const lostRuns = [...new Set(trailingToolResults.map((result) => result.sessionId))]
+        .flatMap((sessionId) => sessionManager.lostRun(sessionId) ?? [])
+      const endVerdict = (run: LostRun): CursorProviderError | undefined => {
+        if (!run.endFrame?.payload.length) return undefined
+        try {
+          return connectFrameError(new TextDecoder().decode(decodeFramePayload(run.endFrame)))
+        } catch {
+          return undefined
+        }
+      }
+      const finalVerdict = lostRuns.flatMap((run) => [run.closeError, endVerdict(run)])
+        .find((failure) => failure?.retryable === false)
+      if (finalVerdict) throw hostFacingError(finalVerdict, { modelId })
+      const unrebuildable = lostRuns.find((run) => !heldRunLossRebuildable(run.replaySafety))
+      if (unrebuildable) {
+        const why = unrebuildable.replaySafety?.attempt?.unrebuildable ?? "a call Cursor ran itself"
+        trace(`continuation: the lost Run cannot be rebuilt from host history (${why})`)
+        throw hostFacingError(retrySuppressedError(
+          new CursorRunInterruptedError(`Cursor Run ended while host tools ran, after ${why}`),
+          "with nothing history can hold for it",
+          retryBudget.retries + 1,
+          retryPolicy.maxAttempts ?? 14,
+        ), { modelId })
+      }
+      for (const run of lostRuns) {
+        if (sessionKey && run.userTurnHostNotes?.length) appendUndeliveredHostNotes(sessionKey, run.userTurnHostNotes)
+      }
       session = await openSession({ recovery: { kind: "rebase", ...(steeredPrompt ? { steer: true } : {}) } })
     } else {
       // Fresh turn (prompt ends with user/assistant text). Historical tool
@@ -7400,11 +7429,11 @@ export async function pump(
     }
     } catch (e) {
       if (e instanceof CursorProviderError) {
-        // A reply that fails on a dead Run ends it like a failed read: the step's host calls still run.
-        if (toolStep.hostCalls > 0 && e.origin !== "protocol" && e.origin !== "local-cancel"
-          && !session.hostInterrupted && !abortSignal?.aborted) {
-          closeHeldToolStepAtRunEnd("reply failed", e)
-          return
+        // A reply cut off with its Run leaves the Run's end to the next read, as if the reply had gone out:
+        // the step's host calls still run.
+        if (toolStep.hostCalls > 0 && e.origin === "transport" && !session.hostInterrupted && !abortSignal?.aborted) {
+          trace(`pump: reply failed while host calls run (${e.message}); reading the Run's end`)
+          continue
         }
         settleOpenEarlyRows()
         throw e

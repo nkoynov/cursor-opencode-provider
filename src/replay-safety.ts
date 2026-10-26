@@ -42,9 +42,19 @@ export type ReplaySafetyState = {
     announcedCalls?: string[]
     /** It handed work to the host or did something history cannot hold. */
     unrepresentable?: boolean
+    /** Fork: what it did that history cannot hold, apart from the host calls whose results history gets. */
+    unrebuildable?: string
     /** Text the host already shows from it. */
     shownText?: string
   }
+}
+
+/**
+ * Fork: whether a Run Cursor ended while the host still ran its calls can go on from host history once their
+ * results are in. Those calls are the interrupted pass's own; anything else it did must be history-representable.
+ */
+export function heldRunLossRebuildable(state: ReplaySafetyState | undefined): boolean {
+  return !state?.attempt?.unrebuildable && announcedCallsClaimed(state, state?.attempt?.announcedCalls)
 }
 
 /**
@@ -145,6 +155,7 @@ export class AttemptReplaySafety {
     if (typeof id !== "number" || !Number.isSafeInteger(id)
       || execs.some(exec => exec.sessionId === this.sessionId && exec.id === id)) {
       this.state.historyRebaseUnsafe = true
+      this.state.attempt!.unrebuildable ??= "repeated-exec-id"
       return
     }
     execs.push({ sessionId: this.sessionId, id, ...(callId ? { callId } : {}) })
@@ -154,7 +165,10 @@ export class AttemptReplaySafety {
   recordHostExec(id: number): void {
     const exec = this.state.execs?.find((entry) => entry.sessionId === this.sessionId && entry.id === id)
     if (exec) exec.host = true
-    else this.state.historyRebaseUnsafe = true
+    else {
+      this.state.historyRebaseUnsafe = true
+      this.state.attempt!.unrebuildable ??= "unrecorded-host-exec"
+    }
     this.state.attempt!.unrepresentable = true
   }
 
@@ -164,14 +178,17 @@ export class AttemptReplaySafety {
    */
   recordHostCall(id: number, callId?: string): void {
     const execs = this.state.execs ??= []
-    if (execs.some((exec) => exec.sessionId === this.sessionId && exec.id === id)) this.state.historyRebaseUnsafe = true
-    else execs.push({ sessionId: this.sessionId, id, ...(callId ? { callId } : {}), host: true })
+    if (execs.some((exec) => exec.sessionId === this.sessionId && exec.id === id)) {
+      this.state.historyRebaseUnsafe = true
+      this.state.attempt!.unrebuildable ??= "repeated-exec-id"
+    } else execs.push({ sessionId: this.sessionId, id, ...(callId ? { callId } : {}), host: true })
     this.state.attempt!.unrepresentable = true
   }
 
   /** Fork: the interrupted pass changed provider state that a history rebuild cannot carry. */
   recordUnrepresentable(why: string): void {
     this.state.attempt!.unrepresentable = true
+    this.state.attempt!.unrebuildable ??= why
     trace(`replay: attempt not rebuildable from history (${why}) sessionId=${this.sessionId}`)
   }
 
@@ -184,7 +201,10 @@ export class AttemptReplaySafety {
     if (!OUTPUT_ONLY_BARRIERS.has(reason)) {
       this.stateful = true
       this.state.statefulBarrier ??= reason
-      if (!historyRepresentable) this.state.historyRebaseUnsafe = true
+      if (!historyRepresentable) {
+        this.state.historyRebaseUnsafe = true
+        this.state.attempt!.unrebuildable ??= reason
+      }
       if (reason !== "non-control-exec" && reason !== "display-tool-lifecycle") this.state.attempt!.unrepresentable = true
     }
     if (this.barrierReason) return

@@ -829,8 +829,10 @@ describe("host calls still running when the Run dies", () => {
   ]
 
   /** `held`: a state-changing command ends its step at once. `open`: a read waits in its step for the next listed call. */
-  const setup = (step: "held" | "open", cut: "reset" | "clean-close" | "reply-write", key: string) => {
+  const setup = (step: "held" | "open", cut: "reset" | "clean-close" | "reply-write" | "final", key: string,
+    before?: "unknown-frame" | "cursor-run-call" | "catalog-lookup") => {
     const requests: RunRequest[] = []
+    let firstRun: http2.ServerHttp2Stream | undefined
     scripted = (stream, message) => {
       if (!message.run_request) return
       requests.push(message.run_request as RunRequest)
@@ -841,9 +843,18 @@ describe("host calls still running when the Run dies", () => {
         stream.end()
         return
       }
+      firstRun = stream
       const shell = (callId: string) => ({ shell_tool_call: { args: { command, tool_call_id: callId } } })
       send({ conversation_checkpoint_update: Uint8Array.of(10, 1, 7) })
       send({ interaction_update: { text_delta: { text: "Running it now." } } })
+      if (before === "unknown-frame") stream.write(frame(Uint8Array.of(0xa2, 0x06, 0)))
+      if (before === "cursor-run-call" || before === "catalog-lookup") {
+        const own = before === "catalog-lookup"
+          ? { get_mcp_tools_tool_call: { args: { server: "opencode", tool_name: "slack_read" } } }
+          : { web_fetch_tool_call: { args: { url: "https://example.com" } } }
+        send({ interaction_update: { tool_call_started: { call_id: "own", tool_call: own } } })
+        send({ interaction_update: { tool_call_completed: { call_id: "own", tool_call: own } } })
+      }
       if (step === "open") {
         send({ interaction_update: { tool_call_started: { call_id: "first", tool_call: { read_tool_call: { args: { path: "notes.txt" } } } } } })
       } else {
@@ -857,6 +868,7 @@ describe("host calls still running when the Run dies", () => {
       setTimeout(() => {
         if (cut === "reset") stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR)
         else if (cut === "clean-close") stream.end()
+        else if (cut === "final") stream.end(frame(Buffer.from('{"error":{"code":"permission_denied"}}'), 2))
         else send({ kv_server_message: { id: 5, set_blob_args: { blob_id: Uint8Array.of(5, 1, 2, 3), blob_data: Uint8Array.of(4, 5) } } })
       }, 50)
     }
@@ -889,6 +901,7 @@ describe("host calls still running when the Run dies", () => {
         const write = session.stream.write.bind(session.stream)
         session.stream.write = bytes => {
           if (decodeMessage<{ kv_client_message?: unknown }>("AgentClientMessage", bytes).kv_client_message) {
+            firstRun?.close(http2.constants.NGHTTP2_INTERNAL_ERROR)
             throw new CursorRunInterruptedError("Cursor Run stream is no longer writable")
           }
           return write(bytes)
@@ -922,11 +935,12 @@ describe("host calls still running when the Run dies", () => {
     prompt.push({ role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName, output }] })
   }
 
-  for (const [step, cut] of [
-    ["held", "reset"], ["held", "clean-close"], ["open", "reset"], ["open", "clean-close"], ["open", "reply-write"],
+  for (const [step, cut, before] of [
+    ["held", "reset", undefined], ["held", "clean-close", undefined], ["open", "reset", undefined],
+    ["open", "clean-close", undefined], ["open", "reply-write", undefined], ["held", "reset", "catalog-lookup"],
   ] as const) {
-    it(`ends the step on its running host call and rebuilds from its result (${step} step, ${cut})`, async () => {
-      const { requests, prompt, read, cleanup } = setup(step, cut, `ses_held_tool_cut_${step}_${cut}`)
+    it(`ends the step on its running host call and rebuilds from its result (${step} step, ${cut}${before ? `, ${before}` : ""})`, async () => {
+      const { requests, prompt, read, cleanup } = setup(step, cut, `ses_held_tool_cut_${step}_${cut}_${before}`, before)
       try {
         const first = await read()
         const calls = hostCalls(first)
@@ -947,6 +961,28 @@ describe("host calls still running when the Run dies", () => {
         const text = requests[1]!.action.user_message_action!.user_message.text
         expect(text.match(/ledger line written/g)).toHaveLength(1)
         expect(text.match(/Running it now\./g)).toHaveLength(1)
+      } finally {
+        await cleanup()
+      }
+    }, 30_000)
+  }
+
+  for (const [step, cut, before] of [
+    ["held", "reset", "unknown-frame"], ["held", "reset", "cursor-run-call"], ["open", "reply-write", "cursor-run-call"],
+    ["held", "final", undefined], ["open", "final", undefined],
+  ] as const) {
+    it(`ends the turn once the running call's result is in when the Run cannot be rebuilt (${step} step, ${cut}${before ? `, ${before}` : ""})`, async () => {
+      const { requests, prompt, read, cleanup } = setup(step, cut, `ses_held_tool_refuse_${step}_${cut}_${before}`, before)
+      try {
+        const calls = hostCalls(await read())
+        expect(calls).toHaveLength(1)
+        await Bun.sleep(100)
+        pushResult(prompt, calls[0]!, { type: "text", value: "ledger line written" })
+        const error = await read().catch((caught: unknown) => caught)
+        expect(APICallError.isInstance(error)).toBe(true)
+        expect(error).toMatchObject({ isRetryable: false, responseHeaders: { "x-should-retry": "false" } })
+        if (cut !== "final") expect((error as APICallError).message).toContain("continue")
+        expect(requests).toHaveLength(1)
       } finally {
         await cleanup()
       }
