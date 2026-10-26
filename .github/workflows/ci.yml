@@ -46,7 +46,8 @@ jobs:
       # On a push the tested commit is the one Codecov records. Pull requests
       # upload from the coverage job below.
       - name: Upload coverage to Codecov
-        if: github.event_name == 'push'
+        # Forks have no CODECOV_TOKEN, and a tokenless upload fails the job.
+        if: github.event_name == 'push' && github.repository == 'oakimov/cursor-opencode-provider'
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
