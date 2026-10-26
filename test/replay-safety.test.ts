@@ -82,6 +82,18 @@ describe("inline catalog recovery", () => {
     expect(announcedCallsClaimed(state)).toBe(false)
   })
 
+  it("does not let a rebuild leave out a catalog lookup the interrupted step started", () => {
+    const state: ReplaySafetyState = {}
+    const earlier = new AttemptReplaySafety("run", state)
+    earlier.recordExec(1, "shell")
+    const step = new AttemptReplaySafety("run", state)
+    step.recordToolLifecycle(analyze(false))
+    expect(state.attempt).toEqual({ announcedCalls: ["catalog"] })
+    expect(announcedCallsClaimed(state, state.attempt!.announcedCalls)).toBe(false)
+    step.recordToolLifecycle(analyze(true))
+    expect(announcedCallsClaimed(state, state.attempt!.announcedCalls)).toBe(true)
+  })
+
   it("requires the matching start and rejects duplicate starts", () => {
     const state: ReplaySafetyState = {}
     const safety = new AttemptReplaySafety("run", state)

@@ -50,7 +50,7 @@ export type ReplaySafetyState = {
 /**
  * Every display call Cursor announced must be represented by a host exec, a bridge to a host tool, or a
  * completed inline catalog lookup. `unfinished`: calls of the interrupted step that nothing ran, which a
- * rebuild may leave out.
+ * rebuild may leave out. A started catalog lookup is Cursor's own work, so only its validated completion counts.
  */
 export function announcedCallsClaimed(state: ReplaySafetyState | undefined, unfinished: readonly string[] = []): boolean {
   const bridged = new Set(state?.bridgedCalls)
@@ -59,7 +59,7 @@ export function announcedCallsClaimed(state: ReplaySafetyState | undefined, unfi
     ...bridged,
     ...state?.execs?.flatMap((exec) => exec.callId ? [exec.callId] : []) ?? [],
     ...Object.entries(state?.catalogCalls ?? {}).flatMap(([callId, stage]) => stage === "completed" ? [callId] : []),
-    ...unfinished.filter((callId) => !completed.has(callId)),
+    ...unfinished.filter((callId) => !completed.has(callId) && !state?.catalogCalls?.[callId]),
   ])
   return (state?.announcedCalls ?? []).every((callId) => claimed.has(callId))
     && (state?.completedCalls ?? []).every((callId) => bridged.has(callId))
