@@ -949,15 +949,22 @@ export function promptIdentityWouldRemint(
 /**
  * Whether a lifecycle frame's `ToolCall` (`interaction_update` #1 → started #2 / completed #3 → `tool_call` #2) is,
  * on the wire, only Cursor's lookup in the MCP catalog the provider sent: `get_mcp_tools_tool_call` #44 once, beside
- * at most its `tool_call_id` #57. The decoder would drop a variant this client does not know.
+ * at most its `tool_call_id` #57 and scalar fields (Cursor adds varint #59 and #60). Every tool variant is a message,
+ * and the decoder would drop one this client does not know.
  */
 function catalogLookupOnWire(payload: Uint8Array, update: 2 | 3): boolean | undefined {
   const toolCall = extractProtobufSubmessage(payload, [1, update, 2])
   if (!toolCall) return undefined
-  const fields = listProtobufFieldNumbers(toolCall)
-  return fields.filter((field) => field === 44).length === 1
-    && fields.filter((field) => field === 57).length <= 1
-    && fields.every((field) => field === 44 || field === 57)
+  const fields = readAllFieldsStrict(toolCall)
+  const lookup = !!fields
+    && fields.filter((field) => field.fn === 44 && field.wt === 2).length === 1
+    && fields.filter((field) => field.fn === 57).length <= 1
+    && fields.every((field) => field.wt !== 2 || field.fn === 44 || field.fn === 57)
+    && fields.every((field) => field.fn !== 44 || field.wt === 2)
+  if (!lookup && fields?.some((field) => field.fn === 44)) {
+    trace(`catalog lookup wire: not a lookup alone update=${update} fields=[${fields.map((field) => `${field.fn}:${field.wt}`).join(",")}]`)
+  }
+  return lookup
 }
 
 function noteRunImageCheckpoint(session: CursorSession, checkpoint: Uint8Array, frame: Frame): void {

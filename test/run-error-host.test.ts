@@ -33,6 +33,16 @@ let bareEof = false
 let scripted: ((stream: http2.ServerHttp2Stream, message: Record<string, unknown>) => void) | undefined
 const savedProxy: Record<string, string | undefined> = {}
 
+function varint(value: number): number[] {
+  const out: number[] = []
+  while (value > 0x7f) {
+    out.push((value & 0x7f) | 0x80)
+    value >>>= 7
+  }
+  out.push(value)
+  return out
+}
+
 function frame(payload: Uint8Array, flags = 0): Buffer {
   const header = Buffer.alloc(5)
   header[0] = flags
@@ -372,11 +382,19 @@ describe("checkpoint eligibility across host results", () => {
           if (scenario === "cursor-run-call") send({ interaction_update: { tool_call_started: { call_id: "cursor-internal" } } })
           // Cursor looks up an MCP tool in the catalog the provider sent, on its own side.
           if (scenario === "catalog-lookup" || scenario === "catalog-lookup-open") {
-            const lookup = { get_mcp_tools_tool_call: { args: { server: "opencode", tool_name: "slack_read" } } }
-            send({ interaction_update: { tool_call_started: { call_id: "lookup", tool_call: lookup } } })
+            // As Cursor sends them: the lookup, its tool_call_id #57 and varints #59 (and #60 on completion).
+            const args = { server: "opencode", tool_name: "slack_read" }
+            const lifecycle = (field: 2 | 3, toolCall: Record<string, unknown>, scalars: number[]) => {
+              const body = [...encodeMessage("ToolCall", { ...toolCall, tool_call_id: "lookup" }), ...scalars]
+              const callId = [0x0a, 6, ...Buffer.from("lookup")]
+              const update = [...callId, 0x12, ...varint(body.length), ...body]
+              const iu = [(field << 3) | 2, ...varint(update.length), ...update]
+              stream.write(frame(Uint8Array.from([0x0a, ...varint(iu.length), ...iu])))
+            }
+            lifecycle(2, { get_mcp_tools_tool_call: { args } }, [0xd8, 0x03, 0x01])
             if (scenario === "catalog-lookup") {
-              send({ interaction_update: { tool_call_completed: { call_id: "lookup", tool_call: { get_mcp_tools_tool_call: {
-                ...lookup.get_mcp_tools_tool_call, result: { success: { content: "slack_read(channel: string)" } } } } } } })
+              lifecycle(3, { get_mcp_tools_tool_call: { args, result: { success: { content: "slack_read(channel: string)" } } } },
+                [0xd8, 0x03, 0x01, 0xe0, 0x03, 0x02])
             }
           }
           if (scenario === "catalog-lookup-unknown-variant") {
