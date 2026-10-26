@@ -352,12 +352,11 @@ export type CursorSession = {
   runId?: string
   /**
    * A steer call's results went to this Run after its last checkpoint; resuming that checkpoint would
-   * drop them. A checkpoint may already be in flight when they are written, so only one read after
-   * Cursor completed every `awaiting` call is known to hold them. `unconfirmed` results have no such
-   * completion, and keep the Run from resuming at all. Results delivered later in the step join it;
+   * drop them. Cleared by the next checkpoint accepted, which `unacknowledgedHostResults` holds back
+   * until Cursor completed every written result. Results delivered later in the step join it;
    * `toolCallIds` are the OpenCode results a rebase must replay because no checkpoint holds them.
    */
-  resultsAfterCheckpoint?: { awaiting: Set<string>; unconfirmed: boolean; toolCallIds: Set<string> }
+  resultsAfterCheckpoint?: { toolCallIds: Set<string> }
   /** Monotonic synthetic exec ids for bridged (display-only) OpenCode tool calls. */
   nextBridgedExecId: number
   /** KV blob store: blob_id (hex) → data, for Cursor's out-of-band payload channel. */

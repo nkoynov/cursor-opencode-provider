@@ -429,11 +429,8 @@ describe("doStream with a mid-turn user message", () => {
     const results = execMessages(held.writes)
     expect(results.map((message) => message.id)).toEqual([1, 2])
     expect(results.map((message) => message.read_result.success.content)).toEqual(["alpha\nbeta", "alpha\nbeta"])
-    expect(held.resultsAfterCheckpoint).toEqual({
-      awaiting: new Set(["call_1", "call_2"]),
-      unconfirmed: false,
-      toolCallIds: new Set(["cursor_stream_1", "cursor_stream_2"]),
-    })
+    expect(held.resultsAfterCheckpoint).toEqual({ toolCallIds: new Set(["cursor_stream_1", "cursor_stream_2"]) })
+    expect(held.unacknowledgedHostResults?.map((result) => result.callId)).toEqual(["call_1", "call_2"])
     expect(JSON.stringify(messages)).not.toContain(FRESH_TURN_PENDING_CANCEL_REASON)
     expect(held.pending.size).toBe(0)
     expect(fetched).toEqual([])
@@ -610,11 +607,8 @@ describe("doStream with a mid-turn user message", () => {
 
     await streamSteer(held, steer("unconfirmed", user("also check 3.ts")))
 
-    expect(held.resultsAfterCheckpoint).toEqual({
-      awaiting: new Set(),
-      unconfirmed: true,
-      toolCallIds: new Set(["cursor_unconfirmed_1", "cursor_unconfirmed_2"]),
-    })
+    expect(held.resultsAfterCheckpoint).toEqual({ toolCallIds: new Set(["cursor_unconfirmed_1", "cursor_unconfirmed_2"]) })
+    expect(held.unacknowledgedHostResults?.map((result) => result.callId)).toEqual([undefined])
   })
 
   it("fails the turn instead of dropping a message it cannot send as a follow-up", async () => {
@@ -645,11 +639,14 @@ describe("doStream with a mid-turn user message", () => {
       const held = heldReads(sid, [3])
       setCheckpoint(held.conversationId, new Uint8Array([1]))
       held.resumeCheckpoint = new Uint8Array([1])
-      held.resultsAfterCheckpoint = { awaiting: new Set(), unconfirmed: false, toolCallIds: new Set([`cursor_${sid}_1`]) }
+      held.resultsAfterCheckpoint = { toolCallIds: new Set([`cursor_${sid}_1`]) }
       let written: unknown
       serve(held, [
         () => {
-          written = structuredClone(held.resultsAfterCheckpoint)
+          written = {
+            ...structuredClone(held.resultsAfterCheckpoint),
+            unacknowledged: held.unacknowledgedHostResults?.map((result) => result.callId),
+          }
           return completed("call_3")()
         },
         ...tail,
@@ -662,7 +659,7 @@ describe("doStream with a mid-turn user message", () => {
     }
 
     expect(outcomes["carried"]).toEqual({
-      written: { awaiting: new Set(["call_3"]), unconfirmed: false, toolCallIds: new Set(["cursor_carried_1", "cursor_carried_3"]) },
+      written: { toolCallIds: new Set(["cursor_carried_1", "cursor_carried_3"]), unacknowledged: ["call_3"] },
       checkpoint: undefined,
     })
     expect(outcomes["checkpointed"]).toMatchObject({ checkpoint: Uint8Array.from([7, 7]) })
@@ -827,7 +824,12 @@ describe("Run recovery around a mid-turn user message", () => {
     for (const [name, script, unconfirmed] of cases) {
       const held = heldSession(`stale-checkpoint-drop-${name}`)
       held.resumeCheckpoint = new Uint8Array([1])
-      held.resultsAfterCheckpoint = { awaiting: new Set(["call_1", "call_2"]), unconfirmed, toolCallIds: new Set(["cursor_a_1"]) }
+      held.resultsAfterCheckpoint = { toolCallIds: new Set(["cursor_a_1"]) }
+      const afterFrame = lastFrameArrival()
+      held.unacknowledgedHostResults = [
+        { callId: "call_1", afterFrame }, { callId: "call_2", afterFrame },
+        ...(unconfirmed ? [{ afterFrame }] : []),
+      ]
       if (name === "queued-before-result") held.resumeCheckpointAfterFrame = lastFrameArrival()
       serve(held, script)
       await pumpWithRecovery({

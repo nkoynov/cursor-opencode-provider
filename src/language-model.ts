@@ -1225,7 +1225,7 @@ async function doStreamImpl(
       ? await decodeTrailingToolImages(session, trailingToolResults, callOptions.abortSignal)
       : trailingToolResults
     const resultsAfterCheckpoint = steeredPrompt || session.resultsAfterCheckpoint
-      ? resultsAwaitingCheckpoint(session, results)
+      ? resultsWithoutCheckpoint(session, results)
       : undefined
     const held = session
     const cancelled = () => new CursorLocalCancellationError("Cursor continuation upload cancelled")
@@ -6151,8 +6151,7 @@ export async function pump(
         const accepted = !isPlanTurnEnding() && acceptResumeCheckpoint(session, bytes, frame)
         if (switchGuard && accepted) switchGuard.latestCheckpoint = Uint8Array.from(bytes)
         noteRunImageCheckpoint(session, bytes, frame)
-        const results = session.resultsAfterCheckpoint
-        if (accepted && results && !results.unconfirmed && results.awaiting.size === 0) session.resultsAfterCheckpoint = undefined
+        if (accepted) session.resultsAfterCheckpoint = undefined
         markEarlySteersCheckpointed(session.openCodeSessionId, session.sessionId)
         const tokenDetails = decodeConversationTokenDetails(bytes)
         if (tokenDetails && !(isPlanTurnEnding() && tokenDetails.usedTokens === 0
@@ -6455,7 +6454,6 @@ export async function pump(
       if (callId) session.editToolCalls?.delete(callId)
       if (callId) announcedCalls.delete(callId)
       if (callId) session.announcedCallIds?.delete(callId)
-      if (callId && !arrivedBeforeResultWrite(session, frame)) session.resultsAfterCheckpoint?.awaiting.delete(callId)
       if (callId) noteCursorWaitEnded(session, callId)
       noteToolCallFinished(order, callId)
       // If exec already claimed this call_id, display map entry is gone — skip.
@@ -7803,22 +7801,13 @@ function resultFinishesToolCall(session: CursorSession, pending: { resultField: 
   return !(pending.resultField === "read_result" && pending.displayCallId && session.editToolCalls?.has(pending.displayCallId))
 }
 
-/** Cursor completes an exec's tool call once it has the result; other replies have no such signal. */
-function resultsAwaitingCheckpoint(
+function resultsWithoutCheckpoint(
   session: CursorSession,
   results: readonly ExtractedToolResult[],
 ): NonNullable<CursorSession["resultsAfterCheckpoint"]> {
-  const awaiting = new Set(session.resultsAfterCheckpoint?.awaiting)
-  let unconfirmed = session.resultsAfterCheckpoint?.unconfirmed ?? false
   const toolCallIds = new Set(session.resultsAfterCheckpoint?.toolCallIds)
-  for (const result of results) {
-    toolCallIds.add(result.toolCallId)
-    const pending = result.sessionId === session.sessionId ? session.pending.get(result.execId) : undefined
-    if (!pending || pending.bridged || pending.aborted) continue
-    if (pending.displayCallId) awaiting.add(pending.displayCallId)
-    else unconfirmed = true
-  }
-  return { awaiting, unconfirmed, toolCallIds }
+  for (const result of results) toolCallIds.add(result.toolCallId)
+  return { toolCallIds }
 }
 
 /**
