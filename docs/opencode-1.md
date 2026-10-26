@@ -197,10 +197,17 @@ whose request upload is cut off is sent again.
 A rebuild too large for the model's context is reported as a context overflow
 (413) so the host can compact. Recovery retains the latest eligible checkpoint across token renewal, including
 a rejected credential on an untouched resumed attempt. Checkpoints received
-while a completed tool result drains remain eligible. Follow-ups retain
+while a completed tool result drains remain eligible only after Cursor acknowledges
+the matching tool completion. A late pre-result checkpoint cannot authorize replay.
+Question, mode-switch and plan replies use the same acknowledgement guard;
+display-only todo mirrors do not wait for a second completion. Terminal drains
+recognize matching completions too. Follow-ups retain
 checkpoints received while opening the new Run. Two resumed attempts that stream without saving a
 checkpoint end the turn.
 History recovery keeps completed results from earlier resumed Runs too.
+Completed inline catalog lookups do not block it; unfinished, spilled, malformed,
+and unknown server-side work still do. For recovery metadata without prompts or
+tool payloads, set `CURSOR_PROVIDER_RECOVERY_DEBUG=1` before starting the host.
 
 The provider shares Cursor CLI's limits of 10 transport retries and 3 server
 retries across this turn, including OpenCode's retries. OpenCode can stop earlier.

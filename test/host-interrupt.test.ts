@@ -500,7 +500,8 @@ describe("host interrupt (OpenCode 2 Stop)", () => {
 
       await expect(consumed).rejects.toBeInstanceOf(CursorLocalCancellationError)
       await until(() => session.closed)
-      expect([...session.resumeCheckpoint ?? []]).toEqual([9, 9, 9])
+      // Abort is not acknowledgement that the delivered result reached Cursor.
+      expect(session.resumeCheckpoint).toBeUndefined()
       expect(session.closed).toBe(true)
     } finally {
       globalThis.fetch = realFetch

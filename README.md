@@ -401,6 +401,7 @@ that stall window. The setting does not override OpenCode's own retry limits.
 | `NO_PROXY` / `no_proxy` | Comma/space hosts that bypass the proxy (`*`, exact host, or `.suffix` / `suffix` domain forms; a `host:port` entry bypasses only that port) |
 | `CURSOR_ENDLESS_RETRIES` | Set to `1` or `true` to bypass retry count limits; off by default. Safety cutoffs and host retry limits still apply. See [retry limits](#retry-limits). |
 | `CURSOR_PROVIDER_DEBUG` | Set to `1` or `true` to enable wire-level debug logging |
+| `CURSOR_PROVIDER_RECOVERY_DEBUG` | Set to `1` or `true` for recovery metadata only (session/call IDs, elapsed time, checkpoints, guard decisions). Uses the same log path and 10 MiB cap; leave full debug off to exclude payload traces. |
 | `CURSOR_PROVIDER_DEBUG_FILE` | Debug log path (default: `debug-<pid>.log` under `$TMPDIR/cursor-provider-logs-<uid>/`) |
 | `CURSOR_PROVIDER_DEBUG_MAX_BYTES` | Debug log size cap in bytes (default 10 MiB). At the cap the file moves to `<file>.1`, replacing an older one, and a fresh file starts; a value that isn't a positive whole number keeps the default |
 | `CURSOR_PROVIDER_TOOL_NICE` | **OpenCode 2.0, Linux and macOS.** Nice increment for the shells of tool calls (default 10, at most 19; `0` turns it off), so a busy test suite the agent runs can't starve the OpenCode server, which shares its cgroup. Also covers background jobs those shells start. Shell commands a user runs directly keep their priority, and OpenCode 1.x is unchanged. A value that isn't a whole number keeps the default |
@@ -547,6 +548,12 @@ Only calls that cannot change anything run together, as in Claude Code: reads, s
 The package root intentionally stays plugin-safe for OpenCode's classic loader. `CursorPluginV2` and non-plugin runtime APIs are **not** re-exported from the package root; load them through their dedicated subpaths.
 
 ## Troubleshooting
+
+For intermittent disconnects or laptop sleep/wake, enable `CURSOR_PROVIDER_RECOVERY_DEBUG=1` before starting the host. Set `CURSOR_PROVIDER_DEBUG_FILE` to a persistent file if the default temporary log is unsuitable. The file is mode 0600 and capped at 10 MiB. Search `recovery:` lines by `hostSessionId`: `interrupted` records the error code and checkpoint/barrier state; `history-check` explains acceptance or refusal; `reopened` links old and replacement Run IDs; `pump-complete` records progress (`closed=true pending=0` is terminal). `host-call-emitted` and `host-result-delivered` correlate dispatched calls and saved results. These IDs help investigate duplicates but do not by themselves prove two different model-generated calls have identical effects. Elapsed wall time includes suspension; it is not proof the OS slept. Correlate with the OS sleep log.
+
+Completed inline `get_mcp_tools` lookups are read-only and do not block rebuilding from completed host results. A lookup that is unfinished, spills to a file, has unknown fields, or has no matching start remains a barrier, as does other unrepresented server-side work.
+
+After sending a host tool result, recovery waits for its matching server-side tool completion before accepting another resume checkpoint. A delayed checkpoint generated before the result can otherwise arrive after the local write and repeat completed work. Without that acknowledgement, recovery rebuilds from saved tool results when safe, or stops. The `checkpoint-unacknowledged` diagnostic identifies this case. Question, mode-switch and plan replies use their interaction call IDs for this acknowledgement, including during terminal draining. Display-only todo mirrors have already completed on Cursor and do not wait for another completion.
 
 | Problem | What to try |
 |---------|-------------|

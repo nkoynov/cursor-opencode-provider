@@ -28,6 +28,8 @@ export type ReplaySafetyState = {
   execs?: Array<{ sessionId: string; id: number; callId?: string; host?: true }>
   /** Display calls Cursor announced; history holds one only through the host exec that claims it. */
   announcedCalls?: string[]
+  /** Only strict inline catalog lookups qualify; spilled catalogs remain barriers. */
+  catalogCalls?: Record<string, "started" | "completed">
   /** History cannot represent opaque interactions, unknown frames or unclaimed display work. */
   historyRebaseUnsafe?: boolean
   /** Fork: display calls the provider bridged to a host tool; the host result stands for each. */
@@ -46,8 +48,9 @@ export type ReplaySafetyState = {
 }
 
 /**
- * Whether a host exec or bridge claimed every display call Cursor announced, so history holds each one.
- * `unfinished`: calls of the interrupted step that nothing ran, which a rebuild may leave out.
+ * Every display call Cursor announced must be represented by a host exec, a bridge to a host tool, or a
+ * completed inline catalog lookup. `unfinished`: calls of the interrupted step that nothing ran, which a
+ * rebuild may leave out.
  */
 export function announcedCallsClaimed(state: ReplaySafetyState | undefined, unfinished: readonly string[] = []): boolean {
   const bridged = new Set(state?.bridgedCalls)
@@ -55,6 +58,7 @@ export function announcedCallsClaimed(state: ReplaySafetyState | undefined, unfi
   const claimed = new Set([
     ...bridged,
     ...state?.execs?.flatMap((exec) => exec.callId ? [exec.callId] : []) ?? [],
+    ...Object.entries(state?.catalogCalls ?? {}).flatMap(([callId, stage]) => stage === "completed" ? [callId] : []),
     ...unfinished.filter((callId) => !completed.has(callId)),
   ])
   return (state?.announcedCalls ?? []).every((callId) => claimed.has(callId))
@@ -85,10 +89,17 @@ export class AttemptReplaySafety {
   /**
    * A display lifecycle frame. A started call stays a stateful barrier but
    * blocks a history rebuild only until a host exec claims it; completion of a
-   * claimed call adds nothing history lacks. Calls Cursor runs itself, and
-   * frames without a call id, cannot be rebuilt.
+   * claimed call adds nothing history lacks. The sole server-side exception is
+   * a completed inline catalog lookup: it has no execution side effect. Other
+   * server-side calls and frames without a call id cannot be rebuilt.
    */
   recordToolLifecycle(lifecycle: ReplayToolLifecycle | undefined): void {
+    if (lifecycle?.catalog && lifecycle.kind === "completed"
+      && this.state.catalogCalls?.[lifecycle.callId] === "started") {
+      this.state.catalogCalls[lifecycle.callId] = "completed"
+      trace(`recovery: inline-catalog-completed callId=${lifecycle.callId} sessionId=${this.sessionId}`)
+      return
+    }
     const claimed = !!lifecycle && (!!this.state.execs?.some((exec) => exec.callId === lifecycle.callId)
       || !!this.state.bridgedCalls?.includes(lifecycle.callId))
     if (lifecycle?.kind === "completed" && claimed) {
@@ -96,6 +107,14 @@ export class AttemptReplaySafety {
       return
     }
     if (lifecycle?.kind === "started" && !claimed) {
+      if (this.state.catalogCalls?.[lifecycle.callId]) {
+        this.mark("display-tool-lifecycle", false)
+        return
+      }
+      if (lifecycle.catalog) {
+        this.state.catalogCalls ??= Object.create(null) as Record<string, "started" | "completed">
+        this.state.catalogCalls[lifecycle.callId] = "started"
+      }
       const announced = this.state.announcedCalls ??= []
       if (!announced.includes(lifecycle.callId)) announced.push(lifecycle.callId)
       const attempt = this.state.attempt!.announcedCalls ??= []
@@ -193,7 +212,36 @@ export type DecodedReplayFrame = {
   interactionQuery?: Record<string, unknown>
 }
 
-export type ReplayToolLifecycle = { kind: "started" | "completed"; callId: string }
+export type ReplayToolLifecycle = { kind: "started" | "completed"; callId: string; catalog?: true }
+
+/** Validate the raw oneof and its nested fields; decoding alone drops unknown bytes. */
+function inlineCatalog(topLevel: StrictRawField | undefined, completed: boolean): boolean {
+  const update = nestedFields(topLevel, 1).find(field => field.fn === (completed ? 3 : 2))
+  const lifecycle = update?.bytes && readAllFieldsStrict(update.bytes)
+  const call = lifecycle && lifecycle.find(field => field.fn === 2)
+  const toolFields = call?.bytes && readAllFieldsStrict(call.bytes)
+  // Cursor CLI: tool_call_id #57, started_at_ms #59, completed_at_ms #60.
+  if (!toolFields || !optionalField(toolFields, 57, 2)
+    || !optionalField(toolFields, 59, 0) || !optionalField(toolFields, 60, 0)) return false
+  const variants = toolFields.filter(field => ![57, 59, 60].includes(field.fn))
+  if (variants.length !== 1 || variants[0]!.fn !== 44 || variants[0]!.wt !== 2) return false
+  const catalog = variants[0]!.bytes && readAllFieldsStrict(variants[0]!.bytes!)
+  if (!catalog || !catalog.every(field => [1, 2].includes(field.fn) && field.wt === 2)
+    || ![1, 2].every(field => optionalField(catalog, field, 2))) return false
+  const args = catalog.find(field => field.fn === 1)?.bytes
+  const fields = args && readAllFieldsStrict(args)
+  if (!fields || !fields.every(field => [1, 2, 3, 4].includes(field.fn) && field.wt === 2)
+    || ![1, 2, 3, 4].every(field => optionalField(fields, field, 2))) return false
+  const result = catalog.find(field => field.fn === 2)?.bytes
+  if (!completed) return result === undefined
+  const outcome = result && readAllFieldsStrict(result)
+  if (!outcome || outcome.length !== 1 || outcome[0]!.fn !== 1 || outcome[0]!.wt !== 2) return false
+  const success = outcome[0]!.bytes && readAllFieldsStrict(outcome[0]!.bytes!)
+  return !!success && success.every(field => [1, 2].includes(field.fn) && field.wt === 2)
+    && [1, 2].every(field => optionalField(success, field, 2))
+    && success.some(field => field.fn === 1)
+    && !success.some(field => field.fn === 2 && field.bytes?.length)
+}
 
 export type ReplayFrameAnalysis = {
   barrier?: ReplayBarrierReason
@@ -231,10 +279,13 @@ function nestedFields(topLevel: StrictRawField | undefined, field: number): Stri
 }
 
 function analyzeExecWire(topLevel: StrictRawField | undefined) {
-  const variants = nestedFields(topLevel, 2)
-    .filter((field) => ![1, 15, 19].includes(field.fn))
+  const fields = nestedFields(topLevel, 2)
+  // accept_hook_additional_contexts #55 is metadata, not an execution variant.
+  const metadataValid = optionalField(fields, 1, 0) && optionalField(fields, 15, 2)
+    && optionalField(fields, 19, 2) && optionalField(fields, 55, 0)
+  const variants = fields.filter((field) => ![1, 15, 19, 55].includes(field.fn))
   const exactVariant = (field: number): boolean =>
-    variants.length === 1 && variants[0]!.fn === field && variants[0]!.wt === 2
+    metadataValid && variants.length === 1 && variants[0]!.fn === field && variants[0]!.wt === 2
   return {
     exactRequestContext: exactVariant(10),
     exactMcpState: exactVariant(36),
@@ -366,7 +417,9 @@ export function analyzeReplayFrame(
     return {
       barrier: "display-tool-lifecycle",
       ...(!malformed && typeof callId === "string" && callId.length > 0
-        ? { toolLifecycle: { kind: started ? "started" : "completed", callId } }
+        ? { toolLifecycle: { kind: started ? "started" : "completed", callId,
+          ...(inlineCatalog(topLevel, !!completed) ? { catalog: true as const } : {}),
+        } }
         : {}),
     }
   }

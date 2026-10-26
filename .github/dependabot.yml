@@ -1,0 +1,16 @@
+# Keep Dependabot config present for supply-chain checks.
+# open-pull-requests-limit: 0 disables version-update PRs; findings still
+# surface as Dependabot alerts (Security tab). Security-update PRs are
+# disabled separately via repository automated-security-fixes setting.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0

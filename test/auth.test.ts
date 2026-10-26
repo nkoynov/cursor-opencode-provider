@@ -140,8 +140,8 @@ describe("exchangeApiKey", () => {
       port: 0,
       fetch() {
         return Response.json({
-          accessToken: "access.jwt",
-          refreshToken: "refresh.jwt",
+          accessToken: "example-access-token",
+          refreshToken: "example-refresh-token",
         })
       },
     })
@@ -149,8 +149,8 @@ describe("exchangeApiKey", () => {
       "sk-test",
       `http://localhost:${server.port}`,
     )
-    expect(result.accessToken).toBe("access.jwt")
-    expect(result.refreshToken).toBe("refresh.jwt")
+    expect(result.accessToken).toBe("example-access-token")
+    expect(result.refreshToken).toBe("example-refresh-token")
   })
 
   // Classification mirrors Cursor CLI `loginWithApiKey`.
@@ -190,18 +190,18 @@ describe("refreshCursorSession", () => {
       port: 0,
       async fetch(req) {
         seen = { path: new URL(req.url).pathname, headers: req.headers, body: await req.json() }
-        return Response.json({ access_token: "new.session.jwt", id_token: "id.jwt", shouldLogout: false })
+        return Response.json({ access_token: "example-new-session-token", id_token: "id.jwt", shouldLogout: false })
       },
     })
-    const result = await refreshCursorSession("old.session.jwt", `http://localhost:${server.port}`)
-    expect(result).toEqual({ ok: true, accessToken: "new.session.jwt" })
+    const result = await refreshCursorSession("example-old-session-token", `http://localhost:${server.port}`)
+    expect(result).toEqual({ ok: true, accessToken: "example-new-session-token" })
     expect(seen?.path).toBe("/oauth/token")
     expect(seen?.headers.get("content-type")).toBe("application/json")
     expect(seen?.headers.get("x-cursor-client-type")).toBe("cli")
     expect(seen?.body).toEqual({
       grant_type: "refresh_token",
       client_id: CURSOR_OAUTH_CLIENT_ID,
-      refresh_token: "old.session.jwt",
+      refresh_token: "example-old-session-token",
     })
   })
 
@@ -300,8 +300,8 @@ describe("pollForTokens", () => {
       port: 0,
       fetch() {
         return Response.json({
-          accessToken: "access.jwt",
-          refreshToken: "refresh.jwt",
+          accessToken: "example-access-token",
+          refreshToken: "example-refresh-token",
         })
       },
     })
@@ -310,8 +310,8 @@ describe("pollForTokens", () => {
       "v",
       `http://localhost:${server.port}`,
     )
-    expect(result.accessToken).toBe("access.jwt")
-    expect(result.refreshToken).toBe("refresh.jwt")
+    expect(result.accessToken).toBe("example-access-token")
+    expect(result.refreshToken).toBe("example-refresh-token")
   })
 
   it("throws AuthPollError after 3 consecutive errors", async () => {
@@ -345,8 +345,8 @@ describe("pollForTokens", () => {
         callCount++
         if (callCount < 4) return new Response("Not found", { status: 404 })
         return Response.json({
-          accessToken: "access.jwt",
-          refreshToken: "refresh.jwt",
+          accessToken: "example-access-token",
+          refreshToken: "example-refresh-token",
         })
       },
     })
@@ -355,7 +355,7 @@ describe("pollForTokens", () => {
       "v",
       `http://localhost:${server.port}`,
     )
-    expect(result.accessToken).toBe("access.jwt")
+    expect(result.accessToken).toBe("example-access-token")
   }, 10000)
 })
 

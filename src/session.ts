@@ -230,6 +230,8 @@ export type CursorSession = {
   checkpointRevokedByHostResult?: boolean
   /** Ignore queued checkpoints received before the latest message/result delivery. */
   resumeCheckpointAfterFrame?: number
+  /** Results sent locally but not yet acknowledged by a matching server completion. */
+  unacknowledgedHostResults?: Array<{ callId?: string; afterFrame: number }>
   /** Stateful replay barriers survive host tool-step boundaries on this Run. */
   replaySafety?: ReplaySafetyState
   /** A delivered plan result refused execution; terminate this Run without continuing. */

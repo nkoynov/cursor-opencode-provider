@@ -160,8 +160,8 @@ describe("credential renewal across module copies", () => {
     const stub = cursorStub(() => Response.json({ accessToken: keyJwt(3600), refreshToken: "unused" }))
     using _ = stub.server
     const [a, b] = await Promise.all([
-      renewalA.resolveApiKeyToken("crsr_shared_key", { baseUrl: stub.base }),
-      renewalB.resolveApiKeyToken("crsr_shared_key", { baseUrl: stub.base }),
+      renewalA.resolveApiKeyToken("crsr_sk", { baseUrl: stub.base }),
+      renewalB.resolveApiKeyToken("crsr_sk", { baseUrl: stub.base }),
     ])
     expect(b.accessToken).toBe(a.accessToken)
     expect(stub.paths).toEqual(["/auth/exchange_user_api_key"])

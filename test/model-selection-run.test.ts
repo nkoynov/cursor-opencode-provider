@@ -126,7 +126,7 @@ it.each(scenarios)("sends cached selection $context fast=$fast max=$max through 
     }] })
     await writeCache(directory, { models, fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION })
     cacheHttp2SessionForTests(origin, client)
-    const model = createCursor({ name: "cursor", accessToken: "test-token", cacheDir: directory, agentBaseURL: origin })
+    const model = createCursor({ name: "cursor", accessToken: "example-token", cacheDir: directory, agentBaseURL: origin })
       .languageModel("grok-4.7")
     const { picked, ...hints } = scenario.options
     const { stream } = await model.doStream({
@@ -180,7 +180,7 @@ for (const host of ["classic", "modern"] as const) {
       expect(settings?.[CURSOR_VARIANT_PARAMETERS_KEY]).toEqual(parameters("500k", fast))
       await writeCache(directory, { models, fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION })
       cacheHttp2SessionForTests(origin, client)
-      const model = createCursor({ name: "cursor", accessToken: "test-token", cacheDir: directory, agentBaseURL: origin })
+      const model = createCursor({ name: "cursor", accessToken: "example-token", cacheDir: directory, agentBaseURL: origin })
         .languageModel(host === "classic" ? id : modern.modelID)
       const { stream } = await model.doStream({
         prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],

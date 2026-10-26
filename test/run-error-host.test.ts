@@ -110,7 +110,7 @@ async function streamError(sessionKey: string): Promise<unknown> {
   cacheHttp2SessionForTests(ORIGIN, client)
   try {
     const model = createCursor({
-      name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root,
+      name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root,
       retry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 },
     })
       .languageModel("composer-2.5")
@@ -177,6 +177,7 @@ describe("checkpoint eligibility across host results", () => {
         const result = message.exec_client_message as { shell_stream?: { start?: unknown } } | undefined
         if (!checkpointSent && (checkpointAt === "final-drain" ? control?.stream_close?.id === 1 : result?.shell_stream?.start)) {
           checkpointSent = true
+          if (checkpointAt === "final-drain") send({ interaction_update: { tool_call_completed: { call_id: "command" } } })
           send({ conversation_checkpoint_update: checkpoint })
         }
         if (control?.stream_close?.id === 1) {
@@ -189,7 +190,7 @@ describe("checkpoint eligibility across host results", () => {
       cacheHttp2SessionForTests(ORIGIN, client)
       try {
         const key = `ses_checkpoint_${checkpointAt}`
-        const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root,
+        const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root,
           workspaceRoot: root, retry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
         const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Run the command" }] }]
         const options: LanguageModelV3CallOptions = { prompt, headers: { "x-opencode-session-id": key },
@@ -285,7 +286,7 @@ describe("checkpoint eligibility across host results", () => {
       }
       cacheHttp2SessionForTests(ORIGIN, client)
       try {
-        const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root,
+        const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root,
           workspaceRoot: root, retry: { baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
         const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Run both commands" }] }]
         const options: LanguageModelV3CallOptions = { prompt, headers: { "x-opencode-session-id": `ses_resume_owners_${nextId}_${incomplete}_${opaque}_${lateCompletion}` },
@@ -330,6 +331,7 @@ describe("checkpoint eligibility across host results", () => {
     "followup-before-result", "new-output", "final-error", "cursor-run-call", "unannounced-completion", "oversized",
     "malformed-completion", "repeated-completion-id", "announced-open",
     "next-call-announced", "provider-exec-after-result", "edit-in-progress", "interaction-after-result",
+    "inline-catalog", "spilled-catalog", "unfinished-catalog", "unacknowledged-checkpoint",
   ] as const) {
     it(`recovers a post-result drop only from represented completed work (${scenario})`, async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-result-history-"))
@@ -368,6 +370,17 @@ describe("checkpoint eligibility across host results", () => {
           if (scenario === "duplicate-exec") send({ exec_server_message: { id: 1, list_mcp_resources_exec_args: {} } })
           // A call Cursor runs itself: announced, never claimed by a host exec.
           if (scenario === "cursor-run-call") send({ interaction_update: { tool_call_started: { call_id: "cursor-internal" } } })
+          if (scenario === "inline-catalog" || scenario === "spilled-catalog" || scenario === "unfinished-catalog") {
+            const args = { server: "opencode", tool_name: "bash" }
+            send({ interaction_update: { tool_call_started: { call_id: "catalog", tool_call: {
+              get_mcp_tools_tool_call: { args },
+            } } } })
+            if (scenario !== "unfinished-catalog") send({ interaction_update: { tool_call_completed: { call_id: "catalog", tool_call: {
+              get_mcp_tools_tool_call: { args, result: { success: {
+                content: "bash: run a command", ...(scenario === "spilled-catalog" ? { output_file_path: "/catalog.json" } : {}),
+              } } },
+            } } } })
+          }
           started("first", "echo first")
           send({ exec_server_message: { id: 1, [shellVariant]: { command: "echo first", tool_call_id: "first" } } })
         } else if (message.exec_client_message) {
@@ -401,6 +414,8 @@ describe("checkpoint eligibility across host results", () => {
               send({ exec_server_message: { id: 3, list_mcp_resources_exec_args: {} } })
             }
             if (scenario === "interaction-after-result") send({ interaction_query: { id: 4, web_search_request_query: new Uint8Array() } })
+            // Arrival after a local write does not prove the checkpoint holds its result.
+            if (scenario === "unacknowledged-checkpoint") send({ conversation_checkpoint_update: Uint8Array.of(10, 1, 7) })
             if (scenario === "final-error") stream.end(frame(Buffer.from('{"error":{"code":"permission_denied"}}'), 2))
             else stream.end() // no checkpoint after either completed result
           }
@@ -408,7 +423,7 @@ describe("checkpoint eligibility across host results", () => {
       }
       cacheHttp2SessionForTests(ORIGIN, client)
       try {
-        const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN,
+        const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN,
           workspaceRoot: root, cacheDir: root, retry: { baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
         const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Run both commands" }] }]
         const options = { prompt, headers: { "x-opencode-session-id": `ses_result_history_${scenario}` },
@@ -436,7 +451,8 @@ describe("checkpoint eligibility across host results", () => {
         if (scenario === "missing-history") prompt.splice(1, 2)
         if (scenario === "complete" || scenario === "announced" || scenario === "announced-shell" || scenario === "announced-open"
           || scenario === "provider-answered-exec" || scenario === "new-output" || scenario === "next-call-announced"
-          || scenario === "provider-exec-after-result" || scenario === "edit-in-progress" || scenario === "interaction-after-result") {
+          || scenario === "provider-exec-after-result" || scenario === "edit-in-progress" || scenario === "interaction-after-result"
+          || scenario === "inline-catalog" || scenario === "unacknowledged-checkpoint") {
           const parts = await read()
           expect(parts.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
           expect(parts.some(part => part.type === "tool-call")).toBe(false)
@@ -628,7 +644,7 @@ describe("checkpoint eligibility across host results", () => {
     }
     cacheHttp2SessionForTests(ORIGIN, client)
     try {
-      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN,
+      const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN,
         workspaceRoot: root, cacheDir: root }).languageModel("composer-2.5")
       // A tool-less call would be a lifecycle helper, which never rebases.
       const headers = { "x-opencode-session-id": "ses_rebase_overflow" }
@@ -685,7 +701,10 @@ describe("checkpoint eligibility across host results", () => {
             if (!afterResult) send({ conversation_checkpoint_update: checkpoint })
           }
         } else if (message.exec_client_message) {
-          if (afterResult) send({ conversation_checkpoint_update: checkpoint })
+          if (afterResult) {
+            send({ interaction_update: { tool_call_completed: { call_id: "command" } } })
+            send({ conversation_checkpoint_update: checkpoint })
+          }
           send({ interaction_update: { thinking_delta: { text: "after the command" } } })
           stream.end(frame(Buffer.from('{"error":{"code":"unavailable"}}'), 2))
         }
@@ -697,7 +716,7 @@ describe("checkpoint eligibility across host results", () => {
           name: "cursor", agentBaseURL: ORIGIN, cacheDir: root,
           getAccessToken: async request => {
             if (request?.forceRefresh) renewals++
-            return renewals ? "renewed-test-token" : "test-token"
+            return renewals ? "renewed-test-token" : "example-token"
           },
           retry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 },
         }).languageModel("composer-2.5")
@@ -773,7 +792,7 @@ describe("follow-up checkpoint arrival", () => {
     try {
       const key = "ses_progress_early_checkpoint"
       const model = createCursor({
-        name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root, workspaceRoot: root,
+        name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root, workspaceRoot: root,
         retry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 },
       }).languageModel("composer-2.5")
       const { stream } = await model.doStream({
@@ -979,7 +998,7 @@ describe("retry limits across OpenCode calls", () => {
       const attempt = async () => {
         // Hosts may reload the SDK model between retries. State belongs to the turn.
         const model = createCursor({
-          name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root,
+          name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root,
           retry: { maxAttempts, baseDelayMs: 1, maxDelayMs: 1 },
         }).languageModel("composer-2.5")
         try {

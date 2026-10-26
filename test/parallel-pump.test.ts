@@ -2,10 +2,11 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import fs from "node:fs"
 import path from "node:path"
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider"
-import { deliverContinuationResults, pump, pumpWithRecovery, resetTurnStateForTests } from "../src/language-model.js"
+import { deliverContinuationResults, drainSessionUntilTurnEnded, pump, pumpWithRecovery, resetTurnStateForTests, settleRunSavesForTests } from "../src/language-model.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { OPENCODE_1_TOOL_DIALECT, OPENCODE_2_TOOL_DIALECT, toolsToDescriptors } from "../src/protocol/tools.js"
 import { sessionManager, type Frame } from "../src/session.js"
+import { setActiveCursorMode, resetActiveCursorModesForTests } from "../src/protocol/switch-mode.js"
 import { sessionFixture } from "./session-fixture.js"
 
 function frame(message: Record<string, unknown>): Frame {
@@ -95,6 +96,7 @@ describe("parallel tool-call pump", () => {
   afterEach(() => {
     sessionManager.dispose()
     resetTurnStateForTests()
+    resetActiveCursorModesForTests()
   })
 
   it("emits the calls before the count in one step and closes it at model output", async () => {
@@ -566,7 +568,7 @@ describe("parallel tool-call pump", () => {
   it("resumes a checkpoint received after a completed host tool result", async () => {
     const checkpoint = Uint8Array.of(10, 1, 2)
     const { session } = fixture([
-      shell(1), frame({ conversation_checkpoint_update: checkpoint }), text("after the result"),
+      shell(1), completed("call-1"), frame({ conversation_checkpoint_update: checkpoint }), text("after the result"),
     ])
     const first = collect()
     await pump(session, first.controller, ids)
@@ -585,6 +587,120 @@ describe("parallel tool-call pump", () => {
       },
     })
     expect(recoveries).toEqual([{ kind: "resume", conversationId: session.conversationId, checkpoint }])
+  })
+
+  const interactionAnswers = [
+    { name: "question", request: question("interaction-call"), output: JSON.stringify({ answers: [["Yes"]] }) },
+    { name: "plan_enter", request: mode("interaction-call"), output: "Approved" },
+    { name: "cursor_plan_stage", request: frame({ interaction_query: {
+      id: 44,
+      create_plan_request_query: encodeMessage("CreatePlanRequestQuery", {
+        args: { name: "Recovery", plan: "Inspect the checkpoint" }, tool_call_id: "interaction-call",
+      }),
+    } }), output: "Approved" },
+  ]
+  for (const dialect of [OPENCODE_1_TOOL_DIALECT, OPENCODE_2_TOOL_DIALECT]) {
+    it.each(interactionAnswers)("resumes after an acknowledged $name interaction answer", async ({ name, request, output }) => {
+      const checkpoint = Uint8Array.of(10, 1, 3)
+      const { session } = fixture([
+        request, completed("interaction-call"),
+        frame({ conversation_checkpoint_update: checkpoint }), text("after the answer"),
+      ])
+      const root = fs.mkdtempSync("/tmp/cursor-interaction-checkpoint-")
+      session.cacheDir = root
+      if (name === "cursor_plan_stage") {
+        session.openCodeSessionId = "ses_stage_checkpoint"
+        setActiveCursorMode(session.openCodeSessionId, "plan", { bridgedPlanEntered: true })
+      }
+      const tools = [{ name, description: "Host interaction" }, ...(name === "cursor_plan_stage" ? [{ name: "write" }] : [])]
+      session.toolCatalog = tools
+      session.toolDescriptors = toolsToDescriptors(tools, "opencode")
+      session.hostToolDialect = dialect
+      try {
+        const first = collect()
+        await pump(session, first.controller, ids)
+        const call = toolCalls(first.parts)[0]!
+        expect(call.toolName).toBe(name)
+        expect(await deliverContinuationResults(session, [{
+          toolCallId: call.toolCallId, sessionId: session.sessionId, execId: 900_000,
+          toolName: call.toolName, output,
+        }])).toBe(session)
+        const recoveries: unknown[] = []
+        await pumpWithRecovery({
+          initialSession: session, controller: collect().controller,
+          retryPolicy: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 },
+          recover: async recovery => {
+            recoveries.push(recovery)
+            return fixture([ended()]).session
+          },
+        })
+        expect(session.unacknowledgedHostResults).toEqual([])
+        expect(recoveries).toEqual([{ kind: "resume", conversationId: session.conversationId, checkpoint }])
+      } finally {
+        sessionManager.close(session, "ordinary-cleanup")
+        await settleRunSavesForTests()
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    })
+  }
+
+  it("does not await a second server completion for a display-only todo mirror", async () => {
+    const checkpoint = Uint8Array.of(10, 1, 5)
+    const call = { update_todos_tool_call: {
+      args: { todos: [{ id: "1", content: "Inspect checkpoint", status: 2 }] },
+      result: { success: { todos: [{ id: "1", content: "Inspect checkpoint", status: 2 }] } },
+    } }
+    const { session, writes } = fixture([
+      frame({ interaction_update: { tool_call_started: { call_id: "todos", tool_call: call } } }),
+      frame({ interaction_update: { tool_call_completed: { call_id: "todos", tool_call: call } } }),
+      frame({ conversation_checkpoint_update: checkpoint }), text("after todos"),
+    ])
+    const tools = [{ name: "todowrite", description: "Update todos" }]
+    session.toolCatalog = tools
+    session.toolDescriptors = toolsToDescriptors(tools, "opencode")
+    const first = collect()
+    await pump(session, first.controller, ids)
+    const emitted = toolCalls(first.parts)[0]!
+    expect(emitted.toolName).toBe("todowrite")
+    await deliverContinuationResults(session, [{
+      toolCallId: emitted.toolCallId, sessionId: session.sessionId, execId: 900_000,
+      toolName: emitted.toolName, output: "Updated todos",
+    }])
+    expect(writes).toHaveLength(0)
+    const recoveries: unknown[] = []
+    await pumpWithRecovery({ initialSession: session, controller: collect().controller,
+      retryPolicy: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 },
+      recover: async recovery => { recoveries.push(recovery); return fixture([ended()]).session },
+    })
+    expect(session.unacknowledgedHostResults?.length ?? 0).toBe(0)
+    expect(recoveries).toEqual([{ kind: "resume", conversationId: session.conversationId, checkpoint }])
+  })
+
+  it.each(["matching", "other-call", "malformed"] as const)("validates a %s completion while draining an abandoned Run", async completion => {
+    const checkpoint = Uint8Array.of(10, 1, 4)
+    const acknowledgement = completed(completion === "other-call" ? "unrelated" : "call-1")
+    if (completion === "malformed") {
+      // Unknown AgentServerMessage field #9 beside the lifecycle envelope.
+      acknowledgement.payload = Uint8Array.from([...acknowledgement.payload, 0x4a, 0])
+    }
+    const { session } = fixture([
+      shell(1), acknowledgement, frame({ conversation_checkpoint_update: checkpoint }), ended(),
+    ])
+    const first = collect()
+    await pump(session, first.controller, ids)
+    const call = toolCalls(first.parts)[0]!
+    await deliverContinuationResults(session, [{
+      toolCallId: call.toolCallId, sessionId: session.sessionId, execId: 1,
+      toolName: call.toolName, output: "command completed",
+    }])
+    expect(await drainSessionUntilTurnEnded(session)).toBe("turn-ended")
+    if (completion === "matching") {
+      expect(session.unacknowledgedHostResults).toEqual([])
+      expect(session.resumeCheckpoint).toEqual(checkpoint)
+    } else {
+      expect(session.unacknowledgedHostResults).toHaveLength(1)
+      expect(session.resumeCheckpoint).toBeUndefined()
+    }
   })
 
   it("retains a guard-timed-out iterator read for the continuation", async () => {

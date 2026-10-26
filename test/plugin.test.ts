@@ -1098,7 +1098,7 @@ describe("loadModels on cache miss", () => {
     legacyRefreshCalls = 0
     exchangeKeys = []
     sessionResponse = () => Response.json({ access_token: sessionJwt(0), id_token: "id", shouldLogout: false })
-    exchangeResponse = () => Response.json({ accessToken: fakeJwt(3600), refreshToken: "exchanged-refresh" })
+    exchangeResponse = () => Response.json({ accessToken: fakeJwt(3600), refreshToken: "example-refresh-token" })
     persisted = []
     persistAttempts = 0
     realFetch = globalThis.fetch
@@ -1339,7 +1339,7 @@ describe("loadModels on cache miss", () => {
     await writeAuth({
       type: "api",
       key: fakeJwt(3600),
-      metadata: { apiKey: "crsr_live" },
+      metadata: { apiKey: "crsr_l" },
     })
 
     const plugin = await CursorPlugin(pluginInput())
@@ -1356,7 +1356,7 @@ describe("loadModels on cache miss", () => {
     await writeAuth({
       type: "api",
       key: fakeJwt(-60),
-      metadata: { apiKey: "crsr_stored", refreshToken: "dead-refresh", note: "keep-me" },
+      metadata: { apiKey: "crsr_s", refreshToken: "example-refresh-token", note: "keep-me" },
     })
 
     const plugin = await CursorPlugin(pluginInput())
@@ -1364,32 +1364,32 @@ describe("loadModels on cache miss", () => {
     await plugin.config?.(config as never)
 
     expect(config.provider?.cursor?.models).toHaveProperty("fetched-model")
-    expect(exchangeKeys).toEqual(["crsr_stored"])
+    expect(exchangeKeys).toEqual(["crsr_s"])
     expect(persisted).toHaveLength(1)
     const saved = persisted[0] as { type: string; key: string; metadata: Record<string, string> }
     expect(saved.type).toBe("api")
     expect(isExpiringSoon(saved.key)).toBe(false)
-    expect(saved.metadata).toEqual({ apiKey: "crsr_stored", note: "keep-me" })
+    expect(saved.metadata).toEqual({ apiKey: "crsr_s", note: "keep-me" })
   })
 
   it("exchanges a raw api key the host stored as `key`", async () => {
-    await writeAuth({ type: "api", key: "crsr_raw-in-key" })
+    await writeAuth({ type: "api", key: "crsr_i" })
 
     const plugin = await CursorPlugin(pluginInput())
     const config: { provider?: Record<string, { models?: Record<string, unknown> }> } = {}
     await plugin.config?.(config as never)
 
     expect(config.provider?.cursor?.models).toHaveProperty("fetched-model")
-    expect(exchangeKeys).toEqual(["crsr_raw-in-key"])
+    expect(exchangeKeys).toEqual(["crsr_i"])
     expect(persisted).toHaveLength(1)
     const saved = persisted[0] as { key: string; metadata: Record<string, string> }
     expect(saved.key.startsWith("crsr_")).toBe(false)
-    expect(saved.metadata).toEqual({ apiKey: "crsr_raw-in-key" })
+    expect(saved.metadata).toEqual({ apiKey: "crsr_i" })
   })
 
   it("explains that an expired API-key login saved without the key needs a new sign-in", async () => {
     const expired = fakeJwt(-60)
-    const stored = { type: "api", key: expired, metadata: { refreshToken: "dead-refresh" } }
+    const stored = { type: "api", key: expired, metadata: { refreshToken: "example-refresh-token" } }
     await writeAuth(stored)
 
     const plugin = await CursorPlugin(pluginInput())
@@ -1404,7 +1404,7 @@ describe("loadModels on cache miss", () => {
 
   it("loader hands the provider a token function and no credential in options", async () => {
     const live = fakeJwt(3600)
-    const stored = { type: "api" as const, key: live, metadata: { apiKey: "crsr_stored" } }
+    const stored = { type: "api" as const, key: live, metadata: { apiKey: "crsr_s" } }
     await writeAuth(stored)
     const session = sessionJwt(DAY_S)
     const oauth = { type: "oauth" as const, access: session, refresh: session, expires: 0 }
@@ -1495,12 +1495,12 @@ describe("loadModels on cache miss", () => {
     const method = plugin.auth?.methods.find((m) => m.type === "api")
     if (!method || method.type !== "api" || !method.authorize) throw new Error("missing api method")
 
-    const result = await method.authorize({ apiKey: "crsr_login" })
+    const result = await method.authorize({ apiKey: "crsr_g" })
 
     expect(result.type).toBe("success")
     if (result.type !== "success") return
     expect(isExpiringSoon(result.key)).toBe(false)
-    expect(result.metadata).toEqual({ apiKey: "crsr_login" })
+    expect(result.metadata).toEqual({ apiKey: "crsr_g" })
   })
 
   it("loader skips discoverModels when config already wrote a fresh cache", async () => {

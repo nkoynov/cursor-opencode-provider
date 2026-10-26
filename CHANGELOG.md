@@ -2,8 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- Recovery-only diagnostics (`CURSOR_PROVIDER_RECOVERY_DEBUG=1`) record interruption, recovery decisions, and host-call/result IDs without logging prompt or tool payloads.
+
 ### Changed
 
+- Upstream #119 (5a7065b) and its follow-up f110bc1 merged: a completed inline catalog lookup (`get_mcp_tools`) whose raw fields validate counts as claimed in the fork's one claim gate, beside host execs and bridged rows, and a checkpoint is accepted only once Cursor has completed every call whose result the provider wrote, matched by call id or by the AskQuestion, SwitchMode or CreatePlan call id. The fork's own wait for those completions after a mid-step steer now uses the same record. The fork keeps rebuilding when nothing of the interrupted step ran on the host, counting bridged rows as claimed, and requiring a mirrored host call's result in history.
 - Upstream #118 (ebdd56b) merged: upstream's fix for shell approvals pending while another project's setup is disposed (c66eae6) plus its follow-up 29f20bf replace the fork's copy of the same fix (d8a7139). Permission refusals are now shared across setups and module copies (bounded at 512), so a decline received while a project's setup reloads keeps its type, and an event subscription that fails at startup no longer counts as a live observer
 - Upstream 0.8.5 (74a827e: #115 and #117) merged: upstream's shell exit status (wrapped commands exit with their real code, 124 after a hard timeout; host exit notices stay out of live stdout and on their own line in rebuilt history; a terminal record outside 0-255 fails closed) and early edit rows (Cursor's own outcome, deferred rows stay unfailed, a terminal Run fails open rows, a refused exec fails its row with the refusal reason, a binary write hands off to the image save tool, failure labels without reading the file) replace the fork's versions. The fork keeps failing rows a held tool step leaves open when its Run ends, leaving closed rows out of rebuilt transcripts, and counting a turn answered only by a closed early row as answered on a rebuild.
 - Upstream 0.8.4 (c63e9ff: #114 and a pricing refresh) merged: upstream's fix for #112 and #113 replaces the fork's (a host exec claims the display call Cursor announced, so a drop right after completed tool results rebuilds from history; a rebuild that cannot fit, or any other host-shaped 413 from opening the Run, reaches OpenCode unchanged so it compacts). The fork keeps counting a Cursor display call mirrored to a host tool, such as a todo update, as claimed, so a step of such rows can rebuild too.
@@ -66,6 +71,9 @@
 - A tool call that fails or is refused reaches the model as a failure also when the plugin has not marked the result: OpenCode sends the error as plain text holding `{"error":…,"content":[]}`, and the provider reads it, so the tool gets Cursor's own result (error, permission denied, or rejected with the user's reason) instead of a success. A refused Pi write or edit gets Cursor's rejected result
 - A message Cursor never checkpointed is also sent again when it was a steer Cursor did not take (sent as a follow-up Run) or a reply to a safety-filter stop, is dropped by a Stop during OpenCode's retry wait too, and is left out of a helper Run on the same session whose prompt does not hold it
 - An edit's early tool row does not open while an earlier call of the step is still on its way, so it shows no failed row next to the real call
+- Completed inline tool-catalog lookups no longer block recovery after saved host tool results. Incomplete, spilled, malformed, and unknown server-side work still blocks unsafe replay.
+- A delayed pre-result checkpoint cannot resume completed host work until Cursor acknowledges the matching result; local receipt order alone no longer authorizes checkpoint replay. Acknowledged question, mode-switch and plan replies, todo mirrors, and terminal drains retain usable recovery checkpoints.
+
 - OpenCode 2 shell approvals survive disposal of another project's plugin setup, avoiding a missing-wrapper spawn failure and a repeated approval prompt. Permission rejections retain their type across setup reloads, and failed event subscriptions do not prevent pending-wrapper cleanup. ([#118](https://github.com/oakimov/cursor-opencode-provider/pull/118), [@nkoynov](https://github.com/nkoynov))
 
 ## [0.8.5] - 2026-10-25

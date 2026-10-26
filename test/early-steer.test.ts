@@ -229,7 +229,7 @@ async function withModel(
   try {
     await body(createCursor({
       name: "cursor", agentBaseURL: ORIGIN, cacheDir: root,
-      ...(getAccessToken ? { getAccessToken } : { accessToken: "test-token" }),
+      ...(getAccessToken ? { getAccessToken } : { accessToken: "example-token" }),
       retry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 },
     }).languageModel("composer-2.5"), root)
   } finally {
@@ -354,7 +354,7 @@ describe("Greptile receipt matching regressions", () => {
           if (restart) {
             await coldMemory()
             cacheHttp2SessionForTests(ORIGIN, client)
-            model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir }).languageModel("composer-2.5")
+            model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir }).languageModel("composer-2.5")
           }
           onRun = (run, message) => { if (message.run_request) endTurn(run, "NEW_REQUEST_ANSWERED") }
           expect(textOf(await collect(model, [...step, assistant(answer), user(repeated)], sessionKey))).toBe("NEW_REQUEST_ANSWERED")
@@ -392,7 +392,7 @@ describe("Greptile receipt matching regressions", () => {
             if (restart) {
               await coldMemory()
               cacheHttp2SessionForTests(ORIGIN, client)
-              model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir }).languageModel("composer-2.5")
+              model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir }).languageModel("composer-2.5")
             }
             onRun = (run, message) => { if (message.run_request) endTurn(run, "ATTACHMENT_ANSWERED") }
             const result = await collect(model, [ask, assistant(answer), ...tail], sessionKey)
@@ -579,7 +579,7 @@ describe("a steer sent while Cursor waits inside a step", () => {
       expect(text).not.toContain(message.text)
     }, async () => {
       if (refuseToken) throw new Error("login expired")
-      return "test-token"
+      return "example-token"
     })
   }, 30_000)
 
@@ -690,7 +690,7 @@ describe("a steer sent while Cursor waits inside a step", () => {
       expect(request.conversation_state.length > 0 && userText(runs.at(-1)!).includes(message.text)).toBe(false)
     }, async () => {
       if (refuseToken) throw new Error("login expired")
-      return "test-token"
+      return "example-token"
     })
   }, 30_000)
 
@@ -743,7 +743,7 @@ describe("a steer sent while Cursor waits inside a step", () => {
       expect(Uint8Array.from(next.conversation_state)).toEqual(rebuilt)
     }, async () => {
       if (refuseToken) throw new Error("login expired")
-      return "test-token"
+      return "example-token"
     })
   }, 30_000)
 
@@ -1057,7 +1057,7 @@ describe("steer restart and mixed-message regressions", () => {
         expect(textOf(await collect(model, promoted, sessionKey))).toBe("")
         await coldMemory()
         cacheHttp2SessionForTests(ORIGIN, client)
-        const restarted = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir }).languageModel("composer-2.5")
+        const restarted = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir }).languageModel("composer-2.5")
         onRun = (run, next) => { if (next.run_request) endTurn(run, "NEW_ANSWER") }
         const nextText = identical ? message.text : "DISTINCT_NEW_REQUEST"
         expect(textOf(await collect(restarted, [...promoted, user(nextText)], sessionKey))).toBe("NEW_ANSWER")
@@ -1126,7 +1126,7 @@ describe("steer restart and mixed-message regressions", () => {
       await coldMemory()
       cacheHttp2SessionForTests(ORIGIN, client)
       const restarted = createCursor({
-        name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir,
+        name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir,
         retry: { maxAttempts: 1 },
       }).languageModel("composer-2.5")
       onRun = (run, next) => { if (next.run_request) endTurn(run, "REPEATED") }
@@ -1232,7 +1232,7 @@ describe("steer restart and mixed-message regressions", () => {
           cacheHttp2SessionForTests(ORIGIN, client)
           model = createCursor({
             name: "cursor", agentBaseURL: ORIGIN, cacheDir,
-            getAccessToken: async () => "test-token",
+            getAccessToken: async () => "example-token",
           }).languageModel("composer-2.5")
         }
         await collect(model, step, sessionKey)
@@ -1242,7 +1242,7 @@ describe("steer restart and mixed-message regressions", () => {
         expect(retryText).not.toContain(early.text)
       }, async () => {
         if (rejectRenewal) throw new Error("fixture credential renewal failed")
-        return "test-token"
+        return "example-token"
       })
     }, 30_000)
   }

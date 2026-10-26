@@ -115,7 +115,7 @@ const user = (text: string) => ({ role: "user", content: [{ type: "text", text }
 
 async function streamParts(root: string, options: Partial<LanguageModelV3CallOptions>): Promise<Array<{ type: string }>> {
   cacheHttp2SessionForTests(ORIGIN, client)
-  const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root })
+  const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root })
     .languageModel("composer-2.5")
   const { stream } = await model.doStream({
     headers: { "x-opencode-session-id": "ses_lifecycle_parent" },

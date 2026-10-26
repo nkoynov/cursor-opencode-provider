@@ -225,19 +225,19 @@ describe("resolveApiKeyToken", () => {
   it("exchanges once, caches, and never calls a refresh endpoint", async () => {
     const stub = cursorStub(() => Response.json({ accessToken: keyJwt(3600), refreshToken: "unused" }))
     using _ = stub.server
-    const a = await resolveApiKeyToken("crsr_cache", { baseUrl: stub.base })
-    const b = await resolveApiKeyToken("crsr_cache", { baseUrl: stub.base })
+    const a = await resolveApiKeyToken("crsr_ca", { baseUrl: stub.base })
+    const b = await resolveApiKeyToken("crsr_ca", { baseUrl: stub.base })
     expect(b.accessToken).toBe(a.accessToken)
     expect(stub.requests.map((r) => r.path)).toEqual(["/auth/exchange_user_api_key"])
-    expect(stub.requests[0]!.authorization).toBe("Bearer crsr_cache")
+    expect(stub.requests[0]!.authorization).toBe("Bearer crsr_ca")
   })
 
   it("re-exchanges the key when the cached JWT nears expiry", async () => {
     let n = 0
     const stub = cursorStub(() => Response.json({ accessToken: keyJwt(++n === 1 ? 120 : 3600), refreshToken: "unused" }))
     using _ = stub.server
-    const first = await resolveApiKeyToken("crsr_renew", { baseUrl: stub.base })
-    const second = await resolveApiKeyToken("crsr_renew", { baseUrl: stub.base })
+    const first = await resolveApiKeyToken("crsr_rn", { baseUrl: stub.base })
+    const second = await resolveApiKeyToken("crsr_rn", { baseUrl: stub.base })
     expect(second.accessToken).not.toBe(first.accessToken)
     expect(stub.requests.map((r) => r.path)).toEqual(["/auth/exchange_user_api_key", "/auth/exchange_user_api_key"])
   })
@@ -247,8 +247,8 @@ describe("resolveApiKeyToken", () => {
     const fresh = keyJwt(3600)
     const stub = cursorStub(() => Response.json({ accessToken: fresh, refreshToken: "unused" }))
     using _ = stub.server
-    expect((await resolveApiKeyToken("crsr_forced", { baseUrl: stub.base, seed: old, force: true })).accessToken).toBe(fresh)
-    expect((await resolveApiKeyToken("crsr_forced", { baseUrl: stub.base, seed: old })).accessToken).toBe(fresh)
+    expect((await resolveApiKeyToken("crsr_fo", { baseUrl: stub.base, seed: old, force: true })).accessToken).toBe(fresh)
+    expect((await resolveApiKeyToken("crsr_fo", { baseUrl: stub.base, seed: old })).accessToken).toBe(fresh)
     expect(stub.requests).toHaveLength(1)
   })
 
@@ -257,8 +257,8 @@ describe("resolveApiKeyToken", () => {
     const two = cursorStub(() => Response.json({ accessToken: keyJwt(3600), refreshToken: "x" }))
     using _a = one.server
     using _b = two.server
-    const a = await resolveApiKeyToken("crsr_shared", { baseUrl: one.base })
-    const b = await resolveApiKeyToken("crsr_shared", { baseUrl: two.base })
+    const a = await resolveApiKeyToken("crsr_sh", { baseUrl: one.base })
+    const b = await resolveApiKeyToken("crsr_sh", { baseUrl: two.base })
     expect(a.accessToken).not.toBe(b.accessToken)
     expect(one.requests).toHaveLength(1)
     expect(two.requests).toHaveLength(1)
@@ -268,9 +268,9 @@ describe("resolveApiKeyToken", () => {
     const stub = cursorStub(() => Response.json({ accessToken: keyJwt(3600), refreshToken: "x" }))
     using _ = stub.server
     const seed = keyJwt(3000)
-    expect(await resolveApiKeyToken("crsr_seed", { baseUrl: stub.base, seed })).toEqual({ accessToken: seed, renewed: false })
+    expect(await resolveApiKeyToken("crsr_sd", { baseUrl: stub.base, seed })).toEqual({ accessToken: seed, renewed: false })
     expect(stub.requests).toHaveLength(0)
-    const fromRaw = await resolveApiKeyToken("crsr_seed2", { baseUrl: stub.base, seed: "crsr_seed2" })
+    const fromRaw = await resolveApiKeyToken("crsr_s2", { baseUrl: stub.base, seed: "crsr_s2" })
     expect(fromRaw.accessToken.startsWith("crsr_")).toBe(false)
     expect(fromRaw.renewed).toBe(true)
   })
@@ -279,15 +279,15 @@ describe("resolveApiKeyToken", () => {
     const stub = cursorStub(() => new Response("no", { status: 401 }))
     using _ = stub.server
     const valid = keyJwt(200) // inside the five-minute renewal window, still usable
-    expect((await resolveApiKeyToken("crsr_revoked", { baseUrl: stub.base, seed: valid })).accessToken).toBe(valid)
-    expect((await resolveApiKeyToken("crsr_revoked", { baseUrl: stub.base, seed: valid })).accessToken).toBe(valid)
+    expect((await resolveApiKeyToken("crsr_rv", { baseUrl: stub.base, seed: valid })).accessToken).toBe(valid)
+    expect((await resolveApiKeyToken("crsr_rv", { baseUrl: stub.base, seed: valid })).accessToken).toBe(valid)
     expect(stub.requests).toHaveLength(1)
   })
 
   it("raises a clear error for a rejected key with no usable JWT", async () => {
     const stub = cursorStub(() => new Response("no", { status: 401 }))
     using _ = stub.server
-    const error = await resolveApiKeyToken("crsr_revoked2", { baseUrl: stub.base }).catch((e: unknown) => e)
+    const error = await resolveApiKeyToken("crsr_r2", { baseUrl: stub.base }).catch((e: unknown) => e)
     expect(error).toBeInstanceOf(CursorAuthError)
     expect((error as CursorAuthError).code).toBe("api_key_rejected")
     expect((error as CursorAuthError).statusCode).toBe(401)
@@ -296,7 +296,7 @@ describe("resolveApiKeyToken", () => {
   it("reports a sign-in policy block", async () => {
     const stub = cursorStub(() => Response.json({ error: "sign_in_policy_violation" }, { status: 403 }))
     using _ = stub.server
-    const error = await resolveApiKeyToken("crsr_blocked", { baseUrl: stub.base }).catch((e: unknown) => e)
+    const error = await resolveApiKeyToken("crsr_bl", { baseUrl: stub.base }).catch((e: unknown) => e)
     expect((error as CursorAuthError).code).toBe("sign_in_policy_violation")
   })
 
@@ -304,7 +304,7 @@ describe("resolveApiKeyToken", () => {
     const stub = cursorStub(() => new Response("down", { status: 503, statusText: "Service Unavailable" }))
     using _ = stub.server
     for (let i = 0; i < 2; i++) {
-      const error = await resolveApiKeyToken("crsr_down", { baseUrl: stub.base }).catch((e: unknown) => e)
+      const error = await resolveApiKeyToken("crsr_dn", { baseUrl: stub.base }).catch((e: unknown) => e)
       expect(error).toBeInstanceOf(CursorServerError)
       expect((error as CursorServerError).transient).toBe(true)
       // OpenCode's SessionRetry re-arms on these words in provider messages.
@@ -313,12 +313,12 @@ describe("resolveApiKeyToken", () => {
     expect(stub.requests).toHaveLength(1)
   })
 
-  it.each(["", "not-a-jwt", "crsr_returned_key", keyJwt(-60)])(
+  it.each(["", "not-a-jwt", "crsr_rk", keyJwt(-60)])(
     "rejects an unusable exchanged access token and backs off: %s", async (accessToken) => {
       const stub = cursorStub(() => Response.json({ accessToken, refreshToken: "unused" }))
       using _ = stub.server
       for (let attempt = 0; attempt < 2; attempt++) {
-        const error = await resolveApiKeyToken("crsr_invalid_result", { baseUrl: stub.base }).catch((e: unknown) => e)
+        const error = await resolveApiKeyToken("crsr_ir", { baseUrl: stub.base }).catch((e: unknown) => e)
         expect(error).toBeInstanceOf(CursorServerError)
         expect((error as CursorServerError).transient).toBe(true)
       }
@@ -332,9 +332,9 @@ describe("resolveApiKeyToken", () => {
       ? new Response("slow down", { status: 429 })
       : Response.json({ accessToken: keyJwt(3600), refreshToken: "x" }))
     using _ = stub.server
-    const first = await resolveApiKeyToken("crsr_limited", { baseUrl: stub.base }).catch((e: unknown) => e)
+    const first = await resolveApiKeyToken("crsr_lm", { baseUrl: stub.base }).catch((e: unknown) => e)
     expect(first).toBeInstanceOf(CursorServerError)
-    const retried = await resolveApiKeyToken("crsr_limited", { baseUrl: stub.base, force: true })
+    const retried = await resolveApiKeyToken("crsr_lm", { baseUrl: stub.base, force: true })
     expect(retried.accessToken.startsWith("crsr_")).toBe(false)
   })
 })
@@ -345,13 +345,13 @@ describe("resolveBearerToken", () => {
     const token = await resolveBearerToken({
       getAccessToken: async (request) => {
         calls.push(request)
-        return "host.jwt"
+        return "example-host-token"
       },
-      accessToken: "static.jwt",
-      apiKey: "crsr_unused",
+      accessToken: "example-static-token",
+      apiKey: "crsr_example",
       forceRefresh: true,
     })
-    expect(token).toBe("host.jwt")
+    expect(token).toBe("example-host-token")
     expect(calls).toEqual([{ forceRefresh: true }])
   })
 
@@ -368,13 +368,13 @@ describe("resolveBearerToken", () => {
     using _ = stub.server
     const exchanged = await resolveBearerToken({ apiKey: "crsr_y", baseUrl: stub.base })
     expect(exchanged.startsWith("crsr_")).toBe(false)
-    expect(await resolveBearerToken({ apiKey: "already.a.jwt", baseUrl: stub.base })).toBe("already.a.jwt")
+    expect(await resolveBearerToken({ apiKey: "example-already-token", baseUrl: stub.base })).toBe("example-already-token")
     expect(stub.requests).toHaveLength(1)
   })
 
   it("never sends a raw key as a Bearer token", async () => {
-    const asAccessToken = await resolveBearerToken({ accessToken: "crsr_raw" }).catch((e: unknown) => e)
-    const fromHost = await resolveBearerToken({ getAccessToken: async () => "crsr_raw" }).catch((e: unknown) => e)
+    const asAccessToken = await resolveBearerToken({ accessToken: "crsr_r" }).catch((e: unknown) => e)
+    const fromHost = await resolveBearerToken({ getAccessToken: async () => "crsr_r" }).catch((e: unknown) => e)
     expect(asAccessToken).toBeInstanceOf(CursorAuthError)
     expect(fromHost).toBeInstanceOf(CursorAuthError)
   })

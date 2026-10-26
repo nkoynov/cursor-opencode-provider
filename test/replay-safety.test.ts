@@ -34,6 +34,76 @@ const getBlob = lengthDelimited(2, Uint8Array.from(lengthDelimited(1, new TextEn
 const span = lengthDelimited(4, Uint8Array.from(lengthDelimited(1, new TextEncoder().encode("trace"))))
 const kv = { id: 7, get_blob_args: { blob_id: new TextEncoder().encode("blob") } }
 
+describe("inline catalog recovery", () => {
+  const analyze = (completed: boolean, extra: number[] = [], spill = false, toolExtra: number[] = []) => {
+    const args = lengthDelimited(1, new TextEncoder().encode("opencode"))
+    const success = [...lengthDelimited(1, new TextEncoder().encode("tools")),
+      ...(spill ? lengthDelimited(2, new TextEncoder().encode("/catalog.json")) : [])]
+    const catalog = [...lengthDelimited(1, Uint8Array.from(args)),
+      ...(completed ? lengthDelimited(2, Uint8Array.from(lengthDelimited(1, Uint8Array.from(success)))) : []), ...extra]
+    const frame = updateFrame(completed ? 3 : 2, [
+      ...lengthDelimited(1, new TextEncoder().encode("catalog")),
+      ...lengthDelimited(2, Uint8Array.from([
+        ...lengthDelimited(44, Uint8Array.from(catalog)),
+        ...lengthDelimited(57, new TextEncoder().encode("catalog")),
+        ...varint(59 << 3), 1,
+        ...(completed ? [...varint(60 << 3), 2] : []),
+        ...toolExtra,
+      ])),
+    ])
+    const decoded = decodeMessage<{ interaction_update: Record<string, unknown> }>("AgentServerMessage", frame)
+    return analyzeReplayFrame(frame, { interactionUpdate: decoded.interaction_update }).toolLifecycle
+  }
+
+  it("accounts for a completed read-only catalog but does not authorize a naked replay", () => {
+    const state: ReplaySafetyState = {}
+    const safety = new AttemptReplaySafety("run", state)
+    safety.recordToolLifecycle(analyze(false))
+    expect(announcedCallsClaimed(state)).toBe(false)
+    safety.recordToolLifecycle(analyze(true))
+    expect(state.historyRebaseUnsafe).toBeUndefined()
+    expect(announcedCallsClaimed(state)).toBe(true)
+    expect(safety.applyTo(new CursorTransportError("drop", { transient: true, replaySafe: true })).replaySafe).toBe(false)
+  })
+
+  it.each([
+    ["unknown field", lengthDelimited(90), false],
+    ["repeated args", lengthDelimited(1), false],
+    ["spilled result", [], true],
+  ] as const)("rejects a catalog completion with %s", (_name, extra, spill) => {
+    const state: ReplaySafetyState = {}
+    const safety = new AttemptReplaySafety("run", state)
+    safety.recordToolLifecycle(analyze(false))
+    const completion = analyze(true, [...extra], spill)
+    expect(completion?.catalog).toBeUndefined()
+    safety.recordToolLifecycle(completion)
+    // Fork: an unexec'd completion waits for a bridge in the claim gate; nothing bridges a catalog lookup.
+    expect(state.completedCalls).toEqual(["catalog"])
+    expect(announcedCallsClaimed(state)).toBe(false)
+  })
+
+  it("requires the matching start and rejects duplicate starts", () => {
+    const state: ReplaySafetyState = {}
+    const safety = new AttemptReplaySafety("run", state)
+    safety.recordToolLifecycle(analyze(true))
+    expect(state.catalogCalls).toBeUndefined()
+    expect(announcedCallsClaimed(state)).toBe(false)
+    const duplicate: ReplaySafetyState = {}
+    const other = new AttemptReplaySafety("run", duplicate)
+    other.recordToolLifecycle(analyze(false))
+    other.recordToolLifecycle(analyze(false))
+    other.recordToolLifecycle(analyze(true))
+    expect(duplicate.historyRebaseUnsafe).toBe(true)
+  })
+
+  it("does not discard mixed variants or malformed catalog metadata", () => {
+    for (const extra of [lengthDelimited(15), lengthDelimited(90), lengthDelimited(59),
+      [...varint(59 << 3), 3], lengthDelimited(57), [...varint(60 << 3), 3]]) {
+      expect(analyze(true, [], false, extra)?.catalog).toBeUndefined()
+    }
+  })
+})
+
 describe("replay frame analysis", () => {
   it("treats a KV request with its span context as a control frame", () => {
     expect(analyzeReplayFrame(kvFrame(id, getBlob, span), { kv })).toEqual({ barrier: undefined })
@@ -320,6 +390,22 @@ describe("display tool lifecycle", () => {
 })
 
 describe("frame layout", () => {
+  it("accepts known exec metadata without hiding unknown or malformed variants", () => {
+    for (const variant of [10, 36]) {
+      for (const [valid, extra] of [
+        [true, [...varint(55 << 3), 1]],
+        [false, lengthDelimited(55)],
+        [false, [...varint(55 << 3), 1, ...varint(55 << 3), 0]],
+        [false, [...varint(55 << 3), 1, ...lengthDelimited(90)]],
+      ] as const) {
+        const frame = Uint8Array.from(lengthDelimited(2, Uint8Array.from([
+          ...id, ...lengthDelimited(variant), ...extra,
+        ])))
+        const result = analyzeReplayFrame(frame, { exec: { id: 7 } })
+        expect(result.barrier).toBe(valid ? undefined : "non-control-exec")
+      }
+    }
+  })
   it("names field numbers and wire types without payload bytes", () => {
     const frame = updateFrame(16, [...varint(1 << 3), 5])
     expect(describeFrameLayout(frame)).toBe("1:2{16:2{1:0}}")

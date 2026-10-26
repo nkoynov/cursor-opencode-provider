@@ -471,8 +471,8 @@ describe("opencode2 integration", () => {
 
   test("an already-exchanged key credential is passed through unchanged", async () => {
     // Non-`crsr_` keys are treated as JWTs, so no network exchange is attempted.
-    const token = await accessTokenFromCredential({ type: "key", key: "already.a.jwt" })
-    expect(token).toBe("already.a.jwt")
+    const token = await accessTokenFromCredential({ type: "key", key: "example-already-token" })
+    expect(token).toBe("example-already-token")
   })
 
   test("a raw key credential is exchanged once and cached", async () => {
@@ -483,8 +483,8 @@ describe("opencode2 integration", () => {
       exchanges++
       return Response.json({ accessToken: exchanged, refreshToken: "unused" })
     }
-    const first = await withFetch(fetchStub, () => accessTokenFromCredential({ type: "key", key: "crsr_oc2" }))
-    const second = await withFetch(fetchStub, () => accessTokenFromCredential({ type: "key", key: "crsr_oc2" }))
+    const first = await withFetch(fetchStub, () => accessTokenFromCredential({ type: "key", key: "crsr_o2" }))
+    const second = await withFetch(fetchStub, () => accessTokenFromCredential({ type: "key", key: "crsr_o2" }))
     expect([first, second]).toEqual([exchanged, exchanged])
     expect(exchanges).toBe(1)
   })
@@ -1335,7 +1335,7 @@ describe("opencode2 setup", () => {
       active: async () => ({ type: "credential", id: "c", label: "Cursor" }),
       resolve: async () => {
         resolves++
-        return { type: "key", key: "already.a.jwt" }
+        return { type: "key", key: "example-already-token" }
       },
     }
     const cleanup = await setupPlugin(ctx)
@@ -1367,7 +1367,7 @@ describe("opencode2 setup", () => {
       package: CURSOR_AISDK_PACKAGE,
       sdk: fallback,
       options: {
-        apiKey: "stale.synthetic.token",
+        apiKey: "example-stale-token",
         getAccessToken: async () => { throw new Error("stale resolver used") },
         retry: { maxAttempts: 1 },
       },
@@ -1452,7 +1452,7 @@ describe("opencode2 setup", () => {
       activeCalls++
       return connected ? { type: "credential", id: "c1", label: "Cursor" } : undefined
     }
-    ctx.integration.connection.resolve = async () => ({ type: "key", key: "already.a.jwt" })
+    ctx.integration.connection.resolve = async () => ({ type: "key", key: "example-already-token" })
 
     await setupPlugin(ctx)
     await new Promise((r) => setTimeout(r, 10))

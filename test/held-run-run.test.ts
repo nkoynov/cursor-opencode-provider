@@ -106,7 +106,7 @@ const execHeartbeats = () => received.filter((message) => message.exec_client_co
 
 async function streamParts(root: string, prompt: LanguageModelV3Prompt): Promise<Array<Record<string, any>>> {
   cacheHttp2SessionForTests(ORIGIN, client)
-  const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root })
+  const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root })
     .languageModel("composer-2.5")
   const { stream } = await model.doStream({
     prompt,

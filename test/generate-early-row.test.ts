@@ -105,7 +105,7 @@ describe("doGenerate with an announced edit that never runs", () => {
       fs.writeFileSync(editPath, "one\n")
       cacheHttp2SessionForTests(ORIGIN, client)
       const model = createCursor({
-        name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root, workspaceRoot: root,
+        name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root, workspaceRoot: root,
       }).languageModel("composer-2.5")
       const result = await model.doGenerate({
         prompt: [{ role: "user", content: [{ type: "text", text: "Check notes.txt" }] }],

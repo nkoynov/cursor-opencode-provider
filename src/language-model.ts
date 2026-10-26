@@ -373,7 +373,14 @@ import {
   hostNoteText,
   wrapHostNotesForCursor,
 } from "./protocol/host-notes.js"
-import { analyzeReplayFrame, announcedCallsClaimed, AttemptReplaySafety, describeFrameLayout, hostExecs } from "./replay-safety.js"
+import {
+  analyzeReplayFrame,
+  announcedCallsClaimed,
+  AttemptReplaySafety,
+  describeFrameLayout,
+  hostExecs,
+  type ReplayToolLifecycle,
+} from "./replay-safety.js"
 import { noteCursorWaitEnded, noteCursorWaitStarted } from "./cursor-waits.js"
 import {
   deferToolExec,
@@ -976,6 +983,15 @@ function arrivedBeforeResultWrite(session: CursorSession, frame: Frame): boolean
 
 /** A queued checkpoint predating a delivered result still describes the old step. */
 function acceptResumeCheckpoint(session: CursorSession, bytes: Uint8Array, frame: Frame): boolean {
+  trace(`recovery: checkpoint hostSessionId=${session.openCodeSessionId} sessionId=${session.sessionId} ` +
+    `arrival=${frameArrival(frame)} after=${session.resumeCheckpointAfterFrame ?? 0} revoked=${!!session.checkpointRevoked}`)
+  // A pre-result checkpoint can arrive late over the network. Receipt order
+  // alone cannot prove it contains a result; wait for the server's completion.
+  if (session.unacknowledgedHostResults?.length) {
+    trace(`recovery: checkpoint-unacknowledged hostSessionId=${session.openCodeSessionId} sessionId=${session.sessionId} ` +
+      `results=${session.unacknowledgedHostResults.length}`)
+    return false
+  }
   if (arrivedBeforeResultWrite(session, frame)) return false
   session.resumeCheckpoint = Uint8Array.from(bytes)
   session.checkpointRevoked = false
@@ -984,6 +1000,16 @@ function acceptResumeCheckpoint(session: CursorSession, bytes: Uint8Array, frame
   session.sideEffectAfterCheckpoint = false
   session.resumeCheckpointAfterFrame = undefined
   return true
+}
+
+/** Both the normal pump and terminal drain consume result acknowledgements. */
+function acknowledgeHostResults(session: CursorSession, lifecycle: ReplayToolLifecycle | undefined, frame: Frame): void {
+  if (lifecycle?.kind !== "completed" || !session.unacknowledgedHostResults?.length) return
+  const arrived = frameArrival(frame)
+  session.unacknowledgedHostResults = session.unacknowledgedHostResults.filter(result =>
+    result.callId !== lifecycle.callId || (arrived !== undefined && arrived <= result.afterFrame))
+  trace(`recovery: host-result-completion hostSessionId=${session.openCodeSessionId} sessionId=${session.sessionId} ` +
+    `callId=${lifecycle.callId} unacknowledged=${session.unacknowledgedHostResults.length}`)
 }
 
 /** `resumeCheckpoint` is set only by a checkpoint this Run received and did not drop. */
@@ -1359,15 +1385,22 @@ async function doStreamImpl(
               retryBudget,
               canRebaseFromHistory: (failed) => {
                 const replay = failed.replaySafety
-                if (failed !== session || trailingToolResults.length === 0
-                  || !failed.checkpointRevokedByHostResult || failed.pending.size > 0
-                  || replay?.historyRebaseUnsafe || replay?.attempt?.unrepresentable
-                  || !announcedCallsClaimed(replay, replay?.attempt?.announcedCalls)) return false
                 const completed = new Set(extractToolResults(prompt)
                   .map(result => `${result.sessionId}:${result.execId}`))
                 const execs = hostExecs(replay)
-                if (!execs.length && !replay?.bridgedCalls?.length) return false
-                return execs.every(exec => completed.has(`${exec.sessionId}:${exec.id}`))
+                const reason = failed !== session ? "different-run"
+                  : trailingToolResults.length === 0 ? "no-tool-result-tail"
+                  : !failed.checkpointRevokedByHostResult ? "checkpoint-not-revoked-by-result"
+                  : failed.pending.size > 0 ? "pending-execs"
+                  : replay?.historyRebaseUnsafe ? "opaque-activity"
+                  : replay?.attempt?.unrepresentable ? "unrepresentable-attempt"
+                  : !announcedCallsClaimed(replay, replay?.attempt?.announcedCalls) ? "unaccounted-display-calls"
+                  : !execs.length && !replay?.bridgedCalls?.length ? "no-host-execs"
+                  : !execs.every(exec => completed.has(`${exec.sessionId}:${exec.id}`)) ? "missing-host-results"
+                  : "completed-tool-results"
+                trace(`recovery: history-check hostSessionId=${failed.openCodeSessionId} sessionId=${failed.sessionId} ` +
+                  `reason=${reason} execs=${execs.length} results=${completed.size} pending=${failed.pending.size}`)
+                return reason === "completed-tool-results"
               },
               recover: (recovery) => openSession({ recovery }),
               onSession: (next) => { activeSession = next },
@@ -1551,6 +1584,8 @@ export async function pumpWithRecovery(input: {
     let next: CursorSession
     try {
       next = await input.recover(recovery)
+      trace(`recovery: reopened hostSessionId=${pumpedSession.openCodeSessionId} previousSessionId=${pumpedSession.sessionId} ` +
+        `sessionId=${next.sessionId} kind=${recovery.kind} reason=${recovery.kind === "rebase" ? recovery.reason ?? "replay-safe" : "checkpoint"}`)
     } catch (error) {
       if (recovery.kind === "resume" && unackedNotes.length > 0 && pumpedSession.openCodeSessionId) {
         appendUndeliveredHostNotes(pumpedSession.openCodeSessionId, unackedNotes)
@@ -1570,6 +1605,7 @@ export async function pumpWithRecovery(input: {
         announcedCalls: pumpedSession.replaySafety?.announcedCalls?.slice(),
         bridgedCalls: pumpedSession.replaySafety?.bridgedCalls?.slice(),
         completedCalls: pumpedSession.replaySafety?.completedCalls?.slice(),
+        catalogCalls: pumpedSession.replaySafety?.catalogCalls && { ...pumpedSession.replaySafety.catalogCalls },
       }
       next.userTurnHostNotes = pumpedSession.userTurnHostNotes
       next.usageEstimate = { ...pumpedSession.usageEstimate }
@@ -1618,6 +1654,7 @@ export async function pumpWithRecovery(input: {
 
   for (let attempt = 0; ; attempt++) {
     const pumpedSession = session
+    const pumpStartedAt = Date.now()
     const pumpOwner = Symbol("cursor-pump")
     if (!openingFailure) sessionManager.beginPump(pumpedSession, pumpOwner)
     // OpenCode 1.x stops a turn by aborting the signal, before the AI SDK cancels
@@ -1656,6 +1693,8 @@ export async function pumpWithRecovery(input: {
       if (pumpedSession.closed && pumpedSession.pending.size === 0) {
         forgetRetryBudget(pumpedSession.openCodeSessionId, retryBudget)
       }
+      trace(`recovery: pump-complete hostSessionId=${pumpedSession.openCodeSessionId} sessionId=${pumpedSession.sessionId} ` +
+        `attempt=${attempt} elapsedMs=${Date.now() - pumpStartedAt} closed=${pumpedSession.closed} pending=${pumpedSession.pending.size}`)
       return session
     } catch (error) {
       // A cancelled Run's stream fails or ends on purpose; recovering would restart the stopped turn.
@@ -1668,6 +1707,10 @@ export async function pumpWithRecovery(input: {
         replaySafe: error instanceof CursorProviderError ? error.replaySafe : false,
         fallback: "Cursor Run interrupted",
       })
+      trace(`recovery: interrupted hostSessionId=${pumpedSession.openCodeSessionId} sessionId=${pumpedSession.sessionId} ` +
+        `attempt=${attempt} elapsedMs=${Date.now() - pumpStartedAt} code=${failure.code} transient=${failure.transient} ` +
+        `replaySafe=${failure.replaySafe} barrier=${failure.replayBarrier ?? "none"} ` +
+        `checkpoint=${!!pumpedSession.resumeCheckpoint} revoked=${!!pumpedSession.checkpointRevoked} pending=${pumpedSession.pending.size}`)
       // A renewable credential error may follow a checkpoint too. Retain it
       // before either recovery path so a later attempt can still resume it.
       const ownCheckpoint = resumableCheckpoint(pumpedSession)
@@ -1738,6 +1781,7 @@ export async function pumpWithRecovery(input: {
           retryBudget.hostRetryPending = true
           throw hostRetryError(failure)
         }
+        trace(`recovery: suppressed hostSessionId=${pumpedSession.openCodeSessionId} sessionId=${pumpedSession.sessionId}`)
         throw retrySuppressedError(
           failure,
           "after visible output or stateful server activity",
@@ -3657,6 +3701,9 @@ export async function drainSessionUntilTurnEnded(
       }
 
       const iu = asm.interaction_update as Record<string, unknown> | undefined
+      if (iu?.tool_call_completed) {
+        acknowledgeHostResults(session, analyzeReplayFrame(payload, { interactionUpdate: iu }).toolLifecycle, frame)
+      }
       const kv = asm.kv_server_message as Record<string, unknown> | undefined
       const esm = asm.exec_server_message as Record<string, unknown> | undefined
       const interactionQuery = asm.interaction_query as Record<string, unknown> | undefined
@@ -4248,6 +4295,20 @@ async function deliverContinuationResultsNow(
     // A host tool that ran after Cursor withdrew its exec still changed state the checkpoint before it lacks.
     if (outcome.framesWritten > 0 || pending.bridged || pending.aborted) {
       invalidateResumeCheckpoint(session, beforeResultWrite, true)
+      // A display-only mirror sends nothing to Cursor: its server completion
+      // already arrived before the host call. Only a real reply needs an ack.
+      if (outcome.framesWritten > 0) {
+        const exec = session.replaySafety?.execs?.find(exec => exec.sessionId === session.sessionId && exec.id === r.execId)
+        const metadata = pending.resultMetadata
+        const interactionCallId = pending.resultField === ASK_QUESTION_RESULT_FIELD ? metadata?.askQuestionToolCallId
+          : pending.resultField === SWITCH_MODE_RESULT_FIELD ? metadata?.switchModeToolCallId
+          : pending.resultField === CREATE_PLAN_RESULT_FIELD ? metadata?.createPlanToolCallId
+          : undefined
+        const callId = typeof interactionCallId === "string" && interactionCallId.length > 0
+          ? interactionCallId : pending.displayCallId ?? exec?.callId
+        const unacknowledged = session.unacknowledgedHostResults ??= []
+        unacknowledged.push({ callId, afterFrame: beforeResultWrite })
+      }
     }
     if (session.historyImages) noteHistoryImagesSent(session.historyImages, deliveredImageHashes, lastFrameArrival())
     if (deliveredSwitchMode) {
@@ -4301,6 +4362,7 @@ async function deliverContinuationResultsNow(
           : pending.resultField === CREATE_PLAN_RESULT_FIELD
             ? "create_plan answer"
             : "exec result"
+    trace(`recovery: host-result-delivered hostSessionId=${session.openCodeSessionId} sessionId=${session.sessionId} execId=${r.execId}`)
     trace(
       `continuation: wrote ${resultKind} execId=${r.execId} field=${pending.resultField} ` +
         `frames=${outcome.framesWritten} outLen=${r.output.length}`,
@@ -6042,8 +6104,10 @@ export async function pump(
         trace(`replay frame unknown: layout=${layout} bytes=${payload.length}`)
       }
     }
-    if (replayFrame.barrier === "display-tool-lifecycle") replaySafety.recordToolLifecycle(replayFrame.toolLifecycle)
-    else if (replayFrame.barrier) replaySafety.markBarrier(replayFrame.barrier)
+    if (replayFrame.barrier === "display-tool-lifecycle") {
+      replaySafety.recordToolLifecycle(replayFrame.toolLifecycle)
+      acknowledgeHostResults(session, replayFrame.toolLifecycle, frame)
+    } else if (replayFrame.barrier) replaySafety.markBarrier(replayFrame.barrier)
     // The provider answers some queries itself (a plan file, an image approval); resuming a checkpoint
     // from before one would repeat it, so only a later checkpoint is resumed.
     if (interactionQuery) {
@@ -6985,6 +7049,7 @@ export async function pump(
           }
           // tc.input is already a JSON string (LanguageModelV3ToolCall.input).
           trace(`exec: EMITTED tool-call toolCallId=${tc.toolCallId} toolName=${tc.toolName} inputLen=${tc.input.length}`)
+          trace(`recovery: host-call-emitted hostSessionId=${session.openCodeSessionId} sessionId=${session.sessionId} toolCallId=${tc.toolCallId}`)
           // Kept until now so an edit whose write the provider refused still shows Cursor's failure.
           if (parsed.resultField === "write_result" && displayCallId) session.editToolCalls?.delete(displayCallId)
           settleOpenEarlyRows(true)

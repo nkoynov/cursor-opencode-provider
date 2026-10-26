@@ -141,7 +141,7 @@ it.each([false, true])("keeps measured occupancy on a zero-token checkpoint (res
     const models = mapAvailableModelsResponse({ models: [{ name: "occupancy-fixture" }] })
     await writeCache(directory, { models, fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION })
     cacheHttp2SessionForTests(origin, client)
-    const model = createCursor({ name: "cursor", accessToken: "test-token", cacheDir: directory, agentBaseURL: origin })
+    const model = createCursor({ name: "cursor", accessToken: "example-token", cacheDir: directory, agentBaseURL: origin })
       .languageModel("occupancy-fixture")
 
     scripts.push(

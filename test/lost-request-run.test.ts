@@ -103,7 +103,7 @@ const partial = { role: "assistant", content: [{ type: "text", text: PARTIAL }] 
 
 async function failedTurn(root: string, sessionKey: string, prompt: LanguageModelV3Prompt): Promise<void> {
   cacheHttp2SessionForTests(ORIGIN, client)
-  const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root })
+  const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root })
     .languageModel("composer-2.5")
   try {
     const { stream } = await model.doStream({

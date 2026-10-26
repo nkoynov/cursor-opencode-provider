@@ -4,6 +4,7 @@ import path from "node:path"
 import { processShared } from "./process-shared.js"
 
 // Wire-level diagnostics. Opt in with CURSOR_PROVIDER_DEBUG=1 (or "true").
+// CURSOR_PROVIDER_RECOVERY_DEBUG=1 keeps only recovery metadata, without payload traces.
 // Default path mirrors Cursor CLI: $TMPDIR/cursor-provider-logs-<uid>/debug-<pid>.log
 // with directory mode 0o700 and file mode 0o600. Override with CURSOR_PROVIDER_DEBUG_FILE.
 // First init in a fresh file writes a header; later inits (module reload / second
@@ -17,6 +18,7 @@ import { processShared } from "./process-shared.js"
 const DEBUG_ENABLED =
   process.env.CURSOR_PROVIDER_DEBUG === "1" ||
   process.env.CURSOR_PROVIDER_DEBUG === "true"
+const RECOVERY_DEBUG_ENABLED = ["1", "true"].includes(process.env.CURSOR_PROVIDER_RECOVERY_DEBUG ?? "")
 
 /** Default soft cap for the debug log file; reaching it rotates the file to `<file>.1`. */
 export const DEBUG_LOG_MAX_BYTES = 10 * 1024 * 1024
@@ -155,7 +157,7 @@ export function rotateDebugLogIfOversized(
 }
 
 export function trace(msg: string): void {
-  if (!DEBUG_ENABLED) return
+  if (!DEBUG_ENABLED && !(RECOVERY_DEBUG_ENABLED && msg.startsWith("recovery:"))) return
   try {
     if (!_debugFile) {
       _debugFileUsesManagedDirectory = !process.env.CURSOR_PROVIDER_DEBUG_FILE

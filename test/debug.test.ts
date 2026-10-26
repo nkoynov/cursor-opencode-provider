@@ -18,6 +18,25 @@ afterEach(() => {
 })
 
 describe("debug log paths / modes (F9)", () => {
+  it("logs recovery metadata without enabling payload traces", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-recovery-log-"))
+    const file = path.join(root, "recovery.log")
+    try {
+      const child = Bun.spawn([process.execPath, "-e", `
+        import { trace } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/debug.ts"))};
+        trace("wire payload must not appear");
+        trace("recovery: interrupted sessionId=test pending=0");
+      `], { env: { ...process.env, CURSOR_PROVIDER_DEBUG: "0", CURSOR_PROVIDER_RECOVERY_DEBUG: "1", CURSOR_PROVIDER_DEBUG_FILE: file },
+        stdout: "ignore", stderr: "pipe" })
+      expect(await child.exited).toBe(0)
+      const log = fs.readFileSync(file, "utf8")
+      expect(log).toContain("recovery: interrupted sessionId=test pending=0")
+      expect(log).not.toContain("wire payload")
+      expect(fs.statSync(file).mode & 0o777).toBe(0o600)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
   it("defaults under per-uid cursor-provider-logs dir", () => {
     delete process.env.CURSOR_PROVIDER_DEBUG_FILE
     const uid = typeof process.getuid === "function" ? process.getuid() : process.pid

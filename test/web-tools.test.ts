@@ -51,7 +51,7 @@ describe("OpenCode-backed websearch tool", () => {
     const asks: unknown[] = []
     let requestUrl = ""
     let requestInit: RequestInit | undefined
-    process.env.EXA_API_KEY = "test-key"
+    process.env.EXA_API_KEY = "example-key"
     const result = await executeOpenCodeWebSearch(
       { query: "current release", numResults: 3, livecrawl: "preferred" },
       context(asks),

@@ -190,6 +190,12 @@ These are failure lessons shared by both hosts, not a replacement for
   checkpoint for that recovery. A later tool result must not erase an earlier
   uncheckpointed follow-up's barrier: that follow-up may be absent from the
   host prompt. Only a newer eligible checkpoint clears the revocation.
+  A result acknowledgement must use the owning channel's call id: interaction
+  replies have no host exec record. Display-only todo mirrors already completed
+  on the server and send no reply, so waiting for another completion blocks every
+  later checkpoint. Normal pumps and terminal drains must both consume validated
+  completions; otherwise the drain cannot confirm the checkpoint's history images
+  (`test/parallel-pump.test.ts`, acknowledged interaction answers and terminal drains).
   Capture result cutoffs at each actual serialized write, before its drain;
   after-drain timestamps rejected valid checkpoints, while a cutoff before the
   queue admitted checkpoints predating the completed result. Retain every
