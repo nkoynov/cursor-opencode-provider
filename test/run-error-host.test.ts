@@ -330,6 +330,7 @@ describe("checkpoint eligibility across host results", () => {
     "followup-before-result", "new-output", "final-error", "cursor-run-call", "unannounced-completion", "oversized",
     "malformed-completion", "repeated-completion-id", "announced-open",
     "next-call-announced", "provider-exec-after-result", "edit-in-progress", "interaction-after-result",
+    "catalog-lookup", "catalog-lookup-open", "cursor-run-completed", "catalog-lookup-mismatch",
   ] as const) {
     it(`recovers a post-result drop only from represented completed work (${scenario})`, async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-result-history-"))
@@ -368,6 +369,24 @@ describe("checkpoint eligibility across host results", () => {
           if (scenario === "duplicate-exec") send({ exec_server_message: { id: 1, list_mcp_resources_exec_args: {} } })
           // A call Cursor runs itself: announced, never claimed by a host exec.
           if (scenario === "cursor-run-call") send({ interaction_update: { tool_call_started: { call_id: "cursor-internal" } } })
+          // Cursor looks up an MCP tool in the catalog the provider sent, on its own side.
+          if (scenario === "catalog-lookup" || scenario === "catalog-lookup-open") {
+            const lookup = { get_mcp_tools_tool_call: { args: { server: "opencode", tool_name: "slack_read" } } }
+            send({ interaction_update: { tool_call_started: { call_id: "lookup", tool_call: lookup } } })
+            if (scenario === "catalog-lookup") {
+              send({ interaction_update: { tool_call_completed: { call_id: "lookup", tool_call: { get_mcp_tools_tool_call: {
+                ...lookup.get_mcp_tools_tool_call, result: { success: { content: "slack_read(channel: string)" } } } } } } })
+            }
+          }
+          if (scenario === "cursor-run-completed" || scenario === "catalog-lookup-mismatch") {
+            const fetch = { web_fetch_tool_call: { args: { url: "https://example.com" } } }
+            send({ interaction_update: { tool_call_started: { call_id: "fetch", tool_call: fetch } } })
+            // A completion naming another variant does not turn the fetch Cursor ran into a lookup.
+            const done = scenario === "catalog-lookup-mismatch"
+              ? { get_mcp_tools_tool_call: { args: { server: "opencode", tool_name: "slack_read" } } }
+              : fetch
+            send({ interaction_update: { tool_call_completed: { call_id: "fetch", tool_call: done } } })
+          }
           started("first", "echo first")
           send({ exec_server_message: { id: 1, [shellVariant]: { command: "echo first", tool_call_id: "first" } } })
         } else if (message.exec_client_message) {
@@ -436,7 +455,8 @@ describe("checkpoint eligibility across host results", () => {
         if (scenario === "missing-history") prompt.splice(1, 2)
         if (scenario === "complete" || scenario === "announced" || scenario === "announced-shell" || scenario === "announced-open"
           || scenario === "provider-answered-exec" || scenario === "new-output" || scenario === "next-call-announced"
-          || scenario === "provider-exec-after-result" || scenario === "edit-in-progress" || scenario === "interaction-after-result") {
+          || scenario === "provider-exec-after-result" || scenario === "edit-in-progress" || scenario === "interaction-after-result"
+          || scenario === "catalog-lookup" || scenario === "catalog-lookup-open") {
           const parts = await read()
           expect(parts.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
           expect(parts.some(part => part.type === "tool-call")).toBe(false)

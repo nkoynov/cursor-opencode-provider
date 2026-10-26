@@ -206,6 +206,12 @@ These are failure lessons shared by both hosts, not a replacement for
   answers anywhere in the Run (they were counted as execs owed a result) and the
   interrupted step's own output. Count only host execs, and judge the
   interrupted pass apart from the Run (`ReplaySafetyState.attempt`).
+  A `get_mcp_tools` lookup Cursor ran at the start of a Run blocked that
+  rebuild for the rest of the Run: a GOAWAY right after two read results ended
+  a 14-minute turn (2026-10-26). The lookup answers from the catalog the
+  provider sent, so it is dropped from the calls history must hold
+  (`forgetCatalogLookup`); other calls Cursor runs itself still bar it, as does
+  a lookup whose call id Cursor also announced or completed as another variant.
   Failed drains must also project as terminal to both hosts, including
   during credential renewal and endless mode (`test/run-interruption.test.ts`).
   Endless mode bypasses counts only, preserving replay guards and CLI's 180 s

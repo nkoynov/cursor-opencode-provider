@@ -113,6 +113,17 @@ export class AttemptReplaySafety {
     this.mark("display-tool-lifecycle", false)
   }
 
+  /**
+   * Fork: a catalog lookup Cursor completed itself (`get_mcp_tools`). Its answer is the MCP catalog the provider
+   * sent, which a rebuilt Run receives too, and it changed nothing, so history needs no record of it.
+   */
+  forgetCatalogLookup(callId: string): void {
+    const drop = (calls: string[] | undefined) => calls?.filter((id) => id !== callId)
+    this.state.announcedCalls = drop(this.state.announcedCalls)
+    this.state.completedCalls = drop(this.state.completedCalls)
+    this.state.attempt!.announcedCalls = drop(this.state.attempt!.announcedCalls)
+  }
+
   /** Fork: a display call handed to a host tool; its result in host history stands for the call. */
   claimBridgedCall(callId: string): void {
     const bridged = this.state.bridgedCalls ??= []

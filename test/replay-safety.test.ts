@@ -251,6 +251,22 @@ describe("display tool lifecycle", () => {
     expect(announcedCallsClaimed(fresh, fresh.attempt!.announcedCalls)).toBe(false)
   })
 
+  it("leaves a catalog lookup Cursor ran itself out of the calls history must hold", () => {
+    const state: ReplaySafetyState = {}
+    const earlier = new AttemptReplaySafety("run-1", state)
+    earlier.recordToolLifecycle(analyze(2, "lookup").toolLifecycle)
+    earlier.recordToolLifecycle(analyze(3, "lookup").toolLifecycle)
+    earlier.recordToolLifecycle(analyze(2, "fetch").toolLifecycle)
+    earlier.recordToolLifecycle(analyze(3, "fetch").toolLifecycle)
+    earlier.forgetCatalogLookup("lookup")
+    expect(state.announcedCalls).toEqual(["fetch"])
+    expect(state.completedCalls).toEqual(["fetch"])
+    expect(state.attempt!.announcedCalls).toEqual(["fetch"])
+    expect(state.statefulBarrier).toBe("display-tool-lifecycle")
+    // The other call Cursor ran itself still bars the rebuild.
+    expect(announcedCallsClaimed(state)).toBe(false)
+  })
+
   it("tells host execs from execs the provider answered, per attempt", () => {
     const state: ReplaySafetyState = {}
     const step = new AttemptReplaySafety("run-1", state)

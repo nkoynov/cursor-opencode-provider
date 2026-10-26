@@ -946,6 +946,12 @@ export function promptIdentityWouldRemint(
   return false
 }
 
+/** A display call that is only Cursor's lookup in the MCP catalog the provider sent. */
+function isCatalogLookup(toolCall: Record<string, unknown>): boolean {
+  const variants = Object.keys(toolCall).filter((key) => key.endsWith("_tool_call") && toolCall[key] != null)
+  return variants.length === 1 && variants[0] === "get_mcp_tools_tool_call"
+}
+
 function noteRunImageCheckpoint(session: CursorSession, checkpoint: Uint8Array, frame: Frame): void {
   if (!session.historyImages || !session.openCodeSessionId) return
   noteHistoryImageCheckpoint(
@@ -6329,9 +6335,11 @@ export async function pump(
       const callId = typeof started.call_id === "string" ? started.call_id : ""
       const toolCall = started.tool_call as Record<string, unknown> | undefined
       if (callId && toolCall) {
+        const earlier = session.displayToolCalls.get(callId)
         session.displayToolCalls.set(callId, toolCall)
         const variant = Object.keys(toolCall).find((k) => k.endsWith("_tool_call")) ?? "?"
         const display = parseDisplayToolCall(callId, toolCall)
+        if (isCatalogLookup(toolCall) && (!earlier || isCatalogLookup(earlier))) replaySafety.forgetCatalogLookup(callId)
         const editPath = display?.variant === "edit_tool_call"
           && typeof display.args.path === "string"
           ? display.args.path
@@ -6367,6 +6375,12 @@ export async function pump(
     } else if (iu?.tool_call_completed) {
       const completed = iu.tool_call_completed as Record<string, unknown>
       const callId = typeof completed.call_id === "string" ? completed.call_id : ""
+      const startedAs = callId ? session.displayToolCalls.get(callId) : undefined
+      const completedAs = completed.tool_call as Record<string, unknown> | undefined
+      if (callId && (startedAs || completedAs) && (!startedAs || isCatalogLookup(startedAs))
+        && (!completedAs || isCatalogLookup(completedAs))) {
+        replaySafety.forgetCatalogLookup(callId)
+      }
       // Only a call no exec has claimed completes here; Cursor also closes the
       // calls of the previous step once their results arrive.
       if (callId && session.displayToolCalls.has(callId)) toolStep.resolved.add(callId)
