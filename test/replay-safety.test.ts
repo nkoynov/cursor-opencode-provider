@@ -108,6 +108,23 @@ describe("inline catalog recovery", () => {
     expect(step.applyTo(new CursorTransportError("drop", { transient: true, replaySafe: true })).replayBarrier).toBe("stateful")
   })
 
+  it("keeps blocking a lookup completed without its ToolCall, as after a resume", () => {
+    const state: ReplaySafetyState = {}
+    new AttemptReplaySafety("run-1", state).recordToolLifecycle(analyze(false))
+    new AttemptReplaySafety("run-2", state).recordToolLifecycle({ kind: "completed", callId: "catalog" })
+    expect(announcedCallsClaimed(state)).toBe(false)
+  })
+
+  it("does not count a lookup under a call id Cursor first used for something else", () => {
+    const state: ReplaySafetyState = {}
+    const safety = new AttemptReplaySafety("run", state)
+    safety.recordToolLifecycle({ kind: "started", callId: "catalog" })
+    safety.recordToolLifecycle({ kind: "completed", callId: "catalog" })
+    safety.recordToolLifecycle(analyze(false))
+    safety.recordToolLifecycle(analyze(true))
+    expect(announcedCallsClaimed(state)).toBe(false)
+  })
+
   it("requires the matching start and rejects duplicate starts", () => {
     const state: ReplaySafetyState = {}
     const safety = new AttemptReplaySafety("run", state)

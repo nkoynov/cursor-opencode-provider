@@ -33,6 +33,16 @@ let bareEof = false
 let scripted: ((stream: http2.ServerHttp2Stream, message: Record<string, unknown>) => void) | undefined
 const savedProxy: Record<string, string | undefined> = {}
 
+function varint(value: number): number[] {
+  const out: number[] = []
+  while (value > 0x7f) {
+    out.push((value & 0x7f) | 0x80)
+    value >>>= 7
+  }
+  out.push(value)
+  return out
+}
+
 function frame(payload: Uint8Array, flags = 0): Buffer {
   const header = Buffer.alloc(5)
   header[0] = flags
@@ -332,6 +342,8 @@ describe("checkpoint eligibility across host results", () => {
     "malformed-completion", "repeated-completion-id", "announced-open",
     "next-call-announced", "provider-exec-after-result", "edit-in-progress", "interaction-after-result",
     "inline-catalog", "spilled-catalog", "unfinished-catalog", "unacknowledged-checkpoint",
+    "catalog-lookup", "catalog-lookup-open", "cursor-run-completed", "catalog-lookup-mismatch",
+    "catalog-lookup-unknown-variant", "catalog-lookup-reused-id",
   ] as const) {
     it(`recovers a post-result drop only from represented completed work (${scenario})`, async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-result-history-"))
@@ -380,6 +392,51 @@ describe("checkpoint eligibility across host results", () => {
                 content: "bash: run a command", ...(scenario === "spilled-catalog" ? { output_file_path: "/catalog.json" } : {}),
               } } },
             } } } })
+          }
+          // Cursor looks up an MCP tool in the catalog the provider sent, on its own side.
+          if (scenario === "catalog-lookup" || scenario === "catalog-lookup-open") {
+            // As Cursor sends them: the lookup, its tool_call_id #57 and varints #59 (and #60 on completion).
+            const args = { server: "opencode", tool_name: "slack_read" }
+            const lifecycle = (field: 2 | 3, toolCall: Record<string, unknown>, scalars: number[]) => {
+              const body = [...encodeMessage("ToolCall", { ...toolCall, tool_call_id: "lookup" }), ...scalars]
+              const callId = [0x0a, 6, ...Buffer.from("lookup")]
+              const update = [...callId, 0x12, ...varint(body.length), ...body]
+              const iu = [(field << 3) | 2, ...varint(update.length), ...update]
+              stream.write(frame(Uint8Array.from([0x0a, ...varint(iu.length), ...iu])))
+            }
+            lifecycle(2, { get_mcp_tools_tool_call: { args } }, [0xd8, 0x03, 0x01])
+            if (scenario === "catalog-lookup") {
+              lifecycle(3, { get_mcp_tools_tool_call: { args, result: { success: { content: "slack_read(channel: string)" } } } },
+                [0xd8, 0x03, 0x01, 0xe0, 0x03, 0x02])
+            }
+          }
+          if (scenario === "catalog-lookup-unknown-variant") {
+            // ToolCall{get_mcp_tools #44, unknown variant #99}: the decoder keeps only the lookup.
+            const lookup = encodeMessage("ToolCall", { get_mcp_tools_tool_call: { args: { server: "opencode", tool_name: "slack_read" } } })
+            const toolCall = [...lookup, 0x9a, 0x06, 0]
+            const callId = [0x0a, 6, ...Buffer.from("lookup")]
+            for (const field of [2, 3]) {
+              const update = [...callId, 0x12, toolCall.length, ...toolCall]
+              const iu = [(field << 3) | 2, update.length, ...update]
+              stream.write(frame(Uint8Array.from([0x0a, iu.length, ...iu])))
+            }
+          }
+          if (scenario === "catalog-lookup-reused-id") {
+            const fetch = { web_fetch_tool_call: { args: { url: "https://example.com" } } }
+            const lookup = { get_mcp_tools_tool_call: { args: { server: "opencode", tool_name: "slack_read" } } }
+            for (const toolCall of [fetch, lookup]) {
+              send({ interaction_update: { tool_call_started: { call_id: "reused", tool_call: toolCall } } })
+              send({ interaction_update: { tool_call_completed: { call_id: "reused", tool_call: toolCall } } })
+            }
+          }
+          if (scenario === "cursor-run-completed" || scenario === "catalog-lookup-mismatch") {
+            const fetch = { web_fetch_tool_call: { args: { url: "https://example.com" } } }
+            send({ interaction_update: { tool_call_started: { call_id: "fetch", tool_call: fetch } } })
+            // A completion naming another variant does not turn the fetch Cursor ran into a lookup.
+            const done = scenario === "catalog-lookup-mismatch"
+              ? { get_mcp_tools_tool_call: { args: { server: "opencode", tool_name: "slack_read" } } }
+              : fetch
+            send({ interaction_update: { tool_call_completed: { call_id: "fetch", tool_call: done } } })
           }
           started("first", "echo first")
           send({ exec_server_message: { id: 1, [shellVariant]: { command: "echo first", tool_call_id: "first" } } })
@@ -452,7 +509,7 @@ describe("checkpoint eligibility across host results", () => {
         if (scenario === "complete" || scenario === "announced" || scenario === "announced-shell" || scenario === "announced-open"
           || scenario === "provider-answered-exec" || scenario === "new-output" || scenario === "next-call-announced"
           || scenario === "provider-exec-after-result" || scenario === "edit-in-progress" || scenario === "interaction-after-result"
-          || scenario === "inline-catalog" || scenario === "unacknowledged-checkpoint") {
+          || scenario === "inline-catalog" || scenario === "unacknowledged-checkpoint" || scenario === "catalog-lookup") {
           const parts = await read()
           expect(parts.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
           expect(parts.some(part => part.type === "tool-call")).toBe(false)
