@@ -299,6 +299,8 @@ export type BidiStream = {
   waitForDrain?(): Promise<void>
   end(): void
   frames(): AsyncIterable<{ flags: number; payload: Uint8Array }>
+  /** Frames received that no reader has taken yet, removed from the stream; `destroy()` would discard them. */
+  takeBufferedFrames?(): Array<{ flags: number; payload: Uint8Array }>
   destroy(): void
   isClosed(): boolean
   onTerminal(listener: (event: BidiTerminalEvent) => void): () => void
@@ -1601,6 +1603,9 @@ export async function bidiRunStream(
       } finally {
         stopInboundReader()
       }
+    },
+    takeBufferedFrames() {
+      return inboundFrames.splice(0)
     },
     destroy() {
       if (!locallyClosed) {

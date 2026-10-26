@@ -829,10 +829,11 @@ describe("host calls still running when the Run dies", () => {
   ]
 
   /** `held`: a state-changing command ends its step at once. `open`: a read waits in its step for the next listed call. */
-  const setup = (step: "held" | "open", cut: "reset" | "clean-close" | "reply-write" | "final" | "invalid-argument", key: string,
-    before?: "unknown-frame" | "cursor-run-call" | "catalog-lookup",
+  const setup = (step: "held" | "open",
+    cut: "reset" | "clean-close" | "reply-write" | "final" | "invalid-argument" | "kv-final" | "none", key: string,
+    before?: "unknown-frame" | "cursor-run-call" | "catalog-lookup" | "catalog-started",
     queued?: "next-step" | "cursor-run-call" | "appended-user" | "unknown-frame" | "exec-abort" | "checkpoint"
-      | "catalog-lookup" | "catalog-started" | "catalog-invalid") => {
+      | "catalog-lookup" | "catalog-started" | "catalog-invalid" | "own-completion") => {
     const requests: RunRequest[] = []
     let firstRun: http2.ServerHttp2Stream | undefined
     scripted = (stream, message) => {
@@ -867,6 +868,11 @@ describe("host calls still running when the Run dies", () => {
         send({ interaction_update: { tool_call_started: { call_id: "first", tool_call: shell("first") } } })
       }
       send({ interaction_update: { tool_call_started: { call_id: "second", tool_call: shell("second") } } })
+      // A lookup Cursor starts after the host's call in this pass and completes while the host runs that call.
+      if (before === "catalog-started") {
+        send({ interaction_update: { tool_call_started: { call_id: "own", tool_call: {
+          get_mcp_tools_tool_call: { args: { server: "opencode", tool_name: "slack_read" } } } } } })
+      }
       send({ interaction_update: { tool_requests_listed: { call_count: 2 } } })
       send({ exec_server_message: step === "open"
         ? { id: 1, read_args: { path: "notes.txt", tool_call_id: "first" } }
@@ -887,6 +893,9 @@ describe("host calls still running when the Run dies", () => {
         } else if (queued === "checkpoint") {
           // Cursor's checkpoint from before the running call's result; resuming it would ask for the call again.
           send({ conversation_checkpoint_update: Uint8Array.of(10, 1, 8) })
+        } else if (queued === "own-completion") {
+          send({ interaction_update: { tool_call_completed: { call_id: "own", tool_call: { get_mcp_tools_tool_call: {
+            args: { server: "opencode", tool_name: "slack_read" }, result: { success: { content: "slack_read(channel: string)" } } } } } } })
         } else if (queued === "exec-abort") {
           // Cursor sends the next call's exec and withdraws it; nothing ran it.
           send({ exec_server_message: { id: 2, shell_stream_args: { command: "echo second", tool_call_id: "second" } } })
@@ -905,7 +914,11 @@ describe("host calls still running when the Run dies", () => {
         else if (cut === "clean-close") stream.end()
         else if (cut === "final") stream.end(frame(Buffer.from('{"error":{"code":"permission_denied"}}'), 2))
         else if (cut === "invalid-argument") stream.end(frame(Buffer.from('{"error":{"code":"invalid_argument"}}'), 2))
-        else send({ kv_server_message: { id: 5, set_blob_args: { blob_id: Uint8Array.of(5, 1, 2, 3), blob_data: Uint8Array.of(4, 5) } } })
+        else if (cut === "reply-write" || cut === "kv-final") {
+          send({ kv_server_message: { id: 5, set_blob_args: { blob_id: Uint8Array.of(5, 1, 2, 3), blob_data: Uint8Array.of(4, 5) } } })
+          // Cursor's final verdict right behind the KV request whose reply is still draining.
+          if (cut === "kv-final") stream.end(frame(Buffer.from('{"error":{"code":"permission_denied"}}'), 2))
+        }
       }, queued ? 80 : 50)
     }
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-held-tool-cut-"))
@@ -930,7 +943,26 @@ describe("host calls still running when the Run dies", () => {
     const read = async (abortSignal?: AbortSignal) => {
       const parts: LanguageModelV3StreamPart[] = []
       await connect()
+      if (cut === "none" && prompt.at(-1)?.role === "tool") {
+        // The result goes into the held Run's write buffer and its drain fails: Cursor may have it.
+        const session = sessionManager.findOpenByOpenCodeSessionId(key)!
+        const write = session.stream.write.bind(session.stream)
+        session.stream.write = bytes =>
+          decodeMessage<{ exec_client_message?: unknown }>("AgentClientMessage", bytes).exec_client_message ? false : write(bytes)
+        session.stream.waitForDrain = async () => { throw new Error("stream reset while draining") }
+      }
       const { stream } = await model.doStream({ ...options, abortSignal })
+      if (cut === "kv-final" && prompt.at(-1)?.role === "user") {
+        // The held reader's reply to Cursor's KV write drains until Cursor has sent its final verdict and closed.
+        const session = sessionManager.findOpenByOpenCodeSessionId(key)!
+        const write = session.stream.write.bind(session.stream)
+        session.stream.write = bytes =>
+          decodeMessage<{ kv_client_message?: unknown }>("AgentClientMessage", bytes).kv_client_message ? false : write(bytes)
+        session.stream.waitForDrain = async () => {
+          await Bun.sleep(20)
+          throw new Error("stream reset while draining")
+        }
+      }
       if (cut === "reply-write" && requests.length === 0) {
         // The Run dies under the provider's reply to Cursor's KV write.
         const session = sessionManager.findOpenByOpenCodeSessionId(key)!
@@ -977,6 +1009,7 @@ describe("host calls still running when the Run dies", () => {
     ["held", "reset", "catalog-lookup", undefined], ["held", "clean-close", undefined, "next-step"],
     ["held", "clean-close", undefined, "exec-abort"], ["held", "clean-close", undefined, "catalog-lookup"],
     ["held", "reset", undefined, "checkpoint"], ["open", "reset", undefined, "checkpoint"],
+    ["held", "clean-close", "catalog-started", "own-completion"],
   ] as const) {
     it(`ends the step on its running host call and rebuilds from its result (${step} step, ${cut}${before ? `, ${before}` : ""}${queued ? `, queued ${queued}` : ""})`, async () => {
       const { requests, prompt, read, cleanup } = setup(step, cut, `ses_held_tool_cut_${step}_${cut}_${before}_${queued}`, before, queued)
@@ -1012,7 +1045,8 @@ describe("host calls still running when the Run dies", () => {
     ["open", "final", undefined, undefined], ["held", "invalid-argument", undefined, undefined],
     ["held", "clean-close", undefined, "cursor-run-call"], ["held", "clean-close", undefined, "appended-user"],
     ["held", "clean-close", undefined, "unknown-frame"], ["held", "clean-close", undefined, "catalog-started"],
-    ["held", "clean-close", undefined, "catalog-invalid"],
+    ["held", "clean-close", undefined, "catalog-invalid"], ["held", "final", undefined, "appended-user"],
+    ["held", "kv-final", undefined, undefined], ["held", "none", undefined, undefined],
   ] as const) {
     it(`ends the turn once the running call's result is in when the Run cannot be rebuilt (${step} step, ${cut}${before ? `, ${before}` : ""}${queued ? `, queued ${queued}` : ""})`, async () => {
       const { requests, prompt, read, cleanup } = setup(step, cut, `ses_held_tool_refuse_${step}_${cut}_${before}_${queued}`, before, queued)
@@ -1031,7 +1065,9 @@ describe("host calls still running when the Run dies", () => {
           expect(APICallError.isInstance(error)).toBe(true)
           expect(error).toMatchObject({ isRetryable: false, responseHeaders: { "x-should-retry": "false" } })
         }
-        if (cut !== "final" && cut !== "invalid-argument") expect((error as APICallError).message).toContain("continue")
+        // Cursor's own final error wins over the provider's refusal.
+        if (cut === "final" || cut === "kv-final") expect((error as APICallError).message).not.toContain("continue")
+        else if (cut !== "invalid-argument") expect((error as APICallError).message).toContain("continue")
         expect(requests).toHaveLength(1)
       } finally {
         await cleanup()

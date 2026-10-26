@@ -288,18 +288,22 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   (`closeHeldToolStepAtRunEnd`), and a reply cut off with it leaves that to the
   next read: the calls still run and their results rebuild.
 - Fork: a Run Cursor ends while host calls run (held or open step) leaves a
-  `LostRun` record. When their results arrive, the rebuild ends the turn instead
-  with a final verdict (`isFinalVerdict`: `retryable: false`, or a server error
-  not marked transient, on the close error or the queued end-of-stream frame)
-  or when the interrupted pass did something history cannot hold
-  (`heldRunLossRebuildable`: `attempt.unrebuildable`, a call Cursor ran itself),
-  also in any frame the held reader queued unread (`queuedFramesVerdict`
-  records them on a copy of the replay state as the pump's next pass would, so
-  catalog and announced-call rules apply unchanged; a started call or an exec
-  nothing ran is left out, and so is a queued abort of an exec that is not the
-  host's). The rebuild never resumes a checkpoint, so one Cursor sent before the
-  results cannot ask for the calls again. Otherwise the Run's carried host notes
-  go back to the next Run.
+  `LostRun` record, with the frames the held reader queued and what the Run
+  received unread before closing (the reader's read in flight, then the frames
+  the stream still buffered: `takeBufferedFrames`, which `destroy()` would drop;
+  `settleLostRunFrames`). When their results arrive, the rebuild ends the turn
+  instead, first with Cursor's own final verdict (`isFinalVerdict`:
+  `retryable: false`, or a server error not marked transient, on the close error
+  or an end-of-stream frame), then when a result went out ambiguously
+  (`ambiguousDelivery`: `ambiguous-partial-write`, or the Run closed after some
+  of a result's frames), then when the interrupted pass, continued by those
+  frames, did something history cannot hold (`lostRunUnrebuildable`: the frames
+  recorded on a copy of the replay state as the pump would, judged by
+  `heldRunLossRebuildable`, so catalog and announced-call rules apply unchanged;
+  a started call or an exec nothing ran is left out, and so is an abort of an
+  exec that is not the host's). The rebuild never resumes a checkpoint, so one
+  Cursor sent before the results cannot ask for the calls again. Otherwise the
+  Run's carried host notes go back to the next Run.
 - Fork tool-call order (`src/tool-call-order.ts`, Claude Code's rule): reads,
   searches, subagents, read-only shell and MCP tools with read-only names run
   together; an edit, write, other shell or other MCP call waits for the calls

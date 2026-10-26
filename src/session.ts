@@ -472,6 +472,13 @@ export type LostRun = {
   closeError: CursorProviderError | null
   /** Frames the held reader queued unread while the host ran the calls, Cursor's end-of-stream frame included. */
   heldFrames: Frame[]
+  /**
+   * What the Run received that nothing read before it closed, in order after `heldFrames`: the held reader's read
+   * still in flight, then the frames the stream still buffered. Cursor's end-of-stream verdict is often among them.
+   */
+  unread?: { read?: Promise<IteratorResult<Frame>>; buffered: Frame[] }
+  /** A host result went out in part, or into a drain that failed: Cursor may hold it, so it is not sent again. */
+  ambiguousDelivery?: true
   expiresAt: number
 }
 
@@ -817,6 +824,8 @@ export class SessionManager {
         this.byExecId.get(key) === session &&
         session.pending.get(execId) === pending
       ) return undefined
+      const lost = framesWritten > 0 ? this.lostRuns.get(session.sessionId) : undefined
+      if (lost) lost.ambiguousDelivery = true
       const current = this.classify(session.sessionId, execId)
       if (current.kind === "duplicate" || current.kind === "terminal") return { ...current, framesWritten }
       return { kind: "missing", reason: "missing-process-local-state", framesWritten }
@@ -982,8 +991,8 @@ export class SessionManager {
     session.terminalUnsubscribe?.()
     session.terminalUnsubscribe = null
     session.deferredTerminalReason = null
-    if ((reason === "remote-error" || reason === "remote-clean-close" || reason === "reply-write-failed")
-      && session.pending.size > 0) {
+    if ((reason === "remote-error" || reason === "remote-clean-close" || reason === "reply-write-failed"
+      || reason === "ambiguous-partial-write") && session.pending.size > 0) {
       this.lostRuns.delete(session.sessionId)
       this.lostRuns.set(session.sessionId, {
         sessionId: session.sessionId,
@@ -991,6 +1000,8 @@ export class SessionManager {
         userTurnHostNotes: session.userTurnHostNotes,
         closeError: session.closeError,
         heldFrames: [...(session.heldFrames ?? [])],
+        unread: { read: session.queuedFrame, buffered: session.stream.takeBufferedFrames?.() ?? [] },
+        ...(reason === "ambiguous-partial-write" ? { ambiguousDelivery: true as const } : {}),
         // The calls' results can come back as late as a running tool may last.
         expiresAt: this.now() + Math.max(this.tombstoneTtlMs, RUNNING_TOOL_CAP_MS + this.tombstoneTtlMs),
       })
