@@ -9,7 +9,7 @@ import { createCursor } from "../src/index.js"
 import { CursorAuthError, CursorRetryExhaustedError, CursorServerError, CursorTransportError } from "../src/errors.js"
 import { decodeFramePayload } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
-import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests, frameArrival, lastFrameArrival } from "../src/transport/connect.js"
+import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests, CursorRunInterruptedError, frameArrival, lastFrameArrival } from "../src/transport/connect.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { sessionManager } from "../src/session.js"
 import { resetTurnStateForTests, settleRunSavesForTests } from "../src/language-model.js"
@@ -815,6 +815,161 @@ describe("checkpoint eligibility across host results", () => {
       } finally {
         await settleRunSavesForTests()
         fs.rmSync(root, { recursive: true, force: true })
+      }
+    }, 30_000)
+  }
+})
+
+describe("host calls still running when the Run dies", () => {
+  type RunRequest = { conversation_id: string; action: { resume_action?: unknown; user_message_action?: { user_message: { text: string } } } }
+  const command = "sleep 20; echo done >> ledger"
+  const tools = [
+    { type: "function" as const, name: "bash", inputSchema: { type: "object", properties: { command: { type: "string" } } } },
+    { type: "function" as const, name: "read", inputSchema: { type: "object", properties: { filePath: { type: "string" } } } },
+  ]
+
+  /** `held`: a state-changing command ends its step at once. `open`: a read waits in its step for the next listed call. */
+  const setup = (step: "held" | "open", cut: "reset" | "clean-close" | "reply-write", key: string) => {
+    const requests: RunRequest[] = []
+    scripted = (stream, message) => {
+      if (!message.run_request) return
+      requests.push(message.run_request as RunRequest)
+      const send = (value: Record<string, unknown>) => stream.write(frame(encodeMessage("AgentServerMessage", value)))
+      if (requests.length > 1) {
+        send({ interaction_update: { text_delta: { text: "The command finished." } } })
+        send({ interaction_update: { turn_ended: {} } })
+        stream.end()
+        return
+      }
+      const shell = (callId: string) => ({ shell_tool_call: { args: { command, tool_call_id: callId } } })
+      send({ conversation_checkpoint_update: Uint8Array.of(10, 1, 7) })
+      send({ interaction_update: { text_delta: { text: "Running it now." } } })
+      if (step === "open") {
+        send({ interaction_update: { tool_call_started: { call_id: "first", tool_call: { read_tool_call: { args: { path: "notes.txt" } } } } } })
+      } else {
+        send({ interaction_update: { tool_call_started: { call_id: "first", tool_call: shell("first") } } })
+      }
+      send({ interaction_update: { tool_call_started: { call_id: "second", tool_call: shell("second") } } })
+      send({ interaction_update: { tool_requests_listed: { call_count: 2 } } })
+      send({ exec_server_message: step === "open"
+        ? { id: 1, read_args: { path: "notes.txt", tool_call_id: "first" } }
+        : { id: 1, shell_stream_args: { command, tool_call_id: "first" } } })
+      setTimeout(() => {
+        if (cut === "reset") stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR)
+        else if (cut === "clean-close") stream.end()
+        else send({ kv_server_message: { id: 5, set_blob_args: { blob_id: Uint8Array.of(5, 1, 2, 3), blob_data: Uint8Array.of(4, 5) } } })
+      }, 50)
+    }
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-held-tool-cut-"))
+    fs.writeFileSync(path.join(root, "notes.txt"), "notes\n")
+    // The cut retires the Run's connection, as a GOAWAY does; the rebuilt Run needs another.
+    const connections: http2.ClientHttp2Session[] = []
+    const connect = async () => {
+      const current = connections.at(-1)
+      if (current && !current.closed && !current.destroyed) return
+      const next = http2.connect(`http://127.0.0.1:${(server.address() as net.AddressInfo).port}`)
+      await new Promise<void>((resolve, reject) => {
+        next.once("connect", () => resolve())
+        next.once("error", reject)
+      })
+      connections.push(next)
+      cacheHttp2SessionForTests(ORIGIN, next)
+    }
+    const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN,
+      workspaceRoot: root, cacheDir: root, retry: { baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
+    const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Run the slow command" }] }]
+    const options = { prompt, tools, headers: { "x-opencode-session-id": key } }
+    const read = async (abortSignal?: AbortSignal) => {
+      const parts: LanguageModelV3StreamPart[] = []
+      await connect()
+      const { stream } = await model.doStream({ ...options, abortSignal })
+      if (cut === "reply-write" && requests.length === 0) {
+        // The Run dies under the provider's reply to Cursor's KV write.
+        const session = sessionManager.findOpenByOpenCodeSessionId(key)!
+        const write = session.stream.write.bind(session.stream)
+        session.stream.write = bytes => {
+          if (decodeMessage<{ kv_client_message?: unknown }>("AgentClientMessage", bytes).kv_client_message) {
+            throw new CursorRunInterruptedError("Cursor Run stream is no longer writable")
+          }
+          return write(bytes)
+        }
+      }
+      const reader = stream.getReader()
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) return parts
+        parts.push(value)
+      }
+    }
+    const cleanup = async () => {
+      sessionManager.dispose()
+      await settleRunSavesForTests()
+      for (const connection of connections) connection.destroy()
+      setHostCacheDirOverride(undefined)
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+    return { requests, prompt, read, cleanup }
+  }
+
+  const hostCalls = (parts: LanguageModelV3StreamPart[]) =>
+    parts.filter((part): part is Extract<LanguageModelV3StreamPart, { type: "tool-call" }> =>
+      part.type === "tool-call" && !part.providerExecuted)
+
+  const pushResult = (prompt: LanguageModelV3CallOptions["prompt"], call: Extract<LanguageModelV3StreamPart, { type: "tool-call" }>,
+    output: { type: "text" | "error-text"; value: string }) => {
+    prompt.push({ role: "assistant", content: [{ type: "text", text: "Running it now." },
+      { type: "tool-call", toolCallId: call.toolCallId, toolName: call.toolName, input: JSON.parse(call.input) }] })
+    prompt.push({ role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName, output }] })
+  }
+
+  for (const [step, cut] of [
+    ["held", "reset"], ["held", "clean-close"], ["open", "reset"], ["open", "clean-close"], ["open", "reply-write"],
+  ] as const) {
+    it(`ends the step on its running host call and rebuilds from its result (${step} step, ${cut})`, async () => {
+      const { requests, prompt, read, cleanup } = setup(step, cut, `ses_held_tool_cut_${step}_${cut}`)
+      try {
+        const first = await read()
+        const calls = hostCalls(first)
+        expect(calls).toHaveLength(1)
+        expect(calls[0]!.toolName).toBe(step === "open" ? "read" : "bash")
+        expect(first.some(part => part.type === "finish" && part.finishReason.unified === "tool-calls")).toBe(true)
+        expect(first.some(part => part.type === "error")).toBe(false)
+        // Nothing reopens while the host is still running the call.
+        await Bun.sleep(100)
+        expect(requests).toHaveLength(1)
+        pushResult(prompt, calls[0]!, { type: "text", value: "ledger line written" })
+        const second = await read()
+        expect(hostCalls(second)).toHaveLength(0)
+        expect(second.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
+        expect(requests).toHaveLength(2)
+        expect(requests[1]!.action.resume_action).toBeUndefined()
+        expect(requests[1]!.conversation_id).not.toBe(requests[0]!.conversation_id)
+        const text = requests[1]!.action.user_message_action!.user_message.text
+        expect(text.match(/ledger line written/g)).toHaveLength(1)
+        expect(text.match(/Running it now\./g)).toHaveLength(1)
+      } finally {
+        await cleanup()
+      }
+    }, 30_000)
+  }
+
+  for (const step of ["held", "open"] as const) {
+    it(`opens no Run when the user stops while the host still runs the call (${step} step)`, async () => {
+      const key = `ses_held_tool_cut_stop_${step}`
+      const { requests, prompt, read, cleanup } = setup(step, "reset", key)
+      try {
+        const calls = hostCalls(await read())
+        expect(calls).toHaveLength(1)
+        await Bun.sleep(100)
+        await notifyHostInterrupt(key, "user", Date.now())
+        // The stopped step's late result arrives on an aborted call.
+        pushResult(prompt, calls[0]!, { type: "error-text", value: "Tool execution aborted" })
+        const stopped = await read(AbortSignal.abort()).then(() => undefined, (error: unknown) => error)
+        expect(stopped).toBeInstanceOf(Error)
+        await Bun.sleep(100)
+        expect(requests).toHaveLength(1)
+      } finally {
+        await cleanup()
       }
     }, 30_000)
   }

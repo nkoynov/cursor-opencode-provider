@@ -284,6 +284,8 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   completion when no exec claimed it; an edit's private read does not count).
   Model output, `turn_ended`, a Run failure or 1.5 s without frames
   (`HELD_TOOL_STEP_QUIET_MS`) close it early, and so does the ordering below.
+  A Run that ends or fails a reply meanwhile closes it with `tool-calls`
+  (`closeHeldToolStepAtRunEnd`): the calls still run and their results rebuild.
 - Fork tool-call order (`src/tool-call-order.ts`, Claude Code's rule): reads,
   searches, subagents, read-only shell and MCP tools with read-only names run
   together; an edit, write, other shell or other MCP call waits for the calls

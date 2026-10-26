@@ -7400,6 +7400,12 @@ export async function pump(
     }
     } catch (e) {
       if (e instanceof CursorProviderError) {
+        // A reply that fails on a dead Run ends it like a failed read: the step's host calls still run.
+        if (toolStep.hostCalls > 0 && e.origin !== "protocol" && e.origin !== "local-cancel"
+          && !session.hostInterrupted && !abortSignal?.aborted) {
+          closeHeldToolStepAtRunEnd("reply failed", e)
+          return
+        }
         settleOpenEarlyRows()
         throw e
       }

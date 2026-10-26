@@ -218,7 +218,9 @@ These are failure lessons shared by both hosts, not a replacement for
   provider sent, so its validated completion counts as claimed
   (`catalogCalls`); other calls Cursor runs itself still bar it. Judge the
   lookup from wire bytes, since the decoder drops a variant it does not know,
-  and from every use of its call id in the Run, resumes included.
+  and from every use of its call id in the Run, resumes included. A reply
+  that fails on a dead Run while the open step's host calls run ends the step
+  as a failed read does, so their results still reach a rebuilt Run.
   Failed drains must also project as terminal to both hosts, including
   during credential renewal and endless mode (`test/run-interruption.test.ts`).
   Endless mode bypasses counts only, preserving replay guards and CLI's 180 s
