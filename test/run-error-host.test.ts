@@ -1000,8 +1000,15 @@ describe("host calls still running when the Run dies", () => {
         await Bun.sleep(100)
         pushResult(prompt, calls[0]!, { type: "text", value: "ledger line written" })
         const error = await read().catch((caught: unknown) => caught)
-        expect(APICallError.isInstance(error)).toBe(true)
-        expect(error).toMatchObject({ isRetryable: false, responseHeaders: { "x-should-retry": "false" } })
+        if (cut === "invalid-argument") {
+          // As the pump ends on it: Cursor's error without a retry verdict reaches the host as it is.
+          expect(APICallError.isInstance(error)).toBe(false)
+          expect(error).toBeInstanceOf(CursorServerError)
+          expect((error as Error).message).toBe("Cursor API error (code=invalid_argument)")
+        } else {
+          expect(APICallError.isInstance(error)).toBe(true)
+          expect(error).toMatchObject({ isRetryable: false, responseHeaders: { "x-should-retry": "false" } })
+        }
         if (cut !== "final" && cut !== "invalid-argument") expect((error as APICallError).message).toContain("continue")
         expect(requests).toHaveLength(1)
       } finally {
