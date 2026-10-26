@@ -466,11 +466,12 @@ type Tombstone = {
 }
 
 export type LostRun = {
+  sessionId: string
   replaySafety?: ReplaySafetyState
   userTurnHostNotes?: HostNoteBatch[]
   closeError: CursorProviderError | null
-  /** Cursor's end-of-stream frame, which the held reader queues unread; it can carry a final verdict. */
-  endFrame?: Frame
+  /** Frames the held reader queued unread while the host ran the calls, Cursor's end-of-stream frame included. */
+  heldFrames: Frame[]
   expiresAt: number
 }
 
@@ -985,10 +986,11 @@ export class SessionManager {
       && session.pending.size > 0) {
       this.lostRuns.delete(session.sessionId)
       this.lostRuns.set(session.sessionId, {
+        sessionId: session.sessionId,
         replaySafety: session.replaySafety,
         userTurnHostNotes: session.userTurnHostNotes,
         closeError: session.closeError,
-        endFrame: session.heldFrames?.find((frame) => frame.flags & 0x02),
+        heldFrames: [...(session.heldFrames ?? [])],
         // The calls' results can come back as late as a running tool may last.
         expiresAt: this.now() + Math.max(this.tombstoneTtlMs, RUNNING_TOOL_CAP_MS + this.tombstoneTtlMs),
       })

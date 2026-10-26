@@ -289,10 +289,13 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   next read: the calls still run and their results rebuild.
 - Fork: a Run Cursor ends while host calls run (held or open step) leaves a
   `LostRun` record. When their results arrive, the rebuild ends the turn instead
-  with a final verdict (the close error or the queued end-of-stream frame) or
-  when the interrupted pass did something history cannot hold
-  (`heldRunLossRebuildable`: `attempt.unrebuildable`, a call Cursor ran itself);
-  otherwise the Run's carried host notes go back to the next Run.
+  with a final verdict (`isFinalVerdict`: `retryable: false`, or a server error
+  not marked transient, on the close error or the queued end-of-stream frame)
+  or when the interrupted pass did something history cannot hold
+  (`heldRunLossRebuildable`: `attempt.unrebuildable`, a call Cursor ran itself),
+  also in any frame the held reader queued unread (`queuedFramesVerdict`: the
+  pump's replay rules; a started call or an exec nothing ran is left out).
+  Otherwise the Run's carried host notes go back to the next Run.
 - Fork tool-call order (`src/tool-call-order.ts`, Claude Code's rule): reads,
   searches, subagents, read-only shell and MCP tools with read-only names run
   together; an edit, write, other shell or other MCP call waits for the calls

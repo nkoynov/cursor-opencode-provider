@@ -829,8 +829,9 @@ describe("host calls still running when the Run dies", () => {
   ]
 
   /** `held`: a state-changing command ends its step at once. `open`: a read waits in its step for the next listed call. */
-  const setup = (step: "held" | "open", cut: "reset" | "clean-close" | "reply-write" | "final", key: string,
-    before?: "unknown-frame" | "cursor-run-call" | "catalog-lookup") => {
+  const setup = (step: "held" | "open", cut: "reset" | "clean-close" | "reply-write" | "final" | "invalid-argument", key: string,
+    before?: "unknown-frame" | "cursor-run-call" | "catalog-lookup",
+    queued?: "next-step" | "cursor-run-call" | "appended-user" | "unknown-frame") => {
     const requests: RunRequest[] = []
     let firstRun: http2.ServerHttp2Stream | undefined
     scripted = (stream, message) => {
@@ -865,12 +866,28 @@ describe("host calls still running when the Run dies", () => {
       send({ exec_server_message: step === "open"
         ? { id: 1, read_args: { path: "notes.txt", tool_call_id: "first" } }
         : { id: 1, shell_stream_args: { command, tool_call_id: "first" } } })
+      // Frames Cursor sends while the host runs the call; the held reader queues them for the next pump.
+      setTimeout(() => {
+        if (queued === "next-step") {
+          send({ interaction_update: { text_delta: { text: "Next, the tests." } } })
+          send({ interaction_update: { tool_call_started: { call_id: "third", tool_call: shell("third") } } })
+        } else if (queued === "cursor-run-call") {
+          const fetch = { web_fetch_tool_call: { args: { url: "https://example.com" } } }
+          send({ interaction_update: { tool_call_started: { call_id: "late", tool_call: fetch } } })
+          send({ interaction_update: { tool_call_completed: { call_id: "late", tool_call: fetch } } })
+        } else if (queued === "appended-user") {
+          send({ interaction_update: { user_message_appended: { user_message: { text: "also check the logs", message_id: "m1" } } } })
+        } else if (queued === "unknown-frame") {
+          stream.write(frame(Uint8Array.of(0xa2, 0x06, 0)))
+        }
+      }, 30)
       setTimeout(() => {
         if (cut === "reset") stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR)
         else if (cut === "clean-close") stream.end()
         else if (cut === "final") stream.end(frame(Buffer.from('{"error":{"code":"permission_denied"}}'), 2))
+        else if (cut === "invalid-argument") stream.end(frame(Buffer.from('{"error":{"code":"invalid_argument"}}'), 2))
         else send({ kv_server_message: { id: 5, set_blob_args: { blob_id: Uint8Array.of(5, 1, 2, 3), blob_data: Uint8Array.of(4, 5) } } })
-      }, 50)
+      }, queued ? 80 : 50)
     }
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-held-tool-cut-"))
     fs.writeFileSync(path.join(root, "notes.txt"), "notes\n")
@@ -935,12 +952,13 @@ describe("host calls still running when the Run dies", () => {
     prompt.push({ role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName, output }] })
   }
 
-  for (const [step, cut, before] of [
-    ["held", "reset", undefined], ["held", "clean-close", undefined], ["open", "reset", undefined],
-    ["open", "clean-close", undefined], ["open", "reply-write", undefined], ["held", "reset", "catalog-lookup"],
+  for (const [step, cut, before, queued] of [
+    ["held", "reset", undefined, undefined], ["held", "clean-close", undefined, undefined], ["open", "reset", undefined, undefined],
+    ["open", "clean-close", undefined, undefined], ["open", "reply-write", undefined, undefined],
+    ["held", "reset", "catalog-lookup", undefined], ["held", "clean-close", undefined, "next-step"],
   ] as const) {
-    it(`ends the step on its running host call and rebuilds from its result (${step} step, ${cut}${before ? `, ${before}` : ""})`, async () => {
-      const { requests, prompt, read, cleanup } = setup(step, cut, `ses_held_tool_cut_${step}_${cut}_${before}`, before)
+    it(`ends the step on its running host call and rebuilds from its result (${step} step, ${cut}${before ? `, ${before}` : ""}${queued ? `, queued ${queued}` : ""})`, async () => {
+      const { requests, prompt, read, cleanup } = setup(step, cut, `ses_held_tool_cut_${step}_${cut}_${before}_${queued}`, before, queued)
       try {
         const first = await read()
         const calls = hostCalls(first)
@@ -967,12 +985,15 @@ describe("host calls still running when the Run dies", () => {
     }, 30_000)
   }
 
-  for (const [step, cut, before] of [
-    ["held", "reset", "unknown-frame"], ["held", "reset", "cursor-run-call"], ["open", "reply-write", "cursor-run-call"],
-    ["held", "final", undefined], ["open", "final", undefined],
+  for (const [step, cut, before, queued] of [
+    ["held", "reset", "unknown-frame", undefined], ["held", "reset", "cursor-run-call", undefined],
+    ["open", "reply-write", "cursor-run-call", undefined], ["held", "final", undefined, undefined],
+    ["open", "final", undefined, undefined], ["held", "invalid-argument", undefined, undefined],
+    ["held", "clean-close", undefined, "cursor-run-call"], ["held", "clean-close", undefined, "appended-user"],
+    ["held", "clean-close", undefined, "unknown-frame"],
   ] as const) {
-    it(`ends the turn once the running call's result is in when the Run cannot be rebuilt (${step} step, ${cut}${before ? `, ${before}` : ""})`, async () => {
-      const { requests, prompt, read, cleanup } = setup(step, cut, `ses_held_tool_refuse_${step}_${cut}_${before}`, before)
+    it(`ends the turn once the running call's result is in when the Run cannot be rebuilt (${step} step, ${cut}${before ? `, ${before}` : ""}${queued ? `, queued ${queued}` : ""})`, async () => {
+      const { requests, prompt, read, cleanup } = setup(step, cut, `ses_held_tool_refuse_${step}_${cut}_${before}_${queued}`, before, queued)
       try {
         const calls = hostCalls(await read())
         expect(calls).toHaveLength(1)
@@ -981,7 +1002,7 @@ describe("host calls still running when the Run dies", () => {
         const error = await read().catch((caught: unknown) => caught)
         expect(APICallError.isInstance(error)).toBe(true)
         expect(error).toMatchObject({ isRetryable: false, responseHeaders: { "x-should-retry": "false" } })
-        if (cut !== "final") expect((error as APICallError).message).toContain("continue")
+        if (cut !== "final" && cut !== "invalid-argument") expect((error as APICallError).message).toContain("continue")
         expect(requests).toHaveLength(1)
       } finally {
         await cleanup()

@@ -270,7 +270,7 @@ describe("SessionManager", () => {
     now = 3 * 60 * 60 * 1_000
     expect(mgr.lostRun(lost.sessionId)).toMatchObject({
       replaySafety: { attempt: { unrebuildable: "unknown-or-malformed-frame" } },
-      endFrame: { flags: 2 },
+      heldFrames: [{ flags: 0 }, { flags: 2 }],
     })
     expect(mgr.lostRun(done.sessionId)).toBeUndefined()
     expect(mgr.lostRun(idle.sessionId)).toBeUndefined()

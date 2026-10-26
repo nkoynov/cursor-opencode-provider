@@ -225,7 +225,9 @@ These are failure lessons shared by both hosts, not a replacement for
   The rebuild from a lost held Run's results was unconditional: it dropped a
   final verdict queued unread behind the held step, a stateful or unknown frame
   of the step, a call Cursor ran itself, and the Run's carried host notes
-  (`LostRun`, `heldRunLossRebuildable`).
+  (`LostRun`, `heldRunLossRebuildable`). Judge every frame the held reader
+  queued, not only the end of stream, and read a server error without a retry
+  verdict as final as the pump does (`queuedFramesVerdict`, `isFinalVerdict`).
   Failed drains must also project as terminal to both hosts, including
   during credential renewal and endless mode (`test/run-interruption.test.ts`).
   Endless mode bypasses counts only, preserving replay guards and CLI's 180 s

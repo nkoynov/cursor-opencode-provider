@@ -955,6 +955,76 @@ export function promptIdentityWouldRemint(
   return false
 }
 
+/** Cursor's verdict ends the turn, as the pump does: an explicit one, or a server error it never marked transient. */
+function isFinalVerdict(failure: CursorProviderError): boolean {
+  return failure.retryable === false
+    || (failure.origin === "server" && !failure.transient && failure.retryable !== true)
+}
+
+/** The id of an exec abort that is the frame's only content (`exec_server_control_message` #5 → abort #1 → id #1). */
+function soleExecAbortId(payload: Uint8Array): number | undefined {
+  const [control, ...rest] = readAllFieldsStrict(payload) ?? []
+  if (!control || rest.length || control.fn !== 5 || control.wt !== 2 || !control.bytes) return undefined
+  const [abort, ...others] = readAllFieldsStrict(control.bytes) ?? []
+  if (!abort || others.length || abort.fn !== 1 || abort.wt !== 2 || !abort.bytes) return undefined
+  const fields = readAllFieldsStrict(abort.bytes)
+  if (!fields || fields.length !== 1 || fields[0]!.fn !== 1 || fields[0]!.wt !== 0) return undefined
+  const id = Number(fields[0]!.varint)
+  return Number.isSafeInteger(id) ? id : undefined
+}
+
+/**
+ * Fork: the frames a lost held Run's reader queued unread, recorded on a copy of its replay state as the pump's next
+ * pass would have recorded them, so the same rules judge them (catalog lookups and announced calls included): Cursor's
+ * end-of-stream verdict, and anything a rebuild from host history would drop. The held reader answers aborts of the
+ * host's own execs itself, so a queued abort of any other exec withdraws one nothing ran and is left out.
+ */
+function queuedFramesVerdict(run: LostRun): { final?: CursorProviderError; unrebuildable?: string } {
+  const state = structuredClone(run.replaySafety ?? {})
+  const interrupted = state.attempt?.announcedCalls ?? []
+  const hostIds = new Set(hostExecs(state).filter((exec) => exec.sessionId === run.sessionId).map((exec) => exec.id))
+  const pass = new AttemptReplaySafety(run.sessionId, state)
+  for (const frame of run.heldFrames) {
+    let payload: Uint8Array
+    try {
+      payload = decodeFramePayload(frame)
+    } catch {
+      return { unrebuildable: "unknown-or-malformed-frame" }
+    }
+    if (frame.flags & 0x02) {
+      if (payload.length) {
+        const failure = connectFrameError(new TextDecoder().decode(payload))
+        if (isFinalVerdict(failure)) return { final: failure }
+      }
+      continue
+    }
+    const abortId = soleExecAbortId(payload)
+    if (abortId !== undefined && !hostIds.has(abortId)) continue
+    let asm: Record<string, unknown>
+    try {
+      asm = decodeMessage<Record<string, unknown>>("AgentServerMessage", payload)
+    } catch {
+      return { unrebuildable: "unknown-or-malformed-frame" }
+    }
+    const esm = asm.exec_server_message as Record<string, unknown> | undefined
+    const analysis = analyzeReplayFrame(payload, {
+      interactionUpdate: asm.interaction_update as Record<string, unknown> | undefined,
+      exec: esm,
+      kv: asm.kv_server_message as Record<string, unknown> | undefined,
+      execControl: asm.exec_server_control_message as Record<string, unknown> | undefined,
+      interactionQuery: asm.interaction_query as Record<string, unknown> | undefined,
+    })
+    if (analysis.barrier === "display-tool-lifecycle") pass.recordToolLifecycle(analysis.toolLifecycle)
+    else if (analysis.barrier) pass.markBarrier(analysis.barrier)
+    if (analysis.barrier === "non-control-exec") pass.recordExec(esm?.id, esm ? extractExecDisplayCallId(esm) : undefined)
+    if (state.attempt?.unrebuildable) return { unrebuildable: state.attempt.unrebuildable }
+  }
+  if (!announcedCallsClaimed(state, [...interrupted, ...state.attempt?.announcedCalls ?? []])) {
+    return { unrebuildable: "a call Cursor ran itself" }
+  }
+  return {}
+}
+
 function noteRunImageCheckpoint(session: CursorSession, checkpoint: Uint8Array, frame: Frame): void {
   if (!session.historyImages || !session.openCodeSessionId) return
   noteHistoryImageCheckpoint(
@@ -1283,20 +1353,16 @@ async function doStreamImpl(
       )
       const lostRuns = [...new Set(trailingToolResults.map((result) => result.sessionId))]
         .flatMap((sessionId) => sessionManager.lostRun(sessionId) ?? [])
-      const endVerdict = (run: LostRun): CursorProviderError | undefined => {
-        if (!run.endFrame?.payload.length) return undefined
-        try {
-          return connectFrameError(new TextDecoder().decode(decodeFramePayload(run.endFrame)))
-        } catch {
-          return undefined
-        }
-      }
-      const finalVerdict = lostRuns.flatMap((run) => [run.closeError, endVerdict(run)])
-        .find((failure) => failure?.retryable === false)
+      const queued = lostRuns.map(queuedFramesVerdict)
+      const finalVerdict = [...lostRuns.map((run) => run.closeError), ...queued.map((verdict) => verdict.final)]
+        .find((failure) => !!failure && isFinalVerdict(failure))
       if (finalVerdict) throw hostFacingError(finalVerdict, { modelId })
-      const unrebuildable = lostRuns.find((run) => !heldRunLossRebuildable(run.replaySafety))
-      if (unrebuildable) {
-        const why = unrebuildable.replaySafety?.attempt?.unrebuildable ?? "a call Cursor ran itself"
+      const unrebuildableIndex = lostRuns.findIndex((run, index) =>
+        !heldRunLossRebuildable(run.replaySafety) || queued[index]!.unrebuildable)
+      if (unrebuildableIndex >= 0) {
+        const unrebuildable = lostRuns[unrebuildableIndex]!
+        const why = unrebuildable.replaySafety?.attempt?.unrebuildable ?? queued[unrebuildableIndex]!.unrebuildable
+          ?? "a call Cursor ran itself"
         trace(`continuation: the lost Run cannot be rebuilt from host history (${why})`)
         throw hostFacingError(retrySuppressedError(
           new CursorRunInterruptedError(`Cursor Run ended while host tools ran, after ${why}`),
