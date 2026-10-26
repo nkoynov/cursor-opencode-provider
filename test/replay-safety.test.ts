@@ -95,12 +95,13 @@ describe("inline catalog recovery", () => {
   })
 
   it.each([
-    ["unknown field", lengthDelimited(90)],
-    ["repeated args", lengthDelimited(1)],
-  ] as const)("keeps a catalog start with %s from any rebuild", (_name, extra) => {
+    ["unknown field", lengthDelimited(90), []],
+    ["repeated args", lengthDelimited(1), []],
+    ["a group field in the tool call", [], [...varint((90 << 3) | 3), ...varint((90 << 3) | 4)]],
+  ] as const)("keeps a catalog start with %s from any rebuild", (_name, extra, toolExtra) => {
     const state: ReplaySafetyState = {}
     const step = new AttemptReplaySafety("run", state)
-    const start = analyze(false, [...extra])
+    const start = analyze(false, [...extra], false, [...toolExtra])
     expect(start).toEqual({ kind: "started", callId: "catalog", unverifiedCatalog: true })
     step.recordToolLifecycle(start)
     expect(state.historyRebaseUnsafe).toBe(true)

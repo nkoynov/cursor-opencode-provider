@@ -213,13 +213,18 @@ export type DecodedReplayFrame = {
   interactionQuery?: Record<string, unknown>
 }
 
-/** Fork: `unverifiedCatalog` marks a catalog lookup frame that fails `inlineCatalog`. */
+/**
+ * Fork: `unverifiedCatalog` marks a frame failing `inlineCatalog` that is a catalog lookup, or whose tool call is too
+ * malformed to tell.
+ */
 export type ReplayToolLifecycle = { kind: "started" | "completed"; callId: string; catalog?: true; unverifiedCatalog?: true }
 
 function catalogVariant(topLevel: StrictRawField | undefined): boolean {
   const update = nestedFields(topLevel, 1).find(field => field.fn === 2 || field.fn === 3)
   const call = update?.bytes && readAllFieldsStrict(update.bytes)?.find(field => field.fn === 2)
-  return !!call?.bytes && !!readAllFieldsStrict(call.bytes)?.some(field => field.fn === 44)
+  if (!call?.bytes) return false
+  const toolFields = readAllFieldsStrict(call.bytes)
+  return !toolFields || toolFields.some(field => field.fn === 44)
 }
 
 /** Validate the raw oneof and its nested fields; decoding alone drops unknown bytes. */
