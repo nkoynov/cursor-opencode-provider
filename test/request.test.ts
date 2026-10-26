@@ -1,11 +1,37 @@
 import { describe, it, expect } from "bun:test"
+import { readFileSync } from "node:fs"
 import { buildRunRequest, buildHeartbeat, buildExecHeartbeat } from "../src/protocol/request.js"
 import { buildLiveRequestContext } from "../src/protocol/tools.js"
 import { SYSTEM_INSTRUCTIONS_RULE_PATH, systemInstructionsRule } from "../src/context/build.js"
-import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
+import { decodeMessage, decodeMessageSparse, encodeMessage, getMessageTypes } from "../src/protocol/messages.js"
 import { readAllFields } from "../src/protocol/struct.js"
 
+const vendorRunRequest: {
+  descriptor: string
+  booleanWireVectors: Array<{ hex: string; value: boolean }>
+} = JSON.parse(readFileSync(new URL("./fixtures/cursor-agent-run-request.vendor.json", import.meta.url), "utf8"))
+
 describe("buildRunRequest", () => {
+  it("matches the independent Cursor CLI descriptor for removed field 10 and optional boolean field 12", () => {
+    const [name, ...declarations] = vendorRunRequest.descriptor.split("|")
+    expect(name).toBe("AgentRunRequest")
+    const fields = declarations.map(declaration => declaration.split(" "))
+    expect(fields.some(([number]) => number === "10")).toBe(false)
+    const exclusion = fields.find(([number]) => number === "12")
+    expect(exclusion).toEqual(["12", "exclude_workspace_context", "8?"])
+
+    const type = getMessageTypes().lookupType(name!)
+    expect(type.fieldsById[10]).toBeUndefined()
+    expect(type.fieldsById[12]).toMatchObject({ name: "exclude_workspace_context", type: "bool" })
+  })
+
+  it.each(vendorRunRequest.booleanWireVectors)("matches vendor-derived field 12 wire bytes $hex", ({ hex, value }) => {
+    const wire = Buffer.from(hex, "hex")
+    expect(readAllFields(wire)).toMatchObject([{ fn: 12, wt: 0, varint: Number(value) }])
+    expect(decodeMessageSparse<{ exclude_workspace_context: boolean }>("AgentRunRequest", wire)).toEqual({ exclude_workspace_context: value })
+    expect(Buffer.from(encodeMessage("AgentRunRequest", { exclude_workspace_context: value })).toString("hex")).toBe(hex)
+  })
+
   it("produces a valid protobuf message", () => {
     const data = buildRunRequest({
       text: "Hello",
@@ -24,6 +50,24 @@ describe("buildRunRequest", () => {
     expect(rr.action?.user_message_action?.user_message?.text).toBe("Hello")
     // The provider sends the concrete model id, never Cursor's "default" Auto.
     expect(rr.requested_model?.model_id).toBe("test-model")
+  })
+
+  it.each(["fresh", "followup", "resume"] as const)("omits retired field 10 and unused workspace-exclusion field 12 in a %s Run", action => {
+    const data = buildRunRequest({
+      text: "Hello",
+      modelId: "test-model",
+      conversationId: "conv-fields",
+      messageId: "message-fields",
+      ...(action === "fresh" ? {} : { conversationState: Uint8Array.of(10, 1, 120) }),
+      ...(action === "resume" ? { action: "resume" as const } : {}),
+    })
+
+    // Inspect raw fields independently of the hand-written AgentRunRequest schema.
+    const runRequest = readAllFields(data).find((field) => field.fn === 1)?.bytes
+    expect(runRequest).toBeDefined()
+    const fieldNumbers = readAllFields(runRequest!).map((field) => field.fn)
+    expect(fieldNumbers).not.toContain(10)
+    expect(fieldNumbers).not.toContain(12)
   })
 
   it("sends the Cursor mode as UserMessage.mode (field 4, agent.v1.AgentMode)", () => {

@@ -1,10 +1,11 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test"
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, spyOn } from "bun:test"
 import { mkdir, writeFile, rm } from "node:fs/promises"
 import { symlinkSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import os from "node:os"
 import { isProjectConfigDisabled, loadMergedConfig } from "../src/context/rules.js"
-import { buildRequestContext } from "../src/context/build.js"
+import { buildRequestContext, resetWorkspaceFactsForTests } from "../src/context/build.js"
+import * as gitDiscovery from "../src/context/git.js"
 import { buildEnv, workspaceRootFromRequestContext } from "../src/context/env.js"
 import { opencodeProjectDir } from "../src/context/paths.js"
 import { encodeMessage, decodeMessage } from "../src/protocol/messages.js"
@@ -15,8 +16,15 @@ describe("buildRequestContext", () => {
   let prevHome: string | undefined
   let prevXdgConfig: string | undefined
   let prevTranscriptsFolder: string | undefined
+  let restoreGit: (() => void) | undefined
 
   beforeAll(async () => {
+    // These catalog/config tests use a non-repository fixture. Native Git's
+    // five-second fallback can race Bun's five-second test deadline; actual
+    // Git discovery and failure handling are covered in workspace-facts.test.ts.
+    const git = spyOn(gitDiscovery, "collectGit").mockResolvedValue({ repositoryInfo: [], gitRepos: [], statusComplete: true })
+    restoreGit = () => git.mockRestore()
+    resetWorkspaceFactsForTests()
     prevTranscriptsFolder = process.env.CURSOR_AGENT_TRANSCRIPTS_FOLDER
     delete process.env.CURSOR_AGENT_TRANSCRIPTS_FOLDER
     prevHome = process.env.HOME
@@ -40,6 +48,8 @@ describe("buildRequestContext", () => {
   })
 
   afterAll(async () => {
+    restoreGit?.()
+    resetWorkspaceFactsForTests()
     if (prevTranscriptsFolder === undefined) delete process.env.CURSOR_AGENT_TRANSCRIPTS_FOLDER
     else process.env.CURSOR_AGENT_TRANSCRIPTS_FOLDER = prevTranscriptsFolder
     if (prevHome === undefined) delete process.env.HOME

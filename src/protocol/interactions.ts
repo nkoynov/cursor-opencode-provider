@@ -14,15 +14,19 @@ import {
 } from "./generate-image.js"
 import {
   CURSOR_PLAN_STAGE_TOOL,
+  type CreatePlanAfterWrite,
   type CreatePlanBridge,
   type DecodedCreatePlanQuery,
+  buildPlanPersistenceCall,
   createPlanApprovalQuestionInput,
-  createPlanSessionEditsDeniedReason,
   decodeCreatePlanQuery,
+  prepareCreatePlanFile,
   renderPlanReviewMessage,
   resolveCreatePlanBridge,
-  writeOpencodePlanFile,
+  resolvePlanPersistence,
 } from "./create-plan.js"
+import type { HostPatchTool } from "./apply-patch.js"
+import type { HostFilePathKey } from "./tools.js"
 import {
   type DecodedSwitchModeQuery,
   type SwitchModeBridge,
@@ -98,19 +102,27 @@ export type HandledInteraction = {
   }
   /**
    * Present when CreatePlan needs a host tool: a host plan-stage tool that
-   * owns the write *and* the review, the host's `plan_exit` review of the
-   * plan file the provider just wrote (`planUri` / `planPath` set), or the
-   * emulated `question` prompt after that write.
+   * owns the write *and* the review, a preliminary host `write`/`patch`
+   * persistence call (`persistence` set; review waits for success), the host
+   * `plan_exit` review, or the emulated `question` prompt after persistence.
    */
   createPlan?: DecodedCreatePlanQuery & {
     bridge: CreatePlanBridge
-    toolName: typeof CURSOR_PLAN_STAGE_TOOL | "plan_exit" | "question"
+    toolName: typeof CURSOR_PLAN_STAGE_TOOL | "plan_exit" | "question" | "write" | HostPatchTool
     planUri?: string
-    /** Filesystem path of the plan the provider just wrote. */
+    /** Filesystem path of the plan being saved. */
     planPath?: string
+    /** Plan markdown prepared for persistence / review display. */
+    markdown?: string
     questionInput?: ReturnType<typeof createPlanApprovalQuestionInput>
     /** The plan to show the user before the host review. */
     planReview?: string
+    /** Host file-tool call that must complete before review or acknowledgment. */
+    persistence?: {
+      toolName: "write" | HostPatchTool
+      input: Record<string, unknown>
+      afterWrite: CreatePlanAfterWrite
+    }
   }
   /**
    * Cursor tool call id of a CreatePlan the host plan agent will record
@@ -118,9 +130,10 @@ export type HandledInteraction = {
    */
   deferredCreatePlanToolCallId?: string
   /**
-   * Plan text for the assistant transcript when the plan was written without a
-   * host review tool. A session edit deny uses this: the user still sees the
-   * plan, and Cursor receives the not-approved error.
+   * Plan text for the assistant transcript when the plan was acknowledged
+   * without a host review tool. A session edit deny may use this after the
+   * host file tool succeeds: the user still sees the plan, and Cursor receives
+   * the not-approved error.
    */
   planReview?: string
   /** End the owning Run after this immediate planning refusal has been delivered. */
@@ -176,6 +189,11 @@ export type HandleInteractionQueryOptions = {
   sessionEditsDenied?: boolean
   /** Session permission evidence was unavailable; no execution approval is safe. */
   sessionPermissionsUnavailable?: boolean
+  /**
+   * Host write-tool path key from advertised schemas (`filePath` vs `path`).
+   * Defaults to OpenCode 1.x `filePath` when omitted.
+   */
+  hostFilePathKey?: HostFilePathKey
 }
 
 export class UnsupportedInteractionQueryError extends Error {
@@ -511,11 +529,10 @@ export function buildInjectUserMessage(input: {
  * so switching models and hosts stays coherent. Empty / missing args keep the
  * CLI empty-`plan_uri` success ack (nothing to write).
  *
- * Writing the plan never asks; executing it always does. Which channel raises
- * that prompt is resolved from the advertised catalog by
- * {@link resolveCreatePlanBridge}, and every channel reports the same outcome:
- * `success` means the user approved execution, `error` means the plan was
- * written but not accepted, so the model keeps planning.
+ * Host permission may ask to save the plan. Execution review is a separate
+ * step resolved from the advertised catalog by {@link resolveCreatePlanBridge}.
+ * Review success approves execution; an acknowledgment outside plan mode only
+ * confirms persistence. A failed or declined review never approves execution.
  */
 function handleCreatePlanQuery(
   id: number,
@@ -566,29 +583,6 @@ function handleCreatePlanQuery(
     }
   }
 
-  // The host plan agent reviews its own plan file: record the plan there and
-  // hand it to the host plan_exit, which asks the user and, on approval,
-  // moves the session to its build agent.
-  if (bridge.kind === "exit") {
-    const written = writeOpencodePlanFile(decoded.args, options.workspaceRoot ?? "", Date.now(), bridge.planPath)
-    if (!written.ok) {
-      return reply({ error: { error: written.error }, plan_uri: "" })
-    }
-    return {
-      ...base,
-      outcome: "bridged",
-      createPlan: {
-        ...decoded,
-        bridge,
-        toolName: "plan_exit",
-        planUri: written.planUri,
-        planPath: written.planPath,
-        planReview: renderPlanReviewMessage(written.markdown, written.planPath),
-      },
-      reply: undefined,
-    }
-  }
-
   // The host plan-stage tool owns the write and the review together.
   if (bridge.kind === "stage") {
     return {
@@ -599,80 +593,73 @@ function handleCreatePlanQuery(
     }
   }
 
-  // The session rule still denies edits. Keep the plan and show it, and tell
-  // Cursor execution was not approved. Do not ask: the answer cannot lift it.
-  if (bridge.kind === "hold") {
-    const stop = (result: Record<string, unknown>): HandledInteraction => ({ ...reply(result), endTurn: true })
-    const workspaceRoot = options.workspaceRoot?.trim()
-    if (!workspaceRoot) {
-      return stop({
-        error: { error: "CreatePlan requires a workspace root to write the plan file" },
-        plan_uri: "",
-      })
-    }
-    const written = writeOpencodePlanFile(decoded.args, workspaceRoot, Date.now(), options.hostPlanFile)
-    if (!written.ok) {
-      return stop({ error: { error: written.error }, plan_uri: "" })
-    }
-    return {
-      ...stop({
-        error: { error: createPlanSessionEditsDeniedReason(written.planPath) },
-        plan_uri: "",
-      }),
-      planReview: renderPlanReviewMessage(written.markdown, written.planPath),
-    }
-  }
-
-  if (bridge.kind === "approve") {
-    const workspaceRoot = options.workspaceRoot?.trim()
-    if (!workspaceRoot) {
-      return reply({
-        error: { error: "CreatePlan requires a workspace root to write the plan file" },
-        plan_uri: "",
-      })
-    }
-    const written = writeOpencodePlanFile(decoded.args, workspaceRoot, Date.now(), options.hostPlanFile)
-    if (!written.ok) {
-      return reply({ error: { error: written.error }, plan_uri: "" })
-    }
-    return {
-      ...base,
-      outcome: "bridged",
-      createPlan: {
-        ...decoded,
-        bridge,
-        toolName: "question",
-        planUri: written.planUri,
-        planPath: written.planPath,
-        questionInput: createPlanApprovalQuestionInput(written.planPath),
-        planReview: renderPlanReviewMessage(written.markdown, written.planPath),
-      },
-      reply: undefined,
-    }
-  }
-
   // A lifecycle turn (title generation, compaction) runs alongside the real one
-  // and would otherwise write a second, throwaway plan file for the same
-  // request. Ack it the CLI way instead of persisting anything.
+  // and would otherwise persist a second, throwaway plan file for the same
+  // request. Ack it the CLI way instead of emitting a host write.
   if (options.allowTools !== true) return reply({ success: {}, plan_uri: "" })
 
   const workspaceRoot = options.workspaceRoot?.trim()
   if (!workspaceRoot) {
-    return reply({
+    const result = {
       error: { error: "CreatePlan requires a workspace root to write the plan file" },
       plan_uri: "",
-    })
+    }
+    return bridge.kind === "hold" ? { ...reply(result), endTurn: true } : reply(result)
   }
 
-  // The session's own plan file when known, as the host's plan agent uses it.
-  const written = writeOpencodePlanFile(decoded.args, workspaceRoot, Date.now(), options.hostPlanFile)
-  if (!written.ok) {
-    return reply({ error: { error: written.error }, plan_uri: "" })
+  const planTarget = bridge.kind === "exit" ? bridge.planPath : options.hostPlanFile
+  const prepared = prepareCreatePlanFile(decoded.args, workspaceRoot, Date.now(), planTarget)
+  if (!prepared.ok) {
+    const result = { error: { error: prepared.error }, plan_uri: "" }
+    return bridge.kind === "hold" ? { ...reply(result), endTurn: true } : reply(result)
   }
 
-  // Nothing advertised can ask: the plan is recorded where the host keeps
-  // plans. Execution starts only if the user later switches agents.
-  return reply({ success: {}, plan_uri: written.planUri })
+  const route = resolvePlanPersistence(
+    options.advertisedTools ?? [],
+    options.hostFilePathKey ?? "filePath",
+  )
+  if (route.kind === "unsupported") {
+    const result = { error: { error: route.error }, plan_uri: "" }
+    return bridge.kind === "hold" ? { ...reply(result), endTurn: true } : reply(result)
+  }
+  const persistence = buildPlanPersistenceCall(route, prepared.planPath, prepared.markdown)
+  if (!persistence.ok) {
+    const result = { error: { error: persistence.error }, plan_uri: "" }
+    return bridge.kind === "hold" ? { ...reply(result), endTurn: true } : reply(result)
+  }
+
+  const afterWrite: CreatePlanAfterWrite =
+    bridge.kind === "exit" ? { kind: "review", toolName: "plan_exit" }
+      : bridge.kind === "approve" ? { kind: "review", toolName: "question" }
+        : bridge.kind === "hold" ? { kind: "hold" }
+          : { kind: "ack" }
+
+  return {
+    ...base,
+    outcome: "bridged",
+    createPlan: {
+      ...decoded,
+      bridge,
+      toolName: persistence.toolName,
+      planUri: prepared.planUri,
+      planPath: prepared.planPath,
+      markdown: prepared.markdown,
+      planReview: renderPlanReviewMessage(prepared.markdown, prepared.planPath),
+      ...(afterWrite.kind === "review"
+        ? {
+            questionInput: afterWrite.toolName === "question"
+              ? createPlanApprovalQuestionInput(prepared.planPath)
+              : undefined,
+          }
+        : {}),
+      persistence: {
+        toolName: persistence.toolName,
+        input: persistence.input,
+        afterWrite,
+      },
+    },
+    reply: undefined,
+  }
 }
 
 /**

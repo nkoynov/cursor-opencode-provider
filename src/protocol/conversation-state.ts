@@ -1,6 +1,7 @@
 import { trace } from "../debug.js"
 import { restoreEarlySteers, serializeEarlySteers } from "../host-steer.js"
 import { restoreLostRequest, serializeLostRequest } from "../lost-request.js"
+import { restorePlanOperations, serializePlanOperations } from "./plan-operations.js"
 import {
   getFrozenRequestContext,
   setFrozenRequestContext,
@@ -67,6 +68,7 @@ export async function hydrateConversationState(
   restoreConversationBinding(sessionKey, persisted.conversationId)
   restoreEarlySteers(sessionKey, persisted.earlySteers)
   restoreLostRequest(sessionKey, persisted.lostRequest)
+  restorePlanOperations(sessionKey, persisted.planOperations)
   // Snapshots written before this marker existed came from releases that never sent a deny.
   restoreSessionEditsDenySent(persisted.conversationId, persisted.sessionEditsDenySent === true)
   if (persisted.occupancyCheckpoint) restoreCheckpointOccupancy(persisted.conversationId, persisted.occupancyCheckpoint)
@@ -156,6 +158,7 @@ export async function persistConversationState(
     earlySteers: serializeEarlySteers(input.sessionKey),
     lostRequest: serializeLostRequest(input.sessionKey),
     ...(input.modelFallbackStop ? { modelFallbackStop: input.modelFallbackStop } : {}),
+    planOperations: serializePlanOperations(input.sessionKey),
     ...(heldImages ? { sentImageHashes: heldImages.hashes, sentImagesCheckpoint: heldImages.checkpoint } : {}),
     ...(sessionEditsDenySent(input.conversationId) ? { sessionEditsDenySent: true } : {}),
     ...(provenance?.conversationId === input.conversationId

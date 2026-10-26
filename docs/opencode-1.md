@@ -115,9 +115,11 @@ feedback into the provider's emulated `question` review keeps the turn open in
 plan mode and sends that text back as the CreatePlan reply so the model can revise.
 Host-owned `plan_exit` and plan-stage reviews retain their native outcomes.
 
-CreatePlan saves and shows the plan before asking whether to implement. A
-session-wide edit deny keeps the plan saved without an implementation approval
+CreatePlan persists the plan through an advertised host `write` or patch tool,
+shows it, then asks whether to implement. When a plan-file exception permits
+saving, a session-wide edit deny keeps the saved plan without an implementation approval
 or a build-agent handoff; allowing only the plan file does not lift that deny.
+Host file permission may still prompt for the save.
 Change the session rule in the client before approving implementation. The
 classic plugin reads native `permission` rules, retries a failed session lookup
 once, and blocks CreatePlan and implementing mode switches if the rules remain

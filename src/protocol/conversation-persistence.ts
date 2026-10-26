@@ -50,6 +50,8 @@ export type PersistedConversation = {
   lostRequest?: string
   /** A session-edit-deny reminder may be in this conversation; absent means none was ever sent. */
   sessionEditsDenySent?: boolean
+  /** Bounded CreatePlan write/review receipts for restart reconciliation. */
+  planOperations?: string
 }
 
 /** Small per-session facts kept for the process; full snapshots stay on disk. */
@@ -209,8 +211,8 @@ function cloneConversation(value: PersistedConversation): PersistedConversation 
  * turn_provenance_json=12, host_note=13, early_steers_json=14,
  * lost_request_json=15, sent_image_hashes=16 (repeated), sent_images_checkpoint_sha256=17,
  * occupancy_checkpoint=18 (token-details-only checkpoint, never Run state),
- * session_edits_deny_sent=19, model_fallback_stop_json=101 (fork). Older fork builds wrote field 14 as
- * repeated answered-steer strings, ignored on read, and the model-fallback stop
+ * session_edits_deny_sent=19, plan_operations_json=20, model_fallback_stop_json=101 (fork). Older fork builds
+ * wrote field 14 as repeated answered-steer strings, ignored on read, and the model-fallback stop
  * as field 15, read as that stop when it is not a lost-request record.
  * Blob: id=1, data=2. Tool: name=1, description=2,
  * input_schema_json=3, source_name=4.
@@ -347,6 +349,7 @@ function encodeCacheFile(value: PersistedConversation): {
   if (value.modelFallbackStop) writer.uint32(fieldTag(MODEL_FALLBACK_STOP_FIELD, 2)).string(value.modelFallbackStop)
   if (value.occupancyCheckpoint?.length) writer.uint32(fieldTag(18, 2)).bytes(value.occupancyCheckpoint)
   if (value.sessionEditsDenySent) writer.uint32(fieldTag(19, 0)).bool(true)
+  if (value.planOperations) writer.uint32(fieldTag(20, 2)).string(value.planOperations)
   return { protobufBytes: writer.finish(), requestContextBytes: requestContext.length }
 }
 
@@ -372,6 +375,7 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
   let sentImagesCheckpoint: string | undefined
   const earlySteerValues: string[] = []
   let sessionEditsDenySent = false
+  let planOperations: string | undefined
   while (reader.pos < reader.len) {
     const tag = reader.uint32()
     const wireType = tag & 7
@@ -456,6 +460,10 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
         if (wireType !== 0) throw new Error("invalid session edits deny marker")
         sessionEditsDenySent = reader.bool()
         break
+      case 20:
+        if (wireType !== 2) throw new Error("invalid plan operations")
+        planOperations = reader.string()
+        break
       default:
         reader.skipType(wireType)
     }
@@ -491,6 +499,7 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
     ...(earlySteerValues.length === 1 && isEarlySteersJson(earlySteerValues[0]!) ? { earlySteers: earlySteerValues[0] } : {}),
     ...(lostRequest ? { lostRequest } : {}),
     ...(sessionEditsDenySent ? { sessionEditsDenySent } : {}),
+    ...(planOperations ? { planOperations } : {}),
   }
 }
 

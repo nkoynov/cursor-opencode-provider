@@ -170,10 +170,19 @@ import {
   CREATE_PLAN_RESULT_FIELD,
   CURSOR_PLAN_STAGE_TOOL,
   createPlanApprovalOutcome,
+  createPlanApprovalQuestion,
+  createPlanApprovalQuestionInput,
   createPlanRefineReason,
   createPlanSessionEditsDeniedReason,
   createPlanStageInput,
 } from "./protocol/create-plan.js"
+import {
+  clearPlanOperation,
+  clearPlanOperations,
+  incompletePlanOperations,
+  recordPlanOperation,
+  updatePlanOperationConsumed,
+} from "./protocol/plan-operations.js"
 import {
   FILE_MUTATION_TOOLS,
   notPermittedThisTurnReason,
@@ -236,6 +245,7 @@ import {
 import {
   bindConversationId,
   hasConversationBinding,
+  isActiveConversationBinding,
   peekConversationId,
   resolveConversationGroupId,
 } from "./protocol/conversation-bind.js"
@@ -1302,6 +1312,13 @@ async function doStreamImpl(
     return { stream: answeredSteerStream() }
   }
   let session = steeredSession ?? findContinuationSession(trailingToolResults)
+  // A restarted process cannot resume a CreatePlan interaction from its old
+  // checkpoint: it predates persistence/review and could request the write again.
+  const mayStartPlanTurn = !isCompactionCall(callOptions, opencodeSessionKey(callOptions))
+    && computeAllowTools(extractTools(callOptions).length, callOptions.toolChoice)
+  if (!session && interruptedPlanContinuation(prompt, opencodeSessionKey(callOptions), mayStartPlanTurn)) {
+    return { stream: answeredSteerStream(PLAN_INTERRUPTED_NOTICE) }
+  }
   // A call that must open a Run gets its credential before it changes any
   // session state (plan mode, finishing the prior held Run), so a login that
   // cannot be renewed fails the turn without side effects.
@@ -1368,6 +1385,11 @@ async function doStreamImpl(
 
   if (!session) {
     const sessionKey = opencodeSessionKey(callOptions)
+    // Delivery itself may have lost the held Run. Do not rebase that failed
+    // plan continuation onto a checkpoint from before the host mutation.
+    if (interruptedPlanContinuation(prompt, sessionKey, mayStartPlanTurn)) {
+      return { stream: answeredSteerStream(PLAN_INTERRUPTED_NOTICE) }
+    }
     if (!session && trailingToolResults.length > 0) {
       // True continuation (prompt ends with tool results) but the held-open Run
       // is gone (or its write path just failed). Rebase the complete OpenCode
@@ -1471,6 +1493,10 @@ async function doStreamImpl(
         }
         // Without TurnEnded, the checkpoint may predate completed side effects.
         // Include their host results instead of resuming that model step.
+        const newUserTurn = liveUserTurn(prompt)
+        if (!lifecycleCall && !isCompactionCall(callOptions, sessionKey) && newUserTurn && newUserTurn.text !== ".") {
+          clearPlanOperations(sessionKey)
+        }
         session = await openSession(unfinishedPrior
           ? { recovery: { kind: "rebase", reason: "unfinished-prior-run" } }
           : undefined)
@@ -3267,6 +3293,28 @@ export async function preparePriorSessionForFreshTurn(
     if (prior.closed) return "settled-only"
   }
 
+  // A real new user turn abandons the prior review. A historical writer
+  // result can queue that review here without opening another host call;
+  // settle its still-owed interaction before draining the old Run.
+  const queuedPlan = prior.queuedCreatePlanAction
+  if (queuedPlan?.kind === "review") {
+    let beforeReply = lastFrameArrival()
+    const written = await writeWithBackpressure(prior.stream, buildCreatePlanInteractionReply(queuedPlan.interactionId, {
+      error: { error: FRESH_TURN_PENDING_CANCEL_REASON }, plan_uri: "",
+    }), "create_plan review abandoned for new user turn", () => {
+      beforeReply = lastFrameArrival()
+      return !prior.closed
+    })
+    if (!written) return "settled-only"
+    invalidateResumeCheckpoint(prior, beforeReply, true)
+    const unacknowledged = prior.unacknowledgedHostResults ??= []
+    unacknowledged.push({ callId: queuedPlan.createPlanToolCallId, afterFrame: beforeReply })
+    prior.queuedCreatePlanAction = undefined
+    prior.planReviewDeclined = true
+    if (queuedPlan.receiptHostCallId) clearPlanOperation(prior.openCodeSessionId, queuedPlan.receiptHostCallId)
+    await persistPlanOperations(prior)
+  }
+
   const cancelled = await cancelPendingExecsForFreshTurn(prior)
   if (cancelled > 0) {
     trace(
@@ -3527,6 +3575,29 @@ function persistRunInProgress(session: CursorSession, where: string): Promise<vo
   runSavesInFlight.add(save)
   void save.finally(() => runSavesInFlight.delete(save))
   return save
+}
+
+/** Unlike a best-effort cache save, a plan receipt must reach disk before mutation. */
+async function persistPlanOperations(session: CursorSession): Promise<void> {
+  if (!session.openCodeSessionId || !session.cacheDir) return
+  const assertOwner = () => {
+    if (!isActiveConversationBinding(session.openCodeSessionId!, session.conversationId)) {
+      throw new CursorLocalCancellationError("CreatePlan conversation was superseded")
+    }
+  }
+  assertOwner()
+  await persistConversationState(session.cacheDir, {
+    sessionKey: session.openCodeSessionId,
+    conversationId: session.conversationId,
+    requestContext: session.requestContext,
+    toolCatalog: session.toolCatalog,
+    postCompactionRebase: session.postCompactionRebase,
+    hostAgent: session.hostAgent,
+    systemPromptHash: session.stableSystemPromptHash,
+    hostNote: encodePersistedHostNotes(persistableHostNotes(session.openCodeSessionId)),
+    runInProgress: true,
+  })
+  assertOwner()
 }
 
 /** How long a Run must wait on host tools before its state is saved for a restart. */
@@ -4247,6 +4318,7 @@ async function deliverContinuationResultsNow(
     let endTurnAfterDelivery = false
     let deliveredCreatePlan: { approved: boolean; emulated: boolean; endTurn: boolean } | undefined
     let deliveredImageHashes: string[] = []
+    let completedPlanOperation: string | undefined
     if (pending.resultField === ASK_QUESTION_RESULT_FIELD) {
       // A bridged Cursor AskQuestion. The host tool result carries the user's
       // choices; translate them back into the Cursor result the interaction is
@@ -4279,20 +4351,110 @@ async function deliverContinuationResultsNow(
         return undefined
       }
     } else if (pending.resultField === CREATE_PLAN_RESULT_FIELD) {
-      try {
-        const built = buildCreatePlanContinuationFrame(
-          pending,
-          reviewResult,
-          delivery.hostAgent,
-          delivery.sessionEditsDenied,
-          delivery.sessionPermissionsUnavailable,
-        )
-        frames = [built.frame]
-        deliveredCreatePlan = built
-      } catch (error) {
-        trace(`continuation: create_plan encode FAILED execId=${r.execId} err=${(error as Error).message}`)
-        sessionManager.close(session, "result-write-failed")
-        return undefined
+      const metadata = pending.resultMetadata ?? {}
+      if (metadata.createPlanPhase === "write") {
+        // Host persistence finished. Success is not execution approval — queue
+        // the review or acknowledgment. Do not send a write_result to Cursor.
+        try {
+          const interactionId = metadata.interactionId
+          const planUri = metadata.planUri
+          const planPath = typeof metadata.planPath === "string" ? metadata.planPath.trim() : ""
+          if (typeof interactionId !== "number" || typeof planUri !== "string" || !planUri.trim()) {
+            throw new CursorProtocolError("Bridged CreatePlan write lost its interaction identity")
+          }
+          const receiptHostCallId = `cursor_${session.sessionId}_${r.execId}`
+          if (reviewResult.error !== undefined || r.interrupted || r.refusal) {
+            completedPlanOperation = receiptHostCallId
+            frames = [buildCreatePlanInteractionReply(interactionId, {
+              error: {
+                error: reviewResult.error?.trim()
+                  || (typeof r.refusal === "string" ? r.refusal : "")
+                  || "Failed to write plan file",
+              },
+              plan_uri: "",
+            })]
+            deliveredCreatePlan = { approved: false, emulated: false, endTurn: true }
+          } else {
+            const afterWrite = metadata.createPlanAfterWrite
+            const planReview = typeof metadata.planReview === "string" ? metadata.planReview : undefined
+            const markdown = typeof metadata.planMarkdown === "string" ? metadata.planMarkdown : undefined
+            if (afterWrite === "review") {
+              const reviewTool = metadata.createPlanReviewToolName === "plan_exit" ? "plan_exit" : "question"
+              session.queuedCreatePlanAction = {
+                kind: "review",
+                interactionId,
+                ...(typeof metadata.createPlanToolCallId === "string"
+                  ? { createPlanToolCallId: metadata.createPlanToolCallId }
+                  : {}),
+                bridgeKind: typeof metadata.createPlanBridgeKind === "string"
+                  ? metadata.createPlanBridgeKind : "approve",
+                receiptHostCallId,
+                planUri,
+                planPath,
+                ...(markdown ? { markdown } : {}),
+                ...(planReview ? { planReview } : {}),
+                toolName: reviewTool,
+                ...(reviewTool === "question"
+                  ? {
+                      questionInput: createPlanApprovalQuestionInput(planPath),
+                      createPlanQuestion: createPlanApprovalQuestion(planPath),
+                    }
+                  : {}),
+              }
+              frames = []
+              updatePlanOperationConsumed(session.openCodeSessionId, receiptHostCallId, `${r.sessionId}:${r.execId}`, "review")
+              await persistPlanOperations(session)
+              trace(
+                `create_plan: write succeeded execId=${r.execId}; queued ${reviewTool} review ` +
+                  `interactionId=${interactionId}`,
+              )
+            } else if (afterWrite === "hold") {
+              completedPlanOperation = receiptHostCallId
+              session.queuedCreatePlanAction = {
+                kind: "hold",
+                interactionId,
+                bridgeKind: "hold",
+                planUri,
+                planPath,
+                ...(planReview ? { planReview } : {}),
+              }
+              frames = [buildCreatePlanInteractionReply(interactionId, {
+                error: { error: createPlanSessionEditsDeniedReason(planPath) },
+                plan_uri: "",
+              })]
+              deliveredCreatePlan = { approved: false, emulated: false, endTurn: true }
+            } else {
+              completedPlanOperation = receiptHostCallId
+              frames = [buildCreatePlanInteractionReply(interactionId, {
+                success: {},
+                plan_uri: planUri,
+              })]
+              deliveredCreatePlan = { approved: false, emulated: false, endTurn: false }
+            }
+          }
+        } catch (error) {
+          trace(`continuation: create_plan write encode FAILED execId=${r.execId} err=${(error as Error).message}`)
+          sessionManager.close(session, "result-write-failed")
+          return undefined
+        }
+      } else {
+        try {
+          const built = buildCreatePlanContinuationFrame(
+            pending,
+            reviewResult,
+            delivery.hostAgent,
+            delivery.sessionEditsDenied,
+            delivery.sessionPermissionsUnavailable,
+          )
+          frames = [built.frame]
+          deliveredCreatePlan = built
+          completedPlanOperation = typeof metadata.planOperationHostCallId === "string"
+            ? metadata.planOperationHostCallId : undefined
+        } catch (error) {
+          trace(`continuation: create_plan encode FAILED execId=${r.execId} err=${(error as Error).message}`)
+          sessionManager.close(session, "result-write-failed")
+          return undefined
+        }
       }
     } else if (pending.aborted) {
       if (isShellResultField(pending.resultField)) consumeCursorShellResult(r.toolCallId, r.output)
@@ -4410,19 +4572,26 @@ async function deliverContinuationResultsNow(
     // including time spent queued behind another write, but admit those that
     // arrive while that frame drains. Earlier result frames are incomplete.
     let beforeResultWrite = lastFrameArrival()
+    const replyDeferred = pending.resultField === CREATE_PLAN_RESULT_FIELD
+      && pending.resultMetadata?.createPlanPhase === "write"
+      && session.queuedCreatePlanAction?.kind === "review"
     const outcome = await sessionManager.deliverClaim(claim, frames, () => {
       beforeResultWrite = lastFrameArrival()
-    })
+    }, { replyDeferred })
     if (outcome.kind !== "delivered") {
       trace(`continuation: delivery stopped execId=${r.execId} reason=${outcome.reason}`)
       if (outcome.kind === "duplicate") continue
       return undefined
     }
     deliveredResults++
+    if (completedPlanOperation) {
+      clearPlanOperation(session.openCodeSessionId, completedPlanOperation)
+      await persistPlanOperations(session)
+    }
     if (endTurnAfterDelivery) session.planReviewDeclined = true
     if (resultFinishesToolCall(session, pending)) noteToolCallFinished(session.toolCallOrder, pending.displayCallId)
     // A host tool that ran after Cursor withdrew its exec still changed state the checkpoint before it lacks.
-    if (outcome.framesWritten > 0 || pending.bridged || pending.aborted) {
+    if (outcome.framesWritten > 0 || replyDeferred || pending.bridged || pending.aborted) {
       invalidateResumeCheckpoint(session, beforeResultWrite, true)
       // A display-only mirror sends nothing to Cursor: its server completion
       // already arrived before the host call. Only a real reply needs an ack.
@@ -4953,10 +5122,40 @@ async function leaveOutAnsweredEarlySteers(
   return "all"
 }
 
-function answeredSteerStream(): ReadableStream<V3Part> {
+const PLAN_INTERRUPTED_NOTICE = "Plan saving or review was interrupted. No implementation was approved. Send a new message to continue."
+
+function interruptedPlanContinuation(prompt: LanguageModelV3CallOptions["prompt"], sessionKey: string | undefined, mayStartUserTurn: boolean): boolean {
+  // Title/summary helpers may carry their parent's history while its plan
+  // write is still live. The ordinary helper-isolation path owns those calls.
+  if (sessionManager.findOpenByOpenCodeSessionId(sessionKey)) return false
+  const incomplete = incompletePlanOperations(sessionKey)
+  if (incomplete.length === 0) return false
+  const calls = new Set(incomplete.map(plan => plan.hostCallId))
+  let priorCall = -1
+  for (let index = prompt.length - 1; index >= 0; index--) {
+    const message = prompt[index]
+    if (message.role === "assistant" && message.content.some(part => part.type === "tool-call" && calls.has(part.toolCallId))) {
+      priorCall = index
+      break
+    }
+  }
+  const live = liveUserTurn(prompt)
+  if (priorCall >= 0 && live && live.text !== "." && live.start > priorCall) {
+    if (mayStartUserTurn) clearPlanOperations(sessionKey)
+    return false
+  }
+  return priorCall >= 0 || extractToolResults(prompt).some(result => calls.has(result.toolCallId))
+}
+
+function answeredSteerStream(notice?: string): ReadableStream<V3Part> {
   return new ReadableStream<V3Part>({
     start(controller) {
       controller.enqueue({ type: "stream-start", warnings: [] } as V3Part)
+      if (notice) {
+        controller.enqueue({ type: "text-start", id: "plan-interrupted" })
+        controller.enqueue({ type: "text-delta", id: "plan-interrupted", delta: notice })
+        controller.enqueue({ type: "text-end", id: "plan-interrupted" })
+      }
       controller.enqueue({
         type: "finish",
         finishReason: { unified: "stop", raw: undefined },
@@ -6033,6 +6232,79 @@ export async function pump(
       trace(`pump: abortSignal aborted pending=${session.pending.size}`)
       sessionManager.closeUnlessPending(session)
       return
+    }
+    // After a successful CreatePlan host write, emit the queued review (or show
+    // the held plan) before waiting for another Cursor frame. Cursor is still
+    // blocking on the interaction query.
+    const queuedPlan = session.queuedCreatePlanAction
+    if (queuedPlan) {
+      session.queuedCreatePlanAction = undefined
+      if (queuedPlan.planReview) emitPlanReview(queuedPlan.planReview)
+      if (queuedPlan.kind === "review") {
+        const reviewTool = queuedPlan.toolName === "plan_exit" ? "plan_exit" : "question"
+        // Re-check current permission evidence before offering execution.
+        const refusal = session.sessionPermissionsUnavailable ? SESSION_PERMISSIONS_UNAVAILABLE_REASON
+          : session.sessionEditsDenied ? createPlanSessionEditsDeniedReason(queuedPlan.planPath)
+            : isPlanTurnEnding() ? CREATE_PLAN_NOT_APPROVED_REASON
+              : !session.allowTools || !advertisedToolNameSet.has(reviewTool) || !fileToolNames().has(reviewTool)
+                ? `CreatePlan review tool '${reviewTool}' is unavailable on this turn. No implementation was approved.`
+                : undefined
+        if (refusal) {
+          try {
+            await writeWithBackpressure(
+              session.stream,
+              buildCreatePlanInteractionReply(queuedPlan.interactionId, {
+                error: { error: refusal },
+                plan_uri: "",
+              }),
+              `create_plan review refused id=${queuedPlan.interactionId}`,
+            )
+          } catch (error) {
+            rethrowTransportWriteFailure(error)
+            failRunProtocol("Cursor interaction reply failed", RUN_REPLY_FAILED)
+          }
+          session.planReviewDeclined = true
+          if (queuedPlan.receiptHostCallId) clearPlanOperation(session.openCodeSessionId, queuedPlan.receiptHostCallId)
+          await persistPlanOperations(session)
+          continue
+        }
+        const reviewExecId = session.nextBridgedExecId++
+        replaySafety.recordHostCall(reviewExecId)
+        sessionManager.registerPending(
+          reviewExecId,
+          session,
+          CREATE_PLAN_RESULT_FIELD,
+          reviewTool,
+          false,
+          {
+            interactionId: queuedPlan.interactionId,
+            createPlanToolCallId: queuedPlan.createPlanToolCallId,
+            createPlanBridgeKind: queuedPlan.bridgeKind,
+            createPlanPhase: "review",
+            planOperationHostCallId: queuedPlan.receiptHostCallId,
+            createPlanQuestion: queuedPlan.createPlanQuestion ?? "",
+            planUri: queuedPlan.planUri,
+            ...(queuedPlan.planPath ? { planPath: queuedPlan.planPath } : {}),
+          },
+        )
+        const reviewToolCallId = `cursor_${session.sessionId}_${reviewExecId}`
+        const input = reviewTool === "question"
+          ? (queuedPlan.questionInput ?? createPlanApprovalQuestionInput(queuedPlan.planPath))
+          : {}
+        emittedHostTools++
+        closeOpenSpans()
+        safeEnqueue({
+          type: "tool-call",
+          toolCallId: reviewToolCallId,
+          toolName: reviewTool,
+          input: JSON.stringify(input),
+        } as V3Part)
+        emitFinish(undefined, { unified: "tool-calls", raw: undefined })
+        return
+      }
+      // hold/ack replies were already written during write-result delivery.
+      if (queuedPlan.kind === "hold") session.planReviewDeclined = true
+      continue
     }
 
     if (toolStepComplete() && !hasDeferredToolExecs(order)) {
@@ -7276,6 +7548,9 @@ export async function pump(
             ...(session.sessionEditsDenied ? { sessionEditsDenied: true } : {}),
             sessionPermissionsUnavailable: session.sessionPermissionsUnavailable,
             workspaceRoot: workspaceRootFromRequestContext(session.requestContext),
+            ...(session.hostToolDialect?.filePathKey
+              ? { hostFilePathKey: session.hostToolDialect.filePathKey }
+              : {}),
           })
         } catch {
           return failRunProtocol("Cursor interaction request could not be handled", RUN_REQUEST_UNSUPPORTED)
@@ -7442,10 +7717,106 @@ export async function pump(
         return
       }
       if (handled.outcome === "bridged" && handled.createPlan) {
-        // A host plan-stage tool, the host plan_exit review of the plan the
-        // provider already wrote, or the emulated `question` prompt after that
-        // write. All hold Cursor's query open until the host answers.
+        // Host plan-stage (write+review together), or a preliminary host write/
+        // patch whose success queues review. Cursor's query stays open.
         const plan = handled.createPlan
+        if (session.queuedCreatePlanAction || [...session.pending.values()].some(pending => pending.resultField === CREATE_PLAN_RESULT_FIELD)) {
+          await writeWithBackpressure(session.stream, buildCreatePlanInteractionReply(handled.id, {
+            error: { error: "Finish the pending CreatePlan before recording another plan." }, plan_uri: "",
+          }), `create_plan already pending id=${handled.id}`)
+          continue
+        }
+        if (plan.persistence) {
+          const planUri = plan.planUri ?? ""
+          const planPath = typeof plan.planPath === "string" ? plan.planPath.trim() : ""
+          const markdown = typeof plan.markdown === "string" ? plan.markdown : ""
+          const writeExecId = session.nextBridgedExecId++
+          const writeToolCallId = `cursor_${session.sessionId}_${writeExecId}`
+          const after = plan.persistence.afterWrite
+          const recorded = recordPlanOperation(session.openCodeSessionId, {
+            interactionId: handled.id,
+            ...(plan.toolCallId ? { createPlanToolCallId: plan.toolCallId } : {}),
+            hostCallId: writeToolCallId,
+            planPath,
+            planUri,
+            markdown,
+            phase: "write",
+            bridgeKind: plan.bridge.kind,
+            afterWrite: after.kind,
+            ...(after.kind === "review" ? { reviewToolName: after.toolName } : {}),
+          })
+          if (!recorded.ok) {
+            try {
+              await writeWithBackpressure(
+                session.stream,
+                buildCreatePlanInteractionReply(handled.id, {
+                  error: { error: recorded.error },
+                  plan_uri: "",
+                }),
+                `create_plan write refused id=${handled.id}`,
+              )
+            } catch (error) {
+              rethrowTransportWriteFailure(error)
+              failRunProtocol("Cursor interaction reply failed", RUN_REPLY_FAILED)
+            }
+            if (after.kind === "hold") session.planReviewDeclined = true
+            continue
+          }
+          // Await the receipt before emitting a mutating host call.
+          try {
+            await persistPlanOperations(session)
+          } catch (error) {
+            clearPlanOperation(session.openCodeSessionId, writeToolCallId)
+            throw error
+          }
+          // The disk save can outlive Stop, cancellation, or a retired Run.
+          // No host mutation has been emitted yet, so abandon this receipt.
+          if (session.hostInterrupted || session.closed || abortSignal?.aborted || !session.allowTools
+            || !fileToolNames().has(plan.persistence.toolName) || isPlanTurnEnding()) {
+            clearPlanOperation(session.openCodeSessionId, writeToolCallId)
+            await persistPlanOperations(session)
+            if (session.hostInterrupted) stopForHostInterrupt()
+            return
+          }
+          replaySafety.recordHostCall(writeExecId)
+          sessionManager.registerPending(
+            writeExecId,
+            session,
+            CREATE_PLAN_RESULT_FIELD,
+            plan.persistence.toolName,
+            false,
+            {
+              interactionId: handled.id,
+              createPlanToolCallId: plan.toolCallId,
+              createPlanBridgeKind: plan.bridge.kind,
+              createPlanPhase: "write",
+              createPlanAfterWrite: after.kind,
+              ...(after.kind === "review" ? { createPlanReviewToolName: after.toolName } : {}),
+              createPlanQuestion: plan.questionInput?.questions[0]?.question ?? "",
+              planUri,
+              ...(planPath ? { planPath } : {}),
+              ...(markdown ? { planMarkdown: markdown } : {}),
+              ...(plan.planReview ? { planReview: plan.planReview } : {}),
+            },
+          )
+          trace(
+            `interaction_query: BRIDGED create_plan write id=${handled.id} bridge=${plan.bridge.kind} ` +
+              `hostTool=${plan.persistence.toolName} writeToolCallId=${writeToolCallId} ` +
+              `after=${after.kind} planUri=${planUri || "(none)"} ` +
+              `cursorToolCallId=${plan.toolCallId || "(none)"}`,
+          )
+          emittedHostTools++
+          closeOpenSpans()
+          replaySafety.markBarrier("stateful-interaction")
+          safeEnqueue({
+            type: "tool-call",
+            toolCallId: writeToolCallId,
+            toolName: plan.persistence.toolName,
+            input: JSON.stringify(plan.persistence.input),
+          } as V3Part)
+          emitFinish(undefined, { unified: "tool-calls", raw: undefined })
+          return
+        }
         const staged = plan.bridge.kind === "stage" ? createPlanStageInput(plan.args) : undefined
         const planUri = staged?.plan_uri ?? plan.planUri ?? ""
         const input = staged ?? plan.questionInput ?? {}
@@ -7461,6 +7832,7 @@ export async function pump(
             interactionId: handled.id,
             createPlanToolCallId: plan.toolCallId,
             createPlanBridgeKind: plan.bridge.kind,
+            createPlanPhase: "review",
             createPlanQuestion: plan.questionInput?.questions[0]?.question ?? "",
             planUri,
             ...(typeof plan.planPath === "string" && plan.planPath.trim()

@@ -17,7 +17,7 @@ Run this checklist for changes to CreatePlan, SwitchMode, file-tool substitution
 
 1. Start stock OpenCode in a TTY with provider debug logging enabled, in the default build agent.
 2. Enter plan mode and ask for a small plan that makes Cursor raise CreatePlan, with `question` advertised and `plan_exit` absent.
-3. Verify the plan file is written to OpenCode's plan location and the plan is visible in the assistant transcript before the `question` approval prompt (`src/protocol/interactions.ts`, `src/protocol/create-plan.ts`).
+3. Verify CreatePlan first emits a host `write` (or patch) of the plan file, then shows the plan in the assistant transcript before the `question` approval prompt. The provider must not write the file itself (`src/protocol/interactions.ts`, `src/protocol/create-plan.ts`, `src/language-model.ts`).
 4. Answer No: the turn ends and the plan agent stays selected. Type freeform feedback instead of Yes/No: the CreatePlan reply carries that text, the turn continues in plan mode, and no build-agent switch starts. Answer Yes: after successful reply delivery, verify a native build-agent turn starts and the requested implementation happens once (`src/language-model.ts`, `src/host-agent-mode.ts`).
 
 ## OpenCode 1.x without `plan_enter`
@@ -25,11 +25,11 @@ Run this checklist for changes to CreatePlan, SwitchMode, file-tool substitution
 1. Start OpenCode 1.x in a TTY with `OPENCODE_EXPERIMENTAL_PLAN_MODE=1` (so `plan_exit` is advertised) and provider debug logging, in the default build agent.
 2. Ask the model to switch to plan mode and plan a tiny change.
 3. Verify `host-agent-mode: pending … target=plan`, any CreatePlan in that Run replies `outcome=failed` (deferred, nothing written), and `host-agent-mode: switched … target=plan` follows the Run's end.
-4. Verify the next turn runs under the `plan` agent with `cursorMode=plan`; CreatePlan logs `BRIDGED create_plan … bridge=exit hostTool=plan_exit`, the plan is shown and written to the session plan file (`.opencode/plans/<created>-<slug>.md` in a git project), and the `plan_exit` question appears. The model makes no `get_mcp_tools` lookup for `plan_exit`.
+4. Verify the next turn runs under the `plan` agent with `cursorMode=plan`; CreatePlan logs a bridged host `write`/`patch` first, then `BRIDGED create_plan … bridge=exit hostTool=plan_exit`, the plan is shown at the session plan file (`.opencode/plans/<created>-<slug>.md` in a git project), and the `plan_exit` question appears. The model makes no `get_mcp_tools` lookup for `plan_exit`.
 5. Answer No: the turn ends, the session stays in `plan`, and no further tool runs until a new human message.
 6. Approve: verify `host-agent-mode: host left plan agent`, the session returns to the build agent, and the change is applied exactly once.
 7. Verify no turn is injected into subagent or hidden sessions.
-8. New session: pick `plan` in the agent picker (Tab) before asking for a plan. Verify `host-agent-mode: host entered plan agent`, the Run logs `cursorMode=plan`, and steps 4–6 hold without any SwitchMode: CreatePlan bridges to `plan_exit`, no `write` of the plan file and no MCP `plan_exit` call by the model, and no `get_mcp_tools` lookup.
+8. New session: pick `plan` in the agent picker (Tab) before asking for a plan. Verify `host-agent-mode: host entered plan agent`, the Run logs `cursorMode=plan`, and steps 4–6 hold without any SwitchMode: CreatePlan persists through the host file tool then bridges to `plan_exit`, with no MCP `plan_exit` call by the model and no `get_mcp_tools` lookup.
 
 ## OpenCode 2.0
 

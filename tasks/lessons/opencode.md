@@ -81,9 +81,10 @@ These are failure lessons shared by both hosts, not a replacement for
   member does not make it control traffic: `user_message_appended` after context
   injection changes conversation state and must retain its replay barrier
   (`test/replay-safety.test.ts`, `test/run-interruption.test.ts`).
-- **Apply protobuf defaults deliberately.** Omitted scalars may mean zero;
-  omission assertions need sparse decoding. Fragmented varints also need a
-  streaming prefix parser (`test/conversation-maintenance.test.ts`).
+- **Apply protobuf defaults deliberately.** Omitted scalars may mean zero, while
+  protobufjs encodes explicitly owned zero values; omission assertions need raw
+  field inspection or sparse decoding. Fragmented varints also need a streaming
+  prefix parser (`test/request.test.ts`, `test/conversation-maintenance.test.ts`).
 - **Every inbound request needs a typed answer.** Ignoring an interaction
   deadlocked both peers. Known unsupported variants need a correlated refusal;
   unknown fields remain protocol drift (`test/interactions.test.ts`).

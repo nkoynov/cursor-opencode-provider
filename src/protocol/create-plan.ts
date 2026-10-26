@@ -14,6 +14,10 @@
  *
  * Body is plain markdown (the same shape a plan-mode model would write with
  * `write`). Cursor YAML frontmatter is never emitted.
+ *
+ * Native CreatePlan persistence goes through an advertised host `write` or
+ * patch tool — never a direct filesystem write from this module. File
+ * permission prompts authorize that save; execution review is a later step.
  */
 
 import { mkdirSync, writeFileSync } from "node:fs"
@@ -24,10 +28,16 @@ import { isHostPlanAgent } from "./cursor-mode.js"
 import { decodeMessageSparse } from "./messages.js"
 import { errorMessage } from "../debug.js"
 import {
+  buildAddFilePatch,
+  hostPatchTool,
+  type HostPatchTool,
+} from "./apply-patch.js"
+import {
   parseAnswerSegments,
   type CursorAskQuestionItem,
   type OpencodeQuestionInput,
 } from "./ask-question.js"
+import type { HostFilePathKey } from "./tools.js"
 
 const PLAN_ADJECTIVES = [
   "brave",
@@ -118,11 +128,32 @@ export type CreatePlanWriteResult =
   | { ok: true; planPath: string; planUri: string; markdown: string }
   | { ok: false; error: string }
 
+/** Prepared plan content and destination — no filesystem mutation. */
+export type PreparedCreatePlanFile = CreatePlanWriteResult
+
 /** Optional host plan-stage tool advertised by a compatible host. */
 export const CURSOR_PLAN_STAGE_TOOL = "cursor_plan_stage"
 
-/** Held InteractionQuery continuation field for a native host plan stage. */
+/** Held InteractionQuery continuation field for CreatePlan write and review. */
 export const CREATE_PLAN_RESULT_FIELD = "create_plan_request_response"
+
+/** Internal CreatePlan continuation phase stored on pending metadata. */
+export type CreatePlanContinuationPhase = "write" | "review"
+
+/** After a successful host plan write, what the provider does next. */
+export type CreatePlanAfterWrite =
+  | { kind: "review"; toolName: "plan_exit" | "question" }
+  | { kind: "ack" }
+  | { kind: "hold" }
+
+export type PlanPersistenceRoute =
+  | { kind: "write"; toolName: "write"; filePathKey: HostFilePathKey }
+  | { kind: "patch"; toolName: HostPatchTool }
+  | { kind: "unsupported"; error: string }
+
+export type PlanPersistenceCall =
+  | { ok: true; toolName: "write" | HostPatchTool; input: Record<string, unknown> }
+  | { ok: false; error: string }
 
 export type CursorPlanStageInput = {
   plan_uri: string
@@ -139,26 +170,29 @@ export type CursorPlanStageInput = {
  *             error = not approved). The result may name the host's own
  *             follow-up approval call. This provider does not invent that prompt.
  * - `ack`     nothing to ask with (or a lifecycle turn / CreatePlan outside
- *             plan mode): write, or for a lifecycle turn skip the write, and
- *             acknowledge the CLI way.
+ *             plan mode): persist through a host file tool, or for a lifecycle
+ *             turn skip the write, and acknowledge the CLI way.
  * - `approve` plan mode is active and the host advertises `question` but not
- *             a plan review tool: write the plan, then ask with upstream
- *             `PlanExitTool`'s own prompt (OpenCode 1.x / 2.0 without
- *             `plan_exit`). Explicit "Yes" is execution approval.
+ *             a plan review tool: persist through a host file tool, then ask
+ *             with upstream `PlanExitTool`'s own prompt (OpenCode 1.x / 2.0
+ *             without `plan_exit`). Explicit "Yes" is execution approval.
  * - `exit`    the host's `plan` agent is active, advertises `plan_exit`, and
- *             its own plan file is known: write the plan there and run the
- *             host `plan_exit` review. The host owns approval and execution;
- *             the turn that carries the result leaves `plan` only on approval.
+ *             its own plan file is known: persist there through a host file
+ *             tool and run the host `plan_exit` review. The host owns approval
+ *             and execution; the turn that carries the result leaves `plan`
+ *             only on approval.
  * - `defer`   the host's `plan` agent owns planning but CreatePlan cannot be
  *             carried out yet: an approved switch into it is still pending (it
  *             applies after this Run), or its plan file is unknown. Nothing is
  *             written; the error tells the model which host workflow follows.
- * - `hold`    the session's edit rule still denies edits. The plan is written
- *             and shown, and Cursor receives the not-approved error. Nothing
- *             asks the user or switches agents: an answer cannot lift the rule.
+ * - `hold`    the session's edit rule still denies edits. The plan is persisted
+ *             through a host file tool and shown, and Cursor receives the
+ *             not-approved error. Nothing asks the user or switches agents: an
+ *             answer cannot lift the rule. Host file permission may still ask
+ *             while saving; that authorizes the file operation only.
  *
- * The plan is always persisted before any review: writing needs no approval,
- * executing does, and only the host asks for it.
+ * Persistence precedes any execution review: saving needs no implementation
+ * approval, executing does, and only the host asks for that.
  */
 export type CreatePlanBridge =
   | { kind: "stage" }
@@ -236,7 +270,8 @@ export function resolveCreatePlanBridge(options: {
   hostPlanFile?: string
   /**
    * The session's last `edit` rule on `*` is deny. An approval cannot lift it,
-   * so the plan is saved without asking or switching agents.
+   * so the plan is saved through a host file tool without asking to implement
+   * or switching agents. Host file permission may still prompt for that save.
    */
   sessionEditsDenied?: boolean
 }): CreatePlanBridge {
@@ -523,8 +558,74 @@ export function renderOpencodePlanMarkdown(args: CursorCreatePlanArgs): string {
 }
 
 /**
- * Write the plan under {@link hostPlansDir} and return a `file://` URI.
+ * Resolve plan destination and markdown without touching the filesystem.
  * Empty / missing content is the caller's responsibility (empty plan_uri ack).
+ */
+export function prepareCreatePlanFile(
+  args: CursorCreatePlanArgs,
+  workspaceRoot: string,
+  created: number = Date.now(),
+  /** Exact host-owned plan file; default is a new file under {@link hostPlansDir}. */
+  target?: string,
+): PreparedCreatePlanFile {
+  const markdown = renderOpencodePlanMarkdown(args)
+  if (!markdown.trim()) {
+    return { ok: false, error: "CreatePlan produced no plan content to write" }
+  }
+  const planPath = target ?? resolveHostPlanPath(workspaceRoot, args.name, created)
+  return {
+    ok: true,
+    planPath,
+    planUri: pathToFileURL(planPath).href,
+    markdown,
+  }
+}
+
+/**
+ * Prefer an advertised `write`, otherwise a host patch tool. Never invent a
+ * binary or shell fallback when neither is available.
+ */
+export function resolvePlanPersistence(
+  advertised: ReadonlySet<string> | Iterable<string>,
+  filePathKey: HostFilePathKey = "filePath",
+): PlanPersistenceRoute {
+  const names = advertised instanceof Set ? advertised : new Set(advertised)
+  if (names.has("write")) return { kind: "write", toolName: "write", filePathKey }
+  const patch = hostPatchTool(names)
+  if (patch) return { kind: "patch", toolName: patch }
+  return {
+    kind: "unsupported",
+    error: "CreatePlan requires an advertised write or patch tool to save the plan file",
+  }
+}
+
+/** Build the host write or Add File patch call for a prepared plan. */
+export function buildPlanPersistenceCall(
+  route: Exclude<PlanPersistenceRoute, { kind: "unsupported" }>,
+  planPath: string,
+  markdown: string,
+): PlanPersistenceCall {
+  if (route.kind === "write") {
+    return {
+      ok: true,
+      toolName: "write",
+      input: { [route.filePathKey]: planPath, content: markdown },
+    }
+  }
+  try {
+    return {
+      ok: true,
+      toolName: route.toolName,
+      input: { patchText: buildAddFilePatch(planPath, markdown, route.toolName) },
+    }
+  } catch (err) {
+    return { ok: false, error: errorMessage(err) || "CreatePlan cannot represent this plan as a patch" }
+  }
+}
+
+/**
+ * Test helper: prepare then write the plan under {@link hostPlansDir}.
+ * Production CreatePlan paths must use a host file tool instead.
  */
 export function writeOpencodePlanFile(
   args: CursorCreatePlanArgs,
@@ -533,24 +634,16 @@ export function writeOpencodePlanFile(
   /** Exact host-owned plan file; default is a new file under {@link hostPlansDir}. */
   target?: string,
 ): CreatePlanWriteResult {
-  const markdown = renderOpencodePlanMarkdown(args)
-  if (!markdown.trim()) {
-    return { ok: false, error: "CreatePlan produced no plan content to write" }
-  }
-  const planPath = target ?? resolveHostPlanPath(workspaceRoot, args.name, created)
+  const prepared = prepareCreatePlanFile(args, workspaceRoot, created, target)
+  if (!prepared.ok) return prepared
   try {
-    mkdirSync(path.dirname(planPath), { recursive: true })
-    writeFileSync(planPath, markdown, "utf-8")
+    mkdirSync(path.dirname(prepared.planPath), { recursive: true })
+    writeFileSync(prepared.planPath, prepared.markdown, "utf-8")
   } catch (err) {
     const message = errorMessage(err)
     return { ok: false, error: `Failed to write plan file: ${message}` }
   }
-  return {
-    ok: true,
-    planPath,
-    planUri: pathToFileURL(planPath).href,
-    markdown,
-  }
+  return prepared
 }
 
 /**

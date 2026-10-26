@@ -1354,6 +1354,7 @@ describe("retry limits across OpenCode calls", () => {
           const reader = stream.getReader()
           while (!(await reader.read()).done) { /* drain host-visible output */ }
         } catch (error) { return error }
+        return undefined
       }
       try {
         for (let i = 0; i < retries; i++) {
