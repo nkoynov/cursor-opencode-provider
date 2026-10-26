@@ -174,7 +174,9 @@ import {
   createPlanApprovalQuestionInput,
   createPlanRefineReason,
   createPlanSessionEditsDeniedReason,
+  createPlanSessionEditsDeniedUnsavedReason,
   createPlanStageInput,
+  renderUnsavedPlanReviewMessage,
 } from "./protocol/create-plan.js"
 import {
   clearPlanOperation,
@@ -4365,15 +4367,26 @@ async function deliverContinuationResultsNow(
           const receiptHostCallId = `cursor_${session.sessionId}_${r.execId}`
           if (reviewResult.error !== undefined || r.interrupted || r.refusal) {
             completedPlanOperation = receiptHostCallId
+            const failure = reviewResult.error?.trim()
+              || (typeof r.refusal === "string" ? r.refusal : "")
+              || "Failed to write plan file"
+            const holdUnsaved = metadata.createPlanAfterWrite === "hold" && !r.interrupted
             frames = [buildCreatePlanInteractionReply(interactionId, {
-              error: {
-                error: reviewResult.error?.trim()
-                  || (typeof r.refusal === "string" ? r.refusal : "")
-                  || "Failed to write plan file",
-              },
+              error: { error: holdUnsaved ? `${createPlanSessionEditsDeniedUnsavedReason()} (${failure})` : failure },
               plan_uri: "",
             })]
             deliveredCreatePlan = { approved: false, emulated: false, endTurn: true }
+            // Fork: under a session edit deny the user still sees the plan the host refused to save.
+            if (holdUnsaved && typeof metadata.planMarkdown === "string") {
+              session.queuedCreatePlanAction = {
+                kind: "hold",
+                interactionId,
+                bridgeKind: "hold",
+                planUri,
+                planPath,
+                planReview: renderUnsavedPlanReviewMessage(metadata.planMarkdown, failure),
+              }
+            }
           } else {
             const afterWrite = metadata.createPlanAfterWrite
             const planReview = typeof metadata.planReview === "string" ? metadata.planReview : undefined

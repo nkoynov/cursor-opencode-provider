@@ -19,9 +19,11 @@ import {
   type DecodedCreatePlanQuery,
   buildPlanPersistenceCall,
   createPlanApprovalQuestionInput,
+  createPlanSessionEditsDeniedUnsavedReason,
   decodeCreatePlanQuery,
   prepareCreatePlanFile,
   renderPlanReviewMessage,
+  renderUnsavedPlanReviewMessage,
   resolveCreatePlanBridge,
   resolvePlanPersistence,
 } from "./create-plan.js"
@@ -618,14 +620,20 @@ function handleCreatePlanQuery(
     options.advertisedTools ?? [],
     options.hostFilePathKey ?? "filePath",
   )
+  // Fork: a session edit deny usually removes every writer; the user still sees the plan, as before the host-tool save.
+  const unsavedHold = (why: string): HandledInteraction => ({
+    ...reply({ error: { error: `${createPlanSessionEditsDeniedUnsavedReason()} (${why})` }, plan_uri: "" }),
+    endTurn: true,
+    planReview: renderUnsavedPlanReviewMessage(prepared.markdown, why),
+  })
   if (route.kind === "unsupported") {
-    const result = { error: { error: route.error }, plan_uri: "" }
-    return bridge.kind === "hold" ? { ...reply(result), endTurn: true } : reply(result)
+    if (bridge.kind === "hold") return unsavedHold(route.error)
+    return reply({ error: { error: route.error }, plan_uri: "" })
   }
   const persistence = buildPlanPersistenceCall(route, prepared.planPath, prepared.markdown)
   if (!persistence.ok) {
-    const result = { error: { error: persistence.error }, plan_uri: "" }
-    return bridge.kind === "hold" ? { ...reply(result), endTurn: true } : reply(result)
+    if (bridge.kind === "hold") return unsavedHold(persistence.error)
+    return reply({ error: { error: persistence.error }, plan_uri: "" })
   }
 
   const afterWrite: CreatePlanAfterWrite =

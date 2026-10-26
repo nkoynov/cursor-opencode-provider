@@ -1996,6 +1996,68 @@ describe("CreatePlan execution approval over a held-open Run", () => {
     }
   })
 
+  it("shows the plan unsaved when a session edit deny leaves no writer", () => {
+    const payload = createPlanPayload({ name: "Denied Plan", plan: "## Approach\n\nImplement it.\n" })
+    const query = decodeMessage<any>("AgentServerMessage", payload).interaction_query
+    const handled = handleInteractionQuery(query, payload, {
+      workspaceRoot: workspace, allowTools: true, planModeActive: true, sessionEditsDenied: true,
+      advertisedTools: ["question", "read"],
+    })
+    expect(handled.createPlan).toBeUndefined()
+    expect(handled.endTurn).toBe(true)
+    expect(handled.planReview).toContain("# Denied Plan")
+    expect(handled.planReview).toContain("Plan not saved: CreatePlan requires an advertised write or patch tool")
+    expect(handled.planReview).not.toContain("Plan saved to")
+    const result = decodeMessage<any>("AgentClientMessage", handled.reply!).interaction_response.create_plan_request_response.result
+    expect(result.success).toBeUndefined()
+    expect(result.error.error).toContain("The plan was not saved")
+    expect(result.error.error).toContain("do not write files through the shell")
+    expect(fs.readdirSync(workspace)).toEqual([])
+  })
+
+  it("shows the plan unsaved when the host refuses the write under a session edit deny", async () => {
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const writes: Uint8Array[] = []
+    const parts: any[] = []
+    const session = planSession(
+      [createPlanPayload({ name: "Refused Plan", overview: "o", plan: "## Approach\n\nImplement it.\n", todos: [] })],
+      writes,
+      ["question", "read", "write"],
+    )
+    session.sessionEditsDenied = true
+    const controller = { enqueue(part: unknown) { parts.push(part) }, error() {} } as unknown as ReadableStreamDefaultController<any>
+    try {
+      await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
+      const writeCall = parts.find((part: any) => part.type === "tool-call")
+      expect(writeCall?.toolName).toBe("write")
+      await deliverContinuationResults(session, [{
+        toolCallId: writeCall.toolCallId,
+        sessionId: session.sessionId,
+        execId: Number(writeCall.toolCallId.split("_").pop()),
+        toolName: "write",
+        output: "",
+        error: "Cannot use write to modify files outside the Plan directory",
+      }] as any)
+      expect(session.queuedCreatePlanAction?.kind).toBe("hold")
+      session.heldFrames = [...(session.heldFrames ?? []), {
+        flags: 0, payload: encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: {} } }),
+      }]
+      await pump(session, controller, { textId: "text-2", reasoningId: "reasoning-2" })
+      const text = parts.filter((part: any) => part.type === "text-delta").map((part: any) => part.delta).join("")
+      expect(text).toContain("# Refused Plan")
+      expect(text).toContain("Plan not saved: ")
+      expect(text).not.toContain("Plan saved to")
+      expect(parts.filter((part: any) => part.type === "tool-call" && part.toolName === "question")).toHaveLength(0)
+      const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
+        .interaction_response.create_plan_request_response.result
+      expect(result.success).toBeUndefined()
+      expect(result.error.error).toContain("The plan was not saved")
+      expect(fs.existsSync(path.join(workspace, ".opencode"))).toBe(false)
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+    }
+  })
+
   it("saves the plan and does not ask or switch when session edits stay denied", async () => {
     setActiveCursorMode("create-plan-opencode-session", "plan")
     const writes: Uint8Array[] = []

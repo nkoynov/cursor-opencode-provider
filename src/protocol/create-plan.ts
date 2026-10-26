@@ -243,6 +243,13 @@ export function createPlanSessionEditsDeniedReason(planPath: string): string {
     + "The user changes that rule in the client."
 }
 
+/** Fork: the session's edit rule also refused the plan save, so the plan exists only in the transcript. */
+export function createPlanSessionEditsDeniedUnsavedReason(): string {
+  return "The plan was not saved: the session's edit rule denies writing files. Execution remains blocked by that rule. "
+    + "Do not implement, and do not write files through the shell. End this turn. "
+    + "The user changes that rule in the client."
+}
+
 /** Upstream `PlanExitTool` wording, with the plan the provider just wrote. */
 export function createPlanApprovalQuestion(planLabel: string): string {
   const where = planLabel.trim()
@@ -661,4 +668,11 @@ export function renderPlanReviewMessage(markdown: string, planPath: string): str
   const body = markdown.trim()
   const saved = `_Plan saved to ${planPath}_`
   return body ? `${body}\n\n${saved}\n` : `${saved}\n`
+}
+
+/** Fork: the plan as the user reads it when the host refused to save it. */
+export function renderUnsavedPlanReviewMessage(markdown: string, why: string): string {
+  const body = markdown.trim()
+  const note = `_Plan not saved: ${why.trim() || "the host refused the file write"}_`
+  return body ? `${body}\n\n${note}\n` : `${note}\n`
 }
