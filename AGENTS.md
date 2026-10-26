@@ -293,9 +293,13 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   not marked transient, on the close error or the queued end-of-stream frame)
   or when the interrupted pass did something history cannot hold
   (`heldRunLossRebuildable`: `attempt.unrebuildable`, a call Cursor ran itself),
-  also in any frame the held reader queued unread (`queuedFramesVerdict`: the
-  pump's replay rules; a started call or an exec nothing ran is left out).
-  Otherwise the Run's carried host notes go back to the next Run.
+  also in any frame the held reader queued unread (`queuedFramesVerdict`
+  records them on a copy of the replay state as the pump's next pass would, so
+  catalog and announced-call rules apply unchanged; a started call or an exec
+  nothing ran is left out, and so is a queued abort of an exec that is not the
+  host's). The rebuild never resumes a checkpoint, so one Cursor sent before the
+  results cannot ask for the calls again. Otherwise the Run's carried host notes
+  go back to the next Run.
 - Fork tool-call order (`src/tool-call-order.ts`, Claude Code's rule): reads,
   searches, subagents, read-only shell and MCP tools with read-only names run
   together; an edit, write, other shell or other MCP call waits for the calls

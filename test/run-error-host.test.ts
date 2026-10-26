@@ -831,7 +831,8 @@ describe("host calls still running when the Run dies", () => {
   /** `held`: a state-changing command ends its step at once. `open`: a read waits in its step for the next listed call. */
   const setup = (step: "held" | "open", cut: "reset" | "clean-close" | "reply-write" | "final" | "invalid-argument", key: string,
     before?: "unknown-frame" | "cursor-run-call" | "catalog-lookup",
-    queued?: "next-step" | "cursor-run-call" | "appended-user" | "unknown-frame") => {
+    queued?: "next-step" | "cursor-run-call" | "appended-user" | "unknown-frame" | "exec-abort" | "checkpoint"
+      | "catalog-lookup" | "catalog-started" | "catalog-invalid") => {
     const requests: RunRequest[] = []
     let firstRun: http2.ServerHttp2Stream | undefined
     scripted = (stream, message) => {
@@ -850,11 +851,15 @@ describe("host calls still running when the Run dies", () => {
       send({ interaction_update: { text_delta: { text: "Running it now." } } })
       if (before === "unknown-frame") stream.write(frame(Uint8Array.of(0xa2, 0x06, 0)))
       if (before === "cursor-run-call" || before === "catalog-lookup") {
+        const args = { server: "opencode", tool_name: "slack_read" }
         const own = before === "catalog-lookup"
-          ? { get_mcp_tools_tool_call: { args: { server: "opencode", tool_name: "slack_read" } } }
+          ? { get_mcp_tools_tool_call: { args } }
           : { web_fetch_tool_call: { args: { url: "https://example.com" } } }
         send({ interaction_update: { tool_call_started: { call_id: "own", tool_call: own } } })
-        send({ interaction_update: { tool_call_completed: { call_id: "own", tool_call: own } } })
+        const done = before === "catalog-lookup"
+          ? { get_mcp_tools_tool_call: { args, result: { success: { content: "slack_read(channel: string)" } } } }
+          : own
+        send({ interaction_update: { tool_call_completed: { call_id: "own", tool_call: done } } })
       }
       if (step === "open") {
         send({ interaction_update: { tool_call_started: { call_id: "first", tool_call: { read_tool_call: { args: { path: "notes.txt" } } } } } })
@@ -879,6 +884,20 @@ describe("host calls still running when the Run dies", () => {
           send({ interaction_update: { user_message_appended: { user_message: { text: "also check the logs", message_id: "m1" } } } })
         } else if (queued === "unknown-frame") {
           stream.write(frame(Uint8Array.of(0xa2, 0x06, 0)))
+        } else if (queued === "checkpoint") {
+          // Cursor's checkpoint from before the running call's result; resuming it would ask for the call again.
+          send({ conversation_checkpoint_update: Uint8Array.of(10, 1, 8) })
+        } else if (queued === "exec-abort") {
+          // Cursor sends the next call's exec and withdraws it; nothing ran it.
+          send({ exec_server_message: { id: 2, shell_stream_args: { command: "echo second", tool_call_id: "second" } } })
+          send({ exec_server_control_message: { abort: { id: 2 } } })
+        } else if (queued?.startsWith("catalog-")) {
+          const args = { server: "opencode", tool_name: "slack_read" }
+          send({ interaction_update: { tool_call_started: { call_id: "lookup", tool_call: { get_mcp_tools_tool_call: { args } } } } })
+          if (queued !== "catalog-started") {
+            const result = queued === "catalog-lookup" ? { result: { success: { content: "slack_read(channel: string)" } } } : {}
+            send({ interaction_update: { tool_call_completed: { call_id: "lookup", tool_call: { get_mcp_tools_tool_call: { args, ...result } } } } })
+          }
         }
       }, 30)
       setTimeout(() => {
@@ -956,6 +975,8 @@ describe("host calls still running when the Run dies", () => {
     ["held", "reset", undefined, undefined], ["held", "clean-close", undefined, undefined], ["open", "reset", undefined, undefined],
     ["open", "clean-close", undefined, undefined], ["open", "reply-write", undefined, undefined],
     ["held", "reset", "catalog-lookup", undefined], ["held", "clean-close", undefined, "next-step"],
+    ["held", "clean-close", undefined, "exec-abort"], ["held", "clean-close", undefined, "catalog-lookup"],
+    ["held", "reset", undefined, "checkpoint"], ["open", "reset", undefined, "checkpoint"],
   ] as const) {
     it(`ends the step on its running host call and rebuilds from its result (${step} step, ${cut}${before ? `, ${before}` : ""}${queued ? `, queued ${queued}` : ""})`, async () => {
       const { requests, prompt, read, cleanup } = setup(step, cut, `ses_held_tool_cut_${step}_${cut}_${before}_${queued}`, before, queued)
@@ -990,7 +1011,8 @@ describe("host calls still running when the Run dies", () => {
     ["open", "reply-write", "cursor-run-call", undefined], ["held", "final", undefined, undefined],
     ["open", "final", undefined, undefined], ["held", "invalid-argument", undefined, undefined],
     ["held", "clean-close", undefined, "cursor-run-call"], ["held", "clean-close", undefined, "appended-user"],
-    ["held", "clean-close", undefined, "unknown-frame"],
+    ["held", "clean-close", undefined, "unknown-frame"], ["held", "clean-close", undefined, "catalog-started"],
+    ["held", "clean-close", undefined, "catalog-invalid"],
   ] as const) {
     it(`ends the turn once the running call's result is in when the Run cannot be rebuilt (${step} step, ${cut}${before ? `, ${before}` : ""}${queued ? `, queued ${queued}` : ""})`, async () => {
       const { requests, prompt, read, cleanup } = setup(step, cut, `ses_held_tool_refuse_${step}_${cut}_${before}_${queued}`, before, queued)

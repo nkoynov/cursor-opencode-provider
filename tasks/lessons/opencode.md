@@ -228,6 +228,9 @@ These are failure lessons shared by both hosts, not a replacement for
   (`LostRun`, `heldRunLossRebuildable`). Judge every frame the held reader
   queued, not only the end of stream, and read a server error without a retry
   verdict as final as the pump does (`queuedFramesVerdict`, `isFinalVerdict`).
+  A hand-copied subset of the pump's rules fell behind upstream's catalog rules
+  and refused a queued abort of an exec nothing ran; replaying the frames
+  through `AttemptReplaySafety` on a copy of the state keeps one rule set.
   Failed drains must also project as terminal to both hosts, including
   during credential renewal and endless mode (`test/run-interruption.test.ts`).
   Endless mode bypasses counts only, preserving replay guards and CLI's 180 s
