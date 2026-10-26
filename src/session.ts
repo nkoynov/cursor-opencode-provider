@@ -989,7 +989,8 @@ export class SessionManager {
         userTurnHostNotes: session.userTurnHostNotes,
         closeError: session.closeError,
         endFrame: session.heldFrames?.find((frame) => frame.flags & 0x02),
-        expiresAt: this.now() + this.tombstoneTtlMs,
+        // The calls' results can come back as late as a running tool may last.
+        expiresAt: this.now() + Math.max(this.tombstoneTtlMs, RUNNING_TOOL_CAP_MS + this.tombstoneTtlMs),
       })
       while (this.lostRuns.size > this.tombstoneLimit) {
         const oldest = this.lostRuns.keys().next().value as string | undefined

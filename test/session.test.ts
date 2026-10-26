@@ -254,6 +254,31 @@ describe("SessionManager", () => {
     mgr.dispose()
   })
 
+  it("keeps a Run lost while host calls ran for as long as a running tool may last", () => {
+    let now = 0
+    const mgr = new SessionManager({ now: () => now })
+    const lost = fakeSession()
+    lost.replaySafety = { attempt: { unrebuildable: "unknown-or-malformed-frame" } }
+    lost.heldFrames = [{ flags: 0, payload: Uint8Array.of(1) }, { flags: 2, payload: Uint8Array.of(2) }]
+    mgr.registerPending(1, lost, "shell_stream")
+    mgr.close(lost, "remote-error")
+    const done = fakeSession()
+    mgr.registerPending(1, done, "shell_stream")
+    mgr.close(done, "host-interrupted")
+    const idle = fakeSession()
+    mgr.close(idle, "remote-clean-close")
+    now = 3 * 60 * 60 * 1_000
+    expect(mgr.lostRun(lost.sessionId)).toMatchObject({
+      replaySafety: { attempt: { unrebuildable: "unknown-or-malformed-frame" } },
+      endFrame: { flags: 2 },
+    })
+    expect(mgr.lostRun(done.sessionId)).toBeUndefined()
+    expect(mgr.lostRun(idle.sessionId)).toBeUndefined()
+    now = 5 * 60 * 60 * 1_000
+    expect(mgr.lostRun(lost.sessionId)).toBeUndefined()
+    mgr.dispose()
+  })
+
   for (const frameCount of [1, 2]) {
     it(`keeps a closed Run terminal when drain resolves with ${frameCount} result frame(s)`, async () => {
       const mgr = new SessionManager()
