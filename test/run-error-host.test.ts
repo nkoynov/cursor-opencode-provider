@@ -919,7 +919,16 @@ describe("host calls still running when the Run dies", () => {
           // Cursor's final verdict right behind the KV request whose reply is still draining.
           if (cut === "kv-final") stream.end(frame(Buffer.from('{"error":{"code":"permission_denied"}}'), 2))
         }
+        cutSent()
       }, queued ? 80 : 50)
+    }
+    let cutSent!: () => void
+    const cutDone = new Promise<void>((resolve) => { cutSent = resolve })
+    /** Until the provider has closed the first Run on the cut, so the host's result goes to a lost Run. */
+    const waitForCut = async () => {
+      await cutDone
+      if (cut === "none") return
+      for (let i = 0; i < 500 && sessionManager.findOpenByOpenCodeSessionId(key); i++) await Bun.sleep(10)
     }
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-held-tool-cut-"))
     fs.writeFileSync(path.join(root, "notes.txt"), "notes\n")
@@ -989,7 +998,7 @@ describe("host calls still running when the Run dies", () => {
       setHostCacheDirOverride(undefined)
       fs.rmSync(root, { recursive: true, force: true })
     }
-    return { requests, prompt, read, cleanup }
+    return { requests, prompt, read, cleanup, waitForCut }
   }
 
   const hostCalls = (parts: LanguageModelV3StreamPart[]) =>
@@ -1012,7 +1021,7 @@ describe("host calls still running when the Run dies", () => {
     ["held", "clean-close", "catalog-started", "own-completion"],
   ] as const) {
     it(`ends the step on its running host call and rebuilds from its result (${step} step, ${cut}${before ? `, ${before}` : ""}${queued ? `, queued ${queued}` : ""})`, async () => {
-      const { requests, prompt, read, cleanup } = setup(step, cut, `ses_held_tool_cut_${step}_${cut}_${before}_${queued}`, before, queued)
+      const { requests, prompt, read, cleanup, waitForCut } = setup(step, cut, `ses_held_tool_cut_${step}_${cut}_${before}_${queued}`, before, queued)
       try {
         const first = await read()
         const calls = hostCalls(first)
@@ -1021,7 +1030,7 @@ describe("host calls still running when the Run dies", () => {
         expect(first.some(part => part.type === "finish" && part.finishReason.unified === "tool-calls")).toBe(true)
         expect(first.some(part => part.type === "error")).toBe(false)
         // Nothing reopens while the host is still running the call.
-        await Bun.sleep(100)
+        await waitForCut()
         expect(requests).toHaveLength(1)
         pushResult(prompt, calls[0]!, { type: "text", value: "ledger line written" })
         const second = await read()
@@ -1049,11 +1058,11 @@ describe("host calls still running when the Run dies", () => {
     ["held", "kv-final", undefined, undefined], ["held", "none", undefined, undefined],
   ] as const) {
     it(`ends the turn once the running call's result is in when the Run cannot be rebuilt (${step} step, ${cut}${before ? `, ${before}` : ""}${queued ? `, queued ${queued}` : ""})`, async () => {
-      const { requests, prompt, read, cleanup } = setup(step, cut, `ses_held_tool_refuse_${step}_${cut}_${before}_${queued}`, before, queued)
+      const { requests, prompt, read, cleanup, waitForCut } = setup(step, cut, `ses_held_tool_refuse_${step}_${cut}_${before}_${queued}`, before, queued)
       try {
         const calls = hostCalls(await read())
         expect(calls).toHaveLength(1)
-        await Bun.sleep(100)
+        await waitForCut()
         pushResult(prompt, calls[0]!, { type: "text", value: "ledger line written" })
         const error = await read().catch((caught: unknown) => caught)
         if (cut === "invalid-argument") {
