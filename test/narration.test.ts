@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { pump, resetTurnStateForTests } from "../src/language-model.js"
+import { pump, resetTurnStateForTests, settleRunSavesForTests } from "../src/language-model.js"
 import { assistantBlobShape, isNarrationSignature } from "../src/narration.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
@@ -63,7 +63,8 @@ describe("progress updates streamed as thinking", () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-narration-"))
     setHostCacheDirOverride(path.join(root, "cache"))
   })
-  afterAll(() => {
+  afterAll(async () => {
+    await settleRunSavesForTests()
     setHostCacheDirOverride(undefined)
     fs.rmSync(root, { recursive: true, force: true })
   })

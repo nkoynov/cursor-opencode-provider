@@ -7,7 +7,7 @@ import os from "node:os"
 import path from "node:path"
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
-import { resetTurnStateForTests } from "../src/language-model.js"
+import { resetTurnStateForTests, settleRunSavesForTests } from "../src/language-model.js"
 import { sessionManager } from "../src/session.js"
 import { decodeFramePayload, encodeFrame } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
@@ -119,7 +119,8 @@ describe("a turn whose Run failed before Cursor checkpointed the request", () =>
     root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-lost-turns-"))
     setHostCacheDirOverride(path.join(root, "cache"))
   })
-  afterAll(() => {
+  afterAll(async () => {
+    await settleRunSavesForTests()
     setHostCacheDirOverride(undefined)
     fs.rmSync(root, { recursive: true, force: true })
   })

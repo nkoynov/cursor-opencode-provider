@@ -6,7 +6,7 @@ import os from "node:os"
 import path from "node:path"
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
-import { resetTurnStateForTests, restoreTurnToolCatalog } from "../src/language-model.js"
+import { resetTurnStateForTests, restoreTurnToolCatalog, settleRunSavesForTests } from "../src/language-model.js"
 import { sessionManager } from "../src/session.js"
 import { forgetEarlySteers, recordEarlySteer } from "../src/host-steer.js"
 import { decodeFramePayload, encodeFrame } from "../src/protocol/framing.js"
@@ -109,7 +109,8 @@ describe("the user turn of a fresh Run", () => {
     cursor = fakeCursorRuns()
   })
 
-  afterAll(() => {
+  afterAll(async () => {
+    await settleRunSavesForTests()
     cursor.restore()
     setHostCacheDirOverride(undefined)
     fs.rmSync(root, { recursive: true, force: true })
