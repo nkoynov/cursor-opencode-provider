@@ -427,6 +427,43 @@ describe("resuming again from the turn's checkpoint", () => {
   })
 })
 
+describe("the turn's stall window", () => {
+  const stallPolicy = { baseDelayMs: 0, maxDelayMs: 0 }
+  const windowOpenedLongAgo = () => ({ ...newRetryBudget(), transport: 1, retries: 1, stallStartedAt: Date.now() - 200_000 })
+
+  it("retries a stall when the Run saved a checkpoint since the turn's last stall", async () => {
+    const budget = windowOpenedLongAgo()
+    const recoveries: CursorRunRecovery[] = []
+    const final = await pumpWithRecovery({
+      initialSession: fakeSession("worked-then-stalled", [
+        { frame: text("partial") },
+        { frame: checkpoint([0x0a, 0x01, 0x05]) },
+      ]),
+      controller: controller(),
+      retryPolicy: stallPolicy,
+      retryBudget: budget,
+      recover: async (recovery) => {
+        recoveries.push(recovery)
+        return fakeSession("after-stall", [{ frame: turnEnded() }])
+      },
+    })
+    expect(final.sessionId).toBe("after-stall")
+    expect(recoveries.map((recovery) => recovery.kind)).toEqual(["resume"])
+    expect(budget.retries).toBe(2)
+  })
+
+  it("still ends the turn when stalls follow each other without a checkpoint for 180 seconds", async () => {
+    await expect(pumpWithRecovery({
+      initialSession: fakeSession("stalled-again", [{ frame: text("partial") }]),
+      controller: controller(),
+      retryPolicy: stallPolicy,
+      retryBudget: windowOpenedLongAgo(),
+      canRebaseFromHistory: () => true,
+      recover: async () => fakeSession("unused", [{ frame: turnEnded() }]),
+    })).rejects.toBeInstanceOf(CursorRetryExhaustedError)
+  })
+})
+
 describe("capacity failures", () => {
   const capacity = (code: string) => new CursorServerError("busy", { transient: true, replaySafe: true, code })
 
