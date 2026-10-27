@@ -92,9 +92,10 @@ describe("CreatePlan restart receipts", () => {
         await expect(model.doStream(helper)).rejects.toThrow("Cursor Run setup failed")
         expect(planOperationsFor(key)).toHaveLength(1)
       }
-      await expect(model.doStream({ ...call, prompt: [...prompt,
-        { role: "user", content: [{ type: "text", text: "Continue planning." }] },
-      ] })).rejects.toThrow("Cursor Run setup failed")
+      const settle: LanguageModelV3CallOptions["prompt"][number] = phase === "write"
+        ? { role: "user", content: [{ type: "file", mediaType: "image/png", data: "iVBORw0KGgo=" }] }
+        : { role: "user", content: [{ type: "text", text: "Continue planning." }] }
+      await expect(model.doStream({ ...call, prompt: [...prompt, settle] })).rejects.toThrow("Cursor Run setup failed")
       expect(credentials).toBe(3)
       expect(planOperationsFor(key)).toHaveLength(0)
     } finally {

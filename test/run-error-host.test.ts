@@ -1085,7 +1085,7 @@ describe("host calls still running when the Run dies", () => {
     }, 30_000)
   }
 
-  for (const cut of ["final", "reset"] as const) {
+  for (const cut of ["final", "none", "reset"] as const) {
     it(`reads a lost Run's verdict before the unfinished plan notice (${cut})`, async () => {
       const key = `ses_held_tool_plan_${cut}`
       const { requests, prompt, read, cleanup, waitForCut } = setup("held", cut, key)
@@ -1103,6 +1103,9 @@ describe("host calls still running when the Run dies", () => {
         if (cut === "final") {
           expect(APICallError.isInstance(result)).toBe(true)
           expect((result as APICallError).message).not.toContain("Plan saving or review was interrupted")
+        } else if (cut === "none") {
+          expect(APICallError.isInstance(result)).toBe(true)
+          expect((result as APICallError).message).toContain("may already hold")
         } else {
           const parts = result as LanguageModelV3StreamPart[]
           expect(parts.flatMap(part => part.type === "text-delta" ? [part.delta] : []).join(""))

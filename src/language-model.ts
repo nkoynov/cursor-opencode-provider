@@ -1415,12 +1415,13 @@ async function doStreamImpl(
       const finalVerdict = [...lostRuns.map((run) => run.closeError), ...lostRuns.map(queuedFinalVerdict)]
         .find((failure) => !!failure && isFinalVerdict(failure))
       if (finalVerdict) throw hostFacingError(finalVerdict, { modelId })
+      const ambiguous = lostRuns.some((run) => run.ambiguousDelivery)
       // Delivery itself may have lost the held Run. Do not rebase that failed
       // plan continuation onto a checkpoint from before the host mutation.
-      if (interruptedPlanContinuation(prompt, sessionKey, mayStartPlanTurn)) {
+      // Cursor may already hold an ambiguously delivered review answer, so that error wins.
+      if (!ambiguous && interruptedPlanContinuation(prompt, sessionKey, mayStartPlanTurn)) {
         return { stream: answeredSteerStream(PLAN_INTERRUPTED_NOTICE) }
       }
-      const ambiguous = lostRuns.some((run) => run.ambiguousDelivery)
       const why = ambiguous
         ? "a tool result it may already hold"
         : lostRuns.map(lostRunUnrebuildable).find((reason) => reason !== undefined)
@@ -9015,18 +9016,20 @@ export function liveUserTurn(
   return { start, text: texts.join("\n\n") }
 }
 
-/** Fork: the user's own text since the model's last output; a host note alone does not settle a CreatePlan. */
+/** Fork: the user's own text since the model's last output; a host note alone does not settle a CreatePlan, an attachment does. */
 function humanUserTurn(
   prompt: LanguageModelV3CallOptions["prompt"],
 ): { start: number; text: string } | undefined {
   if (prompt.at(-1)?.role !== "user") return undefined
   const start = userTurnStart(prompt)
-  const texts = prompt.slice(start).flatMap((message) => {
-    if (hostTailNote(message)) return []
+  const own = prompt.slice(start).filter((message) => !hostTailNote(message))
+  const texts = own.flatMap((message) => {
     const text = extractUserText(message as unknown as Record<string, unknown>)
     return text && text !== "." ? [text] : []
   })
-  return { start, text: texts.join("\n\n") || "." }
+  const attached = own.some((message) => Array.isArray(message.content)
+    && message.content.some((part) => part.type === "file"))
+  return { start, text: texts.join("\n\n") || (attached ? "" : ".") }
 }
 
 /**
