@@ -366,6 +366,8 @@ export async function openProxiedTlsSocket(
       if (settled) return
       settled = true
       cleanup()
+      // Bun leaves the tunnel open when the TLS socket over it is destroyed.
+      socket.once("close", () => { try { plain.destroy() } catch { /* already closed */ } })
       resolve(socket)
     }
 

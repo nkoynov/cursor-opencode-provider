@@ -280,6 +280,27 @@ describe("openProxiedTlsSocket", () => {
     }
   })
 
+  it("closes the tunnel once the TLS socket over it closes", async () => {
+    const proxyServer = await startFakeProxy("HTTP/1.1 200 Connection Established\r\n\r\n")
+    const fake = Object.assign(new EventEmitter(), { destroy: () => {} })
+    const tlsConnect = (() => {
+      queueMicrotask(() => fake.emit("secureConnect"))
+      return fake
+    }) as unknown as typeof tls.connect
+    try {
+      await openProxiedTlsSocket({
+        proxy: new URL(`http://127.0.0.1:${proxyServer.port}`),
+        targetHost: "agent.cursor.sh",
+        tlsConnect,
+      })
+      // Bun destroys the TLS socket with its HTTP/2 session but leaves the socket under it open.
+      fake.emit("close")
+      await proxyServer.firstConnectionClosed
+    } finally {
+      await proxyServer.close()
+    }
+  })
+
   it("destroys the tunnel when TLS setup throws synchronously", async () => {
     const proxyServer = await startFakeProxy("HTTP/1.1 200 Connection Established\r\n\r\n")
     const tlsConnect = (() => {
