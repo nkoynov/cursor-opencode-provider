@@ -397,6 +397,70 @@ test("no copy resumes an older snapshot while the latest save failed", async () 
   }
 })
 
+test("a copy behind another copy's failed save does not resume the older snapshot", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const sessionKey = "unsaved-elsewhere"
+  const conversationId = peekConversationId(sessionKey)
+  other.checkpoint.setCheckpoint(conversationId, checkpointBytes)
+  try {
+    await other.state.persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    other.persistence.setConversationPersistenceHookForTests(phase => {
+      if (phase === "before-write") throw new Error("disk full")
+    })
+    await expect(other.state.persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } }))
+      .rejects.toThrow("disk full")
+    expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    expect(getCheckpoint(conversationId)).toBeUndefined()
+  } finally {
+    other.persistence.setConversationPersistenceHookForTests()
+    other.persistence.resetConversationPersistenceForTests()
+    other.checkpoint.resetCheckpointsForTests()
+  }
+})
+
+test("a copy behind leaves another copy's snapshot alone once the binding has moved past it", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const sessionKey = "moved-on-elsewhere"
+  const conversationId = peekConversationId(sessionKey)
+  other.checkpoint.setCheckpoint(conversationId, checkpointBytes)
+  try {
+    await other.state.persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    const next = bindConversationId(sessionKey, { reset: true }).conversationId
+    expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    expect(getCheckpoint(conversationId)).toBeUndefined()
+    expect(peekConversationId(sessionKey)).toBe(next)
+  } finally {
+    other.persistence.resetConversationPersistenceForTests()
+    other.checkpoint.resetCheckpointsForTests()
+  }
+})
+
+test("a copy gives up restoring while another copy saves during every read", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const sessionKey = "always-writing"
+  const conversationId = peekConversationId(sessionKey)
+  other.checkpoint.setCheckpoint(conversationId, checkpointBytes)
+  let saves = 0
+  try {
+    await other.state.persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    setConversationPersistenceHookForTests(async phase => {
+      if (phase !== "full-decode") return
+      saves++
+      await other.state.persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    })
+    expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    expect(saves).toBe(3)
+    expect(getCheckpoint(conversationId)).toBeUndefined()
+  } finally {
+    setConversationPersistenceHookForTests()
+    other.persistence.resetConversationPersistenceForTests()
+    other.checkpoint.resetCheckpointsForTests()
+  }
+})
+
 test("a module copy leaves a snapshot alone once the binding has moved past it", async () => {
   const cache = root()
   const other = await otherGraph()
