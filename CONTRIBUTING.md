@@ -53,7 +53,7 @@ When opening one:
 - Prefer conventional-commit titles (`fix:`, `docs:`, `test:`, …).
 - PR descriptions must be human-readable: concise, concrete, and written for people — not verbose and not in LLM speak.
 - **Bug fixes must not regress prompt caching** — confirm RequestContext / checkpoint continuity stays warm where it should (see `cache diagnosis:` lines in `CURSOR_PROVIDER_DEBUG` logs and [docs/cache-log-runbook.md](./docs/cache-log-runbook.md)).
-- **Consider both OpenCode 1.x and OpenCode 2.0** for every fix — apply or verify the change on both majors unless the bug is specific to one entrypoint.
+- **Consider both OpenCode 1.x and OpenCode 2.x** for every fix — apply or verify the change on both majors unless the bug is specific to one entrypoint.
 
 ### Review and coverage requirements
 

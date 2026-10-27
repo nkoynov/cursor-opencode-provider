@@ -13,7 +13,7 @@ Run this checklist for changes to CreatePlan, SwitchMode, file-tool substitution
 - [ ] OCP plugin discovery accepts valid JSONC without joining tokens across comments, and rejects malformed JSONC and unterminated block comments
 - [ ] Do not modify a host/vendor checkout
 
-## OpenCode 2 model startup
+## OpenCode 2.x model startup
 
 Use stock OpenCode 2.1.4 with the rebuilt local plugin and AI SDK entry. Isolate
 config, data and cache; use a working Cursor credential without changing the
@@ -35,6 +35,31 @@ operator's store. Enable provider debug logs for each run.
    attempt may publish; dispose a setup while discovery is pending and verify
    no later reload comes from it. Use deterministic fixtures for these races.
 
+## OpenCode 2.x foreign compaction
+
+Use stock OpenCode 2.1.4 with the rebuilt plugin and provider, isolated host
+state, and debug logs. Configure a compaction model from another provider.
+
+1. Build a Cursor conversation, compact it, and retain recent Cursor messages
+   after the summary. Confirm the next Run uses a new conversation id, the same
+   conversation group, no old checkpoint, and the summary plus retained history.
+   Continue once more: the new conversation and checkpoint stay warm.
+2. Fail a summary request. Confirm the next Cursor Run keeps its conversation
+   and checkpoint. Repeat while a successful background summary is held but
+   unused: preparing it alone must not invalidate the saved state. Apply that
+   precomputed summary later and verify the rebase occurs then.
+3. Compact between host tool steps. Confirm completed results seed the new
+   Run once and are never uploaded onto the pre-compaction held Run.
+4. Shut down after the successful compaction, before the next Cursor request,
+   including with a held tool Run. Restart and verify compacted history replaces
+   the old checkpoint. Exercise duplicate event observers across Locations and
+   a late save from the retired conversation with deterministic fixtures.
+5. Make snapshot saving fail. The receipt remains pending, the next request
+   reports the failure, and a later request can retry after storage recovers.
+
+These checks belong to the dedicated OpenCode 2.x entrypoint. Keep classic
+compaction and warm-continuation regressions passing in the full suite.
+
 ## Classic OpenCode — approval without `plan_exit`
 
 1. Start stock OpenCode in a TTY with provider debug logging enabled, in the default build agent.
@@ -53,11 +78,11 @@ operator's store. Enable provider debug logs for each run.
 7. Verify no turn is injected into subagent or hidden sessions.
 8. New session: pick `plan` in the agent picker (Tab) before asking for a plan. Verify `host-agent-mode: host entered plan agent`, the Run logs `cursorMode=plan`, and steps 4–6 hold without any SwitchMode: CreatePlan persists through the host file tool then bridges to `plan_exit`, with no MCP `plan_exit` call by the model and no `get_mcp_tools` lookup.
 
-## OpenCode 2.0
+## OpenCode 2.x
 
-Install and leftover-dump cleanup: [OpenCode 2.0 setup](./opencode-2.md) ([safe transition](./opencode-2.md#safe-transition)).
+Install and leftover-dump cleanup: [OpenCode 2.x setup](./opencode-2.md) ([safe transition](./opencode-2.md#safe-transition)).
 
-1. Load only `cursor-opencode-provider/plugin/opencode2` in stock 2.0 (prefer a dedicated `OPENCODE_CONFIG_DIR`; use a `$OPENCODE_CONFIG_DIR/plugins/<name>/` package directory, not a bare `.js` path).
+1. Load only `cursor-opencode-provider/plugin/opencode2` in stock 2.x (prefer a dedicated `OPENCODE_CONFIG_DIR`; use a `$OPENCODE_CONFIG_DIR/plugins/<name>/` package directory, not a bare `.js` path).
 2. Confirm Cursor auth + models: `/connect` → Cursor, then Cursor models in the picker (in-memory `ctx.provider` inventory). There must be no leftover `providers.cursor` in `opencode.json`. Filter picker by provider Cursor if needed (`time.released` is `0`).
 3. Enter plan mode (Tab to Plan, or ask the model to switch). If the model uses SwitchMode from the build agent, that Run should end and a Plan-agent turn should start (`host-agent-mode: switched`); CreatePlan belongs in that Plan turn.
 4. Verify the plan is written to the Plan directory, the plan appears in the transcript before the advertised `question` approval prompt, and the session is the Plan agent.
@@ -67,7 +92,7 @@ Install and leftover-dump cleanup: [OpenCode 2.0 setup](./opencode-2.md) ([safe 
 
 ## Session edit deny
 
-Run on stock OpenCode 1.x and stock OpenCode 2.0 after the plan-approval checks above.
+Run on stock OpenCode 1.x and stock OpenCode 2.x after the plan-approval checks above.
 
 1. With no session edit rule, a plan-agent catalog that omits edit still asks whether to implement, and Yes switches to the build agent and uses the normal edit or patch tool.
 2. Set a session rule whose last `edit` match on `*` is deny, then allow edit only for the plan file. Ask for a plan.
@@ -85,7 +110,7 @@ Run on both native majors; do not infer permission from catalog membership.
 
 1. Decline an execution review while later text, shell, file, metadata and image requests are queued. The owning Run sends cancellation, drains its terminal acknowledgment, emits no later host call, and keeps the plan agent. A fresh human message is required before any more work. A synthetic handoff or a tool answer does not supply that authorization.
 2. In any self-test, No/dismissal ends the turn before images, scoring, or scratch cleanup. Score P1, P2 and T7 **failed** if any tool executes after refusal and before a new human message, even if it performs only read-only checks or the requested implementation remains unapplied. An honored refusal is an expected passing case. Typed freeform refine feedback may continue the same turn in plan mode; score that separately from refusal. Score unknown chronology **blocked**.
-3. On a later user turn still in plan mode, test path-specific edit allow/deny/ask, read denial, external-directory denial, and plain rejection with the host's native rules. On 2.0 the plan-path exception can leave `cursor_image_save` advertised; a save outside that exception must still be denied, before creating a file or parent directory. Optional todos assert their own permissions too. Policy failure or missing native permission APIs must never become implicit approval.
+3. On a later user turn still in plan mode, test path-specific edit allow/deny/ask, read denial, external-directory denial, and plain rejection with the host's native rules. On 2.x the plan-path exception can leave `cursor_image_save` advertised; a save outside that exception must still be denied, before creating a file or parent directory. Optional todos assert their own permissions too. Policy failure or missing native permission APIs must never become implicit approval.
 4. An exact, successful native read permits the correlated edit prerequisite to supply complete contents above the host preview cap. A denied, failed, unrelated or still-pending read must not do so. The eventual mutation remains a native edit/patch operation.
 5. Keep intentional runtime operations: an authorized shell launch captures output and updates its terminal record without extra edit approval; polling that exact record and catalog spills still work under workspace edit denial. Denied launches start no payload, and released unstarted reservations cannot later launch. Already running authorized jobs survive a plan-review refusal. Reject arbitrary writes, symlinks and hardlinks under the runtime root; generated assets there still require ordinary user-artifact permissions.
 6. Private Git diff requests return a typed refusal directing the model to the native shell; no provider child process starts for that exec. Explicit native shell requests retain the host's command scanner, selected shell and permission path.
@@ -140,7 +165,7 @@ For one cold session followed by a normal continuation:
 - host-empty lifecycle calls advertise `[]` on an ephemeral conversation and do not wait for a sibling catalog;
 - score lifecycle RequestContext separately from the real Run; identical hashes are not required;
 - nonempty epoch catalogs keep existing descriptors/order and append new names; a permission shrink does not rewrite them;
-- execution uses the current permitted set, independently of epoch advertisement; OpenCode 2 compaction can retain a nonempty advertisement while refusing all execution;
+- execution uses the current permitted set, independently of epoch advertisement; OpenCode 2.x compaction can retain a nonempty advertisement while refusing all execution;
 - subsequent diagnostics show warm continuity/cache reads rather than a catalog-induced rebuild;
 - a smaller incoming catalog that carries a result matching a pending parent call reconciles that result on the parent conversation before helper isolation;
 - a real helper uses its own conversation and leaves the held parent intact;
@@ -151,13 +176,13 @@ Use `docs/cache-log-runbook.md` for exact fields and handoff evidence.
 
 ## File edits on both majors
 
-1. Build and verify the loaded provider in native 1.x and 2.0 separately, with
+1. Build and verify the loaded provider in native 1.x and 2.x separately, with
    both `CURSOR_PROVIDER_DEBUG=1` and a fresh `CURSOR_PROVIDER_DEBUG_FILE`.
 2. Use an eligible GPT model. Verify the host advertises `apply_patch` on 1.x or
-   `patch` on 2.0. Create a file, make a native targeted edit, and exercise a direct
+   `patch` on 2.x. Create a file, make a native targeted edit, and exercise a direct
    dynamic patch call. Verify file bytes and exactly one mutation per request.
 3. Cover blank lines, substring changes, existing-file replacement, LF and CRLF.
-   1.x targeted edits retain the existing newline convention; 2.0 patch requests
+   1.x targeted edits retain the existing newline convention; 2.x patch requests
    that would lose CRLF must return a typed refusal and leave the file unchanged.
 4. Switch to a model/turn that permits native edit/write, then back. Verify
    translation follows the current permitted catalog, including edit-only and
@@ -166,7 +191,7 @@ Use `docs/cache-log-runbook.md` for exact fields and handoff evidence.
    raw cache counters. Report refusals separately from unexpected protocol or
    dynamic-wrapper failures ([patch details](../README.md#apply_patch--patch-on-gpt-models)).
 
-## OpenCode 2 early steers and Stop
+## OpenCode 2.x early steers and Stop
 
 1. While Cursor waits on a known background job, send a plain-text steer without
    files or skills. Verify its answer arrives before the job ends and only once.
@@ -184,7 +209,7 @@ Use `docs/cache-log-runbook.md` for exact fields and handoff evidence.
 
 - [ ] `git status --porcelain -uall` unchanged in the test project
 - [ ] no package install or unrelated host configuration created by CreatePlan
-- [ ] plan uses the host's own location: the known session plan file for OpenCode 1.x (which may be worktree `.opencode/plans/`), the Plan directory for OpenCode 2.0, or the structural bridge's location (`src/context/paths.ts`, `src/host-plan-file.ts`)
+- [ ] plan uses the host's own location: the known session plan file for OpenCode 1.x (which may be worktree `.opencode/plans/`), the Plan directory for OpenCode 2.x, or the structural bridge's location (`src/context/paths.ts`, `src/host-plan-file.ts`)
 - [ ] no temporary/debug/agent-worktree files remain in either repository
 
 ## Reporting

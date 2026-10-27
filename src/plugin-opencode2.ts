@@ -51,6 +51,7 @@ import { registerCursorImageSaveTool } from "./opencode2/image-save-tool.js"
 import { OPENCODE_2_TOOL_DIALECT } from "./protocol/tools.js"
 import { clearSessionTodos } from "./todo-store.js"
 import { markCompactionSession } from "./compaction-marker.js"
+import { awaitHostHistoryRewrite, noteHostHistoryRewrite } from "./host-history-rewrite.js"
 import { getSessionDirectory, markSessionDirectory } from "./session-directory.js"
 import { rememberHostSkillFiles } from "./context/skills.js"
 import { trace } from "./debug.js"
@@ -526,6 +527,9 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
         markCompactionAndOptions(event, event.agent === "compaction")
         event.options ??= {}
         event.options[CURSOR_HOST_AGENT_OPTION] = event.agent
+        if (event.model?.providerID === CURSOR_PROVIDER_ID) {
+          await awaitHostHistoryRewrite(opencodeGlobalCacheDir(), event.sessionID)
+        }
         delete event.options[CURSOR_SESSION_EDITS_DENIED_OPTION]
         delete event.options[CURSOR_SESSION_PERMISSIONS_UNAVAILABLE_OPTION]
         // Compaction cannot approve a plan; its session read stays best effort,
@@ -801,6 +805,15 @@ function subscribeSessionActivity(
     void (async () => { try {
       for await (const event of stream as AsyncIterable<any>) {
         if (stopped) break
+        const payload = eventPayload(event)
+        if (event.type === "session.compaction.ended"
+          && typeof event.id === "string" && typeof payload?.sessionID === "string"
+          && typeof payload.model?.providerID === "string"
+          && payload.model.providerID !== CURSOR_PROVIDER_ID) {
+          void noteHostHistoryRewrite(opencodeGlobalCacheDir(), payload.sessionID, event.id).catch((error) => {
+            trace(`host compaction: persistence failed: ${String(error)}`)
+          })
+        }
         applySessionActivity(event, onCredentialSwitch)
         applyBackgroundShellLifecycle(event)
         onToolEvent?.(event)

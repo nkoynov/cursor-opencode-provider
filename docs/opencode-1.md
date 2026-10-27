@@ -1,6 +1,6 @@
 # OpenCode 1.x
 
-Classic OpenCode and the 1.18 Effect/Promise **v2** plugin API. For OpenCode 2.0, see [opencode-2.md](./opencode-2.md). Shared catalog behavior (variants, 1M, Fast, images) lives in the [root README](../README.md#select-a-model).
+Classic OpenCode and the 1.18 Effect/Promise **v2** plugin API. For OpenCode 2.x, see [opencode-2.md](./opencode-2.md). Shared catalog behavior (variants, 1M, Fast, images) lives in the [root README](../README.md#select-a-model).
 
 This guide follows the development checkout. Check [Unreleased](../CHANGELOG.md#unreleased)
 for fixes that require a rebuilt local install until the next release.
@@ -74,9 +74,9 @@ Local clone equivalent: `"file:///absolute/path/to/cursor-opencode-provider/dist
 
 That entry registers the provider via `ctx.aisdk.sdk` / `ctx.aisdk.language`. Keep the classic `plugin` entry for auth **and** plugin tools (notably `cursor_image_save` / `custom_websearch`): the 1.18 `/v2/promise` API has no `tool` domain, so a v2-only load silently disables Cursor image generation.
 
-Do **not** load `cursor-opencode-provider/plugin/opencode2` under OpenCode 1.x. That entrypoint is OpenCode 2.0 only.
+Do **not** load `cursor-opencode-provider/plugin/opencode2` under OpenCode 1.x. That entrypoint is OpenCode 2.x only.
 
-OpenCode 1.18 prefers `package.json` `exports["./server"]` when resolving a package-dir plugin. That subpath is the OpenCode 2 module, but it dual-exports `server: CursorPlugin`, so classic 1.x hooks still run. Keep using `"plugin": ["cursor-opencode-provider"]` or `/plugin` — do not point 1.x config at `/plugin/opencode2` for its `setup()` API.
+OpenCode 1.18 prefers `package.json` `exports["./server"]` when resolving a package-dir plugin. That subpath is the OpenCode 2.x module, but it dual-exports `server: CursorPlugin`, so classic 1.x hooks still run. Keep using `"plugin": ["cursor-opencode-provider"]` or `/plugin` — do not point 1.x config at `/plugin/opencode2` for its `setup()` API.
 
 ## Authenticate
 
@@ -163,6 +163,9 @@ Wrapped commands expose their real exit status to the host. A hard timeout
 exits 124; a background handoff exits 0. The request projection adds failed
 command status from `metadata.exit` for history rebuilds and removes that
 notice from live stdout while preserving command bytes.
+
+Terminal-record headers and footers stay out of command stdout, including
+when completion races a timeout or background handoff.
 
 Shell output keeps path-like text, whitespace and successful timeout-shaped
 text unchanged. Internal wrapper markers are removed without trimming command

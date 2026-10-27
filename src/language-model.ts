@@ -1,3 +1,4 @@
+import { acknowledgeHostHistoryRewrite, awaitHostHistoryRewrite } from "./host-history-rewrite.js"
 import fs from "node:fs"
 import path from "node:path"
 import { createHash } from "node:crypto"
@@ -1239,6 +1240,18 @@ async function doStreamImpl(
   retryBudget: RetryBudget,
 ): Promise<LanguageModelV3StreamResult> {
   await restoreSessionState(opencodeSessionKey(callOptions), opencodeGlobalCacheDir())
+  const rewriteSessionKey = opencodeSessionKey(callOptions)
+  const hostHistoryRewrite = rewriteSessionKey
+    && !isCompactionCall(callOptions, rewriteSessionKey)
+    && computeAllowTools(extractTools(callOptions).length, callOptions.toolChoice)
+    && await awaitHostHistoryRewrite(opencodeGlobalCacheDir(), rewriteSessionKey)
+  if (hostHistoryRewrite) {
+    // A held exec belongs to the history the host just replaced. Its results
+    // must seed the compacted prompt, never continue the old server Run.
+    for (const held of sessionManager.openSessionsStoppedWith(rewriteSessionKey)) {
+      sessionManager.close(held, "superseded-by-new-run")
+    }
+  }
   const withoutAnswered = await leaveOutAnsweredEarlySteers(callOptions.prompt, opencodeSessionKey(callOptions))
   if (withoutAnswered === "all") return { stream: answeredSteerStream() }
   if (withoutAnswered) callOptions = { ...callOptions, prompt: withoutAnswered }
@@ -2453,9 +2466,11 @@ async function startSession(
   // (baseline hash is the epoch baseline, not a per-turn host hash).
   let frozenSystemPromptHash: string | undefined
   const resetState = resolveTurnConversationReset({
-    sessionKey,
+    // Title/helpers cannot consume the durable main conversation's rebase.
+    sessionKey: ephemeralRun ? undefined : sessionKey,
     isCompaction,
-    historyRewrite: providerOptions?.[CURSOR_HISTORY_REWRITE_OPTION] === true,
+    historyRewrite: !ephemeralRun && (providerOptions?.[CURSOR_HISTORY_REWRITE_OPTION] === true
+      || (!!sessionKey && await awaitHostHistoryRewrite(cacheDir, sessionKey))),
   })
   // Cursor could not restore the stored checkpoint (missing blobs) before this
   // turn produced anything: reseed from the full host history as a new turn.
@@ -2483,7 +2498,10 @@ async function startSession(
         reset: resetState.reset || recovery?.kind === "rebase" || !!foreignHistory,
         ephemeral: ephemeralRun,
       })
-  if (sessionKey && !ephemeralRun) trackTurnProvenance(sessionKey, bound.conversationId)
+  if (sessionKey && !ephemeralRun) {
+    if (bound.reset) acknowledgeHostHistoryRewrite(cacheDir, sessionKey)
+    trackTurnProvenance(sessionKey, bound.conversationId)
+  }
   let conversationState = ephemeralRun
     ? undefined
     : resuming

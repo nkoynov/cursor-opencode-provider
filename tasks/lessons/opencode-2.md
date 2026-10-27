@@ -1,8 +1,8 @@
-# OpenCode 2.0 lessons
+# OpenCode 2.x lessons
 
 [Index](../lessons.md) · [General](opencode.md) · [1.x](opencode-1.md)
 
-Operator setup: [OpenCode 2.0](../../docs/opencode-2.md).
+Operator setup: [OpenCode 2.x](../../docs/opencode-2.md).
 
 ## Plugin and daemon lifecycle
 
@@ -40,17 +40,18 @@ Operator setup: [OpenCode 2.0](../../docs/opencode-2.md).
   process-wide but parent links, activity and prompts were per copy, so a
   child's tool never renewed the parent's Run when the plugin and provider were
   different copies (`session-activity.v1`, `test/activity.test.ts`).
-- **`isRetryable: false` does not stop a retry.** 2.0 classifies an
+- **`isRetryable: false` does not stop a retry.** 2.x classifies an
   `APICallError` by status and retries 408/409/429/5xx; only `x-should-retry:
   false` overrides it. An unrecognized failure without a status also retries:
   project pre-stream failures from both public generation methods and mark
   spent or side-effecting provider retries terminal, alongside final server
   verdicts. An output-only failure needs `x-should-retry: true` and no status:
-  2.0 then continues after the shown output (`hostFacingError`,
+  2.x then continues after the shown output (`hostFacingError`,
   `test/errors.test.ts`, `test/run-error-host.test.ts`).
 - **A new plugin header does not prove a new SDK.** Pin the intended binary,
-  isolate config, set the local provider entry before daemon start, and restart
-  after rebuilding ([local setup](../../docs/opencode-2.md#from-a-local-clone-cursor_opencode2_dev_entry)).
+  isolate config, use the 2.1.4 `plugins` configuration key and a local wrapper
+  directory with an index entry, set the provider entry before daemon start,
+  and restart after rebuilding ([local setup](../../docs/opencode-2.md#from-a-local-clone-cursor_opencode2_dev_entry)).
 
 ## Catalog and permissions
 
@@ -72,7 +73,7 @@ Operator setup: [OpenCode 2.0](../../docs/opencode-2.md).
 - **`execute` is JavaScript, not an OS shell.** Native commands go to
   shell/bash; Task maps to `subagent` only when advertised
   (`test/tools.test.ts`).
-- **2.0 calls its patch tool `patch`.** Its parser strips CRLF carriage returns;
+- **2.x calls its patch tool `patch`.** Its parser strips CRLF carriage returns;
   native conversions and direct dynamic calls must refuse lossy content before
   mutation (`test/apply-patch.test.ts`).
 - **Read truncation has several forms.** The host removes bytes after 50 KB,
@@ -104,6 +105,14 @@ Operator setup: [OpenCode 2.0](../../docs/opencode-2.md).
 
 ## Early steers, Stop and restart
 
+- **Summary preparation is not a history rewrite.** OpenCode 2.1.4 prepares
+  failed summaries and unused background precomputes through the compaction
+  hook; applying a cached summary skips that hook. Observe the durable ended
+  event instead. Deleting the old snapshot alone lets a held Run's shutdown
+  save resurrect it. Persist the rebase requirement, serialize it with state
+  saves across module graphs, and consume it only when replacing the binding
+  (`test/plugin-opencode2.test.ts`, committed foreign compaction outcomes;
+  `test/host-history-rewrite.test.ts`, `test/run-error-host.test.ts`).
 - **Inbox admission precedes the model boundary.** A Cursor-side AwaitShell
   could postpone a host steer until the background job finished. Inject eligible
   plain text into the actively pumping Run, with backpressure and admission

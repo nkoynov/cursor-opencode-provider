@@ -6,7 +6,7 @@ variables and limitations. Host setup belongs in the matching guide.
 | Guide | Purpose |
 |-------|---------|
 | [OpenCode 1.x](opencode-1.md) | Classic plugin and the separate 1.18 v2 API |
-| [OpenCode 2.0](opencode-2.md) | Installation, daemon/local builds, tools and migration |
+| [OpenCode 2.x](opencode-2.md) | Installation, daemon/local builds, tools and migration |
 | [Cache and token logs](cache-log-runbook.md) | Continuity, usage, billing and cache evidence |
 | [Host acceptance](host-compat-acceptance.md) | Planning, patch tools, steering and caching checks |
 | [Execution self-verification](execution-self-verify.md) | Native shell, permissions, failures and cleanup |
@@ -17,7 +17,7 @@ variables and limitations. Host setup belongs in the matching guide.
 Maintainers: [AGENTS.md](../AGENTS.md) owns current architecture and release
 requirements, with implementation pointers rather than incident histories;
 [CONTRIBUTING.md](../CONTRIBUTING.md) owns contribution workflow.
-The [lessons index](../tasks/lessons.md) separates general, 1.x and 2.0 incident
+The [lessons index](../tasks/lessons.md) separates general, 1.x and 2.x incident
 rationale. Future work is tracked in [tasks/todo.md](../tasks/todo.md).
 
 [SECURITY.md](../SECURITY.md) covers the trust model and private reporting;

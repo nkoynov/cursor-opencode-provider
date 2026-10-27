@@ -1,3 +1,4 @@
+import { hasHostHistoryRewrite, noteHostHistoryRewrite, resetHostHistoryRewritesForTests } from "../src/host-history-rewrite.js"
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test"
 import fs from "node:fs"
 import http2 from "node:http2"
@@ -110,6 +111,7 @@ afterEach(() => {
   setHostCacheDirOverride(undefined)
   sessionManager.dispose()
   resetTurnStateForTests()
+  resetHostHistoryRewritesForTests()
   resetConversationPersistenceForTests()
   resetConversationBindingsForTests()
   resetCheckpointsForTests()
@@ -207,6 +209,85 @@ describe("checkpoint eligibility across host results", () => {
     if (!call || call.type !== "tool-call") throw new Error("Expected a host tool call")
     prompt.push({ role: "assistant", content: [{ type: "tool-call", toolCallId: call.toolCallId, toolName: call.toolName, input: JSON.parse(call.input) }] })
     prompt.push({ role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName, output: { type: "text", value: output } }] })
+  }
+
+  for (const scenario of ["finished", "held", "restart"] as const) {
+    it(`rebases committed foreign compaction from ${scenario} and keeps the next turn warm`, async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-foreign-compaction-"))
+      const key = `ses_foreign_compaction_${scenario}`
+      const checkpoint = Uint8Array.of(0x2a, 5, 8, 42, 16, 0x80, 2)
+      type Request = { conversation_id: string; conversation_group_id: string; conversation_state?: Uint8Array;
+        action: { resume_action?: unknown; user_message_action?: { user_message: { text: string } } } }
+      const requests: Request[] = []
+      scripted = (stream, message) => {
+        if (!message.run_request) return
+        requests.push(message.run_request as Request)
+        const send = (value: Record<string, unknown>) => stream.write(frame(encodeMessage("AgentServerMessage", value)))
+        send({ conversation_checkpoint_update: checkpoint })
+        if (scenario === "held" && requests.length === 1) {
+          send({ exec_server_message: { id: 1, shell_args: { command: "echo done", tool_call_id: "command" } } })
+        } else {
+          send({ interaction_update: { text_delta: { text: "Cursor answer" } } })
+          send({ interaction_update: { turn_ended: {} } })
+          stream.end()
+        }
+      }
+      cacheHttp2SessionForTests(ORIGIN, client)
+      try {
+        const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN,
+          cacheDir: root, workspaceRoot: root }).languageModel("composer-2.5")
+        const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Original large history" }] }]
+        const options: LanguageModelV3CallOptions = { prompt, headers: { "x-opencode-session-id": key },
+          tools: [{ type: "function", name: "bash", inputSchema: { type: "object", properties: { command: { type: "string" } } } }] }
+        const parts = await readParts(model, options)
+        if (scenario === "held") {
+          appendResult(prompt, parts, "COMPLETED_HOST_RESULT")
+          await notifyHostInterrupt(key, "shutdown")
+        } else prompt.push({ role: "assistant", content: [{ type: "text", text: "Cursor answer" }] })
+        await noteHostHistoryRewrite(root, key, "evt_compacted")
+        if (scenario === "restart") {
+          sessionManager.dispose()
+          await settleRunSavesForTests()
+          resetTurnStateForTests()
+          resetHostHistoryRewritesForTests()
+          resetConversationPersistenceForTests()
+          resetConversationBindingsForTests()
+          resetCheckpointsForTests()
+        }
+        if (scenario === "restart") {
+          // A title request can hydrate the snapshot before the main request.
+          await readParts(model, { ...options, tools: [], prompt: [
+            { role: "user", content: [{ type: "text", text: "Generate a title" }] },
+          ] })
+        }
+        const replacementIndex = requests.length
+        // Native compaction replaces the prefix while retaining a recent tail.
+        prompt[0] = { role: "user", content: [{ type: "text", text: "COMPACTED_HOST_SUMMARY" }] }
+        if (scenario !== "held") prompt.push({ role: "user", content: [{ type: "text", text: "Continue" }] })
+        expect((await readParts(model, options)).some(part => part.type === "finish")).toBe(true)
+        expect(requests).toHaveLength(replacementIndex + 1)
+        expect(requests[replacementIndex]!.conversation_id).not.toBe(requests[0]!.conversation_id)
+        expect(requests[replacementIndex]!.conversation_group_id).toBe(requests[0]!.conversation_group_id)
+        expect(requests[replacementIndex]!.conversation_state?.length ?? 0).toBe(0)
+        expect(requests[replacementIndex]!.action.resume_action).toBeUndefined()
+        const seed = requests[replacementIndex]!.action.user_message_action!.user_message.text
+        expect(seed).toContain("COMPACTED_HOST_SUMMARY")
+        expect(seed).not.toContain("Original large history")
+        if (scenario === "held") expect(seed).toContain("COMPLETED_HOST_RESULT")
+        expect(hasHostHistoryRewrite(root, key)).toBe(false)
+        prompt.push({ role: "assistant", content: [{ type: "text", text: "Cursor answer" }] },
+          { role: "user", content: [{ type: "text", text: "Next warm turn" }] })
+        await readParts(model, options)
+        expect(requests).toHaveLength(replacementIndex + 2)
+        expect(requests[replacementIndex + 1]!.conversation_id).toBe(requests[replacementIndex]!.conversation_id)
+        expect(requests[replacementIndex + 1]!.conversation_state).toEqual(checkpoint)
+      } finally {
+        sessionManager.dispose()
+        await settleRunSavesForTests()
+        setHostCacheDirOverride(undefined)
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    })
   }
 
   for (const checkpointAt of ["prefix-drain", "final-drain"] as const) {

@@ -1,12 +1,12 @@
 # OpenCode 1.x lessons
 
-[Index](../lessons.md) · [General](opencode.md) · [2.0](opencode-2.md)
+[Index](../lessons.md) · [General](opencode.md) · [2.x](opencode-2.md)
 
 Operator setup: [OpenCode 1.x](../../docs/opencode-1.md).
 
 ## Plugin loading and request hooks
 
-- **The 1.18 v2 API is not OpenCode 2.0.** Similar names hid incompatible hook
+- **The 1.18 v2 API is not OpenCode 2.x.** Similar names hid incompatible hook
   signatures and provider schemas. Keep separate entrypoints and check the
   installed declarations (`src/plugin-v2.ts`).
 - **v2-only loading loses classic tools.** The 1.18 API has no tool domain;
@@ -62,5 +62,5 @@ Operator setup: [OpenCode 1.x](../../docs/opencode-1.md).
   rejection cleanup must also handle paths that skip the after hook
   (`test/classic-tool-results.test.ts`).
 - **The cost override is specific to classic OpenCode.** A zero
-  `copilot.totalNanoAiu` hid billing here while 2.0 still charged token prices.
+  `copilot.totalNanoAiu` hid billing here while 2.x still charged token prices.
   Test both formulas rather than extrapolating (`test/billing.test.ts`).

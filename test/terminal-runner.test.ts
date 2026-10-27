@@ -368,6 +368,40 @@ fs.createReadStream(job + "/pipe").on("data", chunk => fs.writeSync(fd, chunk))
     expect(elapsed).toBeLessThan(2500)
   }, 15_000)
 
+  it("keeps a finalized record footer out of output before the done marker is published", async () => {
+    const terminal = job("printf before", { timeoutMs: 300 })
+    const runner = path.join(terminal.directory, "runner.sh")
+    const original = fs.readFileSync(runner, "utf8")
+    const marker = `printf '%s\\n' "$code" >"$job/done"`
+    expect(original).toContain(marker)
+    // Publish readiness only after the complete footer, and keep done absent
+    // until the launcher has sampled that record. Polls impose no race timing.
+    fs.writeFileSync(runner, original.replace(marker, [
+      ': >"$job/test-footer-ready"',
+      'while [ ! -f "$job/test-output-sampled" ]; do sleep 0.01; done',
+      marker,
+    ].join("\n")))
+    const sample = '  cursor_output=$(( $(wc -c <"$cursor_terminal") - cursor_header ))'
+    expect(terminal.command.split(sample)).toHaveLength(3)
+    terminal.command = terminal.command.replaceAll(sample, [
+      '  while [ ! -f "$cursor_job/test-footer-ready" ]; do sleep 0.01; done',
+      '  if [ -f "$cursor_job/done" ]; then exit 1; fi',
+      sample,
+      `  printf '%s\\n' "$cursor_output" >"$cursor_job/test-output-sampled"`,
+    ].join("\n"))
+    const launched = await launch(terminal)
+    expect(launched.code).toBe(0)
+    // Prove the sampled size includes footer bytes, so an unfixed launcher
+    // cannot pass merely because it reached the file before finalization.
+    const sampledBytes = Number(fs.readFileSync(path.join(terminal.directory, "test-output-sampled"), "utf8"))
+    const outputBytes = Number(fs.readFileSync(path.join(terminal.directory, "output-bytes"), "utf8"))
+    expect(sampledBytes).toBeGreaterThan(outputBytes)
+    expect(launched.stdout).toMatch(/^before\n__CURSOR_SHELL_BACKGROUND__/)
+    expect(launched.stdout).not.toContain("exit_code:")
+    expect(launched.stdout).not.toContain("ended_at:")
+    expect(await waitDone(terminal)).toContain("exit_code: 0")
+  })
+
   it("reports a hard timeout as a timeout when its command is still being stopped at the window's end", async () => {
     const terminal = job("printf before; trap '' TERM; exec sleep 30", { timeoutMs: 1000, hardTimeoutMs: 300 })
     const started = Date.now()

@@ -28,7 +28,7 @@ agent protocol. TypeScript ESM; Bun installs/tests; `tsc` builds `dist/`.
 
 ## Non-negotiable provider / compatibility-layer boundary
 
-This provider knows only OpenCode 1.x and 2.0. Compatibility layers adapt it;
+This provider knows only OpenCode 1.x and 2.x. Compatibility layers adapt it;
 this package never imports, detects, or depends on them.
 
 - `src/`, provider tests, package metadata, lockfile and published `dist/` must not
@@ -88,26 +88,26 @@ The executable publish surface is `dist/`; rebuild before testing a local
 
 Package exports are defined in `package.json`. Root exports `createCursor` and
 classic `CursorPlugin`; `CursorPluginV2` stays off the root. Auxiliary APIs stay
-on their subpaths. `/server` resolves the 2.0 module and also exports classic
+on their subpaths. `/server` resolves the 2.x module and also exports classic
 `server: CursorPlugin` for the 1.18 loader.
 
-The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
+The **1.18 v2** API and **OpenCode 2.x** are source-incompatible:
 
 - **1.x:** classic `/plugin` owns auth/tools. `/plugin/v2` uses
   `@opencode-ai/plugin/v2/promise`, `ctx.aisdk.sdk` and `ctx.aisdk.language`;
   load it alongside classic because it has no tool domain.
-- **2.0:** load only `/plugin/opencode2`. Export plain `{ id, setup }`, use
+- **2.x:** load only `/plugin/opencode2`. Export plain `{ id, setup }`, use
   local structural types, and import neither host plugin SDK. Inventory is
   in-memory through `ctx.provider.transform`, not written to config. Compile
   usages against `test/opencode2-host-contract.ts` and
   `test/opencode2-conformance.types.ts`.
-- 2.0 direct plugin tools need `codemode: false` and an output schema. Todo
+- 2.x direct plugin tools need `codemode: false` and an output schema. Todo
   fallbacks are off unless `CURSOR_OPENCODE2_TODOS=1`/`true` and the catalog lacks
   them. MCP placement changes tool options, preserves explicit server opt-ins,
   and never rewrites server config or delays startup. Web search uses the native
-  permission-gated backend; the public 2.0 `ToolContext` cannot request approval.
+  permission-gated backend; the public 2.x `ToolContext` cannot request approval.
 - Keep host hook/permission order intact: 1.x `shell.env` follows permission;
-  2.0 `shell.create.before` preserves the command and shell basename through an
+  2.x `shell.create.before` preserves the command and shell basename through an
   executable adapter. Compaction/agent state comes from explicit host hooks.
 
 ## Auth and transport invariants
@@ -373,7 +373,7 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   and reserve hook context for notices about a result. Never use `system_context`.
   Attribute images only to proven pending owners under one 20 MiB continuation
   budget; remember hashes after delivery and preserve cancellation.
-- OpenCode 2 early-steer receipts persist with checkpoints. Deduplicate exact
+- OpenCode 2.x early-steer receipts persist with checkpoints. Deduplicate exact
   promoted copies at their host boundary, preserve later identical requests and
   attachments, rebuild an unanswered promoted/checkpointed steer after failed
   recovery, and deliver all pending user messages in order.
@@ -389,9 +389,9 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
 ## Tools, planning and images
 
 - Remap from the current permitted catalog, preserving native tools when
-  available: 1.x `apply_patch`, 2.0 `patch`, `task`/`subagent`, and `shell`/`bash`.
-  2.0 `execute` is JavaScript. Refuse lossy patches before mutation, including
-  2.0 CRLF. Keep the correlated Task display title over a prompt fragment.
+  available: 1.x `apply_patch`, 2.x `patch`, `task`/`subagent`, and `shell`/`bash`.
+  2.x `execute` is JavaScript. Refuse lossy patches before mutation, including
+  2.x CRLF. Keep the correlated Task display title over a prompt fragment.
   Answer a Task's correlated attachment reads with placeholder bytes, never the
   file or a host read; list the attachment paths in the subagent prompt.
 - Strip read envelopes while retaining `[Partial read: …]` meaning. Explicit
@@ -421,7 +421,7 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   preview only. Gate GenerateImage approval on advertised `cursor_image_save`.
   Stage bytes behind a single-use opaque `cursor_image_save` id,
   never a model-supplied path/content writer. Recheck symlink-aware containment.
-  Classic asks `external_directory` then `edit`; 2.0 asserts those actions and
+  Classic asks `external_directory` then `edit`; 2.x asserts those actions and
   actual resources through public `ctx.permission.assert`, failing closed when
   no permission API exists. Catalog membership is not execution authorization. Refusal is `permission_denied`.
   Do not return save-tool attachments or change the default project-assets
@@ -438,7 +438,7 @@ counters separately. Keep displayed occupancy separate from retry checkpoints.
 cost at turn end. Book only delivered finishes; bound cache counters and retain
 unsettled balances. In the fork, a steer Cursor did not take, sent as a
 follow-up Run, settles through the same ledger. 1.x supports
-`copilot.totalNanoAiu`; 2.0 prices tokens, so both projections must agree
+`copilot.totalNanoAiu`; 2.x prices tokens, so both projections must agree
 without host detection. Do not invent per-call tier
 attribution or bill unpriced Auto. Use the [log runbook](docs/cache-log-runbook.md)
 for cache, token and billing claims.
@@ -473,4 +473,4 @@ operator or integrator behavior changes. Normalize formatting at release time.
 
 Documentation ownership and environment/setup references:
 [docs index](docs/README.md), [README](README.md), [1.x guide](docs/opencode-1.md),
-[2.0 guide](docs/opencode-2.md), [lessons index](tasks/lessons.md).
+[2.x guide](docs/opencode-2.md), [lessons index](tasks/lessons.md).

@@ -10,7 +10,7 @@ Cite `file:line`. State the concrete consequence. Confirm the finding is in the 
 
 - A new path logs, persists, fixtures, or sends a token, API key, refresh token, or device identifier.
 - Device-id or client-identity derivation changes.
-- The package entrypoint contract breaks. `CursorPluginV2` stays off the root export. The 1.18 plugin loads through `cursor-opencode-provider/plugin/v2`. OpenCode 2.0 loads through `cursor-opencode-provider/plugin/opencode2`.
+- The package entrypoint contract breaks. `CursorPluginV2` stays off the root export. The 1.18 plugin loads through `cursor-opencode-provider/plugin/v2`. OpenCode 2.x loads through `cursor-opencode-provider/plugin/opencode2`.
 - `src/`, tests, package metadata, the lockfile, or published `dist/` import a compatibility package, detect another host, or alias another provider. Unknown advertised tool names may pass through. Recognizing another host's tool, schema, or result is a blocker.
 - Protocol encode or decode changes without an independent fixture or captured wire bytes. A test that only round-trips through the same schema is not evidence.
 - The change widens what the provider can execute or access without an explicit documented option.
@@ -27,7 +27,7 @@ Cite `file:line`. State the concrete consequence. Confirm the finding is in the 
 - The pull-request description does not match the diff.
 - A user-facing behavior change has no `CHANGELOG.md` line under `## [Unreleased]` (pure docs/test/CI corrections are exempt).
 - A version bump, tag, or publish is present without a successful pricing generation and changelog finalization in the same change.
-- A runtime fix considers only one of OpenCode 1.x and OpenCode 2.0, and the bug is not specific to one entrypoint.
+- A runtime fix considers only one of OpenCode 1.x and OpenCode 2.x, and the bug is not specific to one entrypoint.
 - A bug fix remints a sticky conversation or rewrites frozen RequestContext bytes without a stated reason. Read [docs/cache-log-runbook.md](cache-log-runbook.md) before calling a cache result.
 
 ## Nits

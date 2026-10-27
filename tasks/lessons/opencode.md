@@ -1,6 +1,6 @@
 # OpenCode general lessons
 
-[Index](../lessons.md) · [1.x](opencode-1.md) · [2.0](opencode-2.md)
+[Index](../lessons.md) · [1.x](opencode-1.md) · [2.x](opencode-2.md)
 
 These are failure lessons shared by both hosts, not a replacement for
 [AGENTS.md](../../AGENTS.md). Host-specific details live in the linked files.
@@ -62,7 +62,7 @@ These are failure lessons shared by both hosts, not a replacement for
   required outer `namespace`/`toolName`; server-side wrapper failures may appear
   only in display completion (`test/dynamic-catalog.test.ts`).
 - **Read argument keys from the advertised schema.** Passing 1.x skill `name`
-  to 2.0's `id` (or vice versa) was stripped to an empty object (`skillArgKey`,
+  to 2.x's `id` (or vice versa) was stripped to an empty object (`skillArgKey`,
   `test/tools.test.ts`).
 - **Virtual MCP servers need a control plane.** Answer state probes from the
   same descriptors, validate nested inputs, and echo the requested path when
@@ -129,7 +129,7 @@ These are failure lessons shared by both hosts, not a replacement for
   (`test/session-exit.test.ts`, `test/node-http2-drain.mjs`).
   That CANCEL also fires `aborted` on Node and Bun while the request side is
   open, so every ordinary turn-end close logged "aborted by remote" and sent a
-  self-verify run chasing a nonexistent server reset. Bun 1.3 (OpenCode 2.0's
+  self-verify run chasing a nonexistent server reset. Bun 1.3 (OpenCode 2.x's
   runtime) also emits `error` for it while the response is open; a test run on
   a newer Bun missed that. Stream events do not say who closed; check the
   local-close flag, and run transport checks on the host's runtime too
@@ -161,7 +161,7 @@ These are failure lessons shared by both hosts, not a replacement for
   failure handed to an older host with unbounded retries otherwise restarts the
   allowance forever. Share counts across module copies and host tool steps;
   distinguish partial assistant output and host reminders from a new user turn.
-  Test the canonical host projection: OpenCode 2's interruption notice is plain
+  Test the canonical host projection: OpenCode 2.x's interruption notice is plain
   user text, not a `<system-reminder>`, and otherwise reset the budget on every
   continuation (`test/run-error-host.test.ts`). Admit it only after a requested
   host retry, retaining its full prompt key across tool steps; a later literal
@@ -261,7 +261,7 @@ These are failure lessons shared by both hosts, not a replacement for
 - **A helper must not take over its parent.** A smaller catalog was mistaken for
   a helper despite carrying the parent's pending result. Reconcile that result
   first; isolate genuine helpers (`test/fresh-turn-drain.test.ts`). An empty
-  catalog is a helper too: OpenCode 2's tool-less call during a running shell
+  catalog is a helper too: OpenCode 2.x's tool-less call during a running shell
   cancelled the parent Run (`test/lifecycle-isolation-run.test.ts`).
 - **Drain before replacing a held Run.** Cancellation preserves warmth only with
   a valid terminal acknowledgement and fresh checkpoint. An incomplete drain
@@ -295,7 +295,7 @@ These are failure lessons shared by both hosts, not a replacement for
   workspace sends its private read to OpenCode's `read`, which closed the row
   as a failed edit on 193 of 530 edits in a day (#106). Decide both from one
   predicate. Content-dependent remaps stay unpredictable: a rewrite with
-  unchanged content stays a `write`. OpenCode 2 rejects a renamed call and
+  unchanged content stays a `write`. OpenCode 2.x rejects a renamed call and
   both hosts reject an identical `edit`, so such a row completes as a hand-off
   naming the real call, never as a failure (`hostToolForCursorEdit`,
   `cursorEditReadReachesHost`, `earlyRowHandoff`, `test/early-tool-rows.test.ts`). Cursor can
@@ -388,7 +388,7 @@ These are failure lessons shared by both hosts, not a replacement for
   `resolveCreatePlanBridge`, `test/session-edits.test.ts`,
   `test/create-plan.test.ts`, `test/plugin.test.ts`,
   `test/plugin-opencode2.test.ts`). Read native 1.x `permission` rules as well
-  as 2.0 `permissions`; retry before evaluating and reuse that payload for the
+  as 2.x `permissions`; retry before evaluating and reuse that payload for the
   plan path. A failed lookup is not an empty ruleset: carry unknown evidence
   to CreatePlan and implementing SwitchMode instead of aborting ordinary
   requests. Recheck pending approvals too, and clear the unavailable marker
@@ -403,7 +403,7 @@ These are failure lessons shared by both hosts, not a replacement for
   tool step of a session that never had a deny (`sessionEditsGuidance`).
   Persist whether a deny was ever sent: treating every restart as unknown
   history repeated the no-deny note on each conversation. Compaction cannot
-  approve a plan, so its 2.0 session read stays best effort and must not abort
+  approve a plan, so its 2.x session read stays best effort and must not abort
   the compaction (`test/plugin-opencode2.test.ts`). Place current permission guidance after all
   carried notes too, even when this process already recorded no deny: queued
   or unacknowledged injections can restore an older deny. Record suppression
@@ -528,6 +528,13 @@ These are failure lessons shared by both hosts, not a replacement for
 
 ## Shell supervision
 
+- **Completion markers do not freeze a growing record.** A launcher sampled
+  file size before `done` while the supervisor appended its footer. Read the
+  final output-byte bound after sampling live size, so timeout and background
+  results contain command bytes only. A fixed delay before `done` did not
+  guarantee the launcher sampled a footer: coordinate footer readiness and
+  sampling explicitly, and assert the sampled size exceeds command bytes
+  (`test/terminal-runner.test.ts`, finalized record footer).
 - **Read native execution before emulating it.** Both hosts own shell choice,
   permission and process-group cancellation. Preserve native background support;
   the remaining redesign is tracked in [todo](../todo.md).
@@ -559,7 +566,7 @@ These are failure lessons shared by both hosts, not a replacement for
   preserve the host's status (#115); validate terminal codes in the shell's
   0-255 range before exiting. Separate the host's final exit, signal or timeout
   notice block without inserting bytes between unrelated text blocks, including
-  split CRLF. OpenCode 2 sends a lone block as a text result, so a silent failed
+  split CRLF. OpenCode 2.x sends a lone block as a text result, so a silent failed
   command's notice is the whole value
   (`test/terminal-runner.test.ts`, `test/opencode2-tool-results.test.ts`).
 

@@ -1,3 +1,4 @@
+import { acknowledgeHostHistoryRewrite, awaitHostHistoryRewrite, resetHostHistoryRewritesForTests } from "../src/host-history-rewrite.js"
 import { describe, expect, test, beforeEach, afterEach, setSystemTime, spyOn } from "bun:test"
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -6,6 +7,13 @@ import { pathToFileURL } from "node:url"
 import { APICallError } from "@ai-sdk/provider"
 import plugin from "../src/plugin-opencode2.js"
 import { CursorPlugin } from "../src/plugin.js"
+import { hydrateConversationState, persistConversationState } from "../src/protocol/conversation-state.js"
+import { getPersistedConversation, resetConversationPersistenceForTests, setConversationPersistenceHookForTests } from "../src/protocol/conversation-persistence.js"
+import { resetConversationBindingsForTests, restoreConversationBinding } from "../src/protocol/conversation-bind.js"
+import { resetCheckpointsForTests, setCheckpoint } from "../src/protocol/checkpoint.js"
+import { sessionManager } from "../src/session.js"
+import { sessionFixture } from "./session-fixture.js"
+import { settleRunSavesForTests } from "../src/language-model.js"
 import { applyCursorProviderInventory, CURSOR_AISDK_PACKAGE, modelConfigEntryToInfo, ownPackageSpec } from "../src/opencode2/catalog.js"
 import {
   accessTokenFromCredential,
@@ -35,7 +43,7 @@ import { createManagedTerminal } from "../src/terminal-runner.js"
 import { listenForHostSteers, matchEarlySteers, recordEarlySteer, resetHostSteersForTests } from "../src/host-steer.js"
 import { toolResultFailure } from "../src/opencode2/tool-results.js"
 import { RUNNING_TOOL_CAP_MS, sessionActivity } from "../src/activity.js"
-import { onHostInterrupt } from "../src/host-interrupt.js"
+import { notifyHostInterrupt, onHostInterrupt } from "../src/host-interrupt.js"
 import { stageCursorImage } from "../src/image-staging.js"
 import { hostPlansDir, opencode2PlanDir, setHostCacheDirOverride, setNativePlansDir } from "../src/context/paths.js"
 import { hostSkillFiles, resetHostSkillFilesForTests } from "../src/context/skills.js"
@@ -1940,6 +1948,176 @@ describe("opencode2 setup", () => {
 
     expect(isCompactionSession("s-compact")).toBe(true)
     expect(isCompactionSession("s-normal")).toBe(false)
+  })
+
+  describe("committed foreign compaction outcomes", () => {
+    let root: string
+    let id: string
+    beforeEach(() => {
+      root = mkdtempSync(join(tmpdir(), "cursor-review124-"))
+      id = `review124-${Math.random()}`
+      setHostCacheDirOverride(root)
+    })
+    afterEach(async () => {
+      sessionManager.dispose()
+      await settleRunSavesForTests()
+      for (const cleanup of setupCleanups.splice(0).reverse()) await cleanup()
+      resetHostHistoryRewritesForTests()
+      resetConversationPersistenceForTests()
+      resetConversationBindingsForTests()
+      resetCheckpointsForTests()
+      setHostCacheDirOverride(undefined)
+      rmSync(root, { recursive: true, force: true })
+    })
+    const checkpoint = Uint8Array.of(0x2a, 5, 8, 42, 16, 0x80, 2)
+    const start = async () => {
+      const bus = fakeEventBus()
+      const host = fakeContext()
+      host.ctx.event.subscribe = bus.subscribe
+      host.sessionLocations.set(id, "/project")
+      await setupPlugin(host.ctx)
+      const conversationId = `${id}-conversation`
+      restoreConversationBinding(id, conversationId)
+      setCheckpoint(conversationId, checkpoint)
+      const requestContext = { rules_info_complete: true }
+      await persistConversationState(root, { sessionKey: id, conversationId, requestContext })
+      const prepare = () => host.hooks.get("session.compaction")!({
+        sessionID: id, agent: "build", model: { providerID: "openai", id: "summary" },
+        system: [], messages: [], options: {},
+      })
+      const next = async () => {
+        const event = { sessionID: id, agent: "build", model: { providerID: "cursor" },
+          messages: [], options: {} as Record<string, unknown> }
+        await host.hooks.get("session.context")!(event)
+        return event.options
+      }
+      return { ...host, bus, conversationId, requestContext, prepare, next }
+    }
+
+    test("failed summary must not request a history rewrite", async () => {
+      const host = await start()
+      await host.prepare()
+      await host.bus.publish({ type: "session.compaction.failed", data: {
+        sessionID: id, reason: "manual", error: { type: "compaction.failed", message: "summary failed" },
+      } })
+      expect((await host.next()).opencodeHistoryRewrite).toBeUndefined()
+    })
+
+    test("background preparation must keep the current durable checkpoint", async () => {
+      const host = await start()
+      // OpenCode precompute prepares the same hook without applying any summary.
+      await host.prepare()
+      const saved = await getPersistedConversation(root, id)
+      expect(saved?.conversationId).toBe(host.conversationId)
+      expect(saved?.checkpoint).toEqual(checkpoint)
+      expect((await host.next()).opencodeHistoryRewrite).toBeUndefined()
+    })
+
+    test("applying a previously prepared summary must still rebase the next Cursor turn", async () => {
+      const host = await start()
+      await host.prepare()
+      await host.next() // an ordinary turn while the background summary is only held
+      // usePrecomputed applies the summary later without another request hook.
+      await host.bus.publish({ id: `evt_${id}`, type: "session.compaction.ended", data: {
+        sessionID: id, reason: "auto", model: { providerID: "openai", id: "summary" }, text: "compacted",
+      } })
+      await host.next()
+      expect(await awaitHostHistoryRewrite(root, id)).toBe(true)
+    })
+
+    test("a receipt storage failure is visible at the next request and recovers", async () => {
+      const host = await start()
+      setConversationPersistenceHookForTests(phase => {
+        if (phase === "before-write") throw new Error("storage unavailable")
+      })
+      await host.bus.publish({ id: `evt_${id}`, type: "session.compaction.ended", data: {
+        sessionID: id, reason: "manual", model: { providerID: "openai", id: "summary" }, text: "summary",
+      } })
+      await expect(host.next()).rejects.toThrow("storage unavailable")
+      setConversationPersistenceHookForTests()
+      await host.next()
+      expect(await awaitHostHistoryRewrite(root, id)).toBe(true)
+      expect((await getPersistedConversation(root, id))?.postCompactionRebase).toBe(true)
+    })
+
+    test("shutdown must not resurrect a checkpoint invalidated by host compaction", async () => {
+      const host = await start()
+      const frames = { next: async () => ({ done: true as const, value: undefined }) }
+      const held = sessionFixture({
+        sessionId: `${id}-run`, conversationId: host.conversationId, runId: `${id}-run-id`,
+        openCodeSessionId: id, cacheDir: root, requestContext: host.requestContext,
+        stream: { write() { return true }, end() {}, destroy() {}, isClosed: () => false,
+          onTerminal: () => () => {}, frames: () => ({ [Symbol.asyncIterator]: () => frames }) },
+        frames, pending: new Map(), displayToolCalls: new Map(), nextBridgedExecId: 900_000,
+        blobs: new Map(), toolDescriptors: [], toolCatalog: [{ name: "read" }], allowTools: true,
+        usageEstimate: { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 },
+        pumpActive: false, heartbeat: null,
+      })
+      sessionManager.registerSession(held)
+      sessionManager.registerPending(91, held, "read", "read")
+      await host.prepare()
+      await host.bus.publish({ id: `evt_${id}`, type: "session.compaction.ended", data: {
+        sessionID: id, reason: "manual", model: { providerID: "openai", id: "summary" }, text: "compacted",
+      } })
+      await notifyHostInterrupt(id, "shutdown")
+      sessionManager.dispose()
+      await settleRunSavesForTests()
+      resetHostHistoryRewritesForTests()
+      resetConversationPersistenceForTests()
+      resetConversationBindingsForTests()
+      resetCheckpointsForTests()
+      resetHostHistoryRewritesForTests()
+      const restored = await hydrateConversationState(root, id)
+      expect(restored?.conversationId === host.conversationId && restored.postCompactionRebase === false).toBe(false)
+    })
+  })
+
+  test("a committed foreign compaction stays pending until the provider replaces the binding", async () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), "cursor-host-compaction-"))
+    setHostCacheDirOverride(cacheDir)
+    const bus = fakeEventBus()
+    try {
+      const { ctx, hooks, sessionLocations } = fakeContext()
+      ctx.event.subscribe = bus.subscribe
+      sessionLocations.set("s-host-compaction", "/proj")
+      await setupPlugin(ctx)
+      const request = async (agent: string, providerID = "cursor") => {
+        const event = { sessionID: "s-host-compaction", agent, model: { providerID }, options: {} }
+        await hooks.get("session.context")!(event)
+      }
+      const pending = () => awaitHostHistoryRewrite(cacheDir, "s-host-compaction")
+      expect(await pending()).toBe(false)
+      await hooks.get("session.compaction")!({
+        sessionID: "s-host-compaction", agent: "build", model: { providerID: "openai" }, options: {},
+      })
+      expect(await pending()).toBe(false)
+      const ended = { id: "evt_foreign_compaction", type: "session.compaction.ended", data: {
+        sessionID: "s-host-compaction", model: { providerID: "openai" }, text: "summary",
+      } }
+      await bus.publish(ended)
+      await request("compaction", "openai")
+      await request("build", "anthropic")
+      await request("build")
+      await request("build") // Request preparation never consumes the receipt.
+      expect(await pending()).toBe(true)
+      acknowledgeHostHistoryRewrite(cacheDir, "s-host-compaction")
+      expect(await pending()).toBe(false)
+      await bus.publish(ended) // Every Location observes the same durable event.
+      expect(await pending()).toBe(false)
+      await bus.publish({ ...ended, id: "evt_cursor_compaction", data: {
+        ...ended.data, model: { providerID: "cursor" },
+      } })
+      expect(await pending()).toBe(false)
+      await bus.publish({ type: "session.compaction.ended", data: {} })
+      expect(await pending()).toBe(false)
+    } finally {
+      for (const cleanup of setupCleanups.splice(0).reverse()) await cleanup()
+      resetHostHistoryRewritesForTests()
+      resetConversationPersistenceForTests()
+      resetConversationBindingsForTests()
+      setHostCacheDirOverride(undefined)
+      rmSync(cacheDir, { recursive: true, force: true })
+    }
   })
 
   test("the session context carries the active host agent into provider options", async () => {

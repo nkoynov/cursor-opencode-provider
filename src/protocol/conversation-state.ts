@@ -1,3 +1,4 @@
+import { hasHostHistoryRewrite, queueConversationStateWrite } from "../host-history-rewrite.js"
 import { trace } from "../debug.js"
 import { restoreEarlySteers, serializeEarlySteers } from "../host-steer.js"
 import { restoreLostRequest, serializeLostRequest } from "../lost-request.js"
@@ -126,52 +127,54 @@ export async function persistConversationState(
     modelFallbackStop?: string
   },
 ): Promise<void> {
-  // A newer Run may have reset/superseded this conversation while its final
-  // frame was still in flight. Never let that late TurnEnded resurrect it.
-  if (!isActiveConversationBinding(input.sessionKey, input.conversationId)) {
+  await queueConversationStateWrite(cacheDir, input.sessionKey, async () => {
+    // A newer Run may have reset/superseded this conversation while its final
+    // frame was still in flight. Never let that late TurnEnded resurrect it.
+    if (!isActiveConversationBinding(input.sessionKey, input.conversationId)) {
+      trace(
+        `conversation persistence: skipped superseded TurnEnded ` +
+          `sessionKey=${input.sessionKey} conversationId=${input.conversationId}`,
+      )
+      return
+    }
+    const checkpoint = getCheckpoint(input.conversationId)
+    const blobCompaction = compactConversationBlobs(input.conversationId, checkpoint, {
+      keepInMemory: input.runInProgress,
+    })
+    const blobs = blobCompaction.blobs
+    const requestContext = getFrozenRequestContext(input.conversationId) ?? input.requestContext
+    const provenance = getTurnProvenance(input.sessionKey)
+    const heldImages = heldHistoryImagesSnapshot(input.sessionKey, input.conversationId, checkpoint)
+    await persistConversation(cacheDir, {
+      sessionKey: input.sessionKey,
+      conversationId: input.conversationId,
+      checkpoint,
+      occupancyCheckpoint: getCheckpointOccupancy(input.conversationId),
+      blobs,
+      requestContext,
+      toolCatalog: structuredClone(input.toolCatalog ?? []),
+      postCompactionRebase: input.postCompactionRebase || hasHostHistoryRewrite(cacheDir, input.sessionKey),
+      hostAgent: input.hostAgent,
+      systemPromptHash: input.systemPromptHash,
+      hostNote: input.hostNote,
+      earlySteers: serializeEarlySteers(input.sessionKey),
+      lostRequest: serializeLostRequest(input.sessionKey),
+      ...(input.modelFallbackStop ? { modelFallbackStop: input.modelFallbackStop } : {}),
+      planOperations: serializePlanOperations(input.sessionKey),
+      ...(heldImages ? { sentImageHashes: heldImages.hashes, sentImagesCheckpoint: heldImages.checkpoint } : {}),
+      ...(sessionEditsDenySent(input.conversationId) ? { sessionEditsDenySent: true } : {}),
+      ...(provenance?.conversationId === input.conversationId
+        ? { turnProvenance: serializeTurnProvenance(provenance) }
+        : {}),
+    })
     trace(
-      `conversation persistence: skipped superseded TurnEnded ` +
-        `sessionKey=${input.sessionKey} conversationId=${input.conversationId}`,
+      `conversation persistence: saved${input.runInProgress ? " in-progress" : ""} sessionKey=${input.sessionKey} ` +
+        `conversationId=${input.conversationId} checkpoint=${checkpoint?.length ?? 0}B ` +
+        `blobs=${blobCompaction.beforeCount}->${blobCompaction.afterCount} ` +
+        `blobBytes=${blobCompaction.beforeBytes}->${blobCompaction.afterBytes}` +
+        (blobCompaction.fallbackReason ? ` compactionFallback=${blobCompaction.fallbackReason}` : ""),
     )
-    return
-  }
-  const checkpoint = getCheckpoint(input.conversationId)
-  const blobCompaction = compactConversationBlobs(input.conversationId, checkpoint, {
-    keepInMemory: input.runInProgress,
   })
-  const blobs = blobCompaction.blobs
-  const requestContext = getFrozenRequestContext(input.conversationId) ?? input.requestContext
-  const provenance = getTurnProvenance(input.sessionKey)
-  const heldImages = heldHistoryImagesSnapshot(input.sessionKey, input.conversationId, checkpoint)
-  await persistConversation(cacheDir, {
-    sessionKey: input.sessionKey,
-    conversationId: input.conversationId,
-    checkpoint,
-    occupancyCheckpoint: getCheckpointOccupancy(input.conversationId),
-    blobs,
-    requestContext,
-    toolCatalog: structuredClone(input.toolCatalog ?? []),
-    postCompactionRebase: input.postCompactionRebase,
-    hostAgent: input.hostAgent,
-    systemPromptHash: input.systemPromptHash,
-    hostNote: input.hostNote,
-    earlySteers: serializeEarlySteers(input.sessionKey),
-    lostRequest: serializeLostRequest(input.sessionKey),
-    ...(input.modelFallbackStop ? { modelFallbackStop: input.modelFallbackStop } : {}),
-    planOperations: serializePlanOperations(input.sessionKey),
-    ...(heldImages ? { sentImageHashes: heldImages.hashes, sentImagesCheckpoint: heldImages.checkpoint } : {}),
-    ...(sessionEditsDenySent(input.conversationId) ? { sessionEditsDenySent: true } : {}),
-    ...(provenance?.conversationId === input.conversationId
-      ? { turnProvenance: serializeTurnProvenance(provenance) }
-      : {}),
-  })
-  trace(
-    `conversation persistence: saved${input.runInProgress ? " in-progress" : ""} sessionKey=${input.sessionKey} ` +
-      `conversationId=${input.conversationId} checkpoint=${checkpoint?.length ?? 0}B ` +
-      `blobs=${blobCompaction.beforeCount}->${blobCompaction.afterCount} ` +
-      `blobBytes=${blobCompaction.beforeBytes}->${blobCompaction.afterBytes}` +
-      (blobCompaction.fallbackReason ? ` compactionFallback=${blobCompaction.fallbackReason}` : ""),
-  )
 }
 
 /**
@@ -215,5 +218,6 @@ export async function clearPersistedConversationState(
   sessionKey: string,
   expectedConversationId?: string,
 ): Promise<void> {
-  await deletePersistedConversation(cacheDir, sessionKey, expectedConversationId)
+  await queueConversationStateWrite(cacheDir, sessionKey, () =>
+    deletePersistedConversation(cacheDir, sessionKey, expectedConversationId))
 }

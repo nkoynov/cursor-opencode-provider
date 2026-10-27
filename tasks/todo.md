@@ -1,7 +1,7 @@
 # TODO
 
 - [x] Fix [#91](https://github.com/oakimov/cursor-opencode-provider/issues/91),
-  OpenCode 2 cold model readiness.
+  OpenCode 2.x cold model readiness.
   - [x] Trace OpenCode 2.1.4 activation and model resolution.
   - [x] Bound cold discovery/publication, retain warm-cache startup and retries.
   - [x] Reject superseded or expired attempts and publication after cleanup.
@@ -15,16 +15,16 @@
 - [ ] Redesign shell handling around native OpenCode execution and eradicate
   unnecessary provider duplication. Preserve the current fixes while designing
   the replacement; passing supervisor tests alone does not justify keeping it.
-  - [ ] Trace supported OpenCode 1.x and 2.0 execution, permission, background,
+  - [ ] Trace supported OpenCode 1.x and 2.x execution, permission, background,
     timeout, cancellation, output, and completion contracts from their actual
     sources. Start with the [classic shell tool](https://github.com/anomalyco/opencode/blob/v1.18.31/packages/opencode/src/tool/shell.ts),
-    [2.0 shell tool](https://github.com/anomalyco/opencode/blob/v2.0.27/packages/core/src/tool/plugin/shell.ts),
+    [2.x shell tool](https://github.com/anomalyco/opencode/blob/v2.0.27/packages/core/src/tool/plugin/shell.ts),
     [public shell endpoints](https://github.com/anomalyco/opencode/blob/v2.0.27/packages/protocol/src/groups/shell.ts),
     and [plugin context](https://github.com/anomalyco/opencode/blob/v2.0.27/packages/plugin/src/promise/plugin.ts).
     Verify supported access from the plugin rather than inferring missing
     capabilities from the shell hook alone.
   - [ ] Let native tools own foreground execution, shell selection, permissions,
-    process groups, deadlines, cancellation, and OpenCode 2 background jobs and
+    process groups, deadlines, cancellation, and OpenCode 2.x background jobs and
     completion notices. Keep launch authorization on the native tool path;
     direct shell creation must not bypass its permission checks.
   - [ ] Keep only the Cursor protocol adapter: map Cursor numeric shell IDs to
@@ -33,7 +33,7 @@
     hard deadlines, bounded reads, handle retention, and restart behavior.
   - [ ] Retain a classic fallback only for a demonstrated native capability
     gap. Document the gap and the smallest required emulation; do not impose it
-    on OpenCode 2 or add compatibility-layer or alternate-host dependencies.
+    on OpenCode 2.x or add compatibility-layer or alternate-host dependencies.
   - [ ] Remove redundant supervisor, collector, lifeline, polling, wrapper,
     startup-injection, and job-file code and their implementation-specific
     tests once native behavior replaces them. Keep independent catalog-spill
