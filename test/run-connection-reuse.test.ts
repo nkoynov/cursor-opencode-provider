@@ -655,6 +655,8 @@ describe("Run on a connection whose ping fails for another Run", () => {
 
 // The host these run on can be heavily loaded; each test still bounds its own waits.
 const SLOW_TEST_MS = 15_000
+// Random, so gzip leaves it above the large-upload threshold.
+const LARGE_RESULT_BYTES = 96 * 1024
 
 /** Resolves to "pending" when `promise` has not settled within `ms`. */
 function within<T>(promise: Promise<T>, ms: number): Promise<T | "pending"> {
@@ -828,6 +830,30 @@ describe("Keepalive PINGs", () => {
     expect(await within(nextFrame(run).then((frame) => frame.done), 3_000)).toBe(false)
     expect(fake.connections).toBe(2)
     run.end()
+  }, SLOW_TEST_MS)
+
+  it("only moves new Runs off a connection whose PING may wait behind a large upload, then drops it once uploads stop", async () => {
+    // Writes 100 ms apart must stay well inside the upload window on a loaded host.
+    setHttp2KeepaliveForTests({ intervalMs: 100, timeoutMs: 1_000 })
+    fake.answers.push("answer-then-hold")
+    const run = await bidiRunStream("token", { baseURL: ORIGIN })
+    run.write(new Uint8Array([8]))
+    const frames = run.frames()[Symbol.asyncIterator]()
+    expect((await frames.next()).done).toBe(false)
+    const connection = await getSession(ORIGIN)
+    fake.muteClient(0)
+    const failure = failureOf(frames.next())
+
+    for (let i = 0; i < 20; i++) {
+      run.write(crypto.getRandomValues(new Uint8Array(LARGE_RESULT_BYTES)))
+      await sleep(100)
+    }
+    expect(await within(failure, 1)).toBe("pending")
+    expect(connection.closed).toBe(true)
+    expect(connection.destroyed).toBe(false)
+
+    expect((await within(failure, 3_000) as CursorProviderError).code).toBe("CURSOR_HTTP2_PING_TIMEOUT")
+    expect(connection.destroyed).toBe(true)
   }, SLOW_TEST_MS)
 
   it("keeps a connection whose PING answers stop while Cursor keeps streaming", async () => {

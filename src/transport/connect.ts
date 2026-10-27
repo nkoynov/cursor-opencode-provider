@@ -429,6 +429,10 @@ const _keepaliveIntervalScale = new Map<string, number>()
 const _http2KeepaliveStarted = new WeakSet<http2.ClientHttp2Session>()
 // When a Run upload on the session last drained: the peer takes data, so the connection is alive.
 const _http2SessionUploadProgressAt = new WeakMap<http2.ClientHttp2Session, number>()
+// A PING written after a large upload waits behind it in the socket buffers, so its answer can lag a live
+// uplink by many seconds while Cursor sends only flow-control frames we cannot observe.
+const LARGE_UPLOAD_BYTES = 64 * 1024
+const _http2SessionLargeUploadAt = new WeakMap<http2.ClientHttp2Session, number>()
 // Several Runs share each session. Node and Bun count its unsent bytes
 // against maxSessionMemory (10 MB by default) and, once over it, fail every new
 // stream with ENHANCE_YOUR_CALM (Bun before sending it, Node by refusing its
@@ -729,6 +733,15 @@ function startKeepalive(key: string, session: http2.ClientHttp2Session): void {
     if (stopped || pingSentAt === undefined || session.destroyed) return
     const remainingMs = deadline(pingSentAt) - Date.now()
     if (remainingMs > 0) return arm(remainingMs, checkDeadline)
+    const uploadWindowMs = (_http2SessionLargeUploadAt.get(session) ?? 0) + keepaliveTimeoutMs - Date.now()
+    if (uploadWindowMs > 0) {
+      // Possibly only slow: new Runs go elsewhere, and its own Runs keep their watchdogs.
+      if (_http2Sessions.get(key) === session) {
+        trace(`h2 keepalive: PING unanswered behind a large upload — no new Runs on it: origin=${key}`)
+        retireCachedSession(key, session)
+      }
+      return arm(uploadWindowMs, checkDeadline)
+    }
     stop()
     retireDeadSession(key, session, Date.now() - Math.max(lastHeardAt(), pingSentAt - keepaliveIntervalMs))
   }
@@ -1270,6 +1283,7 @@ export async function bidiRunStream(
 
   const send = (frame: Uint8Array): boolean => {
     backpressured = !stream.write(frame)
+    if (backpressured || frame.length >= LARGE_UPLOAD_BYTES) _http2SessionLargeUploadAt.set(session, Date.now())
     return !backpressured
   }
 
