@@ -55,6 +55,8 @@ export async function hydrateConversationState(
   systemPromptHash?: string
   hostNote?: string
   modelFallbackStop?: string
+  /** Another copy advanced this binding: the snapshot replaces this copy's per-session turn state. */
+  replacesCopyState?: true
 } | undefined> {
   // Bindings are process-shared but checkpoints and frozen contexts live per module copy (one per
   // Location): a copy that never served the bound conversation restores it from the snapshot.
@@ -116,6 +118,7 @@ export async function hydrateConversationState(
     ...(persisted.systemPromptHash ? { systemPromptHash: persisted.systemPromptHash } : {}),
     ...(persisted.hostNote ? { hostNote: persisted.hostNote } : {}),
     ...(persisted.modelFallbackStop ? { modelFallbackStop: persisted.modelFallbackStop } : {}),
+    ...(bound !== undefined ? { replacesCopyState: true as const } : {}),
   }
 }
 
