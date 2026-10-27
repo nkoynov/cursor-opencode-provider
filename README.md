@@ -391,8 +391,10 @@ final errors, authentication rules and tool replay guards. An upload with
 uncertain delivery ends the turn even when an older checkpoint exists.
 Cursor CLI's safety cutoffs remain: two resumed attempts that stream without a
 new checkpoint end the turn, and consecutive semantic-stall retries stop once
-180 seconds have elapsed since the first stall retry. A non-stall failure resets
-that stall window. The setting does not override OpenCode's own retry limits.
+180 seconds have elapsed since the first stall retry. A non-stall failure, or a
+new checkpoint the stalled Run saved after the window opened (not the one it was
+resumed from), resets that stall window. The setting does not override
+OpenCode's own retry limits.
 
 ## Environment variables
 
