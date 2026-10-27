@@ -643,9 +643,10 @@ function retireAgedIdleSession(key: string, session: http2.ClientHttp2Session): 
  * timeout. Unlike a failed reuse ping, nothing can still arrive on it, so its Runs are not left to drain.
  */
 function retireDeadSession(key: string, session: http2.ClientHttp2Session, silentMs: number): void {
-  const error = new CursorTransportError(
-    `Cursor HTTP/2 connection answered no PING and sent nothing for ${silentMs}ms — connection presumed dead`,
-    { transient: true, replaySafe: true, code: "CURSOR_HTTP2_PING_TIMEOUT" },
+  // Not a CursorProviderError: every stream gets this one object, and each Run's recovery mutates its own error.
+  const error = Object.assign(
+    new Error(`Cursor HTTP/2 connection answered no PING and sent nothing for ${silentMs}ms — connection presumed dead`),
+    { code: "CURSOR_HTTP2_PING_TIMEOUT" },
   )
   trace(`h2 keepalive: ${error.message}: origin=${key}`)
   dropSession(key, session)

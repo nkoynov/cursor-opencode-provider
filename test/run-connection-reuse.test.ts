@@ -789,17 +789,24 @@ describe("Keepalive PINGs", () => {
   }, SLOW_TEST_MS)
 
   it("fails the Runs of a busy connection that stops answering at all, and opens the next Run elsewhere", async () => {
-    fake.answers.push("answer-then-hold")
-    const busy = await bidiRunStream("token", { baseURL: ORIGIN })
-    busy.write(new Uint8Array([8]))
-    const frames = busy.frames()[Symbol.asyncIterator]()
-    expect((await frames.next()).done).toBe(false)
+    const frames = []
+    for (const request of [8, 9]) {
+      fake.answers.push("answer-then-hold")
+      const busy = await bidiRunStream("token", { baseURL: ORIGIN })
+      busy.write(new Uint8Array([request]))
+      frames.push(busy.frames()[Symbol.asyncIterator]())
+      expect((await frames.at(-1)!.next()).done).toBe(false)
+    }
     const connection = await getSession(ORIGIN)
     fake.muteClient(0)
 
-    const failure = await within(failureOf(frames.next()), 3_000)
-    expect(failure).toBeInstanceOf(CursorProviderError)
-    expect((failure as CursorProviderError).code).toBe("CURSOR_HTTP2_PING_TIMEOUT")
+    const failures = await Promise.all(frames.map((run) => within(failureOf(run.next()), 3_000)))
+    for (const failure of failures) {
+      expect(failure).toBeInstanceOf(CursorProviderError)
+      expect((failure as CursorProviderError).code).toBe("CURSOR_HTTP2_PING_TIMEOUT")
+    }
+    // Each Run's recovery marks its own error; a shared object would carry one Run's verdict to the other.
+    expect(failures[0]).not.toBe(failures[1])
     expect(connection.destroyed).toBe(true)
 
     const next = await bidiRunStream("token", { baseURL: ORIGIN })
