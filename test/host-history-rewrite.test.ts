@@ -14,6 +14,9 @@ import {
   getPersistedConversation, resetConversationPersistenceForTests, setConversationPersistenceHookForTests,
 } from "../src/protocol/conversation-persistence.js"
 import { persistConversationState } from "../src/protocol/conversation-state.js"
+import { getConversationBlob, resetConversationBlobsForTests, setConversationBlob } from "../src/protocol/blob-store.js"
+import { resetCheckpointsForTests, setCheckpoint } from "../src/protocol/checkpoint.js"
+import { encodeMessage } from "../src/protocol/messages.js"
 
 const roots: string[] = []
 const root = () => {
@@ -26,6 +29,35 @@ afterEach(() => {
   resetConversationPersistenceForTests()
   resetConversationBindingsForTests()
   for (const value of roots.splice(0)) rmSync(value, { recursive: true, force: true })
+})
+
+test("a save queued behind a slow write keeps blobs a later Run stores before its checkpoint", async () => {
+  const cache = root()
+  const sessionKey = "queued"
+  const conversationId = peekConversationId(sessionKey)
+  setCheckpoint(conversationId, encodeMessage("ConversationStateStructure", {
+    token_details: { used_tokens: 1, max_tokens: 2 },
+  }))
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let writes = 0
+  setConversationPersistenceHookForTests(async phase => {
+    if (phase === "before-write" && writes++ === 0) await gate
+  })
+  try {
+    const input = { sessionKey, conversationId, requestContext: { rules_info_complete: true } }
+    const first = persistConversationState(cache, input)
+    const second = persistConversationState(cache, input)
+    const blobId = Uint8Array.from({ length: 32 }, (_, i) => i)
+    setConversationBlob(conversationId, blobId, Uint8Array.of(1, 2, 3))
+    release()
+    await Promise.all([first, second])
+    expect(getConversationBlob(conversationId, blobId)).toEqual(Uint8Array.of(1, 2, 3))
+  } finally {
+    setConversationPersistenceHookForTests()
+    resetConversationBlobsForTests()
+    resetCheckpointsForTests()
+  }
 })
 
 test("a rewrite without saved Cursor state leaves restart free to build its full context", async () => {

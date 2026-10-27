@@ -127,45 +127,51 @@ export async function persistConversationState(
     modelFallbackStop?: string
   },
 ): Promise<void> {
+  // A newer Run may have reset/superseded this conversation while its final
+  // frame was still in flight. Never let that late TurnEnded resurrect it.
+  const superseded = () => {
+    if (isActiveConversationBinding(input.sessionKey, input.conversationId)) return false
+    trace(
+      `conversation persistence: skipped superseded TurnEnded ` +
+        `sessionKey=${input.sessionKey} conversationId=${input.conversationId}`,
+    )
+    return true
+  }
+  if (superseded()) return
+  // Fork: capture now, as turn-end saves are not awaited; a queued capture could compact away a later Run's blobs.
+  const checkpoint = getCheckpoint(input.conversationId)
+  const blobCompaction = compactConversationBlobs(input.conversationId, checkpoint, {
+    keepInMemory: input.runInProgress,
+  })
+  const requestContext = getFrozenRequestContext(input.conversationId) ?? input.requestContext
+  const provenance = getTurnProvenance(input.sessionKey)
+  const heldImages = heldHistoryImagesSnapshot(input.sessionKey, input.conversationId, checkpoint)
+  const snapshot = {
+    sessionKey: input.sessionKey,
+    conversationId: input.conversationId,
+    checkpoint,
+    occupancyCheckpoint: getCheckpointOccupancy(input.conversationId),
+    blobs: blobCompaction.blobs,
+    requestContext,
+    toolCatalog: structuredClone(input.toolCatalog ?? []),
+    hostAgent: input.hostAgent,
+    systemPromptHash: input.systemPromptHash,
+    hostNote: input.hostNote,
+    earlySteers: serializeEarlySteers(input.sessionKey),
+    lostRequest: serializeLostRequest(input.sessionKey),
+    ...(input.modelFallbackStop ? { modelFallbackStop: input.modelFallbackStop } : {}),
+    planOperations: serializePlanOperations(input.sessionKey),
+    ...(heldImages ? { sentImageHashes: heldImages.hashes, sentImagesCheckpoint: heldImages.checkpoint } : {}),
+    ...(sessionEditsDenySent(input.conversationId) ? { sessionEditsDenySent: true } : {}),
+    ...(provenance?.conversationId === input.conversationId
+      ? { turnProvenance: serializeTurnProvenance(provenance) }
+      : {}),
+  }
   await queueConversationStateWrite(cacheDir, input.sessionKey, async () => {
-    // A newer Run may have reset/superseded this conversation while its final
-    // frame was still in flight. Never let that late TurnEnded resurrect it.
-    if (!isActiveConversationBinding(input.sessionKey, input.conversationId)) {
-      trace(
-        `conversation persistence: skipped superseded TurnEnded ` +
-          `sessionKey=${input.sessionKey} conversationId=${input.conversationId}`,
-      )
-      return
-    }
-    const checkpoint = getCheckpoint(input.conversationId)
-    const blobCompaction = compactConversationBlobs(input.conversationId, checkpoint, {
-      keepInMemory: input.runInProgress,
-    })
-    const blobs = blobCompaction.blobs
-    const requestContext = getFrozenRequestContext(input.conversationId) ?? input.requestContext
-    const provenance = getTurnProvenance(input.sessionKey)
-    const heldImages = heldHistoryImagesSnapshot(input.sessionKey, input.conversationId, checkpoint)
+    if (superseded()) return
     await persistConversation(cacheDir, {
-      sessionKey: input.sessionKey,
-      conversationId: input.conversationId,
-      checkpoint,
-      occupancyCheckpoint: getCheckpointOccupancy(input.conversationId),
-      blobs,
-      requestContext,
-      toolCatalog: structuredClone(input.toolCatalog ?? []),
+      ...snapshot,
       postCompactionRebase: input.postCompactionRebase || hasHostHistoryRewrite(cacheDir, input.sessionKey),
-      hostAgent: input.hostAgent,
-      systemPromptHash: input.systemPromptHash,
-      hostNote: input.hostNote,
-      earlySteers: serializeEarlySteers(input.sessionKey),
-      lostRequest: serializeLostRequest(input.sessionKey),
-      ...(input.modelFallbackStop ? { modelFallbackStop: input.modelFallbackStop } : {}),
-      planOperations: serializePlanOperations(input.sessionKey),
-      ...(heldImages ? { sentImageHashes: heldImages.hashes, sentImagesCheckpoint: heldImages.checkpoint } : {}),
-      ...(sessionEditsDenySent(input.conversationId) ? { sessionEditsDenySent: true } : {}),
-      ...(provenance?.conversationId === input.conversationId
-        ? { turnProvenance: serializeTurnProvenance(provenance) }
-        : {}),
     })
     trace(
       `conversation persistence: saved${input.runInProgress ? " in-progress" : ""} sessionKey=${input.sessionKey} ` +
