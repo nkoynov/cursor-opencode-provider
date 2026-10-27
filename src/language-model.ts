@@ -1416,10 +1416,16 @@ async function doStreamImpl(
         .find((failure) => !!failure && isFinalVerdict(failure))
       if (finalVerdict) throw hostFacingError(finalVerdict, { modelId })
       const ambiguous = lostRuns.some((run) => run.ambiguousDelivery)
+      const keepLostRunNotes = () => {
+        for (const run of lostRuns) {
+          if (sessionKey && run.userTurnHostNotes?.length) appendUndeliveredHostNotes(sessionKey, run.userTurnHostNotes)
+        }
+      }
       // Delivery itself may have lost the held Run. Do not rebase that failed
       // plan continuation onto a checkpoint from before the host mutation.
       // Cursor may already hold an ambiguously delivered review answer, so that error wins.
       if (!ambiguous && interruptedPlanContinuation(prompt, sessionKey, mayStartPlanTurn)) {
+        keepLostRunNotes()
         return { stream: answeredSteerStream(PLAN_INTERRUPTED_NOTICE) }
       }
       const why = ambiguous
@@ -1436,9 +1442,7 @@ async function doStreamImpl(
           retryPolicy.maxAttempts ?? 14,
         ), { modelId })
       }
-      for (const run of lostRuns) {
-        if (sessionKey && run.userTurnHostNotes?.length) appendUndeliveredHostNotes(sessionKey, run.userTurnHostNotes)
-      }
+      keepLostRunNotes()
       session = await openSession({ recovery: { kind: "rebase", ...(steeredPrompt ? { steer: true } : {}) } })
     } else {
       // Fresh turn (prompt ends with user/assistant text). Historical tool

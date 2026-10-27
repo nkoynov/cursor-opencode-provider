@@ -12,7 +12,10 @@ import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests, CursorRunInterruptedError, frameArrival, lastFrameArrival } from "../src/transport/connect.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { sessionManager } from "../src/session.js"
-import { resetTurnStateForTests, settleRunSavesForTests } from "../src/language-model.js"
+import {
+  releaseHostNoteInjectionsForTests, resetTurnStateForTests, restorePersistedHostNotes, settleRunSavesForTests,
+} from "../src/language-model.js"
+import { encodePersistedHostNotes } from "../src/protocol/host-notes.js"
 import { resetConversationBindingsForTests } from "../src/protocol/conversation-bind.js"
 import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
@@ -1089,8 +1092,12 @@ describe("host calls still running when the Run dies", () => {
     it(`reads a lost Run's verdict before the unfinished plan notice (${cut})`, async () => {
       const key = `ses_held_tool_plan_${cut}`
       const { requests, prompt, read, cleanup, waitForCut } = setup("held", cut, key)
+      const note = "<system-update>Use bazel for builds.</system-update>"
+      restorePersistedHostNotes(key, encodePersistedHostNotes([note]))
       try {
         const calls = hostCalls(await read())
+        expect(requests[0]!.action.user_message_action!.user_message.text).toContain("Use bazel for builds.")
+        expect(releaseHostNoteInjectionsForTests(key).undelivered).toEqual([])
         expect(calls).toHaveLength(1)
         expect(recordPlanOperation(key, {
           interactionId: 42, hostCallId: calls[0]!.toolCallId, planPath: "/workspace/plan.md",
@@ -1110,6 +1117,7 @@ describe("host calls still running when the Run dies", () => {
           const parts = result as LanguageModelV3StreamPart[]
           expect(parts.flatMap(part => part.type === "text-delta" ? [part.delta] : []).join(""))
             .toContain("Plan saving or review was interrupted")
+          expect(releaseHostNoteInjectionsForTests(key).undelivered).toEqual([note])
         }
         expect(requests).toHaveLength(1)
       } finally {
