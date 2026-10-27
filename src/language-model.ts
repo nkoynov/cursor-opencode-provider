@@ -3111,6 +3111,7 @@ async function startSession(
     abortIfNeeded(signal, next)
     sessionManager.replaceStream(session, next, nextRunId)
     session.resumedFromCheckpoint = conversationState
+    session.checkpointAcceptedAt = undefined
     attachSessionHeartbeat(session)
   }
 
