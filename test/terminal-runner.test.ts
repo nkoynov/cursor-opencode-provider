@@ -402,6 +402,23 @@ fs.createReadStream(job + "/pipe").on("data", chunk => fs.writeSync(fd, chunk))
     expect(await waitDone(terminal)).toContain("exit_code: 0")
   })
 
+  it("keeps output after the soft-background window out of the result when the job finishes during the launcher's read", async () => {
+    const terminal = job("printf before; sleep 0.4; printf late", { timeoutMs: 300 })
+    const sample = '  cursor_output=$(( $(wc -c <"$cursor_terminal") - cursor_header ))'
+    expect(terminal.command.split(sample)).toHaveLength(3)
+    // Hold the launcher after its sample until the job has published its final output bound.
+    terminal.command = terminal.command.replaceAll(sample, [
+      sample,
+      '  while [ ! -f "$cursor_job/output-bytes" ]; do sleep 0.01; done',
+    ].join("\n"))
+    const launched = await launch(terminal)
+    expect(launched.code).toBe(0)
+    expect(Number(fs.readFileSync(path.join(terminal.directory, "output-bytes"), "utf8"))).toBe("beforelate".length)
+    expect(launched.stdout).toMatch(/^before\n__CURSOR_SHELL_BACKGROUND__/)
+    expect(launched.stdout).not.toContain("late")
+    expect(await waitDone(terminal)).toContain("exit_code: 0")
+  })
+
   it("reports a hard timeout as a timeout when its command is still being stopped at the window's end", async () => {
     const terminal = job("printf before; trap '' TERM; exec sleep 30", { timeoutMs: 1000, hardTimeoutMs: 300 })
     const started = Date.now()
