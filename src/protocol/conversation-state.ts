@@ -26,6 +26,7 @@ import {
 import { clearCheckpoint, getCheckpoint, getCheckpointOccupancy, restoreCheckpointOccupancy, setCheckpoint } from "./checkpoint.js"
 import type { OpencodeToolDef } from "./tools.js"
 import {
+  forgetTurnProvenance,
   getTurnProvenance,
   parseTurnProvenance,
   rebindTurnProvenance,
@@ -105,6 +106,13 @@ async function trackedSnapshotWrite(key: string, write: () => Promise<boolean>):
   }
 }
 
+const copyStateResets: Array<(sessionKey: string) => void> = []
+
+/** Per-session state this module copy keeps elsewhere, dropped when it accepts a newer state from disk. */
+export function onCopyStateReplaced(reset: (sessionKey: string) => void): void {
+  copyStateResets.push(reset)
+}
+
 export function resetSnapshotGenerationsForTests(): void {
   snapshots.next = 0
   snapshots.bySession.clear()
@@ -156,6 +164,11 @@ export async function hydrateConversationState(
   // A concurrent request in this copy already restored this generation.
   if (bound !== undefined && heldGenerations.get(key) === generation) return undefined
   rememberHeldGeneration(key, generation)
+  if (bound !== undefined) {
+    // This copy was behind: what is on disk (a snapshot, or none after a delete) replaces its per-session state.
+    forgetTurnProvenance(sessionKey)
+    for (const reset of copyStateResets) reset(sessionKey)
+  }
   const persisted = loaded.value
   if (!persisted) {
     trace(
@@ -182,9 +195,9 @@ export async function hydrateConversationState(
   }
   // Snapshots written before this marker existed came from releases that never sent a deny.
   restoreSessionEditsDenySent(persisted.conversationId, persisted.sessionEditsDenySent === true, bound !== undefined)
+  if (bound !== undefined) clearCheckpoint(persisted.conversationId)
   if (persisted.occupancyCheckpoint) restoreCheckpointOccupancy(persisted.conversationId, persisted.occupancyCheckpoint)
   if (persisted.checkpoint) setCheckpoint(persisted.conversationId, persisted.checkpoint)
-  else clearCheckpoint(persisted.conversationId)
   restoreConversationBlobs(persisted.conversationId, persisted.blobs)
   if (bound !== undefined) clearFrozenRequestContext(persisted.conversationId)
   setFrozenRequestContext(persisted.conversationId, persisted.requestContext)

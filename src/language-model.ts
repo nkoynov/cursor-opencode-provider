@@ -264,6 +264,7 @@ import {
 import {
   clearPersistedConversationState,
   hydrateConversationState,
+  onCopyStateReplaced,
   hydrateTurnProvenance,
   persistConversationState,
   rekeyConversation,
@@ -2322,6 +2323,16 @@ async function writeExecHeartbeats(session: CursorSession, generation: number): 
   }
 }
 
+onCopyStateReplaced((sessionKey) => {
+  postCompactionRebaseBySession.delete(sessionKey)
+  undeliveredHostNotesBySession.delete(sessionKey)
+  steerAnsweringRuns.delete(sessionKey)
+  promptIdentityBySession.delete(sessionKey)
+  toolCatalogBySession.delete(sessionKey)
+  mirroredTodosBySession.delete(sessionKey)
+  forgetModelFallbackStop(sessionKey)
+})
+
 /** Restore receipts before matching a promoted copy, which may need no Run at all. */
 async function restoreSessionState(sessionKey: string | undefined, cacheDir: string): Promise<void> {
   if (sessionKey) {
@@ -2329,15 +2340,6 @@ async function restoreSessionState(sessionKey: string | undefined, cacheDir: str
       trace(`conversation persistence: restore failed sessionKey=${sessionKey}: ${String(error)}`)
       return undefined
     })
-    if (restored?.replacesCopyState) {
-      postCompactionRebaseBySession.delete(sessionKey)
-      undeliveredHostNotesBySession.delete(sessionKey)
-      steerAnsweringRuns.delete(sessionKey)
-      promptIdentityBySession.delete(sessionKey)
-      toolCatalogBySession.delete(sessionKey)
-      mirroredTodosBySession.delete(sessionKey)
-      forgetModelFallbackStop(sessionKey)
-    }
     if (restored && serializeEarlySteers(sessionKey)) {
       const requestContext = getFrozenRequestContext(restored.conversationId)
       if (requestContext) rememberSteerAnsweringRun(sessionKey, {

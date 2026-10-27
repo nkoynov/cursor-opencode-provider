@@ -14,8 +14,9 @@ import {
   getPersistedConversation, resetConversationPersistenceForTests, setConversationPersistenceHookForTests,
 } from "../src/protocol/conversation-persistence.js"
 import {
-  hydrateConversationState, persistConversationState, resetSnapshotGenerationsForTests,
+  hydrateConversationState, onCopyStateReplaced, persistConversationState, resetSnapshotGenerationsForTests,
 } from "../src/protocol/conversation-state.js"
+import { getTurnProvenance, resetTurnProvenanceForTests, restoreTurnProvenance } from "../src/protocol/turn-provenance.js"
 import { dropLostRequest, hasLostRequest, rememberLostRequest } from "../src/lost-request.js"
 import {
   recordSessionEditsGuidance, resetSessionEditsGuidanceForTests, sessionEditsGuidance,
@@ -142,6 +143,7 @@ const otherGraph = async () => {
     frozen: await load("context/frozen.ts") as typeof import("../src/context/frozen.js"),
     persistence: await load("protocol/conversation-persistence.ts") as typeof import("../src/protocol/conversation-persistence.js"),
     sessionEdits: await load("protocol/session-edits.ts") as typeof import("../src/protocol/session-edits.js"),
+    provenance: await load("protocol/turn-provenance.ts") as typeof import("../src/protocol/turn-provenance.js"),
   }
 }
 const checkpointBytes = encodeMessage("ConversationStateStructure", { token_details: { used_tokens: 1, max_tokens: 2 } })
@@ -277,6 +279,36 @@ test("a returning copy takes the edit-deny record of the snapshot it restores", 
   } finally {
     other.persistence.resetConversationPersistenceForTests()
     resetSessionEditsGuidanceForTests()
+    resetCheckpointsForTests()
+  }
+})
+
+test("a copy behind takes what is on disk, also a delete or a snapshot without provenance", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const sessionKey = "behind"
+  const conversationId = peekConversationId(sessionKey)
+  const stale = { conversationId, toolCallIds: [], text: "Older answer", textWithReasoning: "Older answer" }
+  const replaced: string[] = []
+  onCopyStateReplaced(key => replaced.push(key))
+  setCheckpoint(conversationId, checkpointBytes)
+  try {
+    restoreTurnProvenance(sessionKey, stale)
+    await persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    await other.state.hydrateConversationState(cache, sessionKey)
+    other.provenance.forgetTurnProvenance(sessionKey)
+    await other.state.persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    expect((await hydrateConversationState(cache, sessionKey))?.conversationId).toBe(conversationId)
+    expect(getTurnProvenance(sessionKey)).toBeUndefined()
+    expect(replaced).toEqual([sessionKey])
+    restoreTurnProvenance(sessionKey, stale)
+    await other.state.clearPersistedConversationState(cache, sessionKey)
+    expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    expect(getTurnProvenance(sessionKey)).toBeUndefined()
+    expect(replaced).toEqual([sessionKey, sessionKey])
+  } finally {
+    other.persistence.resetConversationPersistenceForTests()
+    resetTurnProvenanceForTests()
     resetCheckpointsForTests()
   }
 })

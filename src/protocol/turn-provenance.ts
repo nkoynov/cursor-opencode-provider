@@ -178,6 +178,10 @@ export function restoreTurnProvenance(sessionKey: string, value: TurnProvenance)
   })
 }
 
+export function forgetTurnProvenance(sessionKey: string): void {
+  provenanceBySession.delete(sessionKey)
+}
+
 export function resetTurnProvenanceForTests(): void {
   provenanceBySession.clear()
 }
