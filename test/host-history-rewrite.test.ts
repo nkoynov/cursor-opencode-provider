@@ -13,7 +13,8 @@ import {
 import {
   getPersistedConversation, resetConversationPersistenceForTests, setConversationPersistenceHookForTests,
 } from "../src/protocol/conversation-persistence.js"
-import { persistConversationState } from "../src/protocol/conversation-state.js"
+import { hydrateConversationState, persistConversationState } from "../src/protocol/conversation-state.js"
+import { dropLostRequest, hasLostRequest, rememberLostRequest } from "../src/lost-request.js"
 import { getConversationBlob, resetConversationBlobsForTests, setConversationBlob } from "../src/protocol/blob-store.js"
 import { resetCheckpointsForTests, setCheckpoint } from "../src/protocol/checkpoint.js"
 import { encodeMessage } from "../src/protocol/messages.js"
@@ -120,5 +121,82 @@ test("separate module graphs share committed receipts and fence late saves", asy
     expect(await awaitHostHistoryRewrite(cache, sessionKey)).toBe(true)
   } finally {
     otherPersistence.resetConversationPersistenceForTests()
+  }
+})
+
+// A moved session, or a Location loaded again after an idle eviction, runs in a copy that never served it.
+const otherGraph = async () => {
+  const graph = root()
+  cpSync(resolve(import.meta.dir, "../src"), join(graph, "src"), { recursive: true })
+  symlinkSync(resolve(import.meta.dir, "../node_modules"), join(graph, "node_modules"), "dir")
+  const load = (file: string) => import(pathToFileURL(join(graph, "src", file)).href)
+  return {
+    state: await load("protocol/conversation-state.ts") as typeof import("../src/protocol/conversation-state.js"),
+    checkpoint: await load("protocol/checkpoint.ts") as typeof import("../src/protocol/checkpoint.js"),
+    frozen: await load("context/frozen.ts") as typeof import("../src/context/frozen.js"),
+    persistence: await load("protocol/conversation-persistence.ts") as typeof import("../src/protocol/conversation-persistence.js"),
+  }
+}
+const checkpointBytes = encodeMessage("ConversationStateStructure", { token_details: { used_tokens: 1, max_tokens: 2 } })
+
+test("a module copy that never served the bound conversation restores its snapshot", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const sessionKey = "moved"
+  const conversationId = peekConversationId(sessionKey)
+  setCheckpoint(conversationId, checkpointBytes)
+  try {
+    await persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    expect(other.checkpoint.getCheckpoint(conversationId)).toBeUndefined()
+    expect((await other.state.hydrateConversationState(cache, sessionKey))?.conversationId).toBe(conversationId)
+    expect(other.checkpoint.getCheckpoint(conversationId)).toEqual(checkpointBytes)
+    expect(other.frozen.getFrozenRequestContext(conversationId)).toEqual({ rules_info_complete: true })
+    // Each copy keeps its live state once it has served the conversation.
+    expect(await other.state.hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+  } finally {
+    other.persistence.resetConversationPersistenceForTests()
+    resetCheckpointsForTests()
+  }
+})
+
+test("a module copy leaves a snapshot alone once the binding has moved past it", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const sessionKey = "moved-on"
+  const conversationId = peekConversationId(sessionKey)
+  setCheckpoint(conversationId, checkpointBytes)
+  try {
+    await persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    const next = bindConversationId(sessionKey, { reset: true }).conversationId
+    expect(await other.state.hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    expect(other.checkpoint.getCheckpoint(conversationId)).toBeUndefined()
+    expect(peekConversationId(sessionKey)).toBe(next)
+  } finally {
+    other.persistence.resetConversationPersistenceForTests()
+    resetCheckpointsForTests()
+  }
+})
+
+test("a module copy restoring a snapshot keeps process-shared state and a pending rewrite", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const sessionKey = "moved-shared"
+  const conversationId = peekConversationId(sessionKey)
+  setCheckpoint(conversationId, checkpointBytes)
+  try {
+    rememberLostRequest({ sessionKey, conversationId, checkpoint: checkpointBytes, text: "Sent once" })
+    await persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    // Cursor kept the turn after the save; the snapshot's copy is stale.
+    dropLostRequest(sessionKey)
+    await noteHostHistoryRewrite(cache, sessionKey, "evt_moved")
+    const restored = await other.state.hydrateConversationState(cache, sessionKey)
+    expect(restored?.postCompactionRebase).toBe(true)
+    expect(hasHostHistoryRewrite(cache, sessionKey)).toBe(true)
+    expect(hasLostRequest(sessionKey)).toBe(false)
+  } finally {
+    dropLostRequest(sessionKey)
+    other.persistence.resetConversationPersistenceForTests()
+    resetCheckpointsForTests()
   }
 })

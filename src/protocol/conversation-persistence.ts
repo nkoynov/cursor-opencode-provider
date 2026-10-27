@@ -1056,6 +1056,16 @@ export async function getPersistedConversation(
   return (await loadPersistedConversation(cacheDir, sessionKey, now)).value
 }
 
+/** Drop this module copy's cached view of a session's snapshot so the next read goes to disk. */
+export async function forgetCachedConversation(cacheDir: string, sessionKey: string): Promise<void> {
+  const key = `${path.resolve(cacheDir)}\0${sessionKey}`
+  const pending = stores.get(key)
+  if (!pending) return
+  const store = await pending.catch(() => undefined)
+  await store?.writeChain.catch(() => {})
+  if (stores.get(key) === pending) stores.delete(key)
+}
+
 /** Read a snapshot together with the reason restart hydration did not restore it. */
 export async function loadPersistedConversation(
   cacheDir: string,

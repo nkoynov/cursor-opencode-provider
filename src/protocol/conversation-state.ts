@@ -1,4 +1,4 @@
-import { hasHostHistoryRewrite, queueConversationStateWrite } from "../host-history-rewrite.js"
+import { hasHostHistoryRewrite, queueConversationStateWrite, settleConversationStateWrites } from "../host-history-rewrite.js"
 import { trace } from "../debug.js"
 import { restoreEarlySteers, serializeEarlySteers } from "../host-steer.js"
 import { restoreLostRequest, serializeLostRequest } from "../lost-request.js"
@@ -10,7 +10,7 @@ import {
 } from "../context/frozen.js"
 import { attachContextEpoch, detachContextEpoch, type ContextEpoch } from "../context/epoch.js"
 import {
-  hasConversationBinding,
+  boundConversationId,
   isActiveConversationBinding,
   restoreConversationBinding,
 } from "./conversation-bind.js"
@@ -37,6 +37,7 @@ import {
 import { moveSessionEditsDenySent, restoreSessionEditsDenySent, sessionEditsDenySent } from "./session-edits.js"
 import {
   deletePersistedConversation,
+  forgetCachedConversation,
   getPersistedTurnProvenance,
   loadPersistedConversation,
   persistConversation,
@@ -55,7 +56,15 @@ export async function hydrateConversationState(
   hostNote?: string
   modelFallbackStop?: string
 } | undefined> {
-  if (hasConversationBinding(sessionKey)) return undefined
+  // Bindings are process-shared but checkpoints and frozen contexts live per module copy (one per
+  // Location): a copy that never served the bound conversation restores it from the snapshot.
+  const bound = boundConversationId(sessionKey)
+  const servedHere = (id: string) => !!getFrozenRequestContext(id) || !!getCheckpoint(id)
+  if (bound !== undefined) {
+    if (servedHere(bound)) return undefined
+    await settleConversationStateWrites(cacheDir, sessionKey)
+    await forgetCachedConversation(cacheDir, sessionKey)
+  }
   const loaded = await loadPersistedConversation(cacheDir, sessionKey)
   const persisted = loaded.value
   if (!persisted) {
@@ -65,11 +74,22 @@ export async function hydrateConversationState(
     )
     return undefined
   }
-
-  restoreConversationBinding(sessionKey, persisted.conversationId)
-  restoreEarlySteers(sessionKey, persisted.earlySteers)
-  restoreLostRequest(sessionKey, persisted.lostRequest)
-  restorePlanOperations(sessionKey, persisted.planOperations)
+  if (bound !== undefined) {
+    const current = boundConversationId(sessionKey)
+    if (current !== persisted.conversationId || servedHere(current)) {
+      trace(
+        `conversation persistence: hydration skipped sessionKey=${sessionKey} ` +
+          `status=superseded bound=${current ?? "none"} saved=${persisted.conversationId}`,
+      )
+      return undefined
+    }
+  } else {
+    restoreConversationBinding(sessionKey, persisted.conversationId)
+    // Process-shared: another copy's live state is newer than the snapshot.
+    restoreEarlySteers(sessionKey, persisted.earlySteers)
+    restoreLostRequest(sessionKey, persisted.lostRequest)
+    restorePlanOperations(sessionKey, persisted.planOperations)
+  }
   // Snapshots written before this marker existed came from releases that never sent a deny.
   restoreSessionEditsDenySent(persisted.conversationId, persisted.sessionEditsDenySent === true)
   if (persisted.occupancyCheckpoint) restoreCheckpointOccupancy(persisted.conversationId, persisted.occupancyCheckpoint)
@@ -85,7 +105,8 @@ export async function hydrateConversationState(
   trace(
     `conversation persistence: restored sessionKey=${sessionKey} ` +
       `conversationId=${persisted.conversationId} checkpoint=${persisted.checkpoint?.length ?? 0}B ` +
-      `blobs=${persisted.blobs.length} heldImages=${persisted.sentImageHashes?.length ?? 0}`,
+      `blobs=${persisted.blobs.length} heldImages=${persisted.sentImageHashes?.length ?? 0}` +
+      (bound !== undefined ? " binding=shared" : ""),
   )
   return {
     conversationId: persisted.conversationId,

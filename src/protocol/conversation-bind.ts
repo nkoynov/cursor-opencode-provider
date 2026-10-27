@@ -43,6 +43,11 @@ export function hasConversationBinding(sessionKey: string): boolean {
   return activeBySession.has(sessionKey) || remintedBySession.has(sessionKey)
 }
 
+/** The conversation this process has bound the session to, without minting one. */
+export function boundConversationId(sessionKey: string): string | undefined {
+  return activeBySession.get(sessionKey) ?? remintedBySession.get(sessionKey)
+}
+
 export function isActiveConversationBinding(
   sessionKey: string,
   conversationId: string,

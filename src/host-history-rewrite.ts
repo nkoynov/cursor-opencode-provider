@@ -23,6 +23,11 @@ export function queueConversationStateWrite(
   return next
 }
 
+/** Wait until every snapshot write queued for the session, by any module copy, has reached disk. */
+export function settleConversationStateWrites(cacheDir: string, sessionKey: string): Promise<void> {
+  return (state.writes.get(keyFor(cacheDir, sessionKey)) ?? Promise.resolve()).then(() => {}, () => {})
+}
+
 export function hasHostHistoryRewrite(cacheDir: string, sessionKey: string): boolean {
   return state.rewrites.get(keyFor(cacheDir, sessionKey))?.pending === true
 }
