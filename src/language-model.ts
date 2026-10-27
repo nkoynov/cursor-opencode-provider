@@ -2335,6 +2335,7 @@ async function restoreSessionState(sessionKey: string | undefined, cacheDir: str
       steerAnsweringRuns.delete(sessionKey)
       promptIdentityBySession.delete(sessionKey)
       toolCatalogBySession.delete(sessionKey)
+      mirroredTodosBySession.delete(sessionKey)
       forgetModelFallbackStop(sessionKey)
     }
     if (restored && serializeEarlySteers(sessionKey)) {

@@ -7,13 +7,13 @@ import { getPersistedConversation, persistConversation } from "./protocol/conver
 type Rewrite = { eventID: string; pending: boolean; durable: boolean; saving?: Promise<void> }
 const state = processShared("host-history-rewrite.v1", () => ({
   rewrites: new Map<string, Rewrite>(),
-  writes: new Map<string, Promise<void>>(),
+  writes: new Map<string, Promise<unknown>>(),
 }))
 const keyFor = (cacheDir: string, sessionKey: string) => JSON.stringify([path.resolve(cacheDir), sessionKey])
 
-export function queueConversationStateWrite(
-  cacheDir: string, sessionKey: string, write: () => Promise<void>,
-): Promise<void> {
+export function queueConversationStateWrite<T>(
+  cacheDir: string, sessionKey: string, write: () => Promise<T>,
+): Promise<T> {
   const key = keyFor(cacheDir, sessionKey)
   const next = (state.writes.get(key) ?? Promise.resolve()).catch(() => {}).then(write)
   state.writes.set(key, next)

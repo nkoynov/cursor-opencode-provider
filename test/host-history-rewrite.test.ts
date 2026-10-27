@@ -198,6 +198,37 @@ test("a copy behind another copy's newer save restores it", async () => {
   }
 })
 
+test("a copy at the latest snapshot waits for another copy's save still being written", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const sessionKey = "queued-elsewhere"
+  const conversationId = peekConversationId(sessionKey)
+  const newer = encodeMessage("ConversationStateStructure", { token_details: { used_tokens: 7, max_tokens: 9 } })
+  setCheckpoint(conversationId, checkpointBytes)
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  try {
+    await persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    expect((await other.state.hydrateConversationState(cache, sessionKey))?.conversationId).toBe(conversationId)
+    setConversationPersistenceHookForTests(async phase => { if (phase === "before-write") await gate })
+    setCheckpoint(conversationId, newer)
+    const save = persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    let settled = false
+    const hydrated = other.state.hydrateConversationState(cache, sessionKey).finally(() => { settled = true })
+    await Bun.sleep(30)
+    expect(settled).toBe(false)
+    release()
+    await save
+    expect((await hydrated)?.replacesCopyState).toBe(true)
+    expect(other.checkpoint.getCheckpoint(conversationId)).toEqual(newer)
+  } finally {
+    release()
+    setConversationPersistenceHookForTests()
+    other.persistence.resetConversationPersistenceForTests()
+    resetCheckpointsForTests()
+  }
+})
+
 test("no copy resumes an older snapshot while the latest save failed", async () => {
   const cache = root()
   const other = await otherGraph()

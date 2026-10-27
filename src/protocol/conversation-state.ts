@@ -45,43 +45,62 @@ import {
   persistConversation,
 } from "./conversation-persistence.js"
 
-// Every successful snapshot write or delete gets a process-wide generation; each module copy remembers the one
-// it last saved or restored. Bounded so an evicted session only costs one reread.
-const MAX_SNAPSHOT_GENERATIONS = 4096
+// Every snapshot write or delete that lands gets a process-wide generation, and writes still queued are counted per
+// module copy; each copy remembers the generation it last wrote or restored. The shared records are never evicted:
+// losing one, or its unsaved mark, would let a copy keep or resume a stale snapshot.
+type SnapshotRecord = { generation: number; unsaved: boolean; queued: Map<string, number> }
+const copyId = crypto.randomUUID()
 const snapshots = processShared("conversation-snapshot-generations.v1", () => ({
   next: 0,
-  bySession: new Map<string, { generation: number; unsaved: boolean }>(),
+  bySession: new Map<string, SnapshotRecord>(),
 }))
+const MAX_HELD_GENERATIONS = 4096
 const heldGenerations = new Map<string, number>()
 const snapshotKey = (cacheDir: string, sessionKey: string) => JSON.stringify([path.resolve(cacheDir), sessionKey])
 
-function rememberBounded<V>(map: Map<string, V>, key: string, value: V): void {
-  map.delete(key)
-  map.set(key, value)
-  while (map.size > MAX_SNAPSHOT_GENERATIONS) map.delete(map.keys().next().value as string)
+function snapshotRecord(key: string): SnapshotRecord {
+  let record = snapshots.bySession.get(key)
+  if (!record) {
+    record = { generation: ++snapshots.next, unsaved: false, queued: new Map() }
+    snapshots.bySession.set(key, record)
+  }
+  return record
 }
 
 function rememberHeldGeneration(key: string, generation: number): void {
-  rememberBounded(heldGenerations, key, generation)
+  heldGenerations.delete(key)
+  heldGenerations.set(key, generation)
+  while (heldGenerations.size > MAX_HELD_GENERATIONS) heldGenerations.delete(heldGenerations.keys().next().value as string)
 }
 
-function latestGeneration(key: string): number {
-  const latest = snapshots.bySession.get(key)
-  if (latest) return latest.generation
-  const generation = ++snapshots.next
-  rememberBounded(snapshots.bySession, key, { generation, unsaved: false })
-  return generation
+function holdsLatestSnapshot(key: string): boolean {
+  const record = snapshots.bySession.get(key)
+  return !!record && heldGenerations.get(key) === record.generation
 }
 
-function noteSnapshotWritten(key: string): void {
-  const generation = ++snapshots.next
-  rememberBounded(snapshots.bySession, key, { generation, unsaved: false })
-  rememberHeldGeneration(key, generation)
+function otherCopyQueuedWrite(key: string): boolean {
+  for (const [copy, count] of snapshots.bySession.get(key)?.queued ?? []) if (copy !== copyId && count > 0) return true
+  return false
 }
 
-// A failed write leaves an older snapshot on disk: no copy may resume from it until a later write lands.
-function noteSnapshotFailed(key: string): void {
-  rememberBounded(snapshots.bySession, key, { generation: ++snapshots.next, unsaved: true })
+/** Count a write from when it is requested; record whether it landed. A failed write leaves an older snapshot on disk. */
+async function trackedSnapshotWrite(key: string, write: () => Promise<boolean>): Promise<void> {
+  const record = snapshotRecord(key)
+  record.queued.set(copyId, (record.queued.get(copyId) ?? 0) + 1)
+  try {
+    if (!await write()) return
+    record.generation = ++snapshots.next
+    record.unsaved = false
+    rememberHeldGeneration(key, record.generation)
+  } catch (error) {
+    record.generation = ++snapshots.next
+    record.unsaved = true
+    throw error
+  } finally {
+    const left = (record.queued.get(copyId) ?? 1) - 1
+    if (left > 0) record.queued.set(copyId, left)
+    else record.queued.delete(copyId)
+  }
 }
 
 export function resetSnapshotGenerationsForTests(): void {
@@ -110,17 +129,17 @@ export async function hydrateConversationState(
   const key = snapshotKey(cacheDir, sessionKey)
   const bound = boundConversationId(sessionKey)
   if (bound !== undefined) {
-    const held = heldGenerations.get(key)
-    const latest = snapshots.bySession.get(key)
-    if (held !== undefined && (!latest || held === latest.generation)) return undefined
+    // This copy's own queued writes hold state no newer than its memory; another copy's may.
+    if (holdsLatestSnapshot(key) && !otherCopyQueuedWrite(key)) return undefined
     await settleConversationStateWrites(cacheDir, sessionKey)
+    if (holdsLatestSnapshot(key)) return undefined
     if (snapshots.bySession.get(key)?.unsaved) {
       trace(`conversation persistence: hydration skipped sessionKey=${sessionKey} status=unsaved`)
       return undefined
     }
     await forgetCachedConversation(cacheDir, sessionKey)
   }
-  const generation = latestGeneration(key)
+  const generation = snapshotRecord(key).generation
   const loaded = await loadPersistedConversation(cacheDir, sessionKey)
   // A concurrent request in this copy already restored this generation.
   if (bound !== undefined && heldGenerations.get(key) === generation) return undefined
@@ -249,18 +268,12 @@ export async function persistConversationState(
       ? { turnProvenance: serializeTurnProvenance(provenance) }
       : {}),
   }
-  await queueConversationStateWrite(cacheDir, input.sessionKey, async () => {
-    if (superseded()) return
-    try {
-      await persistConversation(cacheDir, {
-        ...snapshot,
-        postCompactionRebase: input.postCompactionRebase || hasHostHistoryRewrite(cacheDir, input.sessionKey),
-      })
-    } catch (error) {
-      noteSnapshotFailed(snapshotKey(cacheDir, input.sessionKey))
-      throw error
-    }
-    noteSnapshotWritten(snapshotKey(cacheDir, input.sessionKey))
+  await trackedSnapshotWrite(snapshotKey(cacheDir, input.sessionKey), () => queueConversationStateWrite(cacheDir, input.sessionKey, async () => {
+    if (superseded()) return false
+    await persistConversation(cacheDir, {
+      ...snapshot,
+      postCompactionRebase: input.postCompactionRebase || hasHostHistoryRewrite(cacheDir, input.sessionKey),
+    })
     trace(
       `conversation persistence: saved${input.runInProgress ? " in-progress" : ""} sessionKey=${input.sessionKey} ` +
         `conversationId=${input.conversationId} checkpoint=${checkpoint?.length ?? 0}B ` +
@@ -268,7 +281,8 @@ export async function persistConversationState(
         `blobBytes=${blobCompaction.beforeBytes}->${blobCompaction.afterBytes}` +
         (blobCompaction.fallbackReason ? ` compactionFallback=${blobCompaction.fallbackReason}` : ""),
     )
-  })
+    return true
+  }))
 }
 
 /**
@@ -312,13 +326,8 @@ export async function clearPersistedConversationState(
   sessionKey: string,
   expectedConversationId?: string,
 ): Promise<void> {
-  await queueConversationStateWrite(cacheDir, sessionKey, async () => {
-    try {
-      await deletePersistedConversation(cacheDir, sessionKey, expectedConversationId)
-    } catch (error) {
-      noteSnapshotFailed(snapshotKey(cacheDir, sessionKey))
-      throw error
-    }
-    noteSnapshotWritten(snapshotKey(cacheDir, sessionKey))
-  })
+  await trackedSnapshotWrite(snapshotKey(cacheDir, sessionKey), () => queueConversationStateWrite(cacheDir, sessionKey, async () => {
+    await deletePersistedConversation(cacheDir, sessionKey, expectedConversationId)
+    return true
+  }))
 }
