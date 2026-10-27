@@ -23,7 +23,7 @@ export function queueConversationStateWrite(
   return next
 }
 
-/** Wait until every snapshot write queued for the session, by any module copy, has reached disk. */
+/** Wait until every snapshot write queued for the session, by any module copy, has finished or failed. */
 export function settleConversationStateWrites(cacheDir: string, sessionKey: string): Promise<void> {
   return (state.writes.get(keyFor(cacheDir, sessionKey)) ?? Promise.resolve()).then(() => {}, () => {})
 }
