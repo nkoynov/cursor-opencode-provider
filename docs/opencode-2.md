@@ -15,6 +15,25 @@ Discovered Cursor models are published **in memory** through `ctx.provider.trans
 
 Cache seed (and `/connect` afterwards) refill the inventory. An empty first transform is a no-op, so a failed refresh keeps the last successful list.
 
+On OpenCode 2.1.4, session requests wait for plugin activation before resolving
+their model. With no usable cache, setup waits for authenticated discovery and
+inventory publication, sharing a 10-second readiness budget. A populated cache
+publishes immediately without waiting for credential renewal or fresh discovery.
+Endpoint warmup runs separately from catalog readiness.
+
+A temporary connection-metadata lookup failure does not hide saved or discovered
+models: the inventory publishes without that optional metadata. Each Run still
+requires a usable current credential; model visibility does not authorize access.
+
+Missing credentials leave `/connect` available. Authentication, network, empty
+catalog, publication and readiness-timeout failures are reported in startup
+warnings and provider debug logs; setup stays active so later credential events,
+host activity and the startup retry window can recover. The host may still
+report `Model unavailable` when discovery actually fails: its public plugin API
+has no hook to replace that routing error before a model exists. Results from
+superseded credentials, expired attempts or disposed setups cannot publish a
+new inventory. See [startup acceptance checks](host-compat-acceptance.md#opencode-2-model-startup).
+
 You do **not** need a hand-written `providers` entry, and there is no `enabled` flag.
 
 Synced models set `time.released` to `0` (Cursor AvailableModels does not expose release dates). OpenCode 2.0's picker sorts by `released` descending, so filter by provider **Cursor** or search a model id if the global list looks empty.

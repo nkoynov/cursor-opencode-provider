@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach, afterEach, setSystemTime } from "bun:test"
+import { describe, expect, test, beforeEach, afterEach, setSystemTime, spyOn } from "bun:test"
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
@@ -45,7 +45,7 @@ import {
   resetBackgroundShellNotices,
   watchBackgroundShell,
 } from "../src/background-shell-notice.js"
-import { writeCache } from "../src/models.js"
+import { readCache, writeCache } from "../src/models.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
 import { MODEL_CACHE_SCHEMA_VERSION } from "../src/shared.js"
 import {
@@ -1467,6 +1467,304 @@ describe("opencode2 setup", () => {
     const connection = await ctx.integration.connection.active("cursor")
     expect(connection).toBeDefined()
     expect(activeCalls).toBeGreaterThan(beforeLogin)
+  })
+
+  describe("cold model readiness (#91)", () => {
+    let cacheDir: string
+    let previousVersion: string | undefined
+    let originalFetch: typeof fetch
+    const modelResponse = (id = "ready-model") => Response.json({ models: [{
+      name: id, client_display_name: id, supports_agent: true, variants: [],
+    }] })
+    const connectedContext = () => {
+      const host = fakeContext()
+      host.ctx.integration.connection.active = async () => ({ type: "credential", id: "account", label: "Cursor" })
+      host.ctx.integration.connection.resolve = async () => ({ type: "key", key: "test.account.jwt" })
+      return host
+    }
+    const deferred = () => {
+      let release!: () => void
+      const promise = new Promise<void>((resolve) => { release = resolve })
+      return { promise, release }
+    }
+    const until = async (ready: () => boolean | Promise<boolean>) => {
+      for (let i = 0; i < 200; i++) {
+        if (await ready()) return
+        await Bun.sleep(5)
+      }
+      expect(await ready()).toBe(true)
+    }
+    beforeEach(() => {
+      cacheDir = mkdtempSync(join(tmpdir(), "cursor-model-readiness-"))
+      setHostCacheDirOverride(cacheDir)
+      previousVersion = process.env.CURSOR_CLIENT_VERSION
+      process.env.CURSOR_CLIENT_VERSION = "cli-test"
+      resetClientVersionCache()
+      originalFetch = globalThis.fetch
+    })
+    afterEach(async () => {
+      for (const cleanup of setupCleanups.splice(0).reverse()) await cleanup()
+      globalThis.fetch = originalFetch
+      if (previousVersion === undefined) delete process.env.CURSOR_CLIENT_VERSION
+      else process.env.CURSOR_CLIENT_VERSION = previousVersion
+      resetClientVersionCache()
+      setHostCacheDirOverride(undefined)
+      rmSync(cacheDir, { recursive: true, force: true })
+    })
+
+    test("an immediate cold-cache selection waits for discovery AND publication", async () => {
+      const discovery = deferred()
+      const publication = deferred()
+      let requested = false
+      let publishing = false
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        if (!String(input).endsWith("/AvailableModels")) return Response.json({})
+        requested = true
+        await discovery.promise
+        return modelResponse()
+      }) as typeof fetch
+      const { ctx, inventory } = connectedContext()
+      const reload = ctx.provider.reload
+      ctx.provider.reload = async () => { publishing = true; await publication.promise; await reload() }
+      let activated = false
+      const setup = setupPlugin(ctx).then(() => { activated = true })
+      try {
+        await until(() => requested)
+        expect(activated).toBe(false)
+        discovery.release()
+        await until(() => publishing)
+        expect(activated).toBe(false)
+        publication.release()
+        await setup
+        // Host session entry points select a model only after activation.
+        expect(inventory.models.has("cursor/ready-model")).toBe(true)
+      } finally {
+        discovery.release(); publication.release(); await setup
+      }
+    })
+
+    test("warm cache returns without waiting for credential resolution", async () => {
+      await writeCache(cacheDir, { models: [baseModel], fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION })
+      const credentials = deferred()
+      const { ctx, inventory } = connectedContext()
+      ctx.integration.connection.resolve = async () => { await credentials.promise; return undefined }
+      const cleanup = await setupPlugin(ctx)
+      expect(inventory.models.has(`cursor/${baseModel.id}`)).toBe(true)
+      await cleanup()
+      credentials.release()
+      await Bun.sleep(10)
+    })
+
+    for (const source of ["cached", "discovered"] as const) {
+      test(`${source} models still publish when the connection lookup fails`, async () => {
+        if (source === "cached") await writeCache(cacheDir, {
+          models: [baseModel], fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION,
+        })
+        const { ctx, inventory } = connectedContext()
+        const publications: Array<Parameters<ProviderEditor["add"]>[0]> = []
+        const add = inventory.editor.add
+        inventory.editor.add = (input) => { publications.push(input); add(input) }
+        const warning = spyOn(console, "warn").mockImplementation(() => {})
+        let lookups = 0
+        ctx.integration.connection.active = async () => {
+          // Cold discovery first needs a valid credential; only the later,
+          // optional publication lookup fails. Cache seed needs no credential.
+          if (source === "discovered" && ++lookups === 1) {
+            return { type: "credential", id: "account", label: "Cursor" }
+          }
+          throw new Error("connection lookup unavailable")
+        }
+        let discoveries = 0
+        globalThis.fetch = (async (input: RequestInfo | URL) => {
+          if (!String(input).endsWith("/AvailableModels")) return Response.json({})
+          discoveries++
+          return modelResponse()
+        }) as typeof fetch
+        try {
+          await setupPlugin(ctx)
+          const id = source === "cached" ? baseModel.id : "ready-model"
+          expect(inventory.models.has(`cursor/${id}`)).toBe(true)
+          expect(publications).toHaveLength(1)
+          expect(publications[0]).not.toHaveProperty("sourceConnection")
+          expect(warning).not.toHaveBeenCalled()
+          expect(discoveries).toBe(source === "cached" ? 0 : 1)
+          await ctx.provider.reload()
+          expect(inventory.models.has(`cursor/${id}`)).toBe(true)
+          expect(publications).toHaveLength(2)
+          expect(publications[1]).not.toHaveProperty("sourceConnection")
+          // Publishing inventory without metadata must not bypass Run auth.
+          const error = await requireCursorAccessToken(ctx.integration).catch((error: unknown) => error)
+          expect(error).toBeInstanceOf(CursorAuthError)
+          expect(String(error)).toContain("connection lookup unavailable")
+        } finally { warning.mockRestore() }
+      })
+    }
+
+    test("missing credentials keep /connect active and a later event discovers models", async () => {
+      globalThis.fetch = (async (input: RequestInfo | URL) => String(input).endsWith("/AvailableModels")
+        ? modelResponse() : Response.json({})) as typeof fetch
+      const bus = fakeEventBus()
+      const { ctx, inventory, disposed, registered } = fakeContext()
+      ctx.event.subscribe = bus.subscribe
+      await setupPlugin(ctx)
+      expect(inventory.models.size).toBe(0)
+      expect(registered).toContain("integration.transform")
+      expect(disposed).toEqual([])
+      ctx.integration.connection = connectedContext().ctx.integration.connection
+      await bus.publish({ type: "credential.updated", data: { integrationID: "cursor" } })
+      await until(() => inventory.models.has("cursor/ready-model"))
+    })
+
+    for (const failure of ["rejected credential", "discovery authentication", "discovery unavailable", "network", "empty catalog", "publication"] as const) {
+      test(`${failure} reports its real error and allows a later retry`, async () => {
+        const warning = spyOn(console, "warn").mockImplementation(() => {})
+        const bus = fakeEventBus()
+        const { ctx, inventory } = connectedContext()
+        ctx.event.subscribe = bus.subscribe
+        let failing = true
+        const resolve = ctx.integration.connection.resolve
+        ctx.integration.connection.resolve = async () => {
+          if (failing && failure === "rejected credential") throw new CursorAuthError("Cursor session ended", { code: "session_logout" })
+          return resolve()
+        }
+        const reload = ctx.provider.reload
+        ctx.provider.reload = async () => {
+          if (failing && failure === "publication") throw new Error("inventory reload failed")
+          await reload()
+        }
+        globalThis.fetch = (async (input: RequestInfo | URL) => {
+          if (!String(input).endsWith("/AvailableModels")) return Response.json({})
+          if (failing && failure === "discovery authentication") return Response.json({ error: "unauthenticated" }, { status: 401 })
+          if (failing && failure === "discovery unavailable") return Response.json({ error: "unavailable" }, { status: 503 })
+          if (failing && failure === "network") throw new Error("connection lost")
+          if (failing && failure === "empty catalog") return Response.json({ models: [] })
+          return modelResponse()
+        }) as typeof fetch
+        try {
+          await setupPlugin(ctx)
+          expect(inventory.models.size).toBe(0)
+          expect(warning).toHaveBeenCalledTimes(1)
+          const expected = { "rejected credential": "Cursor session ended", "discovery authentication": "401",
+            "discovery unavailable": "503", network: "network request failed",
+            "empty catalog": "empty model catalog", publication: "inventory reload failed" }[failure]
+          expect(String(warning.mock.calls[0]?.[0])).toContain(expected)
+          // An unrelated replay must not publish the failed candidate.
+          if (failure === "publication") {
+            failing = false
+            await ctx.provider.reload()
+            expect(inventory.models.size).toBe(0)
+          }
+          failing = false
+          await bus.publish({ type: "session.updated", data: { sessionID: "retry" } })
+          await until(() => inventory.models.has("cursor/ready-model"))
+        } finally { warning.mockRestore() }
+      })
+    }
+
+    test("credential changes during discovery never publish the previous account", async () => {
+      const first = deferred()
+      const bus = fakeEventBus()
+      const { ctx, inventory } = connectedContext()
+      ctx.event.subscribe = bus.subscribe
+      let requests = 0
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        if (!String(input).endsWith("/AvailableModels")) return Response.json({})
+        if (++requests === 1) { await first.promise; return modelResponse("old-account") }
+        expect(inventory.models.has("cursor/old-account")).toBe(false)
+        return modelResponse("new-account")
+      }) as typeof fetch
+      const setup = setupPlugin(ctx)
+      try {
+        await until(() => requests === 1)
+        ctx.integration.connection.resolve = async () => ({ type: "key", key: "new.account.jwt" })
+        await bus.publish({ type: "credential.switched", data: { integrationID: "cursor" } })
+        first.release()
+        await setup
+        expect(requests).toBe(2)
+        expect(inventory.models.has("cursor/new-account")).toBe(true)
+        expect(inventory.models.has("cursor/old-account")).toBe(false)
+      } finally { first.release(); await setup }
+    })
+
+    test("a credential switch during a failed publication immediately refreshes the new account", async () => {
+      const publication = deferred()
+      const bus = fakeEventBus()
+      const { ctx, inventory } = connectedContext()
+      ctx.event.subscribe = bus.subscribe
+      let requests = 0
+      let reloads = 0
+      let publishing = false
+      const reload = ctx.provider.reload
+      ctx.provider.reload = async () => {
+        if (++reloads === 1) {
+          publishing = true
+          await publication.promise
+          await reload() // a late host replay must not use the superseded candidate
+          expect(inventory.models.has("cursor/old-account")).toBe(false)
+          throw new Error("old-account reload failed")
+        }
+        await reload()
+      }
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        if (!String(input).endsWith("/AvailableModels")) return Response.json({})
+        return modelResponse(++requests === 1 ? "old-account" : "new-account")
+      }) as typeof fetch
+      const setup = setupPlugin(ctx)
+      try {
+        await until(() => publishing)
+        ctx.integration.connection.resolve = async () => ({ type: "key", key: "new.account.jwt" })
+        await bus.publish({ type: "credential.switched", data: { integrationID: "cursor" } })
+        publication.release()
+        await setup
+        expect(requests).toBe(2)
+        expect(inventory.models.has("cursor/new-account")).toBe(true)
+        expect(inventory.models.has("cursor/old-account")).toBe(false)
+      } finally { publication.release(); await setup }
+    })
+
+    test("a stuck credential resolver releases startup at the deadline and cannot publish late", async () => {
+      const credentials = deferred()
+      const warning = spyOn(console, "warn").mockImplementation(() => {})
+      const { ctx, inventory } = connectedContext()
+      ctx.integration.connection.resolve = async () => {
+        await credentials.promise
+        return { type: "key", key: "late.account.jwt" }
+      }
+      let requests = 0
+      globalThis.fetch = (async (_input: RequestInfo | URL) => { requests++; return modelResponse() }) as typeof fetch
+      try {
+        await setupPlugin(ctx)
+        expect(String(warning.mock.calls[0]?.[0])).toContain("timed out after 10000ms")
+        credentials.release()
+        await Bun.sleep(10)
+        expect(requests).toBe(0)
+        expect(inventory.models.size).toBe(0)
+      } finally { credentials.release(); warning.mockRestore() }
+    }, 15_000)
+
+    test("cleanup prevents an in-flight discovery from publishing", async () => {
+      await writeCache(cacheDir, { models: [baseModel], fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION })
+      const discovery = deferred()
+      const finished = deferred()
+      const bus = fakeEventBus()
+      const { ctx, inventory, reloads } = connectedContext()
+      ctx.event.subscribe = bus.subscribe
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        if (!String(input).endsWith("/AvailableModels")) return Response.json({})
+        await discovery.promise
+        finished.release()
+        return modelResponse()
+      }) as typeof fetch
+      const cleanup = await setupPlugin(ctx)
+      await bus.publish({ type: "credential.updated", data: { integrationID: "cursor" } })
+      await cleanup()
+      const count = reloads.length
+      discovery.release()
+      await finished.promise
+      await until(async () => (await readCache(cacheDir))?.models[0]?.id === "ready-model")
+      expect(reloads.length).toBe(count)
+      expect(inventory.models.has("cursor/ready-model")).toBe(false)
+    })
   })
 
   test("credential updates replace a fresh cache with the selected account's inventory", async () => {

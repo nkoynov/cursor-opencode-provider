@@ -55,6 +55,11 @@ OpenCode driving a Cursor-routed Grok model through this provider:
 - **Tool calls** — maps Cursor exec-server messages to AI SDK / OpenCode tool-call parts using only the advertised canonical catalog. Exact advertised subagent names win; standard Cursor roles select compatible OpenCode agents, and native Task maps to OpenCode 1.x `task` or OpenCode 2.0 `subagent`. OCP translates any alternate host vocabulary before it reaches this package. The bridge also covers Cursor's typed read/bash/edit/write/grep/find/ls request/result range, mirrors finalized display-only todo/plan state, and strips OpenCode 1.x and OpenCode 2 read envelopes before returning content to Cursor.
 - **Thinking / reasoning** — surfaces extended-thinking deltas where the model supports it
 
+OpenCode 2.1.4 waits for cold-cache model discovery and publication during plugin
+activation, with a 10-second readiness budget. Warm-cache startup uses the saved
+inventory. Discovery failures leave authentication and later retries available;
+see [model startup and diagnostics](docs/opencode-2.md#how-models-register-current).
+
 ## Requirements
 
 - [Bun](https://bun.sh) (for development and tests)

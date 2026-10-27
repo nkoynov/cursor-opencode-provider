@@ -44,7 +44,6 @@ import { applyCursorProviderInventory, CURSOR_INTEGRATION_ID } from "./opencode2
 import {
   applyCursorIntegration,
   requireCursorAccessToken,
-  resolveCursorAccessToken,
 } from "./opencode2/integration.js"
 import { createDirectMcpPlacement } from "./opencode2/mcp-direct.js"
 import { registerTodoTools } from "./opencode2/todo-tools.js"
@@ -55,6 +54,8 @@ import { markCompactionSession } from "./compaction-marker.js"
 import { getSessionDirectory, markSessionDirectory } from "./session-directory.js"
 import { rememberHostSkillFiles } from "./context/skills.js"
 import { trace } from "./debug.js"
+import { withAbortDeadline } from "./deadline.js"
+import { CursorAuthError, CursorProtocolError, CursorTransportError } from "./errors.js"
 import { processShared } from "./process-shared.js"
 import { loadSessionForPermissions, sessionRulesDenyEdits } from "./protocol/session-edits.js"
 import {
@@ -100,27 +101,17 @@ import type {
 
 async function loadModels(
   cacheDir: string,
-  accessToken: string | undefined,
+  accessToken: string,
   forceRefresh = false,
 ): Promise<ModelInfo[]> {
   const cached = await readCache(cacheDir)
   if (!forceRefresh && cached?.models.length && isCacheFresh(cached)) return cached.models
 
-  if (accessToken) {
-    try {
-      return await discoverModels(accessToken, cacheDir, {
-        baseURL: cursorApiBaseURL(),
-        forceRefresh,
-      })
-    } catch {
-      // A forced refresh follows a credential switch. Do not bind a cache
-      // produced by the prior account to the new connection on failure.
-      if (forceRefresh) return []
-    }
-  }
-  if (forceRefresh) return []
-  // Preserve offline / stale-cache behavior rather than emptying the picker.
-  return cached?.models ?? []
+  return discoverModels(accessToken, cacheDir, {
+    baseURL: cursorApiBaseURL(),
+    // An empty response can be cached; it must not pin later retries to [].
+    forceRefresh: forceRefresh || cached?.models.length === 0,
+  })
 }
 
 function toolExecutionID(event: { readonly id?: string; readonly callID?: string }): string {
@@ -295,70 +286,58 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
 
     let models: ModelInfo[] = []
     let sourceConnection: ConnectionInfo | undefined
+    let disposed = false
+    let inventoryPublished = false
+    let candidateInventory: { models: ModelInfo[]; connection?: ConnectionInfo; current: () => boolean } | undefined
 
     // ── Credentials ─────────────────────────────────────────
     await track(ctx.integration.transform(applyCursorIntegration))
-
-    let tokenInflight: Promise<string | undefined> | undefined
-    /**
-     * Current token for model discovery and endpoint warmup, or undefined.
-     *
-     * Resolved every time (concurrent callers share one attempt) and never
-     * memoized: on a fresh install `setup()` runs before the user has
-     * connected, and a long-running daemon outlives any single token. Both
-     * the host resolve and the renewal layer are cheap until a renewal is due.
-     */
-    const accessToken = async (): Promise<string | undefined> => {
-      tokenInflight ??= resolveCursorAccessToken(ctx.integration).finally(() => {
-        tokenInflight = undefined
-      })
-      return tokenInflight
-    }
-
-    const refreshSourceConnection = async (): Promise<void> => {
-      try {
-        sourceConnection = await ctx.integration.connection.active(CURSOR_INTEGRATION_ID)
-      } catch {
-        sourceConnection = undefined
-      }
-    }
 
     // ── Provider inventory (in-memory `editor.add`) ─────────────────────
     // Transform replays on provider.reload(). Skip while `models` is empty so
     // the first registration is a no-op; discovery/cache then reload.
     await track(
       ctx.provider.transform((editor) => {
-        applyCursorProviderInventory(editor, models, sourceConnection)
+        if (disposed) return
+        const candidate = candidateInventory?.current() ? candidateInventory : undefined
+        applyCursorProviderInventory(editor, candidate?.models ?? models, candidate ? candidate.connection : sourceConnection)
       }),
     )
 
-    try {
-      const cached = await readCache(cacheDir)
-      if (cached?.models?.length) {
-        models = cached.models
-        await refreshSourceConnection()
-        await ctx.provider.reload()
-      }
-    } catch {
-      // Cache seed is best-effort; auth/aisdk still work without it.
-    }
-
-    const publishModels = async (next: ModelInfo[]): Promise<boolean> => {
-      const previousModels = models
-      const previousConnection = sourceConnection
-      models = next
-      await refreshSourceConnection()
+    const publishModels = async (next: ModelInfo[], current: () => boolean): Promise<boolean> => {
+      const connection = await ctx.integration.connection.active(CURSOR_INTEGRATION_ID).catch((error: unknown) => {
+        // Connection metadata is optional for inventory publication; Run auth
+        // still resolves and validates the current credential independently.
+        trace(`opencode2 models: connection lookup failed; publishing without sourceConnection: ${String(error)}`)
+        return undefined
+      })
+      if (!current()) return false
+      const candidate = { models: next, connection, current }
+      candidateInventory = candidate
       try {
         await ctx.provider.reload()
+        if (!current()) return false
+        models = next
+        sourceConnection = connection
+        inventoryPublished = true
         return true
-      } catch {
-        // Keep the transform backed by the last inventory that actually
-        // reloaded. A later host replay must not publish a failed account
-        // refresh merely because the candidate remained in this closure.
-        models = previousModels
-        sourceConnection = previousConnection
-        return false
+      } finally {
+        // A failed, expired or superseded reload must not change later replays.
+        if (candidateInventory === candidate) candidateInventory = undefined
       }
+    }
+
+    // Bound cache publication too: a stalled host reload must not hang setup.
+    const readinessStartedAt = Date.now()
+    try {
+      await withAbortDeadline(MODEL_READINESS_TIMEOUT_MS, modelReadinessTimeout, async (signal) => {
+        const cached = await readCache(cacheDir)
+        if (cached?.models.length && !signal.aborted) {
+          await publishModels(cached.models, () => !disposed && !signal.aborted)
+        }
+      })
+    } catch (error) {
+      trace(`opencode2 models: cache publication failed: ${String(error)}`)
     }
 
     // ── AI SDK wiring ────────────────────────────────────────
@@ -639,68 +618,78 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
     let credentialGeneration = 0
     let loadedCredentialGeneration = 0
     let ensureInflight: Promise<void> | undefined
-    const ensureModels = (): Promise<void> => {
+    const ensureModels = (timeoutMs = MODEL_READINESS_TIMEOUT_MS): Promise<void> => {
+      if (disposed) return Promise.resolve()
       if (modelsLoaded && loadedCredentialGeneration === credentialGeneration) {
         return Promise.resolve()
       }
       // If credentials change during an existing discovery, wait for that
       // attempt and immediately run again. The generation check prevents the
       // older attempt from suppressing the account-scoped refresh.
-      if (ensureInflight) return ensureInflight.then(() => ensureModels())
+      if (ensureInflight) return ensureInflight
 
-      const attemptGeneration = credentialGeneration
-      const forceRefresh = loadedCredentialGeneration !== attemptGeneration
-      ensureInflight = (async () => {
-        try {
-          const token = await accessToken()
-          const discovered = await loadModels(cacheDir, token, forceRefresh)
-          if (!discovered.length) return
-          if (credentialGeneration !== attemptGeneration) return
-          if (!await publishModels(discovered)) return
+      ensureInflight = withAbortDeadline(timeoutMs, modelReadinessTimeout, async (signal) => {
+        while (!disposed && !signal.aborted) {
+          const attemptGeneration = credentialGeneration
+          const current = () => !disposed && !signal.aborted && credentialGeneration === attemptGeneration
+          const forceRefresh = loadedCredentialGeneration !== attemptGeneration
+          let token: string
+          let discovered: ModelInfo[]
+          try {
+            // Preserve auth failures; only a missing connection is normal startup.
+            token = await requireCursorAccessToken(ctx.integration)
+            if (!current()) continue
+            discovered = await loadModels(cacheDir, token, forceRefresh)
+          } catch (error) {
+            if (!current()) continue
+            if (error instanceof CursorAuthError && error.code === "no_credential") {
+              trace("opencode2 models: no Cursor credential; connect Cursor first")
+              return
+            }
+            throw error
+          }
+          if (!current()) continue
+          if (!discovered.length) throw new CursorProtocolError("Cursor returned an empty model catalog", {
+            code: "CURSOR_EMPTY_MODEL_CATALOG",
+          })
+          try {
+            if (!await publishModels(discovered, current)) continue
+          } catch (error) {
+            if (!current()) continue
+            throw error
+          }
           // A newer credential event arrived while this request was in flight.
-          // Keep the state dirty so the chained ensure uses the latest token.
-          if (credentialGeneration !== attemptGeneration) return
+          // Keep the state dirty so the loop uses the latest token.
+          if (!current()) continue
           modelsLoaded = true
           loadedCredentialGeneration = attemptGeneration
-          if (token) {
-            await resolveAgentUrl(token, {
-              apiBaseURL: cursorApiBaseURL(),
-              telemetryEnabled: cursorGetServerConfigTelemetryEnabled(),
-            }).catch(() => {})
-          }
-        } finally {
-          ensureInflight = undefined
+          void resolveAgentUrl(token, {
+            apiBaseURL: cursorApiBaseURL(),
+            telemetryEnabled: cursorGetServerConfigTelemetryEnabled(),
+          }).catch(() => {})
+          trace(`opencode2 models: ready count=${discovered.length}`)
+          return
         }
-      })()
+      }).finally(() => { ensureInflight = undefined })
       return ensureInflight
+    }
+    const refreshModels = () => {
+      void ensureModels().catch((error: unknown) => {
+        trace(`opencode2 models: discovery/publication failed: ${String(error)}`)
+      })
     }
 
     const RETRY_INTERVAL_MS = 3_000
     const RETRY_WINDOW_MS = 300_000
-    const COLD_DISCOVERY_WAIT_MS = 10_000
     const startedAt = Date.now()
     const retry = setInterval(() => {
       if (modelsLoaded || Date.now() - startedAt > RETRY_WINDOW_MS) {
         clearInterval(retry)
         return
       }
-      void ensureModels().catch(() => {})
+      refreshModels()
     }, RETRY_INTERVAL_MS)
     ;(retry as unknown as { unref?: () => void }).unref?.()
-
-    const firstDiscovery = ensureModels().catch(() => {})
-    if (!models.length) {
-      // Without a cached inventory, `opencode run` resolves its model as soon as setup returns.
-      let wait: ReturnType<typeof setTimeout> | undefined
-      await Promise.race([
-        firstDiscovery,
-        new Promise<void>((resolve) => {
-          wait = setTimeout(resolve, COLD_DISCOVERY_WAIT_MS)
-          ;(wait as unknown as { unref?: () => void }).unref?.()
-        }),
-      ])
-      clearTimeout(wait)
-    }
 
     const onCredentialSwitch = () => {
       modelsLoaded = false
@@ -710,14 +699,25 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
     // Own the observer before iteration: an iterator can throw synchronously
     // and invoke onStreamClosed before subscribeSessionActivity returns.
     observePermissionCalls()
-    const unsubscribe = subscribeSessionActivity(ctx, ensureModels, onCredentialSwitch, toolLifecycle, () => {
+    const unsubscribe = subscribeSessionActivity(ctx, refreshModels, onCredentialSwitch, toolLifecycle, () => {
       hostEventsObserved = false
       releasePermissionCalls()
     })
     hostEventsObserved = !!unsubscribe && observingPermissions
     if (!unsubscribe) releasePermissionCalls()
 
+    // OpenCode waits for plugin activation before selecting the first model.
+    // Cached inventory is already usable; only a cold start needs this barrier.
+    if (inventoryPublished) refreshModels()
+    else await ensureModels(Math.max(1, MODEL_READINESS_TIMEOUT_MS - (Date.now() - readinessStartedAt))).catch((error: unknown) => {
+      trace(`opencode2 models: startup readiness failed: ${String(error)}`)
+      // Do not fail setup: the host disables failed plugin revisions, which
+      // would remove /connect and prevent credential/network recovery.
+      console.warn(`Cursor model discovery/publication failed: ${String(error)}`)
+    })
+
     return async () => {
+      disposed = true
       clearInterval(retry)
       unsubscribe?.()
       disposeShellNotifier?.()
@@ -734,6 +734,14 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
 }
 
 const SHUTDOWN_SAVE_TIMEOUT_MS = 2_000
+const MODEL_READINESS_TIMEOUT_MS = 10_000
+
+function modelReadinessTimeout(): CursorTransportError {
+  return new CursorTransportError(
+    `Cursor model discovery/publication timed out after ${MODEL_READINESS_TIMEOUT_MS}ms`,
+    { code: "CURSOR_MODEL_READINESS_TIMEOUT", transient: true, replaySafe: true },
+  )
+}
 
 /** Save every open turn for the next server start, without holding shutdown up for long. */
 async function saveOpenTurnsForShutdown(): Promise<void> {

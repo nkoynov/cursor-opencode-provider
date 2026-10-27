@@ -1,5 +1,17 @@
 # TODO
 
+- [x] Fix [#91](https://github.com/oakimov/cursor-opencode-provider/issues/91),
+  OpenCode 2 cold model readiness.
+  - [x] Trace OpenCode 2.1.4 activation and model resolution.
+  - [x] Bound cold discovery/publication, retain warm-cache startup and retries.
+  - [x] Reject superseded or expired attempts and publication after cleanup.
+  - [x] Cover delayed discovery/publication, warm cache, missing/rejected
+    credentials, discovery/publication failure, deadlines and credential changes.
+  - [x] Update operator docs; run typecheck, build, regressions and native
+    OpenCode 2.1.4 cold/warm checks and same-session continuity.
+  - [x] Preserve cached/discovered inventory when optional connection metadata
+    fails, with independent required authentication and regression coverage.
+
 - [ ] Redesign shell handling around native OpenCode execution and eradicate
   unnecessary provider duplication. Preserve the current fixes while designing
   the replacement; passing supervisor tests alone does not justify keeping it.

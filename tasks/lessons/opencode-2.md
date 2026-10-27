@@ -6,6 +6,17 @@ Operator setup: [OpenCode 2.0](../../docs/opencode-2.md).
 
 ## Plugin and daemon lifecycle
 
+- **Background discovery is outside activation readiness.** The first
+  authenticated standalone request could select its model before the cold
+  catalog existed (#91). OpenCode 2.1.4 session entry points await plugin
+  activation, so hold setup through cold discovery and publication with a
+  deadline; a usable cache needs no network wait. Throwing from setup disables
+  the revision and prevents reconnect/retry, so report discovery failures while
+  retaining registrations. Subscribe before discovery, discard superseded
+  attempts, and keep uncommitted publication candidates out of later transform
+  replays. The readiness change also made optional connection metadata fatal:
+  preserve catalog publication when that lookup fails, while keeping required
+  Run authentication independent (`test/plugin-opencode2.test.ts`, cold model readiness).
 - **Published types outrank early API docs.** Hook arity, domains and the
   `aisdk:` discriminator differed. Check actual usages through the compiled
   host contract (`test/opencode2-conformance.types.ts`).

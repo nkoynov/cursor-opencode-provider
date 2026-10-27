@@ -13,6 +13,28 @@ Run this checklist for changes to CreatePlan, SwitchMode, file-tool substitution
 - [ ] OCP plugin discovery accepts valid JSONC without joining tokens across comments, and rejects malformed JSONC and unterminated block comments
 - [ ] Do not modify a host/vendor checkout
 
+## OpenCode 2 model startup
+
+Use stock OpenCode 2.1.4 with the rebuilt local plugin and AI SDK entry. Isolate
+config, data and cache; use a working Cursor credential without changing the
+operator's store. Enable provider debug logs for each run.
+
+1. With no `cursor-models.json`, immediately run a standalone request for an
+   available Cursor model. Verify `opencode2 models: ready` precedes the first
+   Run and the response completes without `provider.no-route`.
+2. Repeat with the populated cache and compare startup with the cold run.
+   Continue a conversation to verify checkpoint and frozen context continuity.
+3. Delay AvailableModels and publication independently. Activation must remain
+   pending until both finish, bounded by the readiness deadline. A pending
+   GetServerConfig warmup must not postpone catalog readiness.
+4. Check no credentials, rejected credentials, network/discovery failure, empty
+   inventory and publication failure. Keep `/connect` usable, report the real
+   startup failure and recover after a credential event or later activity.
+   Host routing can still say `Model unavailable` after actual discovery failure.
+5. Switch credentials during discovery and publication. Only the current
+   attempt may publish; dispose a setup while discovery is pending and verify
+   no later reload comes from it. Use deterministic fixtures for these races.
+
 ## Classic OpenCode — approval without `plan_exit`
 
 1. Start stock OpenCode in a TTY with provider debug logging enabled, in the default build agent.
