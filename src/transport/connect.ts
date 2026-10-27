@@ -414,6 +414,21 @@ const DEFAULT_READ_IDLE_MS = 120_000
 export const HTTP2_SESSION_MAX_AGE_MS = 15 * 60_000
 // Cursor CLI pings an agent connection before use only after 10 s without a response or ping reply.
 export const HTTP2_SESSION_LIVE_WINDOW_MS = 10_000
+// Cursor CLI's agent connections (connect-node Http2SessionManager, pingIdleConnection) are pinged
+// 10 s after the last PING answer, busy or idle, and dropped when an answer takes 20 s.
+export const HTTP2_KEEPALIVE_INTERVAL_MS = 10_000
+export const HTTP2_KEEPALIVE_TIMEOUT_MS = 20_000
+// A timer this late means the event loop stalled, and the PING answer may still be unread.
+const KEEPALIVE_STALL_GRACE_MS = 1_000
+// Streams above a GOAWAY's last stream id were never processed; a run of drains still ends somewhere.
+const MAX_GOAWAY_RESENDS = 3
+let keepaliveIntervalMs = HTTP2_KEEPALIVE_INTERVAL_MS
+let keepaliveTimeoutMs = HTTP2_KEEPALIVE_TIMEOUT_MS
+// Origins whose server sent GOAWAY too_many_pings: Cursor CLI then doubles its interval.
+const _keepaliveIntervalScale = new Map<string, number>()
+const _http2KeepaliveStarted = new WeakSet<http2.ClientHttp2Session>()
+// When a Run upload on the session last drained: the peer takes data, so the connection is alive.
+const _http2SessionUploadProgressAt = new WeakMap<http2.ClientHttp2Session, number>()
 // Several Runs share each session. Node and Bun count its unsent bytes
 // against maxSessionMemory (10 MB by default) and, once over it, fail every new
 // stream with ENHANCE_YOUR_CALM (Bun before sending it, Node by refusing its
@@ -598,6 +613,125 @@ function cacheReadySession(key: string, session: http2.ClientHttp2Session): void
   _http2SessionCreatedAt.set(session, Date.now())
   _http2SessionKey.set(session, key)
   _http2Sessions.set(key, session)
+  startKeepalive(key, session)
+}
+
+/** Test hook: shorten the keepalive PING interval and timeout; no argument restores Cursor CLI's. */
+export function setHttp2KeepaliveForTests(options?: { intervalMs: number; timeoutMs: number }): void {
+  keepaliveIntervalMs = options?.intervalMs ?? HTTP2_KEEPALIVE_INTERVAL_MS
+  keepaliveTimeoutMs = options?.timeoutMs ?? HTTP2_KEEPALIVE_TIMEOUT_MS
+  _keepaliveIntervalScale.clear()
+}
+
+function keepaliveInterval(key: string): number {
+  return keepaliveIntervalMs * (_keepaliveIntervalScale.get(laneOrigin(key)) ?? 1)
+}
+
+/** Close a session that no Run holds or is about to take once it reaches the rotation age. */
+function retireAgedIdleSession(key: string, session: http2.ClientHttp2Session): boolean {
+  if ((_http2SessionHolds.get(session) ?? 0) > 0 || (_http2LaneReservations.get(key) ?? 0) > 0) return false
+  if (_http2Sessions.get(key) !== session) return false
+  const createdAt = _http2SessionCreatedAt.get(session) ?? 0
+  if (shouldReuseHttp2Session(session, createdAt)) return false
+  trace(`h2 idle session retired at rotation age: origin=${key}`)
+  retireCachedSession(key, session)
+  return true
+}
+
+/**
+ * Fails every stream on a connection that answered no PING and sent nothing else for the keepalive
+ * timeout. Unlike a failed reuse ping, nothing can still arrive on it, so its Runs are not left to drain.
+ */
+function retireDeadSession(key: string, session: http2.ClientHttp2Session, silentMs: number): void {
+  const error = new CursorTransportError(
+    `Cursor HTTP/2 connection answered no PING and sent nothing for ${silentMs}ms — connection presumed dead`,
+    { transient: true, replaySafe: true, code: "CURSOR_HTTP2_PING_TIMEOUT" },
+  )
+  trace(`h2 keepalive: ${error.message}: origin=${key}`)
+  dropSession(key, session)
+  _http2SessionTransportLost.add(session)
+  try { session.destroy(error, http2.constants.NGHTTP2_CANCEL) } catch { /* already closed */ }
+}
+
+/**
+ * Pings the session `keepaliveIntervalMs` after each answer for as long as it is open, draining ones
+ * included. It is dead once a PING has waited `timeout - interval` and nothing — no PING answer, Run
+ * data or upload progress — has arrived for `timeout`.
+ */
+function startKeepalive(key: string, session: http2.ClientHttp2Session): void {
+  if (_http2KeepaliveStarted.has(session)) return
+  _http2KeepaliveStarted.add(session)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let dueAt = 0
+  let pingSentAt: number | undefined
+  let stallGraced = false
+  let stopped = false
+  const stop = () => {
+    stopped = true
+    clearTimeout(timer)
+    timer = undefined
+  }
+  session.once("close", stop)
+  const arm = (delayMs: number, run: () => void) => {
+    clearTimeout(timer)
+    dueAt = Date.now() + Math.max(1, delayMs)
+    timer = setTimeout(run, Math.max(1, delayMs))
+    timer.unref?.()
+  }
+  const lastHeardAt = () => Math.max(
+    _http2SessionLastInboundAt.get(session) ?? 0,
+    _http2SessionUploadProgressAt.get(session) ?? 0,
+  )
+  const deadline = (sentAt: number) => Math.max(lastHeardAt(), sentAt - keepaliveIntervalMs) + keepaliveTimeoutMs
+  const sendPing = () => {
+    timer = undefined
+    if (stopped || session.destroyed) return stop()
+    if (retireAgedIdleSession(key, session)) return stop()
+    const sentAt = Date.now()
+    pingSentAt = sentAt
+    stallGraced = false
+    let accepted = false
+    try {
+      accepted = session.ping((error) => onAnswer(sentAt, error))
+    } catch (error) {
+      trace(`h2 keepalive ping not sent: origin=${key} err=${errorMessage(error)}`)
+    }
+    if (pingSentAt !== sentAt) return
+    if (!accepted) {
+      pingSentAt = undefined
+      return arm(keepaliveInterval(key), sendPing)
+    }
+    arm(deadline(sentAt) - sentAt, checkDeadline)
+  }
+  const onAnswer = (sentAt: number, error: Error | null) => {
+    if (stopped || pingSentAt !== sentAt) return
+    pingSentAt = undefined
+    if (error) {
+      // Node cancels PINGs on a session closing after a GOAWAY; Cursor CLI's transport stops pinging it too.
+      trace(`h2 keepalive stopped: origin=${key} err=${error.message}`)
+      return stop()
+    }
+    noteSessionInbound(session)
+    arm(keepaliveInterval(key), sendPing)
+  }
+  const checkDeadline = () => {
+    const lateMs = Date.now() - dueAt
+    timer = undefined
+    if (lateMs > KEEPALIVE_STALL_GRACE_MS && !stallGraced) {
+      stallGraced = true
+      return arm(KEEPALIVE_STALL_GRACE_MS, checkDeadline)
+    }
+    // Reads already waiting on the socket run before an immediate.
+    setImmediate(decide)
+  }
+  const decide = () => {
+    if (stopped || pingSentAt === undefined || session.destroyed) return
+    const remainingMs = deadline(pingSentAt) - Date.now()
+    if (remainingMs > 0) return arm(remainingMs, checkDeadline)
+    stop()
+    retireDeadSession(key, session, Date.now() - Math.max(lastHeardAt(), pingSentAt - keepaliveIntervalMs))
+  }
+  arm(keepaliveInterval(key), sendPing)
 }
 
 /** Test cleanup for local HTTP/2 fixtures; production sessions stay process-cached. */
@@ -653,9 +787,16 @@ function installSessionInvalidation(
     dropSession(origin, session)
     cleanup()
   }
-  const onSessionGoaway = (errorCode: number, lastStreamID: number) => {
+  const onSessionGoaway = (errorCode: number, lastStreamID: number, opaqueData?: Buffer) => {
     trace(`h2 session GOAWAY: origin=${origin} errorCode=${errorCode} lastStreamID=${lastStreamID}`)
-    _http2SessionGoawayLastStreamId.set(session, lastStreamID)
+    // A later GOAWAY must not raise the id (RFC 9113 §6.8); some servers still send a higher one.
+    const previous = _http2SessionGoawayLastStreamId.get(session)
+    _http2SessionGoawayLastStreamId.set(session, previous === undefined ? lastStreamID : Math.min(previous, lastStreamID))
+    if (errorCode === http2.constants.NGHTTP2_ENHANCE_YOUR_CALM && opaqueData?.toString("ascii") === "too_many_pings") {
+      const scale = (_keepaliveIntervalScale.get(laneOrigin(origin)) ?? 1) * 2
+      _keepaliveIntervalScale.set(laneOrigin(origin), scale)
+      trace(`h2 keepalive interval doubled after too_many_pings: origin=${origin} intervalMs=${keepaliveIntervalMs * scale}`)
+    }
     // Existing streams may drain, but future Runs must use a fresh session.
     dropSession(origin, session)
   }
@@ -1057,12 +1198,16 @@ export async function bidiRunStream(
     trackRunAnswer(owner, opened)
     trackRunStream(owner, opened)
     holdHttp2Session(owner)
+    opened.on("drain", () => _http2SessionUploadProgressAt.set(owner, Date.now()))
     opened.once("close", () => releaseHttp2Session(owner))
     return opened
   }
-  // A Run on a session reused without its ping keeps its frames until Cursor answers, so it can
-  // be sent once more on a new connection if that session turns out dead.
-  let unanswered: Uint8Array[] | undefined = lease.verified ? undefined : []
+  // A Run keeps its frames until Cursor answers, so it can be sent again on a new connection when a
+  // GOAWAY shows Cursor never processed its stream.
+  let unanswered: Uint8Array[] | undefined = []
+  // A Run on a session reused without its ping is also sent once more if that session turns out dead.
+  let resendOnLoss = !lease.verified
+  let goawayResends = 0
   // Frames written while that new connection opens.
   let resending: Uint8Array[] | undefined
   const resendListeners = new Set<(resent: boolean) => void>()
@@ -1075,10 +1220,11 @@ export async function bidiRunStream(
     try {
       stream = openStream()
     } catch (error) {
-      if (!unanswered) throw error
-      trace(`h2 Run stream did not open on a session reused without ping (${errorMessage(error)}) — reconnecting`)
+      // Nothing was sent: a session that closed after it was leased can be left as safely as an unverified one.
+      if (!resendOnLoss && !session.closed && !session.destroyed) throw error
+      trace(`h2 Run stream did not open on a cached session (${errorMessage(error)}) — reconnecting`)
       dropSession(origin, session)
-      unanswered = undefined
+      resendOnLoss = false
       const replacement = await acquireSession(options.baseURL, sessionOptions)
       try {
         session = replacement.session
@@ -1207,26 +1353,40 @@ export async function bidiRunStream(
     resendListeners.clear()
     for (const listener of listeners) listener(resent)
   }
-  // Why Cursor cannot have taken the Run: it refused the stream, or the connection died before
-  // Cursor answered and no GOAWAY said the stream might still be processed.
-  const notTakenByCursor = (): string | undefined => {
+  // Why Cursor cannot have taken the Run: a GOAWAY excluded its stream, it refused the stream, or the
+  // connection died before Cursor answered and no GOAWAY said the stream might still be processed.
+  const notTakenByCursor = (): { reason: string; goaway: boolean } | undefined => {
     const goawayLastStreamId = _http2SessionGoawayLastStreamId.get(session)
-    if (goawayLastStreamId !== undefined && stream.id !== undefined && goawayLastStreamId >= stream.id) {
-      return undefined
+    if (goawayLastStreamId !== undefined) {
+      if (stream.id !== undefined && goawayLastStreamId >= stream.id) return undefined
+      return { reason: `GOAWAY lastStreamID=${goawayLastStreamId} stream=${stream.id ?? "unsent"}`, goaway: true }
     }
-    if (stream.rstCode === http2.constants.NGHTTP2_REFUSED_STREAM) return "stream refused"
-    if (goawayLastStreamId !== undefined) return `GOAWAY lastStreamID=${goawayLastStreamId}`
-    if (connectionLost) return "connection lost"
+    if (stream.rstCode === http2.constants.NGHTTP2_REFUSED_STREAM) return { reason: "stream refused", goaway: false }
+    if (connectionLost) return { reason: "connection lost", goaway: false }
     return undefined
   }
-  const resendOnNewConnection = async (reason: string) => {
+  const resendAllowed = (refusal: { goaway: boolean }) =>
+    refusal.goaway ? goawayResends < MAX_GOAWAY_RESENDS : resendOnLoss
+  // Whether frames written to a failing stream may still go out on a new connection.
+  const mayStillResend = (): boolean => {
+    if (resending) return true
+    if (!unanswered) return false
+    if (resendOnLoss) return true
+    const goawayLastStreamId = _http2SessionGoawayLastStreamId.get(session)
+    return goawayLastStreamId !== undefined
+      && (stream.id === undefined || stream.id > goawayLastStreamId)
+      && goawayResends < MAX_GOAWAY_RESENDS
+  }
+  const resendOnNewConnection = async (refusal: { reason: string; goaway: boolean }) => {
     const frames = unanswered ?? []
     unanswered = undefined
     resending = frames
+    if (refusal.goaway) goawayResends++
+    resendOnLoss = false
     streamGeneration++
     if (inboundReaderStarted) stream.removeListener("data", onInboundChunk)
     trace(
-      `h2 Run stream failed before Cursor answered on a session reused without ping (${reason}) — ` +
+      `h2 Run stream failed before Cursor answered (${refusal.reason}) — ` +
         `sending it again on a new connection (${frames.length} frame(s))`,
     )
     // A refused stream leaves the connection serving other Runs, so it is only taken out of the cache.
@@ -1255,6 +1415,7 @@ export async function bidiRunStream(
       return
     }
     stream = next
+    unanswered = frames
     attachStreamListeners(next)
     if (inboundReaderStarted) {
       next.on("data", onInboundChunk)
@@ -1273,9 +1434,9 @@ export async function bidiRunStream(
       return
     }
     if (unanswered) {
-      const reason = streamFailure ? undefined : notTakenByCursor()
-      if (reason) {
-        void resendOnNewConnection(reason)
+      const refusal = streamFailure ? undefined : notTakenByCursor()
+      if (refusal && resendAllowed(refusal)) {
+        void resendOnNewConnection(refusal)
         return
       }
       unanswered = undefined
@@ -1465,7 +1626,7 @@ export async function bidiRunStream(
   return {
     write(msg: Uint8Array) {
       const failing = !writable || remotelyClosed || stream.closed || stream.destroyed
-      const resendQueue = resending ?? (failing ? unanswered : undefined)
+      const resendQueue = resending ?? (failing && mayStillResend() ? unanswered : undefined)
       if (resendQueue && !locallyClosed && !terminalEvent) {
         // Goes out with the rest of the Run if it is sent again, and is dropped with it otherwise.
         resendQueue.push(encodeOutbound(msg))
@@ -1541,7 +1702,7 @@ export async function bidiRunStream(
           )
         }
         // While the Run may still go out on a new connection, that decision settles the wait.
-        const mayResend = () => !locallyClosed && (unanswered !== undefined || resending !== undefined)
+        const mayResend = () => !locallyClosed && mayStillResend()
         const onError = (cause: Error) => {
           if (!mayResend()) return failOnError(cause)
           failLater ??= () => failOnError(cause)

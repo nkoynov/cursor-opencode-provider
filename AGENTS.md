@@ -140,13 +140,23 @@ The **1.18 v2** API and **OpenCode 2.x** are source-incompatible:
   write still waiting for drain resets the Run at once.
 - Local cancellation resets buffered streams with `NGHTTP2_CANCEL`; `destroy()`
   must work after `end()`. Retiring a cached connection must let siblings drain,
-  never destroy them. Direct and proxy connections use `maxSessionMemory: 256`.
+  never destroy them; only a connection the keepalive found dead is destroyed.
+  Direct and proxy connections use `maxSessionMemory: 256`.
   Idle sessions are unref'd; live streams and health-check pings hold a ref.
 - Fork: Run connections advertise an 8 MiB stream / 16 MiB connection receive
   window. A cached connection that received data in the last 10 s is reused
   without its ping, as Cursor CLI does; if it dies before Cursor answers, the
   Run goes once more on a new connection and a pending drain follows it there.
   Each stream holds its own session until it closes, a resent one too.
+- Fork: like Cursor CLI's agent transport, every open connection, idle or busy,
+  is pinged 10 s after its last PING answer (unref'd timers, no hold). One that
+  has had a PING out for 10 s and received nothing (PING answer, Run data,
+  upload drain) for 20 s is destroyed with `CURSOR_HTTP2_PING_TIMEOUT`, and
+  its Runs take the normal recovery paths. An idle connection past the 15-min
+  rotation age is closed. Every Run keeps its frames until Cursor answers: a
+  stream above a GOAWAY's last stream id (Cursor never processed it) is sent
+  again at once on a new connection, up to 3 times, invisible to the retry
+  budget; streams at or below it finish on the draining connection.
 - Fork: Run frames over 1 KiB go gzip-compressed (`connect-content-encoding`).
   A gzip Run Cursor refuses is sent once more uncompressed, outside the retry
   budget, and the origin stays uncompressed; a refusal during the upload is

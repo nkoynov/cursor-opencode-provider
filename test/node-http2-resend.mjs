@@ -8,6 +8,7 @@ import {
   HTTP2_SESSION_LIVE_WINDOW_MS,
   resetRunCompressionForTests,
   routeHttp2ConnectionsForTests,
+  setHttp2KeepaliveForTests,
 } from "../dist/transport/connect.js"
 import { encodeFrame } from "../dist/protocol/framing.js"
 
@@ -46,6 +47,7 @@ async function startFakeCursor() {
     if (answer === "refuse") return stream.close(http2.constants.NGHTTP2_REFUSED_STREAM)
     if (answer === "cancel") return stream.close(http2.constants.NGHTTP2_CANCEL)
     if (answer === "hold") return held.push(respond)
+    if (answer === "goaway-unprocessed") return stream.session.goaway(http2.constants.NGHTTP2_NO_ERROR, stream.id - 2)
     if (answer === "hold-then-cancel") return held.push(() => stream.close(http2.constants.NGHTTP2_CANCEL))
     respond()
     if (answer === "answer-then-hold") held.push(() => stream.write(encodeFrame(0x00, new Uint8Array([4, 5, 6]))))
@@ -108,8 +110,9 @@ async function startFakeCursor() {
 const nextFrame = (run) => run.frames()[Symbol.asyncIterator]().next()
 const failureOf = (promise) => promise.then(() => undefined, (error) => error)
 
-async function scenario(name, run) {
+async function scenario(name, run, keepalive) {
   const fake = await startFakeCursor()
+  setHttp2KeepaliveForTests(keepalive)
   try {
     const first = await bidiRunStream("token", { baseURL: ORIGIN })
     first.write(new Uint8Array([7]))
@@ -119,6 +122,7 @@ async function scenario(name, run) {
     await run(fake)
   } finally {
     clockOffsetMs = 0
+    setHttp2KeepaliveForTests()
     closeCachedHttp2SessionsForTests()
     routeHttp2ConnectionsForTests()
     await fake.close()
@@ -220,3 +224,41 @@ await scenario("ping-failure-dead-connection-resent", async (fake) => {
   sibling.end()
   next.end()
 })
+
+// Node cancels PINGs on a session a GOAWAY closed; its Runs below the last stream id must still finish.
+const SHORT_KEEPALIVE = { intervalMs: 100, timeoutMs: 200 }
+
+await scenario("goaway-drains-below-and-resends-above", async (fake) => {
+  fake.answers.push("answer-then-hold", "goaway-unprocessed")
+  clockOffsetMs = HTTP2_SESSION_LIVE_WINDOW_MS + 1_000
+  const below = await bidiRunStream("token", { baseURL: ORIGIN })
+  below.write(new Uint8Array([8]))
+  const belowFrames = below.frames()[Symbol.asyncIterator]()
+  assert.equal((await belowFrames.next()).done, false)
+  clockOffsetMs += HTTP2_SESSION_LIVE_WINDOW_MS + 1_000
+  const above = await bidiRunStream("token", { baseURL: ORIGIN })
+  above.write(new Uint8Array([9]))
+  assert.equal((await nextFrame(above)).done, false)
+  await sleep(600)
+  fake.release()
+  assert.equal((await belowFrames.next()).done, false)
+  assert.deepEqual(streamsOf(fake), [["answer", 0], ["answer-then-hold", 0], ["goaway-unprocessed", 0], ["answer", 1]])
+  below.end()
+  above.end()
+}, SHORT_KEEPALIVE)
+
+await scenario("ping-timeout-fails-busy-run", async (fake) => {
+  fake.answers.push("answer-then-hold")
+  const busy = await bidiRunStream("token", { baseURL: ORIGIN })
+  busy.write(new Uint8Array([8]))
+  const frames = busy.frames()[Symbol.asyncIterator]()
+  assert.equal((await frames.next()).done, false)
+  fake.muteClient(0)
+  const failure = await Promise.race([failureOf(frames.next()), sleep(3_000).then(() => "pending")])
+  assert.equal(failure?.code, "CURSOR_HTTP2_PING_TIMEOUT")
+  const next = await bidiRunStream("token", { baseURL: ORIGIN })
+  next.write(new Uint8Array([9]))
+  assert.equal((await nextFrame(next)).done, false)
+  assert.equal(fake.connections, 2)
+  next.end()
+}, SHORT_KEEPALIVE)

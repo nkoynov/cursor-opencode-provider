@@ -53,5 +53,5 @@ One problem per pull request. Unrelated reformatting, renames, or dependency bum
 - Image results: keep tool attribution across detached captions and mixed results. Test failed writes, missing or oversized images, binary oneofs, and host instruction updates. Remember hashes only after delivery, including a fresh recovery run. Do not suppress an explicit user attachment. A reopened run needs its current message id for correlated context injection.
 - Model catalog: trace the model that is actually selected. Titles and compaction are separate host paths. Preserve suffix and minor-version families. Cached metadata, live JSON discovery, and protobuf fallback are separate contracts.
 - Parallel tool calls: preserve iterator reads across idle timeouts, count internal and refused calls, ignore completions from the previous step, and do not replay after the host has started the calls.
-- Shared HTTP/2: a failed reuse ping must not destroy sibling runs. Unit success does not establish live retry safety or cache continuity.
+- Shared HTTP/2: a failed reuse ping must not destroy sibling runs; only the keepalive's verdict that nothing at all arrives on a connection may. Unit success does not establish live retry safety or cache continuity.
 - Stacked changes: compare the final head. Validation from before a follow-up fix is history, not acceptance of the new revision.

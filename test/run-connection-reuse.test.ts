@@ -16,6 +16,7 @@ import {
   RUNS_PER_HTTP2_SESSION,
   resetRunCompressionForTests,
   routeHttp2ConnectionsForTests,
+  setHttp2KeepaliveForTests,
   type BidiStream,
 } from "../src/transport/connect.js"
 
@@ -29,6 +30,7 @@ type Answer =
   | "answer-then-drop"
   | "cancel"
   | "answer-then-hold"
+  | "answer-then-trickle"
   | "hold"
   | "hold-then-cancel"
 type ServerStream = { answer: Answer; connection: number; bytes: number }
@@ -68,7 +70,7 @@ async function startFakeCursor() {
         stream.close(http2.constants.NGHTTP2_REFUSED_STREAM)
         break
       case "goaway-unprocessed":
-        stream.session!.goaway(http2.constants.NGHTTP2_NO_ERROR, stream.id! - 2)
+        stream.session!.goaway(http2.constants.NGHTTP2_NO_ERROR, Math.max(0, stream.id! - 2))
         break
       case "goaway-processed":
         stream.session!.goaway(http2.constants.NGHTTP2_NO_ERROR, stream.id!)
@@ -82,6 +84,14 @@ async function startFakeCursor() {
         stream.write(encodeFrame(0x00, new Uint8Array([1, 2, 3])))
         held.push(() => stream.write(encodeFrame(0x00, new Uint8Array([4, 5, 6]))))
         break
+      case "answer-then-trickle": {
+        stream.respond({ ":status": 200, "content-type": "application/connect+proto" })
+        const trickle = setInterval(() => {
+          try { stream.write(encodeFrame(0x00, new Uint8Array([1]))) } catch { clearInterval(trickle) }
+        }, 25)
+        stream.on("close", () => clearInterval(trickle))
+        break
+      }
       case "hold":
         held.push(() => {
           stream.respond({ ":status": 200, "content-type": "application/connect+proto" })
@@ -137,6 +147,14 @@ async function startFakeCursor() {
     dropConnection(index: number) { clientsByConnection.get(index)?.destroy() },
     /** Stops forwarding what the client sends on a connection, so Cursor sees neither its pings nor its GOAWAY. */
     muteClient(index: number) { muted.add(index) },
+    /** Sends the client a NO_ERROR GOAWAY that Node's server API cannot (it turns last stream id 0 into the last processed one). */
+    injectGoaway(index: number, lastStreamId: number) {
+      const frame = Buffer.alloc(9 + 8)
+      frame.writeUIntBE(8, 0, 3)
+      frame[3] = 0x7
+      frame.writeUInt32BE(lastStreamId, 9)
+      clientsByConnection.get(index)?.write(frame)
+    },
     /** Answers, continues or cancels the streams held so far. */
     release() {
       for (const next of held.splice(0)) next()
@@ -190,6 +208,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   setSystemTime()
+  setHttp2KeepaliveForTests()
   resetRunCompressionForTests()
   closeCachedHttp2SessionsForTests()
   routeHttp2ConnectionsForTests()
@@ -626,4 +645,175 @@ describe("Run on a connection whose ping fails for another Run", () => {
     sibling.end()
     next.end()
   })
+})
+
+// The host these run on can be heavily loaded; each test still bounds its own waits.
+const SLOW_TEST_MS = 15_000
+
+/** Resolves to "pending" when `promise` has not settled within `ms`. */
+function within<T>(promise: Promise<T>, ms: number): Promise<T | "pending"> {
+  return Promise.race([promise, sleep(ms).then(() => "pending" as const)])
+}
+
+describe("Runs on a connection Cursor drains with a GOAWAY", () => {
+  it("sends the first Run on a fresh connection again at once when the GOAWAY excludes it", async () => {
+    fake.answers.push("hold")
+    const run = await bidiRunStream("token", { baseURL: ORIGIN })
+    run.write(new Uint8Array([8]))
+    await until(() => fake.streams[0]?.bytes === 6)
+    await sleep(20)
+
+    fake.injectGoaway(0, 0)
+    expect((await within(nextFrame(run).then((frame) => frame.done), 3_000))).toBe(false)
+
+    expect(fake.connections).toBe(2)
+    expect(fake.streams.map((stream) => [stream.answer, stream.connection, stream.bytes])).toEqual([
+      ["hold", 0, 6],
+      ["answer", 1, 6],
+    ])
+    run.end()
+  }, SLOW_TEST_MS)
+
+  it("sends every Run opened with the connection again when the GOAWAY excludes them all", async () => {
+    fake.answers.push("hold", "hold", "hold")
+    const runs = await Promise.all([1, 2, 3].map(() => bidiRunStream("token", { baseURL: ORIGIN })))
+    for (const run of runs) run.write(new Uint8Array([8]))
+    await until(() => fake.streams.length === 3 && fake.streams.every((stream) => stream.bytes === 6))
+    await sleep(20)
+
+    fake.injectGoaway(0, 0)
+    for (const run of runs) expect((await within(nextFrame(run).then((frame) => frame.done), 3_000))).toBe(false)
+
+    expect(fake.connections).toBe(2)
+    expect(fake.streams.map((stream) => [stream.answer, stream.connection])).toEqual([
+      ["hold", 0], ["hold", 0], ["hold", 0],
+      ["answer", 1], ["answer", 1], ["answer", 1],
+    ])
+    for (const run of runs) run.end()
+  }, SLOW_TEST_MS)
+
+  it("lets Runs at or below the last stream id finish on the draining connection while one above it moves", async () => {
+    await completedRun()
+    fake.answers.push("answer-then-hold", "goaway-unprocessed")
+    // Each Run pings first, so neither counts as reused on recent traffic alone.
+    setSystemTime(new Date(Date.now() + HTTP2_SESSION_LIVE_WINDOW_MS + 1_000))
+    const below = await bidiRunStream("token", { baseURL: ORIGIN })
+    below.write(new Uint8Array([8]))
+    const belowFrames = below.frames()[Symbol.asyncIterator]()
+    expect((await belowFrames.next()).done).toBe(false)
+    const draining = await getSession(ORIGIN)
+    setSystemTime(new Date(Date.now() + 2 * (HTTP2_SESSION_LIVE_WINDOW_MS + 1_000)))
+
+    const above = await bidiRunStream("token", { baseURL: ORIGIN })
+    above.write(new Uint8Array([9]))
+    expect((await nextFrame(above)).done).toBe(false)
+
+    expect(draining.closed).toBe(true)
+    fake.release()
+    expect((await belowFrames.next()).done).toBe(false)
+    expect(fake.streams.map((stream) => [stream.answer, stream.connection])).toEqual([
+      ["answer", 0],
+      ["answer-then-hold", 0],
+      ["goaway-unprocessed", 0],
+      ["answer", 1],
+    ])
+    below.end()
+    above.end()
+  }, SLOW_TEST_MS)
+
+  it("does not send a Run again when the GOAWAY says Cursor may have processed it", async () => {
+    fake.answers.push("goaway-processed")
+
+    const run = await bidiRunStream("token", { baseURL: ORIGIN })
+    run.write(new Uint8Array([8]))
+    expect(await failureOf(nextFrame(run))).toBeInstanceOf(CursorProviderError)
+    await sleep(50)
+
+    expect(fake.connections).toBe(1)
+  }, SLOW_TEST_MS)
+})
+
+describe("Keepalive PINGs", () => {
+  beforeEach(() => setHttp2KeepaliveForTests({ intervalMs: 100, timeoutMs: 200 }))
+
+  it("pings an idle connection and keeps using it while it answers", async () => {
+    await completedRun()
+    const connection = await getSession(ORIGIN)
+    const ping = spyOn(connection, "ping")
+
+    await sleep(450)
+    const run = await bidiRunStream("token", { baseURL: ORIGIN })
+    run.write(new Uint8Array([8]))
+    expect((await nextFrame(run)).done).toBe(false)
+
+    expect(ping.mock.calls.length).toBeGreaterThanOrEqual(3)
+    expect(connection.destroyed).toBe(false)
+    expect(fake.connections).toBe(1)
+    run.end()
+  }, SLOW_TEST_MS)
+
+  it("fails the Runs of a busy connection that stops answering at all, and opens the next Run elsewhere", async () => {
+    fake.answers.push("answer-then-hold")
+    const busy = await bidiRunStream("token", { baseURL: ORIGIN })
+    busy.write(new Uint8Array([8]))
+    const frames = busy.frames()[Symbol.asyncIterator]()
+    expect((await frames.next()).done).toBe(false)
+    const connection = await getSession(ORIGIN)
+    fake.muteClient(0)
+
+    const failure = await within(failureOf(frames.next()), 3_000)
+    expect(failure).toBeInstanceOf(CursorProviderError)
+    expect((failure as CursorProviderError).code).toBe("CURSOR_HTTP2_PING_TIMEOUT")
+    expect(connection.destroyed).toBe(true)
+
+    const next = await bidiRunStream("token", { baseURL: ORIGIN })
+    next.write(new Uint8Array([9]))
+    expect((await nextFrame(next)).done).toBe(false)
+    expect(fake.connections).toBe(2)
+    next.end()
+  }, SLOW_TEST_MS)
+
+  it("drops an idle connection that stops answering before a Run is sent on it", async () => {
+    await completedRun()
+    const connection = await getSession(ORIGIN)
+    fake.muteClient(0)
+    await until(() => connection.destroyed, 3_000)
+    expect(connection.destroyed).toBe(true)
+
+    const run = await bidiRunStream("token", { baseURL: ORIGIN })
+    run.write(new Uint8Array([8]))
+    expect(await within(nextFrame(run).then((frame) => frame.done), 3_000)).toBe(false)
+    expect(fake.connections).toBe(2)
+    run.end()
+  }, SLOW_TEST_MS)
+
+  it("keeps a connection whose PING answers stop while Cursor keeps streaming", async () => {
+    fake.answers.push("answer-then-trickle")
+    const run = await bidiRunStream("token", { baseURL: ORIGIN })
+    run.write(new Uint8Array([8]))
+    const frames = run.frames()[Symbol.asyncIterator]()
+    expect((await frames.next()).done).toBe(false)
+    const connection = await getSession(ORIGIN)
+    fake.muteClient(0)
+
+    await sleep(800)
+    expect((await frames.next()).done).toBe(false)
+    expect(connection.destroyed).toBe(false)
+    run.end()
+  }, SLOW_TEST_MS)
+
+  it("closes an idle connection once it reaches the rotation age", async () => {
+    await completedRun()
+    const connection = await getSession(ORIGIN)
+    spyOn(connection, "ping").mockImplementation(((callback: (error: Error | null) => void) => {
+      callback(null)
+      return true
+    }) as typeof connection.ping)
+    const close = spyOn(connection, "close")
+    setSystemTime(new Date(Date.now() + 16 * 60_000))
+
+    await until(() => close.mock.calls.length > 0)
+    expect(close).toHaveBeenCalled()
+    expect(fake.connections).toBe(1)
+  }, SLOW_TEST_MS)
 })
