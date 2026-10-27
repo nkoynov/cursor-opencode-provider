@@ -433,6 +433,25 @@ const _http2SessionUploadProgressAt = new WeakMap<http2.ClientHttp2Session, numb
 // uplink by many seconds while Cursor sends only flow-control frames we cannot observe.
 const LARGE_UPLOAD_BYTES = 64 * 1024
 const _http2SessionLargeUploadAt = new WeakMap<http2.ClientHttp2Session, number>()
+// Run streams on the session with a write still waiting for 'drain'; one write can take longer than the timeout.
+const _http2SessionBlockedUploads = new WeakMap<http2.ClientHttp2Session, Set<http2.ClientHttp2Stream>>()
+
+function noteBlockedUpload(session: http2.ClientHttp2Session, stream: http2.ClientHttp2Stream): void {
+  let blocked = _http2SessionBlockedUploads.get(session)
+  if (!blocked) {
+    blocked = new Set()
+    _http2SessionBlockedUploads.set(session, blocked)
+  }
+  if (blocked.has(stream)) return
+  blocked.add(stream)
+  const unblock = () => {
+    blocked.delete(stream)
+    stream.removeListener("drain", unblock)
+    stream.removeListener("close", unblock)
+  }
+  stream.once("drain", unblock)
+  stream.once("close", unblock)
+}
 // Several Runs share each session. Node and Bun count its unsent bytes
 // against maxSessionMemory (10 MB by default) and, once over it, fail every new
 // stream with ENHANCE_YOUR_CALM (Bun before sending it, Node by refusing its
@@ -733,7 +752,9 @@ function startKeepalive(key: string, session: http2.ClientHttp2Session): void {
     if (stopped || pingSentAt === undefined || session.destroyed) return
     const remainingMs = deadline(pingSentAt) - Date.now()
     if (remainingMs > 0) return arm(remainingMs, checkDeadline)
-    const uploadWindowMs = (_http2SessionLargeUploadAt.get(session) ?? 0) + keepaliveTimeoutMs - Date.now()
+    const uploadWindowMs = (_http2SessionBlockedUploads.get(session)?.size ?? 0) > 0
+      ? keepaliveTimeoutMs
+      : (_http2SessionLargeUploadAt.get(session) ?? 0) + keepaliveTimeoutMs - Date.now()
     if (uploadWindowMs > 0) {
       // Possibly only slow: new Runs go elsewhere, and its own Runs keep their watchdogs.
       if (_http2Sessions.get(key) === session) {
@@ -1283,6 +1304,7 @@ export async function bidiRunStream(
 
   const send = (frame: Uint8Array): boolean => {
     backpressured = !stream.write(frame)
+    if (backpressured) noteBlockedUpload(session, stream)
     if (backpressured || frame.length >= LARGE_UPLOAD_BYTES) _http2SessionLargeUploadAt.set(session, Date.now())
     return !backpressured
   }

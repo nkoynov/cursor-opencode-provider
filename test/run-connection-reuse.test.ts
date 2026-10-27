@@ -153,6 +153,9 @@ async function startFakeCursor() {
     dropConnection(index: number) { clientsByConnection.get(index)?.destroy() },
     /** Stops forwarding what the client sends on a connection, so Cursor sees neither its pings nor its GOAWAY. */
     muteClient(index: number) { muted.add(index) },
+    /** Stops reading what the client sends on a connection, so its uploads back up as on a crawling uplink. */
+    stallClient(index: number) { clientsByConnection.get(index)?.pause() },
+    resumeClient(index: number) { clientsByConnection.get(index)?.resume() },
     /** Sends the client a NO_ERROR GOAWAY that Node's server API cannot (it turns last stream id 0 into the last processed one). */
     injectGoaway(index: number, lastStreamId: number) {
       const frame = Buffer.alloc(9 + 8)
@@ -832,7 +835,7 @@ describe("Keepalive PINGs", () => {
     run.end()
   }, SLOW_TEST_MS)
 
-  it("only moves new Runs off a connection whose PING may wait behind a large upload, then drops it once uploads stop", async () => {
+  it("only moves new Runs off a connection whose PING may wait behind a large upload, then drops it once no upload is left", async () => {
     // Writes 100 ms apart must stay well inside the upload window on a loaded host.
     setHttp2KeepaliveForTests({ intervalMs: 100, timeoutMs: 1_000 })
     fake.answers.push("answer-then-hold")
@@ -852,8 +855,36 @@ describe("Keepalive PINGs", () => {
     expect(connection.closed).toBe(true)
     expect(connection.destroyed).toBe(false)
 
-    expect((await within(failure, 3_000) as CursorProviderError).code).toBe("CURSOR_HTTP2_PING_TIMEOUT")
+    // Cursor never opened the flow-control window, so the upload ends only with its Run.
+    run.destroy()
+    await until(() => connection.destroyed, 3_000)
     expect(connection.destroyed).toBe(true)
+  }, SLOW_TEST_MS)
+
+  it("keeps a connection while one upload stays blocked past the timeout", async () => {
+    setHttp2KeepaliveForTests({ intervalMs: 100, timeoutMs: 500 })
+    resetRunCompressionForTests(ORIGIN)
+    fake.answers.push("answer-then-hold")
+    const run = await bidiRunStream("token", { baseURL: ORIGIN })
+    run.write(new Uint8Array([8]))
+    const frames = run.frames()[Symbol.asyncIterator]()
+    expect((await frames.next()).done).toBe(false)
+    const connection = await getSession(ORIGIN)
+    fake.stallClient(0)
+    const failure = failureOf(frames.next())
+
+    expect(run.write(new Uint8Array(16_000_000).fill(5))).toBe(false)
+    const drained = run.waitForDrain!()
+    await sleep(2_000)
+    expect(await within(failure, 1)).toBe("pending")
+    expect(connection.destroyed).toBe(false)
+
+    fake.resumeClient(0)
+    await drained
+    fake.release()
+    // The pending read gets Cursor's next frame instead of an error.
+    expect(await within(failure, 3_000)).toBeUndefined()
+    run.end()
   }, SLOW_TEST_MS)
 
   it("keeps a connection whose PING answers stop while Cursor keeps streaming", async () => {

@@ -152,9 +152,10 @@ The **1.18 v2** API and **OpenCode 2.x** are source-incompatible:
   is pinged 10 s after its last PING answer (unref'd timers, no hold). One that
   has had a PING out for 10 s and received nothing (PING answer, Run data,
   upload drain) for 20 s is destroyed with `CURSOR_HTTP2_PING_TIMEOUT`, and
-  its Runs take the normal recovery paths. Within 20 s of a large (64 KiB+) or
-  backpressured Run write the PING may sit behind that upload, so the
-  connection is only retired then. An idle connection past the 15-min
+  its Runs take the normal recovery paths. While a Run write waits for drain,
+  or within 20 s of a 64 KiB+ one, the PING may sit behind that upload, so the
+  connection is only retired then (a dead one is left to the read-idle
+  watchdog). An idle connection past the 15-min
   rotation age is closed. Every Run keeps its frames until Cursor answers: a
   stream above a GOAWAY's last stream id (Cursor never processed it) is sent
   again at once on a new connection, up to 3 times, invisible to the retry
