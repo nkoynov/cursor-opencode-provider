@@ -17,6 +17,9 @@ import {
   hydrateConversationState, persistConversationState, resetSnapshotGenerationsForTests,
 } from "../src/protocol/conversation-state.js"
 import { dropLostRequest, hasLostRequest, rememberLostRequest } from "../src/lost-request.js"
+import {
+  recordSessionEditsGuidance, resetSessionEditsGuidanceForTests, sessionEditsGuidance,
+} from "../src/protocol/session-edits.js"
 import { getConversationBlob, resetConversationBlobsForTests, setConversationBlob } from "../src/protocol/blob-store.js"
 import { clearCheckpoint, resetCheckpointsForTests, setCheckpoint } from "../src/protocol/checkpoint.js"
 import { encodeMessage } from "../src/protocol/messages.js"
@@ -138,6 +141,7 @@ const otherGraph = async () => {
     checkpoint: await load("protocol/checkpoint.ts") as typeof import("../src/protocol/checkpoint.js"),
     frozen: await load("context/frozen.ts") as typeof import("../src/context/frozen.js"),
     persistence: await load("protocol/conversation-persistence.ts") as typeof import("../src/protocol/conversation-persistence.js"),
+    sessionEdits: await load("protocol/session-edits.ts") as typeof import("../src/protocol/session-edits.js"),
   }
 }
 const checkpointBytes = encodeMessage("ConversationStateStructure", { token_details: { used_tokens: 1, max_tokens: 2 } })
@@ -225,6 +229,54 @@ test("a copy at the latest snapshot waits for another copy's save still being wr
     release()
     setConversationPersistenceHookForTests()
     other.persistence.resetConversationPersistenceForTests()
+    resetCheckpointsForTests()
+  }
+})
+
+test("a copy reading the snapshot while another copy saves a newer one restores the newer one", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const sessionKey = "saved-during-read"
+  const conversationId = peekConversationId(sessionKey)
+  const newer = encodeMessage("ConversationStateStructure", { token_details: { used_tokens: 7, max_tokens: 9 } })
+  setCheckpoint(conversationId, checkpointBytes)
+  try {
+    await persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    let saved = false
+    other.persistence.setConversationPersistenceHookForTests(async phase => {
+      if (phase !== "full-decode" || saved) return
+      saved = true
+      setCheckpoint(conversationId, newer)
+      await persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    })
+    expect((await other.state.hydrateConversationState(cache, sessionKey))?.conversationId).toBe(conversationId)
+    expect(saved).toBe(true)
+    expect(other.checkpoint.getCheckpoint(conversationId)).toEqual(newer)
+  } finally {
+    other.persistence.setConversationPersistenceHookForTests()
+    other.persistence.resetConversationPersistenceForTests()
+    resetCheckpointsForTests()
+  }
+})
+
+test("a returning copy takes the edit-deny record of the snapshot it restores", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const sessionKey = "deny-elsewhere"
+  const conversationId = peekConversationId(sessionKey)
+  setCheckpoint(conversationId, checkpointBytes)
+  try {
+    recordSessionEditsGuidance(conversationId, false)
+    await persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    await other.state.hydrateConversationState(cache, sessionKey)
+    other.sessionEdits.recordSessionEditsGuidance(conversationId, true)
+    await other.state.persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    expect((await hydrateConversationState(cache, sessionKey))?.replacesCopyState).toBe(true)
+    // The restored checkpoint holds the other copy's deny, so lifting it needs the no-deny note.
+    expect(sessionEditsGuidance(conversationId, false, { carriesEarlierState: true })).toBe(false)
+  } finally {
+    other.persistence.resetConversationPersistenceForTests()
+    resetSessionEditsGuidanceForTests()
     resetCheckpointsForTests()
   }
 })

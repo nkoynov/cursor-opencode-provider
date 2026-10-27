@@ -6,6 +6,7 @@ import { restoreEarlySteers, serializeEarlySteers } from "../host-steer.js"
 import { restoreLostRequest, serializeLostRequest } from "../lost-request.js"
 import { restorePlanOperations, serializePlanOperations } from "./plan-operations.js"
 import {
+  clearFrozenRequestContext,
   getFrozenRequestContext,
   setFrozenRequestContext,
   transferFrozenRequestContext,
@@ -43,6 +44,7 @@ import {
   getPersistedTurnProvenance,
   loadPersistedConversation,
   persistConversation,
+  type PersistedConversationLoad,
 } from "./conversation-persistence.js"
 
 // Every snapshot write or delete that lands gets a process-wide generation, and writes still queued are counted per
@@ -128,19 +130,29 @@ export async function hydrateConversationState(
   // Location): a copy behind the latest snapshot any copy saved restores it.
   const key = snapshotKey(cacheDir, sessionKey)
   const bound = boundConversationId(sessionKey)
-  if (bound !== undefined) {
-    // This copy's own queued writes hold state no newer than its memory; another copy's may.
-    if (holdsLatestSnapshot(key) && !otherCopyQueuedWrite(key)) return undefined
-    await settleConversationStateWrites(cacheDir, sessionKey)
-    if (holdsLatestSnapshot(key)) return undefined
-    if (snapshots.bySession.get(key)?.unsaved) {
-      trace(`conversation persistence: hydration skipped sessionKey=${sessionKey} status=unsaved`)
-      return undefined
+  let generation = 0
+  let loaded: PersistedConversationLoad | undefined
+  for (let attempt = 0; attempt < 3 && !loaded; attempt++) {
+    if (bound !== undefined) {
+      // This copy's own queued writes hold state no newer than its memory; another copy's may.
+      if (attempt === 0 && holdsLatestSnapshot(key) && !otherCopyQueuedWrite(key)) return undefined
+      await settleConversationStateWrites(cacheDir, sessionKey)
+      if (holdsLatestSnapshot(key)) return undefined
+      if (snapshots.bySession.get(key)?.unsaved) {
+        trace(`conversation persistence: hydration skipped sessionKey=${sessionKey} status=unsaved`)
+        return undefined
+      }
+      await forgetCachedConversation(cacheDir, sessionKey)
     }
-    await forgetCachedConversation(cacheDir, sessionKey)
+    generation = snapshotRecord(key).generation
+    const read = await loadPersistedConversation(cacheDir, sessionKey)
+    // A write that landed or was queued during the read may be newer than what was read.
+    if (snapshotRecord(key).generation === generation && !otherCopyQueuedWrite(key)) loaded = read
   }
-  const generation = snapshotRecord(key).generation
-  const loaded = await loadPersistedConversation(cacheDir, sessionKey)
+  if (!loaded) {
+    trace(`conversation persistence: hydration skipped sessionKey=${sessionKey} status=still-writing`)
+    return undefined
+  }
   // A concurrent request in this copy already restored this generation.
   if (bound !== undefined && heldGenerations.get(key) === generation) return undefined
   rememberHeldGeneration(key, generation)
@@ -169,11 +181,12 @@ export async function hydrateConversationState(
     restorePlanOperations(sessionKey, persisted.planOperations)
   }
   // Snapshots written before this marker existed came from releases that never sent a deny.
-  restoreSessionEditsDenySent(persisted.conversationId, persisted.sessionEditsDenySent === true)
+  restoreSessionEditsDenySent(persisted.conversationId, persisted.sessionEditsDenySent === true, bound !== undefined)
   if (persisted.occupancyCheckpoint) restoreCheckpointOccupancy(persisted.conversationId, persisted.occupancyCheckpoint)
   if (persisted.checkpoint) setCheckpoint(persisted.conversationId, persisted.checkpoint)
   else clearCheckpoint(persisted.conversationId)
   restoreConversationBlobs(persisted.conversationId, persisted.blobs)
+  if (bound !== undefined) clearFrozenRequestContext(persisted.conversationId)
   setFrozenRequestContext(persisted.conversationId, persisted.requestContext)
   const provenance = persisted.turnProvenance ? parseTurnProvenance(persisted.turnProvenance) : undefined
   if (provenance?.conversationId === persisted.conversationId) restoreTurnProvenance(sessionKey, provenance)

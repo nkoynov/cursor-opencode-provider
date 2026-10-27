@@ -128,9 +128,12 @@ export function sessionEditsDenySent(conversationId: string): boolean {
   return editGuidanceByConversation.get(conversationId)?.denySent ?? true
 }
 
-/** Restart snapshot marker; live state recorded by this process wins. */
-export function restoreSessionEditsDenySent(conversationId: string, denySent: boolean): void {
-  if (editGuidanceByConversation.has(conversationId)) return
+/**
+ * Restart snapshot marker; live state recorded by this process wins, unless the snapshot is newer than it
+ * (`replace`: another module copy wrote it after this copy last served the conversation).
+ */
+export function restoreSessionEditsDenySent(conversationId: string, denySent: boolean, replace = false): void {
+  if (!replace && editGuidanceByConversation.has(conversationId)) return
   setEditGuidance(conversationId, { denySent })
 }
 
