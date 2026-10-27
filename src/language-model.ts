@@ -1812,7 +1812,6 @@ export async function pumpWithRecovery(input: {
   const reopenAttempt = async (pumped: CursorSession, failure: CursorProviderError, checkpoint: Uint8Array | undefined) => {
     try {
       session = await reopen(pumped, failure, checkpoint)
-      if (checkpoint) session.resumedFromCheckpoint = checkpoint
     } catch (error) {
       const failure = toCursorProviderError(error, { replaySafe: true, fallback: "Cursor recovery setup failed" })
       // The failed upload belongs to the replacement Run. The preceding Run's
@@ -2970,6 +2969,7 @@ async function startSession(
     conversationId,
     cacheDir,
     resumeCheckpoint: undefined,
+    ...(conversationState ? { resumedFromCheckpoint: conversationState } : {}),
     ...(historyImages ? { historyImages } : {}),
     tokenDetails: priorTokenDetails,
     tokenDetailsFresh: false,
@@ -3110,6 +3110,7 @@ async function startSession(
     await waitForStreamWrites(session.stream)
     abortIfNeeded(signal, next)
     sessionManager.replaceStream(session, next, nextRunId)
+    session.resumedFromCheckpoint = conversationState
     attachSessionHeartbeat(session)
   }
 

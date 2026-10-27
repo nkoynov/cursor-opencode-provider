@@ -145,6 +145,52 @@ async function streamError(sessionKey: string): Promise<unknown> {
   }
 }
 
+describe("a Run resumed from a checkpoint", () => {
+  it("records the checkpoint it started from, so Cursor sending it back is no progress", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-seeded-resume-"))
+    const checkpoint = Uint8Array.of(10, 1, 9)
+    const key = "ses_seeded_resume"
+    let sentState: Uint8Array | undefined
+    let recorded: Uint8Array | undefined
+    scripted = (stream, message) => {
+      if (!message.run_request) return
+      const send = (value: Record<string, unknown>) => stream.write(frame(encodeMessage("AgentServerMessage", value)))
+      runs++
+      if (runs === 1) {
+        send({ conversation_checkpoint_update: checkpoint })
+        stream.end(frame(Buffer.from('{"error":{"code":"unavailable"}}'), 2))
+        return
+      }
+      sentState = (message.run_request as { conversation_state?: Uint8Array }).conversation_state
+      void (async () => {
+        for (let i = 0; i < 200 && !recorded; i++) {
+          recorded = sessionManager.findOpenByOpenCodeSessionId(key)?.resumedFromCheckpoint
+          if (!recorded) await new Promise(resolve => setTimeout(resolve, 10))
+        }
+        send({ interaction_update: { turn_ended: {} } })
+        stream.end()
+      })()
+    }
+    cacheHttp2SessionForTests(ORIGIN, client)
+    try {
+      const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root,
+        retry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
+      const turn = async (prompt: LanguageModelV3CallOptions["prompt"]) => {
+        const { stream } = await model.doStream({ prompt, headers: { "x-opencode-session-id": key } } as LanguageModelV3CallOptions)
+        const reader = stream.getReader()
+        while (!(await reader.read()).done) { /* drain */ }
+      }
+      await turn([{ role: "user", content: [{ type: "text", text: "Hello" }] }])
+    } finally {
+      await settleRunSavesForTests()
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+    expect(runs).toBe(2)
+    expect(Array.from(sentState ?? [])).toEqual([10, 1, 9])
+    expect(Array.from(recorded ?? [])).toEqual([10, 1, 9])
+  })
+})
+
 describe("checkpoint eligibility across host results", () => {
   const readParts = async (model: LanguageModelV3, options: LanguageModelV3CallOptions) => {
     const parts: LanguageModelV3StreamPart[] = []
