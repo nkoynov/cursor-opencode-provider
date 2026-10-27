@@ -1318,7 +1318,10 @@ async function doStreamImpl(
   // checkpoint: it predates persistence/review and could request the write again.
   const mayStartPlanTurn = !isCompactionCall(callOptions, opencodeSessionKey(callOptions))
     && computeAllowTools(extractTools(callOptions).length, callOptions.toolChoice)
-  if (!session && interruptedPlanContinuation(prompt, opencodeSessionKey(callOptions), mayStartPlanTurn)) {
+  // Fork: a lost Run of this process may hold Cursor's final verdict, which is read first, below.
+  const lostRunHolds = trailingToolResults.some((result) => !!sessionManager.lostRun(result.sessionId))
+  if (!session && !lostRunHolds
+    && interruptedPlanContinuation(prompt, opencodeSessionKey(callOptions), mayStartPlanTurn)) {
     return { stream: answeredSteerStream(PLAN_INTERRUPTED_NOTICE) }
   }
   // A call that must open a Run gets its credential before it changes any
@@ -1387,9 +1390,7 @@ async function doStreamImpl(
 
   if (!session) {
     const sessionKey = opencodeSessionKey(callOptions)
-    // Delivery itself may have lost the held Run. Do not rebase that failed
-    // plan continuation onto a checkpoint from before the host mutation.
-    if (interruptedPlanContinuation(prompt, sessionKey, mayStartPlanTurn)) {
+    if (trailingToolResults.length === 0 && interruptedPlanContinuation(prompt, sessionKey, mayStartPlanTurn)) {
       return { stream: answeredSteerStream(PLAN_INTERRUPTED_NOTICE) }
     }
     if (!session && trailingToolResults.length > 0) {
@@ -1414,6 +1415,11 @@ async function doStreamImpl(
       const finalVerdict = [...lostRuns.map((run) => run.closeError), ...lostRuns.map(queuedFinalVerdict)]
         .find((failure) => !!failure && isFinalVerdict(failure))
       if (finalVerdict) throw hostFacingError(finalVerdict, { modelId })
+      // Delivery itself may have lost the held Run. Do not rebase that failed
+      // plan continuation onto a checkpoint from before the host mutation.
+      if (interruptedPlanContinuation(prompt, sessionKey, mayStartPlanTurn)) {
+        return { stream: answeredSteerStream(PLAN_INTERRUPTED_NOTICE) }
+      }
       const ambiguous = lostRuns.some((run) => run.ambiguousDelivery)
       const why = ambiguous
         ? "a tool result it may already hold"
@@ -1495,7 +1501,7 @@ async function doStreamImpl(
         }
         // Without TurnEnded, the checkpoint may predate completed side effects.
         // Include their host results instead of resuming that model step.
-        const newUserTurn = liveUserTurn(prompt)
+        const newUserTurn = humanUserTurn(prompt)
         if (!lifecycleCall && !isCompactionCall(callOptions, sessionKey) && newUserTurn && newUserTurn.text !== ".") {
           clearPlanOperations(sessionKey)
         }
@@ -5152,7 +5158,7 @@ function interruptedPlanContinuation(prompt: LanguageModelV3CallOptions["prompt"
       break
     }
   }
-  const live = liveUserTurn(prompt)
+  const live = humanUserTurn(prompt)
   if (priorCall >= 0 && live && live.text !== "." && live.start > priorCall) {
     if (mayStartUserTurn) clearPlanOperations(sessionKey)
     return false
@@ -9007,6 +9013,20 @@ export function liveUserTurn(
     return text && text !== "." ? [text] : []
   })
   return { start, text: texts.join("\n\n") }
+}
+
+/** Fork: the user's own text since the model's last output; a host note alone does not settle a CreatePlan. */
+function humanUserTurn(
+  prompt: LanguageModelV3CallOptions["prompt"],
+): { start: number; text: string } | undefined {
+  if (prompt.at(-1)?.role !== "user") return undefined
+  const start = userTurnStart(prompt)
+  const texts = prompt.slice(start).flatMap((message) => {
+    if (hostTailNote(message)) return []
+    const text = extractUserText(message as unknown as Record<string, unknown>)
+    return text && text !== "." ? [text] : []
+  })
+  return { start, text: texts.join("\n\n") || "." }
 }
 
 /**

@@ -16,6 +16,7 @@ import { resetTurnStateForTests, settleRunSavesForTests } from "../src/language-
 import { resetConversationBindingsForTests } from "../src/protocol/conversation-bind.js"
 import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
+import { recordPlanOperation, resetPlanOperationsForTests } from "../src/protocol/plan-operations.js"
 import { notifyHostInterrupt } from "../src/host-interrupt.js"
 import { resetActiveCursorModesForTests, setActiveCursorMode, takeActiveCursorModeReminder } from "../src/protocol/switch-mode.js"
 
@@ -1079,6 +1080,37 @@ describe("host calls still running when the Run dies", () => {
         else if (cut !== "invalid-argument") expect((error as APICallError).message).toContain("continue")
         expect(requests).toHaveLength(1)
       } finally {
+        await cleanup()
+      }
+    }, 30_000)
+  }
+
+  for (const cut of ["final", "reset"] as const) {
+    it(`reads a lost Run's verdict before the unfinished plan notice (${cut})`, async () => {
+      const key = `ses_held_tool_plan_${cut}`
+      const { requests, prompt, read, cleanup, waitForCut } = setup("held", cut, key)
+      try {
+        const calls = hostCalls(await read())
+        expect(calls).toHaveLength(1)
+        expect(recordPlanOperation(key, {
+          interactionId: 42, hostCallId: calls[0]!.toolCallId, planPath: "/workspace/plan.md",
+          planUri: "file:///workspace/plan.md", markdown: "# Plan\n", phase: "write", bridgeKind: "approve",
+          afterWrite: "review", reviewToolName: "question",
+        }).ok).toBe(true)
+        await waitForCut()
+        pushResult(prompt, calls[0]!, { type: "text", value: "ledger line written" })
+        const result = await read().catch((caught: unknown) => caught)
+        if (cut === "final") {
+          expect(APICallError.isInstance(result)).toBe(true)
+          expect((result as APICallError).message).not.toContain("Plan saving or review was interrupted")
+        } else {
+          const parts = result as LanguageModelV3StreamPart[]
+          expect(parts.flatMap(part => part.type === "text-delta" ? [part.delta] : []).join(""))
+            .toContain("Plan saving or review was interrupted")
+        }
+        expect(requests).toHaveLength(1)
+      } finally {
+        resetPlanOperationsForTests()
         await cleanup()
       }
     }, 30_000)
