@@ -642,6 +642,35 @@ test("snapshot generation records stay bounded and keep every bound session's re
   }
 })
 
+test("a copy whose snapshot record was evicted drops its older checkpoint while another copy's latest save failed", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const sessionKey = "evicted-then-unsaved"
+  const conversationId = peekConversationId(sessionKey)
+  setCheckpoint(conversationId, checkpointBytes)
+  try {
+    await persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    for (let index = 0; index < MAX_ACTIVE_CONVERSATION_BINDINGS; index++) {
+      bindConversationId(`busy-${index}`)
+      expect(await hydrateConversationState(cache, `busy-${index}`)).toBeUndefined()
+    }
+    // The session's binding and then its record are gone; the other copy rebinds it from disk.
+    expect((await other.state.hydrateConversationState(cache, sessionKey))?.conversationId).toBe(conversationId)
+    other.persistence.setConversationPersistenceHookForTests(phase => {
+      if (phase === "before-write") throw new Error("disk full")
+    })
+    expect(await rejectionMessage(other.state.persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })))
+      .toContain("disk full")
+    expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    expect(getCheckpoint(conversationId)).toBeUndefined()
+  } finally {
+    other.persistence.setConversationPersistenceHookForTests()
+    other.persistence.resetConversationPersistenceForTests()
+    other.checkpoint.resetCheckpointsForTests()
+    resetCheckpointsForTests()
+  }
+})
+
 test("snapshot generation records of bound sessions are kept past the cap", async () => {
   const cache = root()
   for (let index = 0; index < MAX_ACTIVE_CONVERSATION_BINDINGS; index++) {

@@ -152,15 +152,18 @@ export function onCopyStateReplaced(reset: (sessionKey: string) => void): void {
  * A copy behind the latest state replaces its per-session state with what it could read: a snapshot, or nothing.
  * A copy that served the session before holds a checkpoint without the turns another copy ran since, so without a
  * snapshot to restore it drops that checkpoint and its next Run seeds host history. A copy that never held a
- * generation has no older checkpoint of its own.
+ * generation has no older checkpoint of its own, unless its record was evicted since: so while another copy holds
+ * newer state (its save failed, or its writes keep landing) every copy behind drops its checkpoint.
  */
-function replaceCopyState(key: string, generation: number, sessionKey: string, conversationId: string): void {
+function replaceCopyState(
+  key: string, generation: number, sessionKey: string, conversationId: string, newerElsewhere = false,
+): void {
   const held = snapshotRecord(key, sessionKey).held
   const servedBefore = held.has(copyId)
   held.set(copyId, generation)
   forgetTurnProvenance(sessionKey)
   for (const reset of copyStateResets) reset(sessionKey)
-  if (servedBefore) clearCheckpoint(conversationId)
+  if (servedBefore || newerElsewhere) clearCheckpoint(conversationId)
 }
 
 export function resetSnapshotGenerationsForTests(): void {
@@ -201,8 +204,8 @@ export async function hydrateConversationState(
       if (holdsLatestSnapshot(key)) return undefined
       if (snapshots.bySession.get(key)?.unsaved) {
         trace(`conversation persistence: hydration skipped sessionKey=${sessionKey} status=unsaved`)
-        if (heldGeneration(key) !== undefined && boundConversationId(sessionKey) === bound) {
-          replaceCopyState(key, snapshotRecord(key, sessionKey).generation, sessionKey, bound)
+        if (boundConversationId(sessionKey) === bound) {
+          replaceCopyState(key, snapshotRecord(key, sessionKey).generation, sessionKey, bound, true)
         }
         return undefined
       }
@@ -222,8 +225,8 @@ export async function hydrateConversationState(
   }
   if (!loaded) {
     trace(`conversation persistence: hydration skipped sessionKey=${sessionKey} status=still-writing`)
-    if (bound !== undefined && heldGeneration(key) !== undefined && boundConversationId(sessionKey) === bound) {
-      replaceCopyState(key, snapshotRecord(key, sessionKey).generation, sessionKey, bound)
+    if (bound !== undefined && boundConversationId(sessionKey) === bound) {
+      replaceCopyState(key, snapshotRecord(key, sessionKey).generation, sessionKey, bound, true)
     }
     return undefined
   }
