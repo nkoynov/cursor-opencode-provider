@@ -57,7 +57,7 @@ const snapshots = processShared("conversation-snapshot-generations.v1", () => ({
   next: 0,
   bySession: new Map<string, SnapshotRecord>(),
 }))
-const MAX_HELD_GENERATIONS = 4096
+// Never evicted either: a copy without its entry would count as behind and overwrite unsaved live state.
 const heldGenerations = new Map<string, number>()
 const snapshotKey = (cacheDir: string, sessionKey: string) => JSON.stringify([path.resolve(cacheDir), sessionKey])
 
@@ -70,19 +70,15 @@ function snapshotRecord(key: string): SnapshotRecord {
   return record
 }
 
-function rememberHeldGeneration(key: string, generation: number): void {
-  heldGenerations.delete(key)
-  heldGenerations.set(key, generation)
-  while (heldGenerations.size > MAX_HELD_GENERATIONS) heldGenerations.delete(heldGenerations.keys().next().value as string)
-}
-
 function holdsLatestSnapshot(key: string): boolean {
   const record = snapshots.bySession.get(key)
   return !!record && heldGenerations.get(key) === record.generation
 }
 
-function otherCopyQueuedWrite(key: string): boolean {
-  for (const [copy, count] of snapshots.bySession.get(key)?.queued ?? []) if (copy !== copyId && count > 0) return true
+function queuedWrite(key: string, otherCopiesOnly: boolean): boolean {
+  for (const [copy, count] of snapshots.bySession.get(key)?.queued ?? []) {
+    if (count > 0 && (!otherCopiesOnly || copy !== copyId)) return true
+  }
   return false
 }
 
@@ -94,7 +90,7 @@ async function trackedSnapshotWrite(key: string, write: () => Promise<boolean>):
     if (!await write()) return
     record.generation = ++snapshots.next
     record.unsaved = false
-    rememberHeldGeneration(key, record.generation)
+    heldGenerations.set(key, record.generation)
   } catch (error) {
     record.generation = ++snapshots.next
     record.unsaved = true
@@ -143,7 +139,7 @@ export async function hydrateConversationState(
   for (let attempt = 0; attempt < 3 && !loaded; attempt++) {
     if (bound !== undefined) {
       // This copy's own queued writes hold state no newer than its memory; another copy's may.
-      if (attempt === 0 && holdsLatestSnapshot(key) && !otherCopyQueuedWrite(key)) return undefined
+      if (attempt === 0 && holdsLatestSnapshot(key) && !queuedWrite(key, true)) return undefined
       await settleConversationStateWrites(cacheDir, sessionKey)
       if (holdsLatestSnapshot(key)) return undefined
       if (snapshots.bySession.get(key)?.unsaved) {
@@ -154,16 +150,18 @@ export async function hydrateConversationState(
     }
     generation = snapshotRecord(key).generation
     const read = await loadPersistedConversation(cacheDir, sessionKey)
-    // A write that landed or was queued during the read may be newer than what was read.
-    if (snapshotRecord(key).generation === generation && !otherCopyQueuedWrite(key)) loaded = read
+    // A write that landed or was queued during the read, also this copy's own, may be newer than what was read.
+    if (snapshotRecord(key).generation === generation && !queuedWrite(key, false)) loaded = read
   }
   if (!loaded) {
     trace(`conversation persistence: hydration skipped sessionKey=${sessionKey} status=still-writing`)
     return undefined
   }
-  // A concurrent request in this copy already restored this generation.
-  if (bound !== undefined && heldGenerations.get(key) === generation) return undefined
-  rememberHeldGeneration(key, generation)
+  // A concurrent request in this copy already restored this generation, or moved the binding meanwhile.
+  if (bound !== undefined && (heldGenerations.get(key) === generation || boundConversationId(sessionKey) !== bound)) {
+    return undefined
+  }
+  heldGenerations.set(key, generation)
   if (bound !== undefined) {
     // This copy was behind: what is on disk (a snapshot, or none after a delete) replaces its per-session state.
     forgetTurnProvenance(sessionKey)

@@ -22,7 +22,7 @@ import {
   recordSessionEditsGuidance, resetSessionEditsGuidanceForTests, sessionEditsGuidance,
 } from "../src/protocol/session-edits.js"
 import { getConversationBlob, resetConversationBlobsForTests, setConversationBlob } from "../src/protocol/blob-store.js"
-import { clearCheckpoint, resetCheckpointsForTests, setCheckpoint } from "../src/protocol/checkpoint.js"
+import { clearCheckpoint, getCheckpoint, resetCheckpointsForTests, setCheckpoint } from "../src/protocol/checkpoint.js"
 import { encodeMessage } from "../src/protocol/messages.js"
 
 const roots: string[] = []
@@ -309,6 +309,65 @@ test("a copy behind takes what is on disk, also a delete or a snapshot without p
   } finally {
     other.persistence.resetConversationPersistenceForTests()
     resetTurnProvenanceForTests()
+    resetCheckpointsForTests()
+  }
+})
+
+test("a copy's own save requested during its read wins over the older snapshot", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const sessionKey = "own-save-during-read"
+  const conversationId = peekConversationId(sessionKey)
+  const middle = encodeMessage("ConversationStateStructure", { token_details: { used_tokens: 5, max_tokens: 9 } })
+  const own = encodeMessage("ConversationStateStructure", { token_details: { used_tokens: 7, max_tokens: 9 } })
+  setCheckpoint(conversationId, checkpointBytes)
+  let save: Promise<void> | undefined
+  try {
+    await persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    await other.state.hydrateConversationState(cache, sessionKey)
+    other.checkpoint.setCheckpoint(conversationId, middle)
+    await other.state.persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    setConversationPersistenceHookForTests(phase => {
+      if (phase !== "full-decode" || save) return
+      setCheckpoint(conversationId, own)
+      save = persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    })
+    expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    await save
+    expect(getCheckpoint(conversationId)).toEqual(own)
+    expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    expect(getCheckpoint(conversationId)).toEqual(own)
+  } finally {
+    setConversationPersistenceHookForTests()
+    await save
+    other.persistence.resetConversationPersistenceForTests()
+    resetCheckpointsForTests()
+  }
+})
+
+test("a copy behind leaves its state alone when its own request moves the binding during the read", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const sessionKey = "rebound-during-read"
+  const conversationId = peekConversationId(sessionKey)
+  const replaced: string[] = []
+  onCopyStateReplaced(key => replaced.push(key))
+  setCheckpoint(conversationId, checkpointBytes)
+  try {
+    await persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    await other.state.hydrateConversationState(cache, sessionKey)
+    await other.state.persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    let next: string | undefined
+    setConversationPersistenceHookForTests(phase => {
+      if (phase === "full-decode" && !next) next = bindConversationId(sessionKey, { reset: true }).conversationId
+    })
+    expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    expect(next).toBeDefined()
+    expect(replaced).toEqual([])
+    expect(peekConversationId(sessionKey)).toBe(next!)
+  } finally {
+    setConversationPersistenceHookForTests()
+    other.persistence.resetConversationPersistenceForTests()
     resetCheckpointsForTests()
   }
 })
