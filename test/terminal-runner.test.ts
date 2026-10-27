@@ -403,12 +403,15 @@ fs.createReadStream(job + "/pipe").on("data", chunk => fs.writeSync(fd, chunk))
   })
 
   it("keeps output after the soft-background window out of the result when the job finishes during the launcher's read", async () => {
-    const terminal = job("printf before; sleep 0.4; printf late", { timeoutMs: 300 })
+    const sampled = path.join(root, "launcher-sampled")
+    const terminal = job(`printf before; while [ ! -f '${sampled}' ]; do sleep 0.01; done; printf late`, { timeoutMs: 300 })
     const sample = '  cursor_output=$(( $(wc -c <"$cursor_terminal") - cursor_header ))'
     expect(terminal.command.split(sample)).toHaveLength(3)
-    // Hold the launcher after its sample until the job has published its final output bound.
+    // The job writes "late" only after the launcher's sample, and the launcher
+    // reads the final output bound only after the job has published it.
     terminal.command = terminal.command.replaceAll(sample, [
       sample,
+      `  : >'${sampled}'`,
       '  while [ ! -f "$cursor_job/output-bytes" ]; do sleep 0.01; done',
     ].join("\n"))
     const launched = await launch(terminal)
