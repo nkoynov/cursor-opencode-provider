@@ -212,7 +212,9 @@ export type CursorSession = {
   cacheDir?: string
   /** Latest eligible checkpoint emitted by this Run attempt. */
   resumeCheckpoint?: Uint8Array
-  /** When this Run attempt last accepted a checkpoint (epoch ms). */
+  /** The checkpoint this Run attempt was resumed from. */
+  resumedFromCheckpoint?: Uint8Array
+  /** When this Run attempt last accepted a checkpoint other than the one it resumed from (epoch ms). */
   checkpointAcceptedAt?: number
   /**
    * This Run asked the host for something, or the provider answered a query, since its last

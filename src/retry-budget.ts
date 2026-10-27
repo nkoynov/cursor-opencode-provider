@@ -84,11 +84,14 @@ export function retryCategory(failure: CursorProviderError): "server" | "transpo
     && failure.code !== "CURSOR_READ_IDLE_TIMEOUT" ? "transport" : "server"
 }
 
-/** A checkpoint Cursor saved after the stall window opened breaks the run of consecutive stalls. */
-export function noteRunProgress(budget: RetryBudget, checkpointAcceptedAt: number | undefined): void {
-  if (checkpointAcceptedAt !== undefined && budget.stallStartedAt !== undefined && checkpointAcceptedAt > budget.stallStartedAt) {
-    budget.stallStartedAt = undefined
-  }
+/**
+ * Only stalls back to back share the stall window: any other failure, or a new checkpoint Cursor saved
+ * after the window opened, ends it, including on recovery paths that never reserve a retry.
+ */
+export function noteRunFailure(budget: RetryBudget, failure: CursorProviderError, checkpointAcceptedAt: number | undefined): void {
+  const progressed = checkpointAcceptedAt !== undefined && budget.stallStartedAt !== undefined
+    && checkpointAcceptedAt > budget.stallStartedAt
+  if (progressed || failure.code !== "CURSOR_SEMANTIC_IDLE_TIMEOUT") budget.stallStartedAt = undefined
 }
 
 /** Reserve one retry before either reopening locally or handing it to OpenCode. */

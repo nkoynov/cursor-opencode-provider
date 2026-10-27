@@ -452,6 +452,52 @@ describe("the turn's stall window", () => {
     expect(budget.retries).toBe(2)
   })
 
+  it("does not count the checkpoint a resumed Run started from as progress", async () => {
+    const resumedFrom = [0x0a, 0x01, 0x06]
+    await expect(pumpWithRecovery({
+      initialSession: fakeSession("echoed-then-stalled", [{ frame: checkpoint(resumedFrom) }], {
+        resumedFromCheckpoint: Uint8Array.from(resumedFrom),
+      }),
+      controller: controller(),
+      retryPolicy: stallPolicy,
+      retryBudget: windowOpenedLongAgo(),
+      recover: async () => fakeSession("unused", [{ frame: turnEnded() }]),
+    })).rejects.toBeInstanceOf(CursorRetryExhaustedError)
+  })
+
+  it("marks the checkpoint a Run was resumed from, so only a newer one counts", async () => {
+    const budget = { ...newRetryBudget(), stallStartedAt: Date.now() - 1_000, transport: 1, retries: 1 }
+    let resumedRun: CursorSession | undefined
+    await expect(pumpWithRecovery({
+      initialSession: fakeSession("saved-then-stalled", [{ frame: text("partial") }, { frame: checkpoint([0x0a, 0x01, 0x04]) }]),
+      controller: controller(),
+      retryPolicy: stallPolicy,
+      retryBudget: budget,
+      recover: async () => {
+        budget.stallStartedAt = Date.now() - 200_000
+        resumedRun = fakeSession("resumed-echo", [{ frame: checkpoint([0x0a, 0x01, 0x04]) }])
+        return resumedRun
+      },
+    })).rejects.toBeInstanceOf(CursorRetryExhaustedError)
+    expect(Array.from(resumedRun!.resumedFromCheckpoint!)).toEqual([0x0a, 0x01, 0x04])
+    expect(resumedRun!.checkpointAcceptedAt).toBeUndefined()
+  })
+
+  it("lets a capacity refusal between two stalls end the stall window", async () => {
+    let recoveries = 0
+    const final = await pumpWithRecovery({
+      initialSession: fakeSession("refused-after-stall", [{ frame: endStreamError("resource_exhausted") }]),
+      controller: controller(),
+      retryPolicy: { ...stallPolicy, capacityMaxAttempts: 6 },
+      retryBudget: windowOpenedLongAgo(),
+      recover: async () => ++recoveries === 1
+        ? fakeSession("stalls", [])
+        : fakeSession("after", [{ frame: turnEnded() }]),
+    })
+    expect(final.sessionId).toBe("after")
+    expect(recoveries).toBe(2)
+  })
+
   it("still ends the turn when stalls follow each other without a checkpoint for 180 seconds", async () => {
     await expect(pumpWithRecovery({
       initialSession: fakeSession("stalled-again", [{ frame: text("partial") }]),

@@ -3,7 +3,7 @@ import path from "node:path"
 import { createHash } from "node:crypto"
 import { APICallError } from "@ai-sdk/provider"
 import protobuf from "protobufjs"
-import { endlessRetriesEnabled, newRetryBudget, turnRetryBudget, forgetRetryBudget, noteRunProgress, reserveRetry, resetRetryBudgetsForTests, type RetryBudget } from "./retry-budget.js"
+import { endlessRetriesEnabled, newRetryBudget, turnRetryBudget, forgetRetryBudget, noteRunFailure, reserveRetry, resetRetryBudgetsForTests, type RetryBudget } from "./retry-budget.js"
 import type { LanguageModelV3, LanguageModelV3CallOptions, LanguageModelV3StreamResult, LanguageModelV3GenerateResult, LanguageModelV3StreamPart, LanguageModelV3Usage, LanguageModelV3FinishReason } from "@ai-sdk/provider"
 import type { CreateCursorOptions, CursorRetryOptions } from "./index.js"
 import {
@@ -1111,7 +1111,8 @@ function acceptResumeCheckpoint(session: CursorSession, bytes: Uint8Array, frame
   }
   if (arrivedBeforeResultWrite(session, frame)) return false
   session.resumeCheckpoint = Uint8Array.from(bytes)
-  session.checkpointAcceptedAt = Date.now()
+  const resumedFrom = session.resumedFromCheckpoint
+  if (!resumedFrom || !Buffer.from(bytes).equals(resumedFrom)) session.checkpointAcceptedAt = Date.now()
   session.checkpointRevoked = false
   session.checkpointRevokedByHostResult = false
   session.earlierCheckpointStale = false
@@ -1811,6 +1812,7 @@ export async function pumpWithRecovery(input: {
   const reopenAttempt = async (pumped: CursorSession, failure: CursorProviderError, checkpoint: Uint8Array | undefined) => {
     try {
       session = await reopen(pumped, failure, checkpoint)
+      if (checkpoint) session.resumedFromCheckpoint = checkpoint
     } catch (error) {
       const failure = toCursorProviderError(error, { replaySafe: true, fallback: "Cursor recovery setup failed" })
       // The failed upload belongs to the replacement Run. The preceding Run's
@@ -1882,7 +1884,7 @@ export async function pumpWithRecovery(input: {
         `attempt=${attempt} elapsedMs=${Date.now() - pumpStartedAt} code=${failure.code} transient=${failure.transient} ` +
         `replaySafe=${failure.replaySafe} barrier=${failure.replayBarrier ?? "none"} ` +
         `checkpoint=${!!pumpedSession.resumeCheckpoint} revoked=${!!pumpedSession.checkpointRevoked} pending=${pumpedSession.pending.size}`)
-      noteRunProgress(retryBudget, pumpedSession.checkpointAcceptedAt)
+      noteRunFailure(retryBudget, failure, pumpedSession.checkpointAcceptedAt)
       // A renewable credential error may follow a checkpoint too. Retain it
       // before either recovery path so a later attempt can still resume it.
       const ownCheckpoint = resumableCheckpoint(pumpedSession)

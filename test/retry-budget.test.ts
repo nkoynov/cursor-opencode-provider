@@ -3,7 +3,7 @@ import { CursorRetryExhaustedError, CursorServerError, CursorTransportError, hos
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
 import { retryTurnKey } from "../src/language-model.js"
 import type { LanguageModelV3Prompt } from "@ai-sdk/provider"
-import { endlessRetriesEnabled, forgetRetryBudget, newRetryBudget, noteRunProgress, reserveRetry, resetRetryBudgetsForTests, retryCategory, turnRetryBudget } from "../src/retry-budget.js"
+import { endlessRetriesEnabled, forgetRetryBudget, newRetryBudget, noteRunFailure, reserveRetry, resetRetryBudgetsForTests, retryCategory, turnRetryBudget } from "../src/retry-budget.js"
 
 const savedEndless = process.env.CURSOR_ENDLESS_RETRIES
 afterEach(() => {
@@ -146,12 +146,19 @@ describe("Cursor CLI retry budgets", () => {
   it("opens a new stall window once a checkpoint arrived after the last one opened", () => {
     const budget = newRetryBudget()
     reserveRetry(budget, stall(), undefined, 100)
-    noteRunProgress(budget, 100)
-    noteRunProgress(budget, undefined)
+    noteRunFailure(budget, stall(), 100)
+    noteRunFailure(budget, stall(), undefined)
     expect(budget.stallStartedAt).toBe(100)
-    noteRunProgress(budget, 50_000)
+    noteRunFailure(budget, stall(), 50_000)
     reserveRetry(budget, stall(), undefined, 182_000)
     expect(budget.stallStartedAt).toBe(182_000)
     expect(() => reserveRetry(budget, stall(), undefined, 362_000)).toThrow(CursorRetryExhaustedError)
+  })
+
+  it("ends the stall window on any other failure, also one that reserves no retry", () => {
+    const budget = newRetryBudget()
+    reserveRetry(budget, stall(), undefined, 100)
+    noteRunFailure(budget, server(), undefined)
+    expect(budget.stallStartedAt).toBeUndefined()
   })
 })
