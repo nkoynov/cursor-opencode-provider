@@ -65,7 +65,7 @@ import {
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { sessionFixture } from "./session-fixture.js"
 import { restoreConversationBinding } from "../src/protocol/conversation-bind.js"
-import { setConversationPersistenceHookForTests } from "../src/protocol/conversation-persistence.js"
+import { setConversationPersistenceHookForTests, waitForConversationMaintenanceForTests } from "../src/protocol/conversation-persistence.js"
 import {
   hostGlobalDataDir,
   getHostCacheDirOverride,
@@ -1102,6 +1102,8 @@ describe("CreatePlan full-pump host write and patch matrix", () => {
       sessionManager.close(session, "ordinary-cleanup")
       resetPlanOperationsForTests()
       setHostCacheDirOverride(previousCache)
+      // The held Run skips hydration, so nothing else awaits the model's background cache setup.
+      await waitForConversationMaintenanceForTests(workspace)
     }
   })
 
