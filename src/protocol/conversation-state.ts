@@ -62,15 +62,30 @@ type SnapshotRecord = {
   held: Map<string, number>
   reading: number
 }
+// A copy of an older build loaded in the same process (7d3650e) shares this map and creates records without the
+// fields added since; it reads only generation, unsaved and queued.
+type StoredRecord = Pick<SnapshotRecord, "generation" | "unsaved" | "queued"> & Partial<SnapshotRecord>
 const copyId = randomUUID()
 const snapshots = processShared("conversation-snapshot-generations.v1", () => ({
   next: 0,
-  bySession: new Map<string, SnapshotRecord>(),
+  bySession: new Map<string, StoredRecord>(),
 }))
 const snapshotKey = (cacheDir: string, sessionKey: string) => JSON.stringify([path.resolve(cacheDir), sessionKey])
 
+function upgraded(key: string, record: StoredRecord): SnapshotRecord {
+  record.sessionKey ??= (JSON.parse(key) as [string, string])[1]
+  record.held ??= new Map()
+  record.reading ??= 0
+  return record as SnapshotRecord
+}
+
+function existingRecord(key: string): SnapshotRecord | undefined {
+  const record = snapshots.bySession.get(key)
+  return record && upgraded(key, record)
+}
+
 function snapshotRecord(key: string, sessionKey: string): SnapshotRecord {
-  let record = snapshots.bySession.get(key)
+  let record = existingRecord(key)
   if (!record) {
     record = { sessionKey, generation: ++snapshots.next, unsaved: false, queued: new Map(), held: new Map(), reading: 0 }
     snapshots.bySession.set(key, record)
@@ -80,19 +95,20 @@ function snapshotRecord(key: string, sessionKey: string): SnapshotRecord {
 }
 
 function pruneSnapshotRecords(keep: string): void {
-  for (const [key, record] of snapshots.bySession) {
+  for (const [key, stored] of snapshots.bySession) {
     if (snapshots.bySession.size <= MAX_ACTIVE_CONVERSATION_BINDINGS) return
+    const record = upgraded(key, stored)
     if (key === keep || record.queued.size > 0 || record.reading > 0) continue
     if (boundConversationId(record.sessionKey) === undefined) snapshots.bySession.delete(key)
   }
 }
 
 function heldGeneration(key: string): number | undefined {
-  return snapshots.bySession.get(key)?.held.get(copyId)
+  return existingRecord(key)?.held.get(copyId)
 }
 
 function holdsLatestSnapshot(key: string): boolean {
-  const record = snapshots.bySession.get(key)
+  const record = existingRecord(key)
   return !!record && record.held.get(copyId) === record.generation
 }
 

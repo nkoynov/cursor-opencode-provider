@@ -25,6 +25,7 @@ import {
 import { getConversationBlob, resetConversationBlobsForTests, setConversationBlob } from "../src/protocol/blob-store.js"
 import { clearCheckpoint, getCheckpoint, resetCheckpointsForTests, setCheckpoint } from "../src/protocol/checkpoint.js"
 import { encodeMessage } from "../src/protocol/messages.js"
+import { processShared } from "../src/process-shared.js"
 
 const roots: string[] = []
 const root = () => {
@@ -595,6 +596,26 @@ test("a module copy restoring a snapshot keeps process-shared state and a pendin
     expect(hasLostRequest(sessionKey)).toBe(false)
   } finally {
     dropLostRequest(sessionKey)
+    other.persistence.resetConversationPersistenceForTests()
+    resetCheckpointsForTests()
+  }
+})
+
+test("a snapshot record an older build's copy in the same process created keeps working", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const sessionKey = "older-build-record"
+  const conversationId = peekConversationId(sessionKey)
+  const shared = processShared("conversation-snapshot-generations.v1", () => ({ next: 0, bySession: new Map() })) as
+    { next: number; bySession: Map<string, unknown> }
+  shared.bySession.set(JSON.stringify([resolve(cache), sessionKey]), { generation: ++shared.next, unsaved: false, queued: new Map() })
+  setCheckpoint(conversationId, checkpointBytes)
+  try {
+    await persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    expect((await other.state.hydrateConversationState(cache, sessionKey))?.replacesCopyState).toBe(true)
+    expect(other.checkpoint.getCheckpoint(conversationId)).toEqual(checkpointBytes)
+  } finally {
     other.persistence.resetConversationPersistenceForTests()
     resetCheckpointsForTests()
   }
