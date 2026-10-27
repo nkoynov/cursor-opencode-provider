@@ -1249,6 +1249,8 @@ async function doStreamImpl(
     // A held exec belongs to the history the host just replaced. Its results
     // must seed the compacted prompt, never continue the old server Run.
     for (const held of sessionManager.openSessionsStoppedWith(rewriteSessionKey)) {
+      // Fork: the compacted seed keeps only the notes it holds; the next Run's setup leaves those out again.
+      if (held.userTurnHostNotes?.length) appendUndeliveredHostNotes(rewriteSessionKey, held.userTurnHostNotes)
       sessionManager.close(held, "superseded-by-new-run")
     }
   }

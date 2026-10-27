@@ -239,7 +239,10 @@ describe("checkpoint eligibility across host results", () => {
         const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Original large history" }] }]
         const options: LanguageModelV3CallOptions = { prompt, headers: { "x-opencode-session-id": key },
           tools: [{ type: "function", name: "bash", inputSchema: { type: "object", properties: { command: { type: "string" } } } }] }
+        // Fork: a note the held Run carries is not in the compacted history and must reach the replacement Run.
+        if (scenario === "held") restorePersistedHostNotes(key, encodePersistedHostNotes(["<system-update>Use bazel for builds.</system-update>"]))
         const parts = await readParts(model, options)
+        if (scenario === "held") expect(requests[0]!.action.user_message_action!.user_message.text).toContain("Use bazel for builds.")
         if (scenario === "held") {
           appendResult(prompt, parts, "COMPLETED_HOST_RESULT")
           await notifyHostInterrupt(key, "shutdown")
@@ -274,6 +277,7 @@ describe("checkpoint eligibility across host results", () => {
         expect(seed).toContain("COMPACTED_HOST_SUMMARY")
         expect(seed).not.toContain("Original large history")
         if (scenario === "held") expect(seed).toContain("COMPLETED_HOST_RESULT")
+        if (scenario === "held") expect(seed.split("Use bazel for builds.")).toHaveLength(2)
         expect(hasHostHistoryRewrite(root, key)).toBe(false)
         prompt.push({ role: "assistant", content: [{ type: "text", text: "Cursor answer" }] },
           { role: "user", content: [{ type: "text", text: "Next warm turn" }] })
