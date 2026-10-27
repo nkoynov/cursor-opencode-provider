@@ -1207,6 +1207,7 @@ export async function bidiRunStream(
   let unanswered: Uint8Array[] | undefined = []
   // A Run on a session reused without its ping is also sent once more if that session turns out dead.
   let resendOnLoss = !lease.verified
+  let resentAfterLoss = false
   let goawayResends = 0
   // Frames written while that new connection opens.
   let resending: Uint8Array[] | undefined
@@ -1228,6 +1229,7 @@ export async function bidiRunStream(
       const replacement = await acquireSession(options.baseURL, sessionOptions)
       try {
         session = replacement.session
+        resendOnLoss = !replacement.verified
         stream = openStream()
       } finally {
         replacement.release()
@@ -1382,6 +1384,7 @@ export async function bidiRunStream(
     unanswered = undefined
     resending = frames
     if (refusal.goaway) goawayResends++
+    else resentAfterLoss = true
     resendOnLoss = false
     streamGeneration++
     if (inboundReaderStarted) stream.removeListener("data", onInboundChunk)
@@ -1400,6 +1403,8 @@ export async function bidiRunStream(
       const replacement = await acquireSession(options.baseURL, sessionOptions)
       try {
         session = replacement.session
+        // A GOAWAY resend onto another lane reused without its ping keeps the one resend after a loss.
+        resendOnLoss = !replacement.verified && !resentAfterLoss
         if (!locallyClosed && !terminalEvent && !streamFailure) next = openStream()
       } finally {
         replacement.release()

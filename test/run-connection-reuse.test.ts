@@ -46,6 +46,7 @@ async function startFakeCursor() {
   const muted = new Set<number>()
   let connections = 0
   let dropNextRequest: number | undefined
+  const dropNextRequestOn = new Map<number, number>()
   const dropAll = () => {
     for (const client of clients) client.destroy()
   }
@@ -115,9 +116,11 @@ async function startFakeCursor() {
     let swallowing = false
     client.on("data", (chunk) => {
       if (swallowing || muted.has(connection)) return
-      if (dropNextRequest !== undefined) {
-        const afterMs = dropNextRequest
-        dropNextRequest = undefined
+      const dropHere = dropNextRequestOn.get(connection)
+      if (dropHere !== undefined || dropNextRequest !== undefined) {
+        const afterMs = dropHere ?? dropNextRequest!
+        if (dropHere !== undefined) dropNextRequestOn.delete(connection)
+        else dropNextRequest = undefined
         swallowing = true
         client.pause()
         setTimeout(() => { client.destroy(); upstream.destroy() }, afterMs)
@@ -143,7 +146,10 @@ async function startFakeCursor() {
      * The next bytes a client sends are never forwarded and its connection is cut `afterMs` later, as a
      * stale one would be; meanwhile nothing more is read from it.
      */
-    dropNextRequest(afterMs = 0) { dropNextRequest = afterMs },
+    dropNextRequest(afterMs = 0, connection?: number) {
+      if (connection === undefined) dropNextRequest = afterMs
+      else dropNextRequestOn.set(connection, afterMs)
+    },
     dropConnection(index: number) { clientsByConnection.get(index)?.destroy() },
     /** Stops forwarding what the client sends on a connection, so Cursor sees neither its pings nor its GOAWAY. */
     muteClient(index: number) { muted.add(index) },
@@ -719,6 +725,36 @@ describe("Runs on a connection Cursor drains with a GOAWAY", () => {
     ])
     below.end()
     above.end()
+  }, SLOW_TEST_MS)
+
+  it("keeps the one resend after a loss when a GOAWAY moves a Run onto a lane reused without its ping", async () => {
+    const lane0: BidiStream[] = []
+    let lane0Session: http2.ClientHttp2Session | undefined
+    for (let i = 0; i < RUNS_PER_HTTP2_SESSION; i++) {
+      fake.answers.push("answer-then-hold")
+      const run = await bidiRunStream("token", { baseURL: ORIGIN })
+      run.write(new Uint8Array([8]))
+      expect((await nextFrame(run)).done).toBe(false)
+      lane0.push(run)
+      lane0Session ??= await getSession(ORIGIN)
+    }
+    fake.answers.push("hold")
+    const moved = await bidiRunStream("token", { baseURL: ORIGIN })
+    moved.write(new Uint8Array([9]))
+    await until(() => fake.streams.length === RUNS_PER_HTTP2_SESSION + 1 && fake.streams.at(-1)!.bytes === 6)
+    lane0[0]!.end()
+    await until(() => openRunStreamsForTests(lane0Session!) === RUNS_PER_HTTP2_SESSION - 1)
+    await sleep(20)
+    const lane0Request = spyOn(lane0Session!, "request")
+    fake.dropNextRequest(0, 0)
+
+    fake.injectGoaway(1, 0)
+    expect(await within(nextFrame(moved).then((frame) => frame.done), 3_000)).toBe(false)
+
+    expect(lane0Request).toHaveBeenCalledTimes(1)
+    expect(fake.connections).toBe(3)
+    expect(fake.streams.at(-1)).toMatchObject({ answer: "answer", connection: 2 })
+    for (const run of [...lane0.slice(1), moved]) run.end()
   }, SLOW_TEST_MS)
 
   it("does not send a Run again when the GOAWAY says Cursor may have processed it", async () => {
