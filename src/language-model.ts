@@ -1295,6 +1295,7 @@ async function doStreamImpl(
   // started the next step with old tools still in the prompt body.
   let trailingToolResults = extractTrailingToolResults(prompt)
   let steerInjections: EarlySteer[] = []
+  let steerReachesRun = false
   let steeredPrompt = false
   let steeredSession: CursorSession | undefined
   if (trailingToolResults.length === 0) {
@@ -1304,7 +1305,7 @@ async function doStreamImpl(
       incomingTools: extractTools(callOptions),
     })
     if (steered) {
-      ({ results: trailingToolResults, session: steeredSession, inject: steerInjections } = steered)
+      ({ results: trailingToolResults, session: steeredSession, inject: steerInjections, messageReachesRun: steerReachesRun } = steered)
       // Any of the step's messages may go out as a follow-up, which needs a checkpoint that holds the step's results.
       steeredPrompt = true
     }
@@ -1369,6 +1370,7 @@ async function doStreamImpl(
       }
       session = await deliverContinuationResults(held, results, {
         steer: steerInjections,
+        messageReachesRun: steerReachesRun,
         hostAgent: hostAgentFromCallOptions(callOptions),
         sessionEditsDenied: sessionEditsDeniedFromCallOptions(callOptions),
         sessionPermissionsUnavailable: sessionPermissionsUnavailableFromCallOptions(callOptions),
@@ -4272,7 +4274,10 @@ const continuationDeliveryChains = new WeakMap<CursorSession, Promise<CursorSess
 export async function deliverContinuationResults(
   session: CursorSession,
   trailingToolResults: ExtractedToolResult[],
-  delivery: { steer?: readonly EarlySteer[]; hostAgent?: string; sessionEditsDenied?: boolean; sessionPermissionsUnavailable?: boolean } = {},
+  delivery: {
+    steer?: readonly EarlySteer[]; messageReachesRun?: boolean; hostAgent?: string; sessionEditsDenied?: boolean
+    sessionPermissionsUnavailable?: boolean
+  } = {},
 ): Promise<CursorSession | undefined> {
   // Claim, result writes, state transitions and the step's note injection form
   // one delivery. Serializing individual frames cannot prevent two callers
@@ -4292,7 +4297,10 @@ async function deliverContinuationResultsNow(
   session: CursorSession,
   trailingToolResults: ExtractedToolResult[],
   /** Host primary agent of the request that carries these results. */
-  delivery: { steer?: readonly EarlySteer[]; hostAgent?: string; sessionEditsDenied?: boolean; sessionPermissionsUnavailable?: boolean } = {},
+  delivery: {
+    steer?: readonly EarlySteer[]; messageReachesRun?: boolean; hostAgent?: string; sessionEditsDenied?: boolean
+    sessionPermissionsUnavailable?: boolean
+  } = {},
 ): Promise<CursorSession | undefined> {
   const pendingResults = trailingToolResults.filter(
     (r) => r.sessionId === session.sessionId && session.pending.has(r.execId),
@@ -4737,7 +4745,7 @@ async function deliverContinuationResultsNow(
     }
   }
   if (delivery.steer?.length && !(await injectPromotedSteers(session, delivery.steer))) return undefined
-  if (delivery.steer?.length && !(await settleReviewForSteer(session))) return undefined
+  if ((delivery.steer?.length || delivery.messageReachesRun) && !(await settleReviewForSteer(session))) return undefined
   if (deliveredResults > 0) recordSessionEditsGuidance(session.conversationId, delivery.sessionEditsDenied)
   return session
 }
@@ -5202,7 +5210,7 @@ export function continuationAfterEarlySteers(
   prompt: LanguageModelV3CallOptions["prompt"],
   sessionKey: string | undefined,
   guard?: HeldSteerGuard,
-): { results: ExtractedToolResult[]; session: CursorSession; inject: EarlySteer[] } | undefined {
+): { results: ExtractedToolResult[]; session: CursorSession; inject: EarlySteer[]; messageReachesRun: boolean } | undefined {
   const held = sessionKey ? sessionManager.findOpenByOpenCodeSessionId(sessionKey) : undefined
   if (!held || held.pending.size === 0) return undefined
   const tail = trailingUserTexts(prompt)
@@ -5254,7 +5262,7 @@ export function continuationAfterEarlySteers(
       `the held Run already has inboxIDs=${steers.map((steer) => steer.inboxID).join(",")} ` +
       `and ${added.length} new message(s)${injectNew ? " to inject" : " for a follow-up"}`,
   )
-  return { results, session: held, inject: injectNew ? added : [] }
+  return { results, session: held, inject: injectNew ? added : [], messageReachesRun: steers.length > 0 || (injectNew && added.length > 0) }
 }
 
 async function loadAvailableModels(): Promise<void> {
@@ -8372,7 +8380,8 @@ const CREATE_PLAN_SUPERSEDED_BY_MESSAGE_REASON =
   + "Read their message, then stay in plan mode and revise the plan or answer it. Do not start implementing yet."
 
 /**
- * Fork: a message injected with the plan writer's result reaches Cursor before the queued review, so approving the
+ * Fork: a user message injected with the plan writer's result, or one the Run already holds as an early steer,
+ * reaches Cursor before the queued review, so approving the
  * plan as saved could approve one the message changes. The review is settled as not approved; the plan is still shown.
  */
 async function settleReviewForSteer(session: CursorSession): Promise<boolean> {

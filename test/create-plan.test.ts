@@ -1182,7 +1182,7 @@ describe("CreatePlan full-pump host write and patch matrix", () => {
     }
   })
 
-  it("shows the plan without asking for approval when a user message arrives with the writer's result", async () => {
+  it.each(["injected", "held"] as const)("shows the plan without asking for approval when a user message arrives with the writer's result (%s)", async steer => {
     resetPlanOperationsForTests()
     setActiveCursorMode("create-plan-opencode-session", "plan")
     const { session, writes, parts } = await runCreatePlan([
@@ -1195,7 +1195,9 @@ describe("CreatePlan full-pump host write and patch matrix", () => {
       await deliverContinuationResults(session, [{
         toolCallId: call.toolCallId, sessionId: session.sessionId,
         execId: Number(call.toolCallId.split("_").pop()), toolName: "write", output: "Saved",
-      }], { steer: [{ injectionId: "inject-1", text: "Also handle --whisper." }] as any })
+      }], steer === "injected"
+        ? { steer: [{ injectionId: "inject-1", text: "Also handle --whisper." }] as any }
+        : { messageReachesRun: true })
       await pump(session, { enqueue(part: LanguageModelV3StreamPart) { parts.push(part) }, error() {} } as ReadableStreamDefaultController<LanguageModelV3StreamPart>,
         { textId: "steered", reasoningId: "r" })
       expect(parts.filter(part => part.type === "tool-call" && part.toolName === "question")).toHaveLength(0)
@@ -1204,8 +1206,10 @@ describe("CreatePlan full-pump host write and patch matrix", () => {
       const injected = messages.findIndex(message => message.conversation_action?.inject_user_message_action
         ?? message.inject_user_message ?? JSON.stringify(message).includes("Also handle --whisper."))
       const reply = messages.findIndex(message => message.interaction_response?.create_plan_request_response)
-      expect(injected).toBeGreaterThanOrEqual(0)
-      expect(reply).toBeGreaterThan(injected)
+      if (steer === "injected") {
+        expect(injected).toBeGreaterThanOrEqual(0)
+        expect(reply).toBeGreaterThan(injected)
+      } else expect(reply).toBeGreaterThanOrEqual(0)
       expect(messages[reply].interaction_response.create_plan_request_response.result.error.error).toContain("new message")
       expect(session.planReviewDeclined).toBeFalsy()
       expect(planOperationsFor(session.openCodeSessionId)).toHaveLength(0)

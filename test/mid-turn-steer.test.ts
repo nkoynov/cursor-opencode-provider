@@ -154,7 +154,7 @@ const TOOLS = [{ name: "read" }]
 /** The held-Run continuation of a user step for `wireModelId`, and the messages it injects. */
 function steered(prompt: Prompt, sessionKey: string | undefined = OPENCODE_SESSION, wireModelId = MODEL, incomingTools = TOOLS) {
   const found = continuationAfterEarlySteers(prompt, sessionKey, { userStep: true, wireModelId, incomingTools })
-  return found && { results: found.results, messages: found.inject.map((record) => record.text) }
+  return found && { results: found.results, messages: found.inject.map((record) => record.text), reaches: found.messageReachesRun }
 }
 
 /** A message the held Run `run` was sent, as OpenCode promoted it after the step's results. */
@@ -179,8 +179,9 @@ describe("mid-turn user message after a complete step", () => {
   it("injects a message once when the host repeats the step", () => {
     heldReads("repeated")
     const prompt = steer("repeated", user("also check 3.ts"))
-    expect(steered(prompt)?.messages).toEqual(["also check 3.ts"])
-    expect(steered(prompt)?.messages).toEqual([])
+    expect(steered(prompt)).toMatchObject({ messages: ["also check 3.ts"], reaches: true })
+    // The held Run already has it: not injected again, but it still reaches Cursor before anything queued.
+    expect(steered(prompt)).toMatchObject({ messages: [], reaches: true })
   })
 
   it("keeps each message separate, and the step's host notes with its results", () => {
