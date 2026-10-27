@@ -4737,6 +4737,7 @@ async function deliverContinuationResultsNow(
     }
   }
   if (delivery.steer?.length && !(await injectPromotedSteers(session, delivery.steer))) return undefined
+  if (delivery.steer?.length && !(await settleReviewForSteer(session))) return undefined
   if (deliveredResults > 0) recordSessionEditsGuidance(session.conversationId, delivery.sessionEditsDenied)
   return session
 }
@@ -8363,6 +8364,40 @@ async function injectPromotedSteers(session: CursorSession, steers: readonly Ear
     `steer: injected ${steers.length} promoted message(s) runId=${session.runId} ` +
       `ids=${steers.map((steer) => steer.injectionId).join(",")}`,
   )
+  return true
+}
+
+const CREATE_PLAN_SUPERSEDED_BY_MESSAGE_REASON =
+  "The user sent a new message before reviewing this plan, so no implementation was approved. "
+  + "Read their message, then stay in plan mode and revise the plan or answer it. Do not start implementing yet."
+
+/**
+ * Fork: a message injected with the plan writer's result reaches Cursor before the queued review, so approving the
+ * plan as saved could approve one the message changes. The review is settled as not approved; the plan is still shown.
+ */
+async function settleReviewForSteer(session: CursorSession): Promise<boolean> {
+  const queued = session.queuedCreatePlanAction
+  if (queued?.kind !== "review") return true
+  let beforeReply = lastFrameArrival()
+  try {
+    await writeWithBackpressure(session.stream, buildCreatePlanInteractionReply(queued.interactionId, {
+      error: { error: CREATE_PLAN_SUPERSEDED_BY_MESSAGE_REASON }, plan_uri: "",
+    }), "create_plan review superseded by a user message", () => {
+      beforeReply = lastFrameArrival()
+      return true
+    })
+  } catch (error) {
+    trace(`create_plan: superseded review reply FAILED sessionId=${session.sessionId} err=${(error as Error).message}`)
+    sessionManager.close(session, "result-write-failed")
+    return false
+  }
+  invalidateResumeCheckpoint(session, beforeReply, true)
+  const unacknowledged = session.unacknowledgedHostResults ??= []
+  unacknowledged.push({ callId: queued.createPlanToolCallId, afterFrame: beforeReply })
+  session.queuedCreatePlanAction = { ...queued, kind: "ack" }
+  if (queued.receiptHostCallId) clearPlanOperation(session.openCodeSessionId, queued.receiptHostCallId)
+  await persistPlanOperations(session)
+  trace(`create_plan: review superseded by a user message interactionId=${queued.interactionId}; continuing in plan mode`)
   return true
 }
 

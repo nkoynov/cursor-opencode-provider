@@ -1182,6 +1182,40 @@ describe("CreatePlan full-pump host write and patch matrix", () => {
     }
   })
 
+  it("shows the plan without asking for approval when a user message arrives with the writer's result", async () => {
+    resetPlanOperationsForTests()
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const { session, writes, parts } = await runCreatePlan([
+      createPlanPayload({ name: "Steered", plan: "Original plan." }),
+      encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: {} } }),
+    ], ["write", "question"])
+    const call = parts.find(part => part.type === "tool-call")
+    session.runId = "run-steered"
+    try {
+      await deliverContinuationResults(session, [{
+        toolCallId: call.toolCallId, sessionId: session.sessionId,
+        execId: Number(call.toolCallId.split("_").pop()), toolName: "write", output: "Saved",
+      }], { steer: [{ injectionId: "inject-1", text: "Also handle --whisper." }] as any })
+      await pump(session, { enqueue(part: LanguageModelV3StreamPart) { parts.push(part) }, error() {} } as ReadableStreamDefaultController<LanguageModelV3StreamPart>,
+        { textId: "steered", reasoningId: "r" })
+      expect(parts.filter(part => part.type === "tool-call" && part.toolName === "question")).toHaveLength(0)
+      expect(parts.flatMap(part => part.type === "text-delta" ? [part.delta] : []).join("")).toContain("Original plan.")
+      const messages = writes.map(bytes => decodeMessage<any>("AgentClientMessage", bytes))
+      const injected = messages.findIndex(message => message.conversation_action?.inject_user_message_action
+        ?? message.inject_user_message ?? JSON.stringify(message).includes("Also handle --whisper."))
+      const reply = messages.findIndex(message => message.interaction_response?.create_plan_request_response)
+      expect(injected).toBeGreaterThanOrEqual(0)
+      expect(reply).toBeGreaterThan(injected)
+      expect(messages[reply].interaction_response.create_plan_request_response.result.error.error).toContain("new message")
+      expect(session.planReviewDeclined).toBeFalsy()
+      expect(planOperationsFor(session.openCodeSessionId)).toHaveLength(0)
+      expect(getActiveCursorMode(session.openCodeSessionId)).toBe("plan")
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+      resetPlanOperationsForTests()
+    }
+  })
+
   it("refuses a second parallel CreatePlan instead of losing its pending review", async () => {
     resetPlanOperationsForTests()
     setActiveCursorMode("create-plan-opencode-session", "plan")
