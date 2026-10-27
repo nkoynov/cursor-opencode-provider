@@ -8,13 +8,14 @@ import {
   noteHostHistoryRewrite, resetHostHistoryRewritesForTests,
 } from "../src/host-history-rewrite.js"
 import {
-  bindConversationId, peekConversationId, resetConversationBindingsForTests,
+  bindConversationId, MAX_ACTIVE_CONVERSATION_BINDINGS, peekConversationId, resetConversationBindingsForTests,
 } from "../src/protocol/conversation-bind.js"
 import {
   getPersistedConversation, resetConversationPersistenceForTests, setConversationPersistenceHookForTests,
 } from "../src/protocol/conversation-persistence.js"
 import {
   hydrateConversationState, onCopyStateReplaced, persistConversationState, resetSnapshotGenerationsForTests,
+  snapshotGenerationRecordsForTests,
 } from "../src/protocol/conversation-state.js"
 import { getTurnProvenance, resetTurnProvenanceForTests, restoreTurnProvenance } from "../src/protocol/turn-provenance.js"
 import { dropLostRequest, hasLostRequest, rememberLostRequest } from "../src/lost-request.js"
@@ -38,6 +39,15 @@ afterEach(() => {
   resetSnapshotGenerationsForTests()
   for (const value of roots.splice(0)) rmSync(value, { recursive: true, force: true })
 })
+/** The message a promise rejects with; bun-types types the `rejects` matchers as synchronous. */
+const rejectionMessage = async (promise: Promise<unknown>): Promise<string> => {
+  try {
+    await promise
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error)
+  }
+  throw new Error("Expected the promise to reject")
+}
 
 test("a save queued behind a slow write keeps blobs a later Run stores before its checkpoint", async () => {
   const cache = root()
@@ -83,8 +93,8 @@ test("a failed receipt save fails the request barrier and can be retried", async
   setConversationPersistenceHookForTests(phase => {
     if (phase === "before-write") throw new Error("disk unavailable")
   })
-  await expect(noteHostHistoryRewrite(cache, "retry", "evt_retry")).rejects.toThrow("disk unavailable")
-  await expect(awaitHostHistoryRewrite(cache, "retry")).rejects.toThrow("disk unavailable")
+  expect(await rejectionMessage(noteHostHistoryRewrite(cache, "retry", "evt_retry"))).toContain("disk unavailable")
+  expect(await rejectionMessage(awaitHostHistoryRewrite(cache, "retry"))).toContain("disk unavailable")
   expect(hasHostHistoryRewrite(cache, "retry")).toBe(true)
   setConversationPersistenceHookForTests()
   expect(await awaitHostHistoryRewrite(cache, "retry")).toBe(true)
@@ -383,8 +393,8 @@ test("no copy resumes an older snapshot while the latest save failed", async () 
     setConversationPersistenceHookForTests(phase => {
       if (phase === "before-write") throw new Error("disk full")
     })
-    await expect(persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } }))
-      .rejects.toThrow("disk full")
+    expect(await rejectionMessage(persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })))
+      .toContain("disk full")
     setConversationPersistenceHookForTests()
     expect(await other.state.hydrateConversationState(cache, sessionKey)).toBeUndefined()
     expect(other.checkpoint.getCheckpoint(conversationId)).toBeUndefined()
@@ -408,14 +418,102 @@ test("a copy behind another copy's failed save does not resume the older snapsho
     other.persistence.setConversationPersistenceHookForTests(phase => {
       if (phase === "before-write") throw new Error("disk full")
     })
-    await expect(other.state.persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } }))
-      .rejects.toThrow("disk full")
+    expect(await rejectionMessage(other.state.persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })))
+      .toContain("disk full")
     expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
     expect(getCheckpoint(conversationId)).toBeUndefined()
   } finally {
     other.persistence.setConversationPersistenceHookForTests()
     other.persistence.resetConversationPersistenceForTests()
     other.checkpoint.resetCheckpointsForTests()
+  }
+})
+
+test("a copy that served the conversation before drops its older checkpoint while another copy's latest save failed", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const sessionKey = "unsaved-after-return"
+  const conversationId = peekConversationId(sessionKey)
+  const middle = encodeMessage("ConversationStateStructure", { token_details: { used_tokens: 5, max_tokens: 9 } })
+  const live = encodeMessage("ConversationStateStructure", { token_details: { used_tokens: 7, max_tokens: 9 } })
+  const replaced: string[] = []
+  onCopyStateReplaced(key => replaced.push(key))
+  setCheckpoint(conversationId, checkpointBytes)
+  try {
+    await persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    await other.state.hydrateConversationState(cache, sessionKey)
+    other.checkpoint.setCheckpoint(conversationId, middle)
+    await other.state.persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    other.checkpoint.setCheckpoint(conversationId, live)
+    other.persistence.setConversationPersistenceHookForTests(phase => {
+      if (phase === "before-write") throw new Error("disk full")
+    })
+    expect(await rejectionMessage(other.state.persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })))
+      .toContain("disk full")
+    other.persistence.setConversationPersistenceHookForTests()
+    // Neither the snapshot nor this copy's own checkpoint holds the turns the other copy ran: start from host history.
+    expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    expect(getCheckpoint(conversationId)).toBeUndefined()
+    expect(replaced).toEqual([sessionKey])
+    expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    expect(replaced).toEqual([sessionKey])
+    // The copy whose save failed still holds the newest state.
+    expect(await other.state.hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    expect(other.checkpoint.getCheckpoint(conversationId)).toEqual(live)
+    await other.state.persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    expect((await hydrateConversationState(cache, sessionKey))?.replacesCopyState).toBe(true)
+    expect(getCheckpoint(conversationId)).toEqual(live)
+  } finally {
+    other.persistence.setConversationPersistenceHookForTests()
+    other.persistence.resetConversationPersistenceForTests()
+    other.checkpoint.resetCheckpointsForTests()
+    resetCheckpointsForTests()
+  }
+})
+
+test("a copy behind drops its older checkpoint when the latest snapshot is gone", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const sessionKey = "deleted-after-return"
+  const conversationId = peekConversationId(sessionKey)
+  setCheckpoint(conversationId, checkpointBytes)
+  try {
+    await persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    await other.state.hydrateConversationState(cache, sessionKey)
+    await other.state.clearPersistedConversationState(cache, sessionKey)
+    expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    expect(getCheckpoint(conversationId)).toBeUndefined()
+  } finally {
+    other.persistence.resetConversationPersistenceForTests()
+    other.checkpoint.resetCheckpointsForTests()
+    resetCheckpointsForTests()
+  }
+})
+
+test("a copy that gives up restoring drops its older checkpoint", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const sessionKey = "always-writing-after-return"
+  const conversationId = peekConversationId(sessionKey)
+  setCheckpoint(conversationId, checkpointBytes)
+  let saves = 0
+  try {
+    await persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    await other.state.hydrateConversationState(cache, sessionKey)
+    await other.state.persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    setConversationPersistenceHookForTests(async phase => {
+      if (phase !== "full-decode") return
+      saves++
+      await other.state.persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    })
+    expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    expect(saves).toBe(3)
+    expect(getCheckpoint(conversationId)).toBeUndefined()
+  } finally {
+    setConversationPersistenceHookForTests()
+    other.persistence.resetConversationPersistenceForTests()
+    other.checkpoint.resetCheckpointsForTests()
+    resetCheckpointsForTests()
   }
 })
 
@@ -498,6 +596,27 @@ test("a module copy restoring a snapshot keeps process-shared state and a pendin
   } finally {
     dropLostRequest(sessionKey)
     other.persistence.resetConversationPersistenceForTests()
+    resetCheckpointsForTests()
+  }
+})
+
+test("snapshot generation records stay bounded and keep every bound session's record", async () => {
+  const cache = root()
+  const sessionKey = "bound-among-many"
+  const conversationId = peekConversationId(sessionKey)
+  const live = encodeMessage("ConversationStateStructure", { token_details: { used_tokens: 7, max_tokens: 9 } })
+  setCheckpoint(conversationId, checkpointBytes)
+  try {
+    await persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    for (let index = 0; index <= MAX_ACTIVE_CONVERSATION_BINDINGS; index++) {
+      expect(await hydrateConversationState(cache, `unbound-${index}`)).toBeUndefined()
+    }
+    expect(snapshotGenerationRecordsForTests()).toBe(MAX_ACTIVE_CONVERSATION_BINDINGS)
+    // An evicted record would count this copy as behind and restore the older snapshot over its live checkpoint.
+    setCheckpoint(conversationId, live)
+    expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    expect(getCheckpoint(conversationId)).toEqual(live)
+  } finally {
     resetCheckpointsForTests()
   }
 })
