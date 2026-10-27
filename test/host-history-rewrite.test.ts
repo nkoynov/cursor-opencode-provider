@@ -641,3 +641,15 @@ test("snapshot generation records stay bounded and keep every bound session's re
     resetCheckpointsForTests()
   }
 })
+
+test("snapshot generation records of bound sessions are kept past the cap", async () => {
+  const cache = root()
+  for (let index = 0; index < MAX_ACTIVE_CONVERSATION_BINDINGS; index++) {
+    const sessionKey = `bound-${index}`
+    bindConversationId(sessionKey)
+    expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+  }
+  expect(snapshotGenerationRecordsForTests()).toBe(MAX_ACTIVE_CONVERSATION_BINDINGS)
+  expect(await hydrateConversationState(cache, "unbound-late")).toBeUndefined()
+  expect(snapshotGenerationRecordsForTests()).toBe(MAX_ACTIVE_CONVERSATION_BINDINGS + 1)
+})
