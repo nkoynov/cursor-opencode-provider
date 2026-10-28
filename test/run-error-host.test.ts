@@ -967,7 +967,7 @@ describe("host calls still running when the Run dies", () => {
 
   /** `held`: a state-changing command ends its step at once. `open`: a read waits in its step for the next listed call. */
   const setup = (step: "held" | "open",
-    cut: "reset" | "clean-close" | "reply-write" | "final" | "invalid-argument" | "kv-final" | "none", key: string,
+    cut: "reset" | "clean-close" | "clean-end" | "reply-write" | "final" | "invalid-argument" | "kv-final" | "none", key: string,
     before?: "unknown-frame" | "cursor-run-call" | "catalog-lookup" | "catalog-started",
     queued?: "next-step" | "cursor-run-call" | "appended-user" | "unknown-frame" | "exec-abort" | "checkpoint"
       | "catalog-lookup" | "catalog-started" | "catalog-invalid" | "own-completion") => {
@@ -1049,6 +1049,8 @@ describe("host calls still running when the Run dies", () => {
       setTimeout(() => {
         if (cut === "reset") stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR)
         else if (cut === "clean-close") stream.end()
+        // Cursor's end-of-stream frame without an error, as production Runs close.
+        else if (cut === "clean-end") stream.end(frame(Buffer.from("{}"), 2))
         else if (cut === "final") stream.end(frame(Buffer.from('{"error":{"code":"permission_denied"}}'), 2))
         else if (cut === "invalid-argument") stream.end(frame(Buffer.from('{"error":{"code":"invalid_argument"}}'), 2))
         else if (cut === "reply-write" || cut === "kv-final") {
@@ -1156,6 +1158,8 @@ describe("host calls still running when the Run dies", () => {
     ["held", "clean-close", undefined, "exec-abort"], ["held", "clean-close", undefined, "catalog-lookup"],
     ["held", "reset", undefined, "checkpoint"], ["open", "reset", undefined, "checkpoint"],
     ["held", "clean-close", "catalog-started", "own-completion"],
+    ["held", "clean-end", undefined, undefined], ["open", "clean-end", undefined, undefined],
+    ["held", "clean-end", undefined, "next-step"],
   ] as const) {
     it(`ends the step on its running host call and rebuilds from its result (${step} step, ${cut}${before ? `, ${before}` : ""}${queued ? `, queued ${queued}` : ""})`, async () => {
       const { requests, prompt, read, cleanup, waitForCut } = setup(step, cut, `ses_held_tool_cut_${step}_${cut}_${before}_${queued}`, before, queued)

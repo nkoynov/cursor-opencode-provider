@@ -1011,10 +1011,23 @@ async function settleLostRunFrames(run: LostRun): Promise<void> {
   }
 }
 
+/** A Connect end-of-stream frame without an error (`{}`): Cursor closed the Run, it gave no verdict. */
+function isCleanEndStream(frame: Frame): boolean {
+  if (!(frame.flags & 0x02)) return false
+  try {
+    const payload = decodeFramePayload(frame)
+    if (!payload.length) return false
+    const envelope = JSON.parse(new TextDecoder().decode(payload)) as { error?: unknown } | null
+    return !envelope?.error
+  } catch {
+    return false
+  }
+}
+
 /** Cursor's final verdict in a lost Run's queued end-of-stream frame, which wins over anything queued before it. */
 function queuedFinalVerdict(run: LostRun): CursorProviderError | undefined {
   for (const frame of run.heldFrames) {
-    if (!(frame.flags & 0x02)) continue
+    if (!(frame.flags & 0x02) || isCleanEndStream(frame)) continue
     let payload: Uint8Array
     try {
       payload = decodeFramePayload(frame)
@@ -6466,7 +6479,8 @@ export async function pump(
     }
     if (session.hostInterrupted) stopForHostInterrupt(next)
     if (toolStep.hostCalls > 0 && (next.done || next.value.flags & 0x02)) {
-      closeHeldToolStepAtRunEnd("Run ended", next.done ? undefined : endStreamFailure(next.value))
+      closeHeldToolStepAtRunEnd("Run ended",
+        next.done || isCleanEndStream(next.value) ? undefined : endStreamFailure(next.value))
       return
     }
     if (next.done) {
