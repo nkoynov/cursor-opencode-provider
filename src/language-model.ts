@@ -1011,14 +1011,15 @@ async function settleLostRunFrames(run: LostRun): Promise<void> {
   }
 }
 
-/** A Connect end-of-stream frame without an error (`{}`): Cursor closed the Run, it gave no verdict. */
+/** A Connect end-of-stream frame with no `error` (`{}`, or trailers only): Cursor closed the Run, it gave no verdict. */
 function isCleanEndStream(frame: Frame): boolean {
   if (!(frame.flags & 0x02)) return false
   try {
     const payload = decodeFramePayload(frame)
     if (!payload.length) return false
-    const envelope = JSON.parse(new TextDecoder().decode(payload)) as { error?: unknown } | null
-    return !envelope?.error
+    const envelope: unknown = JSON.parse(new TextDecoder().decode(payload))
+    return !!envelope && typeof envelope === "object" && !Array.isArray(envelope)
+      && Object.keys(envelope).every((key) => key === "metadata")
   } catch {
     return false
   }
