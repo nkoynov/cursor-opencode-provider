@@ -11,7 +11,8 @@ import {
   bindConversationId, MAX_ACTIVE_CONVERSATION_BINDINGS, peekConversationId, resetConversationBindingsForTests,
 } from "../src/protocol/conversation-bind.js"
 import {
-  getPersistedConversation, resetConversationPersistenceForTests, setConversationPersistenceHookForTests,
+  conversationCacheFilePath, getPersistedConversation, resetConversationPersistenceForTests,
+  setConversationPersistenceHookForTests,
 } from "../src/protocol/conversation-persistence.js"
 import {
   hydrateConversationState, onCopyStateReplaced, persistConversationState, resetSnapshotGenerationsForTests,
@@ -696,6 +697,78 @@ test("a copy whose snapshot record was evicted drops its older checkpoint once a
   } finally {
     other.persistence.resetConversationPersistenceForTests()
     other.checkpoint.resetCheckpointsForTests()
+    resetCheckpointsForTests()
+  }
+})
+
+test("a copy behind drops its older checkpoint once the snapshot another copy rebound the session from is unreadable", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const sessionKey = "rebound-then-unreadable"
+  const conversationId = peekConversationId(sessionKey)
+  const newer = encodeMessage("ConversationStateStructure", { token_details: { used_tokens: 7, max_tokens: 9 } })
+  setCheckpoint(conversationId, checkpointBytes)
+  try {
+    await persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    expect((await other.state.hydrateConversationState(cache, sessionKey))?.conversationId).toBe(conversationId)
+    other.checkpoint.setCheckpoint(conversationId, newer)
+    await other.state.persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    for (let index = 0; index < MAX_ACTIVE_CONVERSATION_BINDINGS; index++) {
+      bindConversationId(`busy-${index}`)
+      expect(await hydrateConversationState(cache, `busy-${index}`)).toBeUndefined()
+    }
+    // The record that saw the other copy's write is gone; the other copy rebinds the session from that snapshot.
+    expect((await other.state.hydrateConversationState(cache, sessionKey))?.conversationId).toBe(conversationId)
+    writeFileSync(other.persistence.conversationCacheFilePath(cache, sessionKey), "not a snapshot")
+    expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    expect(getCheckpoint(conversationId)).toBeUndefined()
+  } finally {
+    other.persistence.resetConversationPersistenceForTests()
+    other.checkpoint.resetCheckpointsForTests()
+    resetCheckpointsForTests()
+  }
+})
+
+test("a copy whose binding and record were evicted drops its older checkpoint when no snapshot rebinds the session", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const sessionKey = "unbound-then-unreadable"
+  const conversationId = peekConversationId(sessionKey)
+  const newer = encodeMessage("ConversationStateStructure", { token_details: { used_tokens: 7, max_tokens: 9 } })
+  setCheckpoint(conversationId, checkpointBytes)
+  try {
+    await persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    expect((await other.state.hydrateConversationState(cache, sessionKey))?.conversationId).toBe(conversationId)
+    other.checkpoint.setCheckpoint(conversationId, newer)
+    await other.state.persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    for (let index = 0; index < MAX_ACTIVE_CONVERSATION_BINDINGS; index++) {
+      bindConversationId(`busy-${index}`)
+      expect(await hydrateConversationState(cache, `busy-${index}`)).toBeUndefined()
+    }
+    writeFileSync(other.persistence.conversationCacheFilePath(cache, sessionKey), "not a snapshot")
+    expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    // The next Run binds the session's default conversation id again.
+    expect(peekConversationId(sessionKey)).toBe(conversationId)
+    expect(getCheckpoint(conversationId)).toBeUndefined()
+  } finally {
+    other.persistence.resetConversationPersistenceForTests()
+    other.checkpoint.resetCheckpointsForTests()
+    resetCheckpointsForTests()
+  }
+})
+
+test("a copy holding the latest generation keeps its checkpoint when its binding was evicted and the snapshot is gone", async () => {
+  const cache = root()
+  const sessionKey = "unbound-latest"
+  const conversationId = peekConversationId(sessionKey)
+  setCheckpoint(conversationId, checkpointBytes)
+  try {
+    await persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    for (let index = 0; index < MAX_ACTIVE_CONVERSATION_BINDINGS; index++) bindConversationId(`busy-${index}`)
+    writeFileSync(conversationCacheFilePath(cache, sessionKey), "not a snapshot")
+    expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    expect(getCheckpoint(conversationId)).toEqual(checkpointBytes)
+  } finally {
     resetCheckpointsForTests()
   }
 })

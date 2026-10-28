@@ -18,6 +18,7 @@ import {
   isActiveConversationBinding,
   MAX_ACTIVE_CONVERSATION_BINDINGS,
   restoreConversationBinding,
+  sessionIdToUuid,
 } from "./conversation-bind.js"
 import {
   clearConversationBlobs,
@@ -54,7 +55,8 @@ import {
 // module copy; each copy's entry in `held` is the generation it last wrote or restored. Only a bound session consults
 // its record (an unbound one restores from disk), so a record is evicted only once its session is unbound and no write
 // or read is using it. Generations are never reused: a copy whose record was evicted counts as never having held one.
-// `writer` is the copy whose write or delete, landed or failed, produced the current generation.
+// `writer` is the copy whose write or delete, landed or failed, produced the current generation, or that rebound the
+// unbound session from its snapshot.
 type SnapshotRecord = {
   sessionKey: string
   generation: number
@@ -172,6 +174,18 @@ function replaceCopyState(
   if (servedBefore || newerElsewhere || writtenElsewhere) clearCheckpoint(conversationId)
 }
 
+/**
+ * An unbound session's binding, and maybe its record, were evicted, but this copy's checkpoint for the conversation
+ * the session binds next was not: unless this copy holds the latest generation, it may lack turns another copy ran.
+ * A copy that rebinds the session from its snapshot holds the newest state any copy can tell of.
+ */
+function adoptUnboundState(key: string, generation: number, sessionKey: string, restored: string | undefined): void {
+  const record = snapshotRecord(key, sessionKey)
+  if (record.held.get(copyId) !== generation) clearCheckpoint(restored ?? sessionIdToUuid(sessionKey))
+  record.held.set(copyId, generation)
+  if (restored !== undefined) record.writer = copyId
+}
+
 export function resetSnapshotGenerationsForTests(): void {
   snapshots.next = 0
   snapshots.bySession.clear()
@@ -242,7 +256,7 @@ export async function hydrateConversationState(
   }
   // This copy was behind: what is on disk (a snapshot, or none after a delete) replaces its per-session state.
   if (bound !== undefined) replaceCopyState(key, generation, sessionKey, bound)
-  else snapshotRecord(key, sessionKey).held.set(copyId, generation)
+  else adoptUnboundState(key, generation, sessionKey, loaded.value?.conversationId)
   const persisted = loaded.value
   if (!persisted) {
     trace(
