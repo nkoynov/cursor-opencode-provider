@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test"
-import { cpSync, mkdtempSync, rmSync, symlinkSync } from "node:fs"
+import { cpSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
@@ -665,6 +665,35 @@ test("a copy whose snapshot record was evicted drops its older checkpoint while 
     expect(getCheckpoint(conversationId)).toBeUndefined()
   } finally {
     other.persistence.setConversationPersistenceHookForTests()
+    other.persistence.resetConversationPersistenceForTests()
+    other.checkpoint.resetCheckpointsForTests()
+    resetCheckpointsForTests()
+  }
+})
+
+test("a copy whose snapshot record was evicted drops its older checkpoint once another copy's newer snapshot is unreadable", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const sessionKey = "evicted-then-unreadable"
+  const conversationId = peekConversationId(sessionKey)
+  const newer = encodeMessage("ConversationStateStructure", { token_details: { used_tokens: 7, max_tokens: 9 } })
+  setCheckpoint(conversationId, checkpointBytes)
+  try {
+    await persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    for (let index = 0; index < MAX_ACTIVE_CONVERSATION_BINDINGS; index++) {
+      bindConversationId(`busy-${index}`)
+      expect(await hydrateConversationState(cache, `busy-${index}`)).toBeUndefined()
+    }
+    // The session's binding and then its record are gone; the other copy rebinds it from disk and saves a newer turn.
+    expect((await other.state.hydrateConversationState(cache, sessionKey))?.conversationId).toBe(conversationId)
+    other.checkpoint.setCheckpoint(conversationId, newer)
+    await other.state.persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    // Expiry or a decode failure loses that snapshot without a tracked write.
+    writeFileSync(other.persistence.conversationCacheFilePath(cache, sessionKey), "not a snapshot")
+    expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+    expect(peekConversationId(sessionKey)).toBe(conversationId)
+    expect(getCheckpoint(conversationId)).toBeUndefined()
+  } finally {
     other.persistence.resetConversationPersistenceForTests()
     other.checkpoint.resetCheckpointsForTests()
     resetCheckpointsForTests()

@@ -44,9 +44,12 @@ Operator setup: [OpenCode 2.x](../../docs/opencode-2.md).
   moved to another Location, or back, skipped restore and resumed nothing or
   an older checkpoint. A copy behind the latest snapshot generation restores
   it; when it cannot (failed latest save, missing snapshot, writes that never
-  settle) it drops its own checkpoint and seeds host history. Tests need a
-  copy that served the session before, not only one that never did
-  (`hydrateConversationState`, `test/host-history-rewrite.test.ts`).
+  settle) it drops its own checkpoint and seeds host history. A per-copy
+  checkpoint outlives an evicted shared record, so "never held a generation"
+  does not mean "holds no older checkpoint"; whether another copy wrote the
+  latest generation decides. Tests need a copy that served the session
+  before, and one whose record was evicted since, not only one that never
+  did (`hydrateConversationState`, `test/host-history-rewrite.test.ts`).
 - **`isRetryable: false` does not stop a retry.** 2.x classifies an
   `APICallError` by status and retries 408/409/429/5xx; only `x-should-retry:
   false` overrides it. An unrecognized failure without a status also retries:

@@ -54,9 +54,11 @@ import {
 // module copy; each copy's entry in `held` is the generation it last wrote or restored. Only a bound session consults
 // its record (an unbound one restores from disk), so a record is evicted only once its session is unbound and no write
 // or read is using it. Generations are never reused: a copy whose record was evicted counts as never having held one.
+// `writer` is the copy whose write or delete, landed or failed, produced the current generation.
 type SnapshotRecord = {
   sessionKey: string
   generation: number
+  writer?: string
   unsaved: boolean
   queued: Map<string, number>
   held: Map<string, number>
@@ -126,11 +128,13 @@ async function trackedSnapshotWrite(cacheDir: string, sessionKey: string, write:
   try {
     if (!await write()) return
     record.generation = ++snapshots.next
+    record.writer = copyId
     record.unsaved = false
     record.held.set(copyId, record.generation)
   } catch (error) {
     // The disk misses this state, but this copy's memory still holds it.
     record.generation = ++snapshots.next
+    record.writer = copyId
     record.unsaved = true
     record.held.set(copyId, record.generation)
     throw error
@@ -153,17 +157,19 @@ export function onCopyStateReplaced(reset: (sessionKey: string) => void): void {
  * A copy that served the session before holds a checkpoint without the turns another copy ran since, so without a
  * snapshot to restore it drops that checkpoint and its next Run seeds host history. A copy that never held a
  * generation has no older checkpoint of its own, unless its record was evicted since: so while another copy holds
- * newer state (its save failed, or its writes keep landing) every copy behind drops its checkpoint.
+ * newer state (its save failed, or its writes keep landing), or another copy wrote the latest generation and that
+ * snapshot is now unreadable or gone, every copy behind drops its checkpoint.
  */
 function replaceCopyState(
   key: string, generation: number, sessionKey: string, conversationId: string, newerElsewhere = false,
 ): void {
-  const held = snapshotRecord(key, sessionKey).held
-  const servedBefore = held.has(copyId)
-  held.set(copyId, generation)
+  const record = snapshotRecord(key, sessionKey)
+  const servedBefore = record.held.has(copyId)
+  const writtenElsewhere = record.writer !== undefined && record.writer !== copyId
+  record.held.set(copyId, generation)
   forgetTurnProvenance(sessionKey)
   for (const reset of copyStateResets) reset(sessionKey)
-  if (servedBefore || newerElsewhere) clearCheckpoint(conversationId)
+  if (servedBefore || newerElsewhere || writtenElsewhere) clearCheckpoint(conversationId)
 }
 
 export function resetSnapshotGenerationsForTests(): void {
