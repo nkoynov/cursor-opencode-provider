@@ -622,6 +622,34 @@ test("a snapshot record an older build's copy in the same process created keeps 
   }
 })
 
+test("a copy behind drops its older checkpoint when a b635ce1 copy, which sets no writer, holds the latest generation", async () => {
+  const cache = root()
+  const other = await otherGraph()
+  const shared = processShared("conversation-snapshot-generations.v1", () => ({ next: 0, bySession: new Map() })) as
+    { next: number; bySession: Map<string, { generation: number; held: Map<string, number> }> }
+  const rebound = "b635ce1-rebound"
+  const advanced = "b635ce1-advanced"
+  for (const sessionKey of [rebound, advanced]) setCheckpoint(peekConversationId(sessionKey), checkpointBytes)
+  try {
+    // After the record was evicted, a b635ce1 copy rebound the session from disk, and may have saved since.
+    const generation = ++shared.next
+    shared.bySession.set(JSON.stringify([resolve(cache), rebound]), { sessionKey: rebound, generation, unsaved: false,
+      queued: new Map(), held: new Map([["b635ce1", generation]]), reading: 0 } as never)
+    // A b635ce1 copy saves into a record this build created without a writer.
+    expect(await other.state.hydrateConversationState(cache, advanced)).toBeUndefined()
+    const record = shared.bySession.get(JSON.stringify([resolve(cache), advanced]))!
+    record.generation = ++shared.next
+    record.held.set("b635ce1", record.generation)
+    for (const sessionKey of [rebound, advanced]) {
+      expect(await hydrateConversationState(cache, sessionKey)).toBeUndefined()
+      expect(getCheckpoint(peekConversationId(sessionKey))).toBeUndefined()
+    }
+  } finally {
+    other.persistence.resetConversationPersistenceForTests()
+    resetCheckpointsForTests()
+  }
+})
+
 test("snapshot generation records stay bounded and keep every bound session's record", async () => {
   const cache = root()
   const sessionKey = "bound-among-many"

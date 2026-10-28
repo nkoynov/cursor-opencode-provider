@@ -67,13 +67,17 @@ type SnapshotRecord = {
   reading: number
 }
 // A copy of an older build loaded in the same process (7d3650e) shares this map and creates records without the
-// fields added since; it reads only generation, unsaved and queued.
+// fields added since; it reads only generation, unsaved and queued. A b635ce1 copy never sets `writer` but enters its
+// writes, restores and rebinds in `held`, so a copy missing from `writerAware` that holds the latest generation counts
+// as its writer.
 type StoredRecord = Pick<SnapshotRecord, "generation" | "unsaved" | "queued"> & Partial<SnapshotRecord>
 const copyId = randomUUID()
-const snapshots = processShared("conversation-snapshot-generations.v1", () => ({
-  next: 0,
-  bySession: new Map<string, StoredRecord>(),
-}))
+const snapshots: { next: number; bySession: Map<string, StoredRecord>; writerAware?: Set<string> } = processShared(
+  "conversation-snapshot-generations.v1",
+  () => ({ next: 0, bySession: new Map<string, StoredRecord>(), writerAware: new Set<string>() }),
+)
+const writerAware = snapshots.writerAware ??= new Set()
+writerAware.add(copyId)
 const snapshotKey = (cacheDir: string, sessionKey: string) => JSON.stringify([path.resolve(cacheDir), sessionKey])
 
 function upgraded(key: string, record: StoredRecord): SnapshotRecord {
@@ -167,7 +171,8 @@ function replaceCopyState(
 ): void {
   const record = snapshotRecord(key, sessionKey)
   const servedBefore = record.held.has(copyId)
-  const writtenElsewhere = record.writer !== undefined && record.writer !== copyId
+  const writtenElsewhere = (record.writer !== undefined && record.writer !== copyId)
+    || [...record.held].some(([copy, held]) => held === record.generation && !writerAware.has(copy))
   record.held.set(copyId, generation)
   forgetTurnProvenance(sessionKey)
   for (const reset of copyStateResets) reset(sessionKey)
