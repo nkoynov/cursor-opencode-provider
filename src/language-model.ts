@@ -4690,8 +4690,12 @@ async function deliverContinuationResultsNow(
           : undefined
         const callId = typeof interactionCallId === "string" && interactionCallId.length > 0
           ? interactionCallId : pending.displayCallId ?? exec?.callId
-        const unacknowledged = session.unacknowledgedHostResults ??= []
-        unacknowledged.push({ callId, afterFrame: beforeResultWrite })
+        // Cursor never completes its uncorrelated image writes (a Run's input images): waiting would refuse every
+        // later checkpoint, and a resumed checkpoint from before one only has Cursor write that image again.
+        if (callId || pending.toolName !== CURSOR_IMAGE_SAVE_TOOL) {
+          const unacknowledged = session.unacknowledgedHostResults ??= []
+          unacknowledged.push({ callId, afterFrame: beforeResultWrite })
+        }
       }
     }
     if (session.historyImages) noteHistoryImagesSent(session.historyImages, deliveredImageHashes, lastFrameArrival())
