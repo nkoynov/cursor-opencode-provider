@@ -154,6 +154,25 @@ export type PendingExec = {
    * the host's late result still finds this Run so the turn goes on.
    */
   aborted?: boolean
+  /** Arrival of the exec request (`frameArrival`). */
+  execArrival?: number
+  /** The request without its per-Run fields (`execReplayKey`): a resumed Run asking for the same call matches it. */
+  replayKey?: string
+}
+
+/**
+ * A host result this Run wrote for one of Cursor's execs. `rebuild` re-encodes the same reply under another exec id;
+ * it is set only for a plain exec result, which carries no interaction, plan or provider state.
+ */
+export type WrittenHostResult = {
+  callId?: string
+  replayKey?: string
+  execArrival?: number
+  /** The last frame arrival before the write: a checkpoint that arrived later may hold the result. */
+  afterFrame: number
+  /** Arrival of Cursor's `tool_call_completed` for it: a checkpoint that arrived later holds the result. */
+  ackArrival?: number
+  rebuild?: (execId: number) => Uint8Array[]
 }
 
 export type ContinuationTerminalReason =
@@ -236,6 +255,16 @@ export type CursorSession = {
   resumeCheckpointAfterFrame?: number
   /** Results sent locally but not yet acknowledged by a matching server completion. */
   unacknowledgedHostResults?: Array<{ callId?: string; afterFrame: number }>
+  /** The checkpoint frame that arrived last on this Run, accepted or not. */
+  latestCheckpointFrame?: { bytes: Uint8Array; arrival: number }
+  /** Arrival of the last frame on this Run that was more than KV, a heartbeat, a checkpoint or a completion of a written result. */
+  lastActivityArrival?: number
+  writtenResults?: WrittenHostResult[]
+  /**
+   * Results a resumed Run answers from what the host already returned when Cursor asks for the same call again
+   * (same call id and request). Until every `required` call is answered, anything else Cursor sends ends the turn.
+   */
+  resultReplay?: { results: Map<string, WrittenHostResult>; required: Set<string> }
   /** Stateful replay barriers survive host tool-step boundaries on this Run. */
   replaySafety?: ReplaySafetyState
   /** A delivered plan result refused execution; terminate this Run without continuing. */

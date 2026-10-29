@@ -307,6 +307,7 @@ import {
   type Frame,
   type LostRun,
   type PendingExec,
+  type WrittenHostResult,
 } from "./session.js"
 import {
   CursorAuthError,
@@ -1147,6 +1148,79 @@ function acknowledgeHostResults(session: CursorSession, lifecycle: ReplayToolLif
     `callId=${lifecycle.callId} unacknowledged=${session.unacknowledgedHostResults.length}`)
 }
 
+function noteResultCompletion(session: CursorSession, lifecycle: ReplayToolLifecycle | undefined, frame: Frame): boolean {
+  if (lifecycle?.kind !== "completed") return false
+  const arrived = frameArrival(frame)
+  const written = session.writtenResults?.filter(result => result.callId === lifecycle.callId) ?? []
+  for (const result of written) {
+    if (arrived !== undefined && arrived > result.afterFrame) result.ackArrival ??= arrived
+  }
+  return written.length > 0
+}
+
+function noteRunActivity(session: CursorSession, frame: Frame): void {
+  session.lastActivityArrival = Math.max(session.lastActivityArrival ?? 0, frameArrival(frame) ?? Number.POSITIVE_INFINITY)
+}
+
+/** An exec request without its id, `exec_id` (#15) and `span` (#19), which differ when a resumed Run asks again. */
+export function execReplayKey(payload: Uint8Array): string | undefined {
+  const exec = readAllFieldsStrict(payload)?.find(field => field.fn === 2 && field.wt === 2)
+  const fields = exec?.bytes && readAllFieldsStrict(exec.bytes)
+  if (!fields) return undefined
+  const hex = (bytes: Uint8Array | undefined) => bytes ? Buffer.from(bytes).toString("hex") : ""
+  return fields.filter(field => field.fn !== 1 && field.fn !== 15 && field.fn !== 19)
+    .map(field => `${field.fn}:${field.wt}:${field.varint ?? ""}:${hex(field.bytes ?? field.fixed64 ?? field.fixed32)}`)
+    .join(",")
+}
+
+/** An edit's read and write, or a Task's attachment reads, share one call id: the request tells them apart. */
+function replayEntryKey(callId: string, replayKey: string): string {
+  return `${callId}\n${replayKey}`
+}
+
+function replayableResults(session: CursorSession): Map<string, WrittenHostResult> {
+  const results = new Map(session.resultReplay?.results)
+  for (const result of session.writtenResults ?? []) {
+    if (result.callId && result.rebuild && result.replayKey !== undefined) {
+      results.set(replayEntryKey(result.callId, result.replayKey), result)
+    }
+  }
+  return results
+}
+
+/**
+ * Fork: a Run Cursor cut after the host's results were written, before a checkpoint that holds them. Cursor sends a
+ * checkpoint right after a step lists its tool calls; resumed from it, Cursor asks for those calls again, and the
+ * results the host already returned answer them, so no tool runs twice. Only when nothing but KV, heartbeats,
+ * checkpoints and completions of the written results arrived after that checkpoint, every result it may lack is a
+ * plain exec result this Run can encode again, and nothing waits on the host.
+ */
+function resultReplayPlan(session: CursorSession): { checkpoint: Uint8Array; replay: NonNullable<CursorSession["resultReplay"]> } | undefined {
+  const base = session.latestCheckpointFrame
+  const written = session.writtenResults ?? []
+  const lacking = base ? written.filter(result => result.ackArrival === undefined || result.ackArrival >= base.arrival) : []
+  const reason = !base ? "no-checkpoint"
+    : !session.checkpointRevokedByHostResult ? "checkpoint-not-revoked-by-result"
+    : session.pending.size > 0 ? "pending-execs"
+    : session.resultsAfterCheckpoint ? "steer-results"
+    : session.queuedCreatePlanAction || session.planReviewDeclined ? "plan-review"
+    : (session.lastActivityArrival ?? 0) > base.arrival ? "activity-after-checkpoint"
+    : !written.some(result => result.afterFrame >= base.arrival) ? "no-result-after-checkpoint"
+    : lacking.some(result => !result.callId || !result.rebuild || result.replayKey === undefined
+      || result.execArrival === undefined || result.execArrival >= base.arrival) ? "unreplayable-result"
+    : undefined
+  trace(`recovery: result-replay-check hostSessionId=${session.openCodeSessionId} sessionId=${session.sessionId} ` +
+    `reason=${reason ?? "replayable"} written=${written.length} lacking=${lacking.length}`)
+  if (reason) return undefined
+  return {
+    checkpoint: Uint8Array.from(base!.bytes),
+    replay: {
+      results: replayableResults(session),
+      required: new Set(lacking.map(result => replayEntryKey(result.callId!, result.replayKey!))),
+    },
+  }
+}
+
 /** `resumeCheckpoint` is set only by a checkpoint this Run received and did not drop. */
 function confirmRunImagesAtTurnEnd(session: CursorSession): void {
   if (!session.historyImages || !session.openCodeSessionId) return
@@ -1741,6 +1815,7 @@ export async function pumpWithRecovery(input: {
     pumpedSession: CursorSession,
     failure: CursorProviderError,
     checkpoint: Uint8Array | undefined,
+    replay?: CursorSession["resultReplay"],
   ) => {
     const toolCallIds = pumpedSession.resultsAfterCheckpoint?.toolCallIds
     const fromHistory = !failure.checkpointUnusable && !checkpoint && !!input.canRebaseFromHistory?.(pumpedSession)
@@ -1809,6 +1884,15 @@ export async function pumpWithRecovery(input: {
         completedCalls: pumpedSession.replaySafety?.completedCalls?.slice(),
         catalogCalls: pumpedSession.replaySafety?.catalogCalls && { ...pumpedSession.replaySafety.catalogCalls },
       }
+      // Any later resume of this turn may have Cursor ask again for a call the host already ran.
+      const results = replayableResults(pumpedSession)
+      const required = replay?.required ?? pumpedSession.resultReplay?.required
+      if (results.size > 0) next.resultReplay = { results, required: new Set(required) }
+      if (replay) {
+        trace(`recovery: result-replay hostSessionId=${pumpedSession.openCodeSessionId} previousSessionId=${pumpedSession.sessionId} ` +
+          `sessionId=${next.sessionId} checkpointBytes=${checkpoint?.length ?? 0} ` +
+          `required=${[...replay.required].map(key => key.split("\n")[0]).join(",")}`)
+      }
       next.userTurnHostNotes = pumpedSession.userTurnHostNotes
       next.usageEstimate = { ...pumpedSession.usageEstimate }
       next.editToolCalls = new Map(pumpedSession.editToolCalls)
@@ -1839,9 +1923,14 @@ export async function pumpWithRecovery(input: {
 
   // A replacement can fail before pump() starts (for example while connecting).
   // Classify it in this same loop rather than exposing an unbudgeted host retry.
-  const reopenAttempt = async (pumped: CursorSession, failure: CursorProviderError, checkpoint: Uint8Array | undefined) => {
+  const reopenAttempt = async (
+    pumped: CursorSession,
+    failure: CursorProviderError,
+    checkpoint: Uint8Array | undefined,
+    replay?: CursorSession["resultReplay"],
+  ) => {
     try {
-      session = await reopen(pumped, failure, checkpoint)
+      session = await reopen(pumped, failure, checkpoint, replay)
     } catch (error) {
       const failure = toCursorProviderError(error, { replaySafe: true, fallback: "Cursor recovery setup failed" })
       // The failed upload belongs to the replacement Run. The preceding Run's
@@ -1923,7 +2012,7 @@ export async function pumpWithRecovery(input: {
       } else if (pumpedSession.checkpointRevoked || pumpedSession.resultsAfterCheckpoint || pumpedSession.earlierCheckpointStale) {
         turnCheckpoint = undefined
       }
-      const checkpoint = turnCheckpoint
+      let checkpoint = turnCheckpoint
       // The inherited tool barrier forbids replaying the action, but an untouched
       // replacement may renew and resume its checkpoint without replaying tools.
       const untouchedCheckpointResume = resumedAttempt && checkpoint !== undefined
@@ -1975,6 +2064,10 @@ export async function pumpWithRecovery(input: {
       }
       // The interrupted step's own output and provider-answered execs do not bar it: the rebuild generates them again.
       const historyRecovery = input.canRebaseFromHistory?.(pumpedSession)
+      const resultReplay = !failure.replaySafe && !checkpoint && !historyRecovery && !failure.checkpointUnusable
+        ? resultReplayPlan(pumpedSession)
+        : undefined
+      if (resultReplay) checkpoint = turnCheckpoint = resultReplay.checkpoint
       if (!failure.replaySafe && !checkpoint && !historyRecovery) {
         // Cursor CLI sends the same action again. Shown output keeps the
         // provider from doing so; the host can, unless a side effect would repeat.
@@ -2012,7 +2105,7 @@ export async function pumpWithRecovery(input: {
       const delayMs = retryDelayMs(failure, attempt + 1, retryPolicy)
       trace(`Run retry backoff: attempt=${attempt + 1}/${recoveries} delayMs=${delayMs}${capacity ? " (capacity)" : ""}`)
       await sleepForRetry(delayMs, input.abortSignal)
-      await reopenAttempt(pumpedSession, failure, checkpoint)
+      await reopenAttempt(pumpedSession, failure, checkpoint, resultReplay?.replay)
     } finally {
       input.abortSignal?.removeEventListener("abort", stopPumpedRun)
       stopSteers?.()
@@ -3378,6 +3471,7 @@ export async function preparePriorSessionForFreshTurn(
     invalidateResumeCheckpoint(prior, beforeReply, true)
     const unacknowledged = prior.unacknowledgedHostResults ??= []
     unacknowledged.push({ callId: queuedPlan.createPlanToolCallId, afterFrame: beforeReply })
+    ;(prior.writtenResults ??= []).push({ callId: queuedPlan.createPlanToolCallId, afterFrame: beforeReply })
     prior.queuedCreatePlanAction = undefined
     prior.planReviewDeclined = true
     if (queuedPlan.receiptHostCallId) clearPlanOperation(prior.openCodeSessionId, queuedPlan.receiptHostCallId)
@@ -3563,6 +3657,7 @@ function applyQueuedAborts(session: CursorSession): void {
   for (let index = 0; index < queued.length;) {
     const held = heldControlFrame(queued[index]!)
     if (held?.kind === "exec-control" && abortsPendingExec(session, held.control)) {
+      noteRunActivity(session, queued[index]!)
       queued.splice(index, 1)
       applyExecControl(session, held.control, "held queue")
     } else {
@@ -3607,6 +3702,7 @@ async function readHeldFrames(session: CursorSession, frames: CursorSession["fra
       continue
     }
     if (held?.kind === "exec-control" && abortsPendingExec(session, held.control)) {
+      noteRunActivity(session, frame)
       applyExecControl(session, held.control, "held")
       if (![...session.pending.values()].some((pending) => isOwedCursorExec(pending) && !pending.aborted)) {
         trace(`held Run: Cursor aborted every exec it was waiting on sessionId=${session.sessionId}`)
@@ -4389,6 +4485,7 @@ async function deliverContinuationResultsNow(
       ? { ...r, error: CREATE_PLAN_NOT_APPROVED_REASON }
       : r
     let frames: Uint8Array[] = []
+    let replayInput: ToolResultInput | undefined
     let deliveredSwitchMode: { target: string; bridgeKind?: unknown } | undefined
     let endTurnAfterDelivery = false
     let deliveredCreatePlan: { approved: boolean; emulated: boolean; endTurn: boolean } | undefined
@@ -4636,6 +4733,7 @@ async function deliverContinuationResultsNow(
           const input = continuationResultInput(session, pending, directPlanReason ? { ...r, error: directPlanReason } : r, shellResult)
           const images = input.images ?? []
           frames = buildExecClientMessages(input)
+          if (!directPlanStage && !directPlanExit) replayInput = input
           if (images.length > 0) {
             deliveredImageHashes = r.imageHashes?.slice(0, images.length) ?? []
             trace(`continuation: ${images.length} tool-result image(s) on ${pending.resultField} execId=${r.execId}`)
@@ -4697,6 +4795,16 @@ async function deliverContinuationResultsNow(
         if (!savedUncorrelatedImage) {
           const unacknowledged = session.unacknowledgedHostResults ??= []
           unacknowledged.push({ callId, afterFrame: beforeResultWrite })
+          const input = replayInput
+          ;(session.writtenResults ??= []).push({
+            callId, replayKey: pending.replayKey, execArrival: pending.execArrival, afterFrame: beforeResultWrite,
+            ...(input ? {
+              rebuild: (execId: number) => {
+                const rebuilt = buildExecClientMessages({ ...input, execId })
+                return hookContexts.length > 0 ? attachHookAdditionalContexts(rebuilt, hookContexts) ?? rebuilt : rebuilt
+              },
+            } : {}),
+          })
         }
       }
     }
@@ -5638,6 +5746,18 @@ export async function pump(
   const failRunProtocol = (message: string, code: string): never => {
     replaySafety.markBarrier("unknown-or-malformed-frame")
     const error = new CursorProtocolError(message, { code })
+    sessionManager.close(session, "remote-error", error)
+    throw error
+  }
+  /** The resumed Run went on without the results the host already returned: the model would not know they ran. */
+  const endResultReplay = (why: string): never => {
+    trace(`recovery: result-replay-refused hostSessionId=${session.openCodeSessionId} sessionId=${session.sessionId} ${why}`)
+    replaySafety.markBarrier("unknown-or-malformed-frame")
+    const error = new CursorProtocolError(
+      "Cursor Run resumed after it was cut but did not ask again for the tool results already returned; " +
+        "automatic retry unsafe. Send a message such as \"continue\" to resume from the last saved state",
+      { code: "CURSOR_RESULT_REPLAY_REFUSED" },
+    )
     sessionManager.close(session, "remote-error", error)
     throw error
   }
@@ -6592,6 +6712,53 @@ export async function pump(
       execControl,
       interactionQuery,
     })
+    const resultReplay = session.resultReplay
+    if (resultReplay) {
+      const execCallId = esm ? extractExecDisplayCallId(esm) : undefined
+      const execKey = esm ? execReplayKey(payload) : undefined
+      const entryKey = execCallId && execKey !== undefined ? replayEntryKey(execCallId, execKey) : undefined
+      const written = entryKey ? resultReplay.results.get(entryKey) : undefined
+      if (esm && written && execCallId && entryKey && typeof esm.id === "number") {
+        replaySafety.markBarrier("non-control-exec")
+        replaySafety.recordExec(esm.id, execCallId)
+        toolStep.resolved.add(execCallId)
+        announcedCalls.delete(execCallId)
+        session.announcedCallIds?.delete(execCallId)
+        noteToolCallFinished(order, execCallId)
+        session.displayToolCalls.delete(execCallId)
+        const beforeWrite = lastFrameArrival()
+        if (!await writeExecFrames(written.rebuild!(esm.id as number), `replayed result id=${esm.id}`)) return
+        invalidateResumeCheckpoint(session, beforeWrite, true)
+        ;(session.unacknowledgedHostResults ??= []).push({ callId: execCallId, afterFrame: beforeWrite })
+        ;(session.writtenResults ??= []).push({
+          ...written, execArrival: frameArrival(frame), afterFrame: beforeWrite, ackArrival: undefined,
+        })
+        noteRunActivity(session, frame)
+        resultReplay.required.delete(entryKey)
+        trace(`recovery: result-replayed hostSessionId=${session.openCodeSessionId} sessionId=${session.sessionId} ` +
+          `execId=${esm.id} callId=${execCallId} required=${resultReplay.required.size}`)
+        continue
+      }
+      if (resultReplay.required.size > 0) {
+        const partial = (iu?.partial_tool_call ?? iu?.tool_call_delta) as Record<string, unknown> | undefined
+        const updateCallId = replayFrame.toolLifecycle?.callId ?? (typeof partial?.call_id === "string" ? partial.call_id : undefined)
+        if (updateCallId && [...resultReplay.results.values()].some(result => result.callId === updateCallId)) {
+          // Cursor streams the call it asks for again; the host already shows it.
+          acknowledgeHostResults(session, replayFrame.toolLifecycle, frame)
+          noteResultCompletion(session, replayFrame.toolLifecycle, frame)
+          continue
+        }
+        const updates = iu ? Object.keys(iu).filter(key => iu[key]) : []
+        const passes = isSoleControlFrame(payload)
+          || (!!esm && !replayFrame.barrier && !!(esm.request_context_args || esm.mcp_state_exec_args))
+          || (!esm && !kv && !execControl && !interactionQuery && !replayFrame.barrier && updates.length > 0
+            && updates.every(key => key === "step_started" || key === "tool_requests_listed" || key === "heartbeat"))
+        if (!passes) {
+          const awaited = [...resultReplay.required].map(key => key.split("\n")[0]).join(",")
+          endResultReplay(`sent ${describeFrameLayout(payload, 2)}${execCallId ? ` for call ${execCallId}` : ""} before asking again for ${awaited}`)
+        }
+      }
+    }
     if (replayFrame.barrier === "unknown-or-malformed-frame" && isDebugEnabled()) {
       const layout = describeFrameLayout(payload)
       if (!unknownFrameLayouts.has(layout)) {
@@ -6599,6 +6766,8 @@ export async function pump(
         trace(`replay frame unknown: layout=${layout} bytes=${payload.length}`)
       }
     }
+    const completesWrittenResult = noteResultCompletion(session, replayFrame.toolLifecycle, frame)
+    if (!isSoleControlFrame(payload) && !completesWrittenResult) noteRunActivity(session, frame)
     if (replayFrame.barrier === "display-tool-lifecycle") {
       replaySafety.recordToolLifecycle(replayFrame.toolLifecycle)
       acknowledgeHostResults(session, replayFrame.toolLifecycle, frame)
@@ -6643,6 +6812,13 @@ export async function pump(
         cacheDiagnostics.checkpointUpdates++
         setCheckpoint(session.conversationId, bytes)
         noteCheckpoint(session.openCodeSessionId, bytes)
+        const arrival = frameArrival(frame)
+        if (arrival !== undefined && arrival > (session.latestCheckpointFrame?.arrival ?? 0)) {
+          session.latestCheckpointFrame = { bytes: Uint8Array.from(bytes), arrival }
+          // A result Cursor completed before this checkpoint is in it and in every later one.
+          session.writtenResults = session.writtenResults?.filter(result =>
+            result.ackArrival === undefined || result.ackArrival >= arrival)
+        }
         const accepted = !isPlanTurnEnding() && acceptResumeCheckpoint(session, bytes, frame)
         if (switchGuard && accepted) switchGuard.latestCheckpoint = Uint8Array.from(bytes)
         noteRunImageCheckpoint(session, bytes, frame)
@@ -7529,7 +7705,10 @@ export async function pump(
             parsed.resultMetadata,
             displayCallId,
           )
-          if (earlyToolCallId) session.pending.get(parsed.id)!.toolCallId = earlyToolCallId
+          const registered = session.pending.get(parsed.id)!
+          if (earlyToolCallId) registered.toolCallId = earlyToolCallId
+          registered.execArrival = frameArrival(frame)
+          registered.replayKey = execReplayKey(payload)
           // A direct host `todowrite` is a replace-all snapshot: it is the new
           // truth for later Cursor merge patches, which otherwise apply onto a
           // stale (or empty) mirrored list.
@@ -8464,6 +8643,7 @@ async function settleReviewForSteer(session: CursorSession): Promise<boolean> {
   invalidateResumeCheckpoint(session, beforeReply, true)
   const unacknowledged = session.unacknowledgedHostResults ??= []
   unacknowledged.push({ callId: queued.createPlanToolCallId, afterFrame: beforeReply })
+  ;(session.writtenResults ??= []).push({ callId: queued.createPlanToolCallId, afterFrame: beforeReply })
   session.queuedCreatePlanAction = { ...queued, kind: "ack" }
   if (queued.receiptHostCallId) clearPlanOperation(session.openCodeSessionId, queued.receiptHostCallId)
   await persistPlanOperations(session)

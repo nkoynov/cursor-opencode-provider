@@ -11,6 +11,7 @@ import { setActiveCursorMode, resetActiveCursorModesForTests } from "../src/prot
 import { getHostCacheDirOverride, setHostCacheDirOverride } from "../src/context/paths.js"
 import { discardPendingCursorImage } from "../src/image-staging.js"
 import { IMAGE_PERMISSION_DENIED_PREFIX } from "../src/image-save.js"
+import { noteFrameArrivalForTests } from "../src/transport/connect.js"
 import { sessionFixture } from "./session-fixture.js"
 
 function frame(message: Record<string, unknown>): Frame {
@@ -744,6 +745,110 @@ describe("parallel tool-call pump", () => {
       fs.rmSync(workspace, { recursive: true, force: true })
       fs.rmSync(cacheDir, { recursive: true, force: true })
     }
+  })
+
+  describe("a Run cut right after a host result was written", () => {
+    const stepCheckpoint = Uint8Array.of(10, 1, 9)
+    const arrived = (made: Frame) => { noteFrameArrivalForTests(made); return made }
+    const shellAgain = (command = "echo test") => frame({
+      exec_server_message: { id: 1, exec_id: "resumed-exec", shell_stream_args: { command, tool_call_id: "call-1" } },
+    })
+    const shellReplies = (writes: Uint8Array[]) => writes
+      .map(bytes => decodeMessage<any>("AgentClientMessage", bytes))
+      .filter(message => message.exec_client_message?.id === 1 || message.exec_client_control_message?.stream_close?.id === 1)
+
+    /** Cursor's call, the step's count and a checkpoint, all read before the host's result went out. */
+    async function cutAfterResult(options: { checkpointAfterCall?: boolean; afterWrite?: readonly Frame[] } = {}) {
+      const before = options.checkpointAfterCall === false
+        ? [arrived(frame({ conversation_checkpoint_update: stepCheckpoint })), arrived(shell(1))]
+        : [arrived(shell(1)), arrived(listed(1)), arrived(frame({ conversation_checkpoint_update: stepCheckpoint }))]
+      const { session, writes } = fixture(before)
+      const first = collect()
+      await pump(session, first.controller, ids)
+      const call = toolCalls(first.parts).at(-1)!
+      expect(await deliverContinuationResults(session, [{
+        toolCallId: call.toolCallId, sessionId: session.sessionId, execId: 1, toolName: call.toolName, output: "RAN-ONCE",
+      }])).toBe(session)
+      before.push(...(options.afterWrite ?? []).map(arrived))
+      return { session, writes, resultFrames: shellReplies(writes) }
+    }
+
+    async function recoverWith(session: ReturnType<typeof fixture>["session"], replacements: Frame[][]) {
+      const recoveries: unknown[] = []
+      const runs: Array<ReturnType<typeof fixture>> = []
+      const resumed = collect()
+      const outcome = await pumpWithRecovery({ initialSession: session, controller: resumed.controller,
+        retryPolicy: { maxAttempts: replacements.length + 1, baseDelayMs: 1, maxDelayMs: 1 },
+        recover: async recovery => {
+          recoveries.push(recovery)
+          const run = fixture(replacements[runs.length]!.map(arrived), `parallel-pump-resumed-${runs.length}`)
+          runs.push(run)
+          return run.session
+        },
+      }).then(() => "completed", (error: Error) => error.message)
+      return { outcome, recoveries, runs, parts: resumed.parts }
+    }
+
+    it("resumes the checkpoint sent after the call and answers Cursor's repeat from the written result", async () => {
+      const { session, resultFrames } = await cutAfterResult()
+      const { outcome, recoveries, runs, parts } = await recoverWith(session, [[shellAgain(), text("done"), ended()]])
+      expect(outcome).toBe("completed")
+      expect(recoveries).toEqual([{ kind: "resume", conversationId: session.conversationId, checkpoint: stepCheckpoint }])
+      expect(toolCalls(parts)).toHaveLength(0)
+      expect(parts.some(part => part.type === "text-delta" && part.delta === "done")).toBe(true)
+      expect(finishes(parts).map(part => part.finishReason.unified)).toEqual(["stop"])
+      expect(shellReplies(runs[0]!.writes)).toEqual(resultFrames)
+      expect(JSON.stringify(resultFrames)).toContain("RAN-ONCE")
+    })
+
+    it("sends a later request under the same call id (an edit's write after its read) to the host", async () => {
+      const { session } = await cutAfterResult()
+      const { outcome, parts } = await recoverWith(session, [[shellAgain(), shellAgain("echo second")]])
+      expect(outcome).toBe("completed")
+      expect(toolCalls(parts).map(call => JSON.parse(call.input).command)).toEqual(["echo second"])
+    })
+
+    it("resumes again with the same answer when the resumed Run is cut before Cursor asks", async () => {
+      const { session, resultFrames } = await cutAfterResult()
+      const { outcome, recoveries, runs, parts } = await recoverWith(session, [[], [shellAgain(), ended()]])
+      expect(outcome).toBe("completed")
+      expect(recoveries).toHaveLength(2)
+      expect(recoveries.every(recovery => (recovery as { kind: string }).kind === "resume")).toBe(true)
+      expect(toolCalls(parts)).toHaveLength(0)
+      expect(shellReplies(runs[1]!.writes)).toEqual(resultFrames)
+    })
+
+    it.each([
+      ["output", () => [text("a different answer"), ended()]],
+      ["another request", () => [shellAgain("rm -rf build"), ended()]],
+      ["another call", () => [shell(1, "call-2"), ended()]],
+    ] as const)("ends the turn when the resumed Run sends %s before asking again", async (_, replacement) => {
+      const { session } = await cutAfterResult()
+      const { outcome, recoveries, runs, parts } = await recoverWith(session, [replacement()])
+      expect(outcome).toContain("did not ask again for the tool results already returned")
+      expect(recoveries).toHaveLength(1)
+      expect(toolCalls(parts)).toHaveLength(0)
+      expect(parts.some(part => part.type === "text-delta")).toBe(false)
+      expect(shellReplies(runs[0]!.writes)).toEqual([])
+    })
+
+    it.each([
+      ["Cursor went on after the result", { afterWrite: [text("after the result")] }],
+      ["no checkpoint came after the call", { checkpointAfterCall: false }],
+    ] as const)("does not resume when %s", async (_, options) => {
+      const { session } = await cutAfterResult(options)
+      const { outcome, recoveries } = await recoverWith(session, [[shellAgain(), ended()]])
+      expect(outcome).toContain("automatic retry unsafe")
+      expect(recoveries).toEqual([])
+    })
+
+    it("still resumes when only KV, heartbeats and the result's completion followed it", async () => {
+      const heartbeat = frame({ interaction_update: { heartbeat: {} } })
+      const { session } = await cutAfterResult({ afterWrite: [heartbeat, completed("call-1")] })
+      const { outcome, recoveries } = await recoverWith(session, [[shellAgain(), ended()]])
+      expect(outcome).toBe("completed")
+      expect(recoveries).toEqual([{ kind: "resume", conversationId: session.conversationId, checkpoint: stepCheckpoint }])
+    })
   })
 
   it.each(["matching", "other-call", "malformed"] as const)("validates a %s completion while draining an abandoned Run", async completion => {
