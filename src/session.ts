@@ -1004,6 +1004,7 @@ export class SessionManager {
     session.terminalUnsubscribe?.()
     session.terminalUnsubscribe = null
     session.deferredTerminalReason = null
+    session.closeError = null
     const old = session.stream
     session.stream = next
     // Preserve session totals but give the replacement Run its own estimates.

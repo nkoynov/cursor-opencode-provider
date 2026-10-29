@@ -2386,7 +2386,8 @@ function noteAssistantBlob(session: CursorSession, kv: Record<string, unknown>):
 
 /** Cursor refused a gzip Run before acting on it: send the same request once more, now uncompressed. */
 async function resendRefusedGzipRun(session: CursorSession, error: unknown, signal?: AbortSignal): Promise<boolean> {
-  if (!(error instanceof CursorProviderError) || !error.replaySafe) return false
+  // Fork: only this Run's own barrier bars the resend; one an earlier Run of the turn left (a resume) does not.
+  if (!(error instanceof CursorProviderError) || (!error.replaySafe && error.replayBarrier !== undefined)) return false
   if (!session.resendRunRequest || !session.stream.compressionRejected?.()) return false
   if (session.closed || session.hostInterrupted || signal?.aborted) return false
   trace(`Run compression: sessionId=${session.sessionId} refused before Cursor acted on it; resending once uncompressed`)

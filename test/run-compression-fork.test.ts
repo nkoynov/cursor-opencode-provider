@@ -2,13 +2,14 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import http2 from "node:http2"
 import net from "node:net"
 import { CursorProviderError, CursorTransportError } from "../src/errors.js"
-import { connectFrameError, sendRunRequest } from "../src/language-model.js"
+import { connectFrameError, pumpWithRecovery, sendRunRequest } from "../src/language-model.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
 import { decodeFramePayload, encodeFrame, FLAG_GZIP, streamFrames } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { describeTtftBreakdown } from "../src/protocol/ttft.js"
-import type { Frame } from "../src/session.js"
+import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import type { BidiStream } from "../src/transport/connect.js"
+import { sessionFixture } from "./session-fixture.js"
 import {
   bidiRunStream,
   closeCachedHttp2SessionsForTests,
@@ -170,6 +171,79 @@ describe("Connect frame errors", () => {
   it("keeps Cursor's error message", () => {
     const error = connectFrameError(JSON.stringify({ error: { code: "internal", message: "boom" } }))
     expect(error.serverMessage).toBe("boom")
+  })
+})
+
+const unsupported = { code: "unimplemented", message: "unknown compression \"gzip\"" }
+const endStreamFrame = (error: Record<string, unknown>): Frame =>
+  ({ flags: 0x02, payload: new TextEncoder().encode(JSON.stringify({ error })) })
+const turnEnded = (): Frame => ({
+  flags: 0,
+  payload: encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: { input_tokens: 1, output_tokens: 1 } } }),
+})
+
+function frameStream(frames: Frame[], refused = false): BidiStream {
+  return {
+    write() { return true },
+    compressionRejected: () => refused,
+    end() {},
+    frames: () => ({ async *[Symbol.asyncIterator]() { yield* frames } }),
+    destroy() {},
+    isClosed: () => false,
+    onTerminal: () => () => {},
+  }
+}
+
+function refusedSession(id: string): CursorSession {
+  const stream = frameStream([endStreamFrame(unsupported)], true)
+  return sessionFixture({
+    sessionId: id,
+    conversationId: `conv-${id}`,
+    stream,
+    frames: stream.frames()[Symbol.asyncIterator](),
+    pending: new Map(),
+    displayToolCalls: new Map(),
+    nextBridgedExecId: 900_000,
+    blobs: new Map(),
+    toolDescriptors: [],
+    requestContext: {},
+    allowTools: true,
+    usageEstimate: { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 },
+    pumpActive: false,
+    heartbeat: null,
+  })
+}
+
+const discard = {
+  enqueue() {},
+  close() {},
+  error(error: unknown) { throw error },
+} as unknown as ReadableStreamDefaultController<any>
+
+describe("a gzip Run Cursor refuses after its request went out", () => {
+  it("is sent once more uncompressed although an earlier Run of the turn crossed a stateful barrier", async () => {
+    const session = refusedSession("resumed-refused")
+    session.replaySafety = { statefulBarrier: "non-control-exec" }
+    let resends = 0
+    session.resendRunRequest = async () => {
+      resends++
+      sessionManager.replaceStream(session, frameStream([turnEnded()]))
+    }
+    const final = await pumpWithRecovery({
+      initialSession: session,
+      controller: discard,
+      retryPolicy: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async () => { throw new Error("the refused Run must be resent, not recovered") },
+    })
+    expect(resends).toBe(1)
+    expect(final.sessionId).toBe("resumed-refused")
+  })
+
+  it("leaves the refusal behind with the stream it came on", () => {
+    const session = refusedSession("refusal-stays")
+    session.closeError = connectFrameError(JSON.stringify({ error: unsupported }))
+    sessionManager.replaceStream(session, frameStream([turnEnded()]))
+    expect(session.closeError).toBeNull()
   })
 })
 
