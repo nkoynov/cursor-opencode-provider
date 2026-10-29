@@ -1163,14 +1163,27 @@ function noteRunActivity(session: CursorSession, frame: Frame): void {
   session.lastActivityArrival = Math.max(session.lastActivityArrival ?? 0, frameArrival(frame) ?? Number.POSITIVE_INFINITY)
 }
 
-/** An exec request without its id, `exec_id` (#15) and `span` (#19), which differ when a resumed Run asks again. */
+/** Per-issuance `request_id` inside an exec's args: `ShellArgs` #23 (shell_args #2, shell_stream_args #14), `BackgroundShellSpawnArgs` #15 (#16). */
+const ARGS_REQUEST_ID_FIELD = new Map([[2, 23], [14, 23], [16, 15]])
+
+/**
+ * An exec request without its id, `exec_id` (#15), `span` (#19) and its args' `request_id`, which differ each time
+ * Cursor issues the same call.
+ */
 export function execReplayKey(payload: Uint8Array): string | undefined {
   const exec = readAllFieldsStrict(payload)?.find(field => field.fn === 2 && field.wt === 2)
   const fields = exec?.bytes && readAllFieldsStrict(exec.bytes)
   if (!fields) return undefined
   const hex = (bytes: Uint8Array | undefined) => bytes ? Buffer.from(bytes).toString("hex") : ""
-  return fields.filter(field => field.fn !== 1 && field.fn !== 15 && field.fn !== 19)
-    .map(field => `${field.fn}:${field.wt}:${field.varint ?? ""}:${hex(field.bytes ?? field.fixed64 ?? field.fixed32)}`)
+  const withoutRequestId = (field: StrictRawField): StrictRawField | undefined => {
+    const requestId = ARGS_REQUEST_ID_FIELD.get(field.fn)
+    if (requestId === undefined || field.wt !== 2 || !field.bytes) return field
+    const args = readAllFieldsStrict(field.bytes)
+    return args && { ...field, bytes: encodeRawFields(args.filter(arg => arg.fn !== requestId)) }
+  }
+  const kept = fields.filter(field => field.fn !== 1 && field.fn !== 15 && field.fn !== 19).map(withoutRequestId)
+  if (kept.some(field => !field)) return undefined
+  return kept.map(field => `${field!.fn}:${field!.wt}:${field!.varint ?? ""}:${hex(field!.bytes ?? field!.fixed64 ?? field!.fixed32)}`)
     .join(",")
 }
 

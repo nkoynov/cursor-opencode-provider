@@ -932,6 +932,29 @@ describe("parallel tool-call pump", () => {
       }
     })
 
+    it("answers a repeated shell call whose only difference is Cursor's per-issuance request_id", async () => {
+      const bytes = (...parts: Array<number[] | Uint8Array>) => Uint8Array.from(parts.flatMap(part => [...part]))
+      const lengthDelimited = (tag: number[], body: Uint8Array) => bytes(tag, [body.length], body)
+      const shellWithRequestId = (id: number, requestId: string) => {
+        const args = bytes(encodeMessage("ShellArgs", { command: "echo test", tool_call_id: "call-1" }),
+          lengthDelimited([0xba, 0x01], new TextEncoder().encode(requestId)))
+        const exec = bytes([0x08, id], lengthDelimited([0x72], args))
+        return { flags: 0, payload: lengthDelimited([0x12], exec) } as Frame
+      }
+      const { session, writes } = fixture([arrived(shellWithRequestId(1, "request-a")), arrived(listed(1)),
+        arrived(frame({ conversation_checkpoint_update: stepCheckpoint }))])
+      const first = collect()
+      await pump(session, first.controller, ids)
+      const call = toolCalls(first.parts).at(-1)!
+      expect(await deliverContinuationResults(session, [{
+        toolCallId: call.toolCallId, sessionId: session.sessionId, execId: 1, toolName: call.toolName, output: "RAN-ONCE",
+      }])).toBe(session)
+      const { outcome, runs, parts } = await recoverWith(session, [[shellWithRequestId(7, "request-b"), ended()]])
+      expect(outcome).toBe("completed")
+      expect(toolCalls(parts)).toHaveLength(0)
+      expect(shellReplies(runs[0]!.writes, 7)).toEqual(asResumed(shellReplies(writes)))
+    })
+
     it("names the request fields that differ when Cursor asks for the same call with another request", () => {
       const key = (command: string, timeout?: number) => execReplayKey(frame({ exec_server_message: {
         id: 3, exec_id: "x", shell_stream_args: { command, tool_call_id: "call-1", ...(timeout ? { timeout } : {}) },
