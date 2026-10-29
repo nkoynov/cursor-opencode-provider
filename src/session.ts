@@ -255,6 +255,8 @@ export type CursorSession = {
   resumeCheckpointAfterFrame?: number
   /** Results sent locally but not yet acknowledged by a matching server completion. */
   unacknowledgedHostResults?: Array<{ callId?: string; afterFrame: number }>
+  /** Arrival of the frame that carried `resumeCheckpoint`. */
+  resumeCheckpointArrival?: number
   /** The checkpoint frame that arrived last on this Run, accepted or not. */
   latestCheckpointFrame?: { bytes: Uint8Array; arrival: number }
   /** Arrival of the last frame on this Run that was more than KV, a heartbeat, a checkpoint or a completion of a written result. */

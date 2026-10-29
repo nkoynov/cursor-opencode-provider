@@ -1128,6 +1128,7 @@ function acceptResumeCheckpoint(session: CursorSession, bytes: Uint8Array, frame
   }
   if (arrivedBeforeResultWrite(session, frame)) return false
   session.resumeCheckpoint = Uint8Array.from(bytes)
+  session.resumeCheckpointArrival = frameArrival(frame)
   const resumedFrom = session.resumedFromCheckpoint
   if (!resumedFrom || !Buffer.from(bytes).equals(resumedFrom)) session.checkpointAcceptedAt = Date.now()
   session.checkpointRevoked = false
@@ -1858,6 +1859,7 @@ export async function pumpWithRecovery(input: {
   // own resumes the latest one this turn received, and two resumed attempts
   // that streamed without saving a new checkpoint stop the automatic retries.
   let turnCheckpoint: Uint8Array | undefined
+  let turnCheckpointArrival: number | undefined
   let resumedAttempt = false
   let noProgressResumes = 0
   let openingFailure: CursorProviderError | undefined
@@ -1944,9 +1946,11 @@ export async function pumpWithRecovery(input: {
       const results = replayableResults(pumpedSession)
       const required = new Set([...pumpedSession.resultReplay?.required ?? [], ...replay?.replay.required ?? []])
       if (results.size > 0) next.resultReplay = { results, required }
+      // The resumed Run starts from this checkpoint: a cut after it answers Cursor's repeat resumes the same one.
+      if (checkpoint === turnCheckpoint && turnCheckpointArrival !== undefined) {
+        next.latestCheckpointFrame = { bytes: Uint8Array.from(recovery.checkpoint), arrival: turnCheckpointArrival }
+      }
       if (replay) {
-        // The resumed Run starts from this checkpoint: a cut after it answers Cursor resumes the same one.
-        next.latestCheckpointFrame = { bytes: Uint8Array.from(replay.checkpoint), arrival: replay.arrival }
         trace(`recovery: result-replay hostSessionId=${pumpedSession.openCodeSessionId} previousSessionId=${pumpedSession.sessionId} ` +
           `sessionId=${next.sessionId} checkpointBytes=${checkpoint?.length ?? 0} ` +
           `required=${[...required].map(key => key.split("\n")[0]).join(",")}`)
@@ -2066,6 +2070,7 @@ export async function pumpWithRecovery(input: {
       const ownCheckpoint = resumableCheckpoint(pumpedSession)
       if (ownCheckpoint) {
         turnCheckpoint = ownCheckpoint
+        turnCheckpointArrival = pumpedSession.resumeCheckpointArrival
         noProgressResumes = 0
       } else if (pumpedSession.checkpointRevoked || pumpedSession.resultsAfterCheckpoint || pumpedSession.earlierCheckpointStale) {
         turnCheckpoint = undefined
@@ -2125,7 +2130,10 @@ export async function pumpWithRecovery(input: {
       const resultReplay = !failure.replaySafe && !checkpoint && !historyRecovery && !failure.checkpointUnusable
         ? resultReplayPlan(pumpedSession)
         : undefined
-      if (resultReplay) checkpoint = turnCheckpoint = resultReplay.checkpoint
+      if (resultReplay) {
+        checkpoint = turnCheckpoint = resultReplay.checkpoint
+        turnCheckpointArrival = resultReplay.arrival
+      }
       if (!failure.replaySafe && !checkpoint && !historyRecovery) {
         // Cursor CLI sends the same action again. Shown output keeps the
         // provider from doing so; the host can, unless a side effect would repeat.

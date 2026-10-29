@@ -39,13 +39,14 @@ const question = (tool_call_id: string) => frame({ interaction_query: {
 } })
 const completed = (call_id: string) => frame({ interaction_update: { tool_call_completed: { call_id } } })
 
-function fixture(frames: Frame[], sessionId = "parallel-pump") {
+function fixture(frames: Frame[], sessionId = "parallel-pump", arriveOnRead = false) {
   const writes: Uint8Array[] = []
   let reads = 0
   const iterator: AsyncIterator<Frame> = {
     next: async () => {
       reads++
       const value = frames.shift()
+      if (value && arriveOnRead) noteFrameArrivalForTests(value)
       return value ? { done: false, value } : { done: true, value: undefined }
     },
   }
@@ -783,7 +784,7 @@ describe("parallel tool-call pump", () => {
         retryPolicy: { maxAttempts: replacements.length + 1, baseDelayMs: 1, maxDelayMs: 1 },
         recover: async recovery => {
           recoveries.push(recovery)
-          const run = fixture(replacements[runs.length]!.map(arrived), `parallel-pump-resumed-${runs.length}`)
+          const run = fixture(replacements[runs.length]!, `parallel-pump-resumed-${runs.length}`, true)
           runs.push(run)
           return run.session
         },
@@ -811,6 +812,33 @@ describe("parallel tool-call pump", () => {
       expect(recoveries).toEqual([1, 2].map(() => ({ kind: "resume", conversationId: session.conversationId, checkpoint: stepCheckpoint })))
       expect(toolCalls(parts)).toHaveLength(0)
       expect(runs.map(run => shellReplies(run.writes, 7))).toEqual([asResumed(resultFrames), asResumed(resultFrames)])
+    })
+
+    it("resumes a checkpoint taken between two repeats and still answers the second from the written result", async () => {
+      await noteToolRequestsListedSeen()
+      const before = [arrived(shell(1, "call-1")), arrived(shell(2, "call-2")), arrived(listed(2)),
+        arrived(frame({ conversation_checkpoint_update: stepCheckpoint }))]
+      const { session } = fixture(before)
+      const first = collect()
+      await pump(session, first.controller, ids)
+      const calls = toolCalls(first.parts)
+      expect(calls).toHaveLength(2)
+      expect(await deliverContinuationResults(session, calls.map((call, index) => ({
+        toolCallId: call.toolCallId, sessionId: session.sessionId, execId: index + 1, toolName: call.toolName, output: `RAN-${index + 1}`,
+      })))).toBe(session)
+      const again = (id: number, callId: string) => frame({
+        exec_server_message: { id, shell_stream_args: { command: "echo test", tool_call_id: callId } },
+      })
+      const between = Uint8Array.of(10, 1, 11)
+      const { outcome, recoveries, runs, parts } = await recoverWith(session, [
+        [again(7, "call-1"), completed("call-1"), frame({ conversation_checkpoint_update: between })],
+        [again(8, "call-2")],
+        [again(9, "call-2"), ended()],
+      ])
+      expect(outcome).toBe("completed")
+      expect(recoveries.map(recovery => (recovery as { checkpoint: Uint8Array }).checkpoint)).toEqual([stepCheckpoint, between, between])
+      expect(toolCalls(parts)).toHaveLength(0)
+      expect(JSON.stringify(shellReplies(runs[2]!.writes, 9))).toContain("RAN-2")
     })
 
     it("sends a later request under the same call id (an edit's write after its read) to the host", async () => {
