@@ -4866,6 +4866,7 @@ async function deliverContinuationResultsNow(
           ;(session.writtenResults ??= []).push({
             callId, replayKey: pending.replayKey, execArrival: pending.execArrival, afterFrame: beforeResultWrite,
             ...(rebuild ? { rebuild } : {}),
+            ...(deliveredImageHashes.length > 0 ? { imageHashes: deliveredImageHashes } : {}),
           })
         }
       }
@@ -6792,6 +6793,7 @@ export async function pump(
         const beforeWrite = lastFrameArrival()
         if (!await writeExecFrames(written.rebuild!(esm.id as number), `replayed result id=${esm.id}`)) return
         invalidateResumeCheckpoint(session, beforeWrite, true)
+        if (session.historyImages && written.imageHashes) noteHistoryImagesSent(session.historyImages, written.imageHashes, beforeWrite)
         ;(session.unacknowledgedHostResults ??= []).push({ callId: execCallId, afterFrame: beforeWrite })
         // The call itself is in the checkpoint this Run resumed, which `execArrival` keeps saying.
         ;(session.writtenResults ??= []).push({ ...written, afterFrame: beforeWrite, ackArrival: undefined })

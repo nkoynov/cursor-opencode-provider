@@ -173,6 +173,8 @@ export type WrittenHostResult = {
   /** Arrival of Cursor's `tool_call_completed` for it: a checkpoint that arrived later holds the result. */
   ackArrival?: number
   rebuild?: (execId: number) => Uint8Array[]
+  /** History images the reply carries; a replay sends them to the resumed Run again. */
+  imageHashes?: string[]
 }
 
 export type ContinuationTerminalReason =

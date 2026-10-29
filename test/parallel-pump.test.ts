@@ -12,6 +12,7 @@ import { getHostCacheDirOverride, setHostCacheDirOverride } from "../src/context
 import { discardPendingCursorImage } from "../src/image-staging.js"
 import { IMAGE_PERMISSION_DENIED_PREFIX } from "../src/image-save.js"
 import { noteFrameArrivalForTests } from "../src/transport/connect.js"
+import { runHistoryImages } from "../src/protocol/sent-history-images.js"
 import { sessionFixture } from "./session-fixture.js"
 
 function frame(message: Record<string, unknown>): Frame {
@@ -839,6 +840,44 @@ describe("parallel tool-call pump", () => {
       expect(recoveries.map(recovery => (recovery as { checkpoint: Uint8Array }).checkpoint)).toEqual([stepCheckpoint, between, between])
       expect(toolCalls(parts)).toHaveLength(0)
       expect(JSON.stringify(shellReplies(runs[2]!.writes, 9))).toContain("RAN-2")
+    })
+
+    it("records the images of a replayed result as sent on the resumed Run", async () => {
+      const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-replay-image-"))
+      const badge = path.join(workspace, "badge.png")
+      fs.writeFileSync(badge, Uint8Array.of(0x89, 0x50, 0x4e, 0x47))
+      const read = (id: number) => frame({ exec_server_message: { id, read_args: { path: badge, tool_call_id: "call-1" } } })
+      const before = [arrived(read(1)), arrived(listed(1)), arrived(frame({ conversation_checkpoint_update: stepCheckpoint }))]
+      const { session } = fixture(before)
+      session.requestContext.env = { workspace_paths: [workspace] }
+      const tools = [{ name: "read", description: "Read" }]
+      session.toolCatalog = tools
+      session.toolDescriptors = toolsToDescriptors(tools, "opencode")
+      session.historyImages = runHistoryImages()
+      const first = collect()
+      await pump(session, first.controller, ids)
+      const call = toolCalls(first.parts).at(-1)!
+      expect(call.toolName).toBe("read")
+      expect(await deliverContinuationResults(session, [{
+        toolCallId: call.toolCallId, sessionId: session.sessionId, execId: 1, toolName: "read", output: "Image read successfully",
+        images: [{ data: Uint8Array.of(0x89, 0x50, 0x4e, 0x47), filename: "badge.png", mimeType: "image/png" }],
+        imageHashes: ["badge-hash"],
+      }])).toBe(session)
+      let resumed: ReturnType<typeof fixture>["session"] | undefined
+      const outcome = await pumpWithRecovery({ initialSession: session, controller: collect().controller,
+        retryPolicy: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 },
+        recover: async () => {
+          resumed = fixture([read(7), ended()], "parallel-pump-resumed-image", true).session
+          resumed.toolCatalog = tools
+          resumed.toolDescriptors = toolsToDescriptors(tools, "opencode")
+          resumed.requestContext.env = { workspace_paths: [workspace] }
+          resumed.historyImages = runHistoryImages()
+          return resumed
+        },
+      }).then(() => "completed", (error: Error) => error.message)
+      fs.rmSync(workspace, { recursive: true, force: true })
+      expect(outcome).toBe("completed")
+      expect(resumed!.historyImages!.sent.map(image => image.hash)).toEqual(["badge-hash"])
     })
 
     it("sends a later request under the same call id (an edit's write after its read) to the host", async () => {
