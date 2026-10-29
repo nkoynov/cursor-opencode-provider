@@ -175,6 +175,8 @@ export type WrittenHostResult = {
   rebuild?: (execId: number) => Uint8Array[]
   /** History images the reply carries; a replay sends them to the resumed Run again. */
   imageHashes?: string[]
+  /** The provider answered the exec itself (a refusal, an edit's empty read): no host tool ran. */
+  provider?: true
 }
 
 export type ContinuationTerminalReason =
@@ -264,6 +266,8 @@ export type CursorSession = {
   /** Arrival of the last frame on this Run that was more than KV, a heartbeat, a checkpoint or a completion of a written result. */
   lastActivityArrival?: number
   writtenResults?: WrittenHostResult[]
+  /** This Run's correlated exec requests by exec id, with the reply frames the provider wrote for each itself. */
+  execRequests?: Map<number, { callId: string; replayKey: string; frames: Uint8Array[] }>
   /**
    * Results a resumed Run answers from what the host already returned when Cursor asks for the same call again
    * (same call id and request). Until every `required` call is answered, anything else Cursor sends ends the turn.

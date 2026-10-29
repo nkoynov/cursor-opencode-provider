@@ -1232,8 +1232,56 @@ function replayEntryKey(callId: string, replayKey: string): string {
   return `${callId}\n${replayKey}`
 }
 
+/** The field numbers (and nested ones, one level down) where two `execReplayKey`s differ; no field content. */
+export function replayKeyDifference(stored: string, incoming: string): string {
+  const fields = (key: string) => new Map(key.split(",").filter(Boolean).map(entry => {
+    const [fn, wt, varint, hex] = entry.split(":")
+    return [fn!, { wt, varint, hex: hex ?? "" }]
+  }))
+  const before = fields(stored)
+  const after = fields(incoming)
+  const out: string[] = []
+  for (const fn of new Set([...before.keys(), ...after.keys()])) {
+    const a = before.get(fn)
+    const b = after.get(fn)
+    if (a && b && a.wt === b.wt && a.varint === b.varint && a.hex === b.hex) continue
+    if (!a || !b || a.wt !== "2" || b.wt !== "2") {
+      out.push(`${fn}${a ? "" : "+"}${b ? "" : "-"}`)
+      continue
+    }
+    const nested = (hex: string) => new Map((readAllFieldsStrict(Buffer.from(hex, "hex")) ?? [])
+      .map(field => [field.fn, `${field.wt}:${field.varint ?? ""}:${Buffer.from(field.bytes ?? field.fixed64 ?? field.fixed32 ?? []).toString("hex")}`]))
+    const na = nested(a.hex)
+    const nb = nested(b.hex)
+    const inner = [...new Set([...na.keys(), ...nb.keys()])].filter(key => na.get(key) !== nb.get(key))
+      .map(key => `${key}${na.has(key) ? "" : "+"}${nb.has(key) ? "" : "-"}`)
+    out.push(`${fn}.{${inner.join(",")}}`)
+  }
+  return out.join(",") || "nothing"
+}
+
+/** An exec reply the provider wrote itself, kept so a resumed Run that asks for the same call gets the same answer. */
+function noteProviderReply(session: CursorSession, frame: Uint8Array): void {
+  if (!session.execRequests?.size) return
+  const top = readAllFieldsStrict(frame)
+  const field = top?.length === 1 && top[0]!.wt === 2 ? top[0]! : undefined
+  const reply = field?.fn === 2 ? field.bytes
+    : field?.fn === 5 ? readAllFieldsStrict(field.bytes!)?.find(inner => inner.fn === 1 && inner.wt === 2)?.bytes
+    : undefined
+  const id = reply && readAllFieldsStrict(reply)?.find(inner => inner.fn === 1 && inner.wt === 0)?.varint
+  const request = id === undefined ? undefined : session.execRequests.get(Number(id))
+  request?.frames.push(Uint8Array.from(frame))
+}
+
 function replayableResults(session: CursorSession): Map<string, WrittenHostResult> {
   const results = new Map(session.resultReplay?.results)
+  for (const [execId, request] of session.execRequests ?? []) {
+    const rebuild = request.frames.length ? execReplyRebuilder(request.frames, execId) : undefined
+    if (rebuild) {
+      results.set(replayEntryKey(request.callId, request.replayKey),
+        { callId: request.callId, replayKey: request.replayKey, afterFrame: 0, rebuild, provider: true })
+    }
+  }
   for (const result of session.writtenResults ?? []) {
     if (result.callId && result.rebuild && result.replayKey !== undefined) {
       results.set(replayEntryKey(result.callId, result.replayKey), result)
@@ -5827,14 +5875,16 @@ export async function pump(
   const rethrowTransportWriteFailure = (error: unknown): void => {
     if (error instanceof CursorProviderError && error.origin !== "protocol") throw error
   }
+  const writeReplyFrame = async (frame: Uint8Array, operation: string): Promise<void> => {
+    await writeWithBackpressure(session.stream, frame, operation)
+    noteProviderReply(session, frame)
+  }
   const writeExecFrames = async (
     frames: Uint8Array[],
     operation: string,
   ): Promise<boolean> => {
     try {
-      for (const frame of frames) {
-        await writeWithBackpressure(session.stream, frame, operation)
-      }
+      for (const frame of frames) await writeReplyFrame(frame, operation)
       return true
     } catch (error) {
       rethrowTransportWriteFailure(error)
@@ -5989,7 +6039,7 @@ export async function pump(
         resultMetadata: { path: requestedPath },
         workspaceRoot,
       })) {
-        await writeWithBackpressure(session.stream, frame, "missing edit target reply")
+        await writeReplyFrame(frame, "missing edit target reply")
       }
       trace(
         `exec: missing edit target treated as empty file id=${parsed.id} ` +
@@ -6086,7 +6136,7 @@ export async function pump(
     if (!readResult) return false
     try {
       for (const frame of buildReadRejectionMessages(parsed.id, readResult)) {
-        await writeWithBackpressure(session.stream, frame, "missing read target reply")
+        await writeReplyFrame(frame, "missing read target reply")
       }
       const kind = Object.keys(readResult)[0]
       trace(
@@ -6792,14 +6842,16 @@ export async function pump(
         session.displayToolCalls.delete(execCallId)
         const beforeWrite = lastFrameArrival()
         if (!await writeExecFrames(written.rebuild!(esm.id as number), `replayed result id=${esm.id}`)) return
-        invalidateResumeCheckpoint(session, beforeWrite, true)
-        if (session.historyImages && written.imageHashes) noteHistoryImagesSent(session.historyImages, written.imageHashes, beforeWrite)
-        ;(session.unacknowledgedHostResults ??= []).push({ callId: execCallId, afterFrame: beforeWrite })
-        // The call itself is in the checkpoint this Run resumed, which `execArrival` keeps saying.
-        ;(session.writtenResults ??= []).push({ ...written, afterFrame: beforeWrite, ackArrival: undefined })
+        if (!written.provider) {
+          invalidateResumeCheckpoint(session, beforeWrite, true)
+          if (session.historyImages && written.imageHashes) noteHistoryImagesSent(session.historyImages, written.imageHashes, beforeWrite)
+          ;(session.unacknowledgedHostResults ??= []).push({ callId: execCallId, afterFrame: beforeWrite })
+          // The call itself is in the checkpoint this Run resumed, which `execArrival` keeps saying.
+          ;(session.writtenResults ??= []).push({ ...written, afterFrame: beforeWrite, ackArrival: undefined })
+        }
         resultReplay.required.delete(entryKey)
         trace(`recovery: result-replayed hostSessionId=${session.openCodeSessionId} sessionId=${session.sessionId} ` +
-          `execId=${esm.id} callId=${execCallId} required=${resultReplay.required.size}`)
+          `execId=${esm.id} callId=${execCallId} provider=${!!written.provider} required=${resultReplay.required.size}`)
         continue
       }
       if (resultReplay.required.size > 0) {
@@ -6818,7 +6870,11 @@ export async function pump(
             && updates.every(key => key === "step_started" || key === "tool_requests_listed" || key === "heartbeat"))
         if (!passes) {
           const awaited = [...resultReplay.required].map(key => key.split("\n")[0]).join(",")
-          endResultReplay(`sent ${describeFrameLayout(payload, 2)}${execCallId ? ` for call ${execCallId}` : ""} before asking again for ${awaited}`)
+          const sameCall = execKey === undefined ? [] : [...resultReplay.results.values()]
+            .filter(result => result.callId === execCallId && result.replayKey !== undefined)
+          const differs = sameCall.map(result => replayKeyDifference(result.replayKey!, execKey!)).join(" | ")
+          endResultReplay(`sent ${describeFrameLayout(payload, 2)}${execCallId ? ` for call ${execCallId}` : ""} ` +
+            `before asking again for ${awaited}${differs ? `; request differs in ${differs}` : ""}`)
         }
         // Cursor setting up the resumed step again; the checkpoint already held it.
         replayGuardPassed = true
@@ -7303,6 +7359,11 @@ export async function pump(
     } else if (esm) {
       cacheDiagnostics.execRequests++
       const esmId = (esm.id as number) ?? 0
+      {
+        const callId = extractExecDisplayCallId(esm)
+        const replayKey = callId && typeof esm.id === "number" ? execReplayKey(payload) : undefined
+        if (callId && replayKey !== undefined) (session.execRequests ??= new Map()).set(esmId, { callId, replayKey, frames: [] })
+      }
       if (esm.request_context_args) {
         // Server turn-setup probe (#10). Reply with the same RequestContext the Run sent.
         {
@@ -7390,7 +7451,7 @@ export async function pump(
             ? CREATE_PLAN_NOT_APPROVED_REASON
             : undefined)
           for (const frame of frames) {
-            await writeWithBackpressure(session.stream, frame, `git_diff reply id=${esmId}`)
+            await writeReplyFrame(frame, `git_diff reply id=${esmId}`)
           }
           trace(`exec git_diff: replied id=${esmId}`)
         } catch (error) {
@@ -7828,7 +7889,7 @@ export async function pump(
           const frames = buildUnsupportedExecDeny({ execId: esmId, variant, reason: grounded })
           try {
             for (const frame of frames) {
-              await writeWithBackpressure(session.stream, frame, `unsupported deny ${variant.requestName} id=${esmId}`)
+              await writeReplyFrame(frame, `unsupported deny ${variant.requestName} id=${esmId}`)
             }
           } catch (error) {
             rethrowTransportWriteFailure(error)

@@ -3,7 +3,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider"
-import { deliverContinuationResults, drainSessionUntilTurnEnded, pump, pumpWithRecovery, resetTurnStateForTests, settleRunSavesForTests } from "../src/language-model.js"
+import { deliverContinuationResults, drainSessionUntilTurnEnded, execReplayKey, pump, pumpWithRecovery, replayKeyDifference, resetTurnStateForTests, settleRunSavesForTests } from "../src/language-model.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { OPENCODE_1_TOOL_DIALECT, OPENCODE_2_TOOL_DIALECT, toolsToDescriptors } from "../src/protocol/tools.js"
 import { sessionManager, type Frame } from "../src/session.js"
@@ -878,6 +878,66 @@ describe("parallel tool-call pump", () => {
       fs.rmSync(workspace, { recursive: true, force: true })
       expect(outcome).toBe("completed")
       expect(resumed!.historyImages!.sent.map(image => image.hash)).toEqual(["badge-hash"])
+    })
+
+    it("answers a repeated edit read with the empty file the provider returned before the host wrote it", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-replay-edit-"))
+      const target = path.join(root, "notes.txt")
+      const started = () => frame({ interaction_update: { tool_call_started: {
+        call_id: "edit", tool_call: { edit_tool_call: { args: { path: target } } },
+      } } })
+      const readArgs = (id: number) => frame({ exec_server_message: { id, read_args: { path: target, tool_call_id: "edit" } } })
+      const writeArgs = (id: number) => frame({ exec_server_message: { id, write_args: { path: target, file_text: "alpha\n", tool_call_id: "edit" } } })
+      const tools = [{ name: "read" }, { name: "write" }, { name: "edit" }]
+      const prepare = (session: ReturnType<typeof fixture>["session"]) => {
+        session.toolCatalog = tools
+        session.toolDescriptors = toolsToDescriptors(tools, "opencode")
+        session.permittedToolNames = new Set(tools.map(tool => tool.name))
+        session.hostToolDialect = OPENCODE_2_TOOL_DIALECT
+        session.requestContext.env = { workspace_paths: [root] }
+      }
+      try {
+        const { session, writes } = fixture([arrived(started()), arrived(readArgs(1)), arrived(writeArgs(2)),
+          arrived(listed(1)), arrived(frame({ conversation_checkpoint_update: stepCheckpoint }))])
+        prepare(session)
+        const first = collect()
+        await pump(session, first.controller, ids)
+        const write = toolCalls(first.parts).at(-1)!
+        expect(write.toolName).toBe("write")
+        fs.writeFileSync(target, "alpha\n")
+        expect(await deliverContinuationResults(session, [{
+          toolCallId: write.toolCallId, sessionId: session.sessionId, execId: 2, toolName: "write", output: "Wrote file",
+        }])).toBe(session)
+        const replies = (bytes: Uint8Array[], id: number) => bytes.map(item => decodeMessage<any>("AgentClientMessage", item))
+          .filter(message => message.exec_client_message?.id === id)
+        const originalRead = replies(writes, 1)
+        expect(originalRead[0].exec_client_message.read_result.success.content ?? "").toBe("")
+        let resumed: ReturnType<typeof fixture> | undefined
+        const resumedParts = collect()
+        const outcome = await pumpWithRecovery({ initialSession: session, controller: resumedParts.controller,
+          retryPolicy: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 },
+          recover: async () => {
+            resumed = fixture([started(), readArgs(7), writeArgs(8), ended()], "parallel-pump-resumed-edit", true)
+            prepare(resumed.session)
+            return resumed.session
+          },
+        }).then(() => "completed", (error: Error) => error.message)
+        expect(outcome).toBe("completed")
+        expect(toolCalls(resumedParts.parts)).toHaveLength(0)
+        const json = (value: unknown, from: number, to: number) => JSON.stringify(value).replaceAll(`"id":${from}`, `"id":${to}`)
+        expect(json(replies(resumed!.writes, 7), 7, 7)).toBe(json(originalRead, 1, 7))
+        expect(json(replies(resumed!.writes, 8), 8, 8)).toBe(json(replies(writes, 2), 2, 8))
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    })
+
+    it("names the request fields that differ when Cursor asks for the same call with another request", () => {
+      const key = (command: string, timeout?: number) => execReplayKey(frame({ exec_server_message: {
+        id: 3, exec_id: "x", shell_stream_args: { command, tool_call_id: "call-1", ...(timeout ? { timeout } : {}) },
+      } }).payload)!
+      expect(replayKeyDifference(key("echo a"), key("echo a"))).toBe("nothing")
+      expect(replayKeyDifference(key("echo a"), key("echo b", 30))).toBe("14.{1,3+}")
     })
 
     it("sends a later request under the same call id (an edit's write after its read) to the host", async () => {
