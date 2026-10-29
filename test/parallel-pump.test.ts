@@ -750,12 +750,14 @@ describe("parallel tool-call pump", () => {
   describe("a Run cut right after a host result was written", () => {
     const stepCheckpoint = Uint8Array.of(10, 1, 9)
     const arrived = (made: Frame) => { noteFrameArrivalForTests(made); return made }
-    const shellAgain = (command = "echo test") => frame({
-      exec_server_message: { id: 1, exec_id: "resumed-exec", shell_stream_args: { command, tool_call_id: "call-1" } },
+    const shellAgain = (command = "echo test", id = 7) => frame({
+      exec_server_message: { id, exec_id: "resumed-exec", shell_stream_args: { command, tool_call_id: "call-1" } },
     })
-    const shellReplies = (writes: Uint8Array[]) => writes
+    const shellReplies = (writes: Uint8Array[], id = 1) => writes
       .map(bytes => decodeMessage<any>("AgentClientMessage", bytes))
-      .filter(message => message.exec_client_message?.id === 1 || message.exec_client_control_message?.stream_close?.id === 1)
+      .filter(message => message.exec_client_message?.id === id || message.exec_client_control_message?.stream_close?.id === id)
+    /** The same replies under exec id 7, the id the resumed Run asked with. */
+    const asResumed = (replies: any[]) => JSON.parse(JSON.stringify(replies).replaceAll('"id":1', '"id":7'))
 
     /** Cursor's call, the step's count and a checkpoint, all read before the host's result went out. */
     async function cutAfterResult(options: { checkpointAfterCall?: boolean; afterWrite?: readonly Frame[] } = {}) {
@@ -797,8 +799,18 @@ describe("parallel tool-call pump", () => {
       expect(toolCalls(parts)).toHaveLength(0)
       expect(parts.some(part => part.type === "text-delta" && part.delta === "done")).toBe(true)
       expect(finishes(parts).map(part => part.finishReason.unified)).toEqual(["stop"])
-      expect(shellReplies(runs[0]!.writes)).toEqual(resultFrames)
+      expect(shellReplies(runs[0]!.writes, 7)).toEqual(asResumed(resultFrames))
+      expect(resultFrames.some(reply => reply.exec_client_control_message?.stream_close)).toBe(true)
       expect(JSON.stringify(resultFrames)).toContain("RAN-ONCE")
+    })
+
+    it("resumes the same checkpoint again when the resumed Run is cut after answering Cursor's repeat", async () => {
+      const { session, resultFrames } = await cutAfterResult()
+      const { outcome, recoveries, runs, parts } = await recoverWith(session, [[shellAgain()], [shellAgain(), ended()]])
+      expect(outcome).toBe("completed")
+      expect(recoveries).toEqual([1, 2].map(() => ({ kind: "resume", conversationId: session.conversationId, checkpoint: stepCheckpoint })))
+      expect(toolCalls(parts)).toHaveLength(0)
+      expect(runs.map(run => shellReplies(run.writes, 7))).toEqual([asResumed(resultFrames), asResumed(resultFrames)])
     })
 
     it("sends a later request under the same call id (an edit's write after its read) to the host", async () => {
@@ -815,7 +827,7 @@ describe("parallel tool-call pump", () => {
       expect(recoveries).toHaveLength(2)
       expect(recoveries.every(recovery => (recovery as { kind: string }).kind === "resume")).toBe(true)
       expect(toolCalls(parts)).toHaveLength(0)
-      expect(shellReplies(runs[1]!.writes)).toEqual(resultFrames)
+      expect(shellReplies(runs[1]!.writes, 7)).toEqual(asResumed(resultFrames))
     })
 
     it.each([
@@ -829,7 +841,7 @@ describe("parallel tool-call pump", () => {
       expect(recoveries).toHaveLength(1)
       expect(toolCalls(parts)).toHaveLength(0)
       expect(parts.some(part => part.type === "text-delta")).toBe(false)
-      expect(shellReplies(runs[0]!.writes)).toEqual([])
+      expect(shellReplies(runs[0]!.writes, 7)).toEqual([])
     })
 
     it.each([
