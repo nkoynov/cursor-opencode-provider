@@ -38,7 +38,7 @@ const question = (tool_call_id: string) => frame({ interaction_query: {
 } })
 const completed = (call_id: string) => frame({ interaction_update: { tool_call_completed: { call_id } } })
 
-function fixture(frames: Frame[]) {
+function fixture(frames: Frame[], sessionId = "parallel-pump") {
   const writes: Uint8Array[] = []
   let reads = 0
   const iterator: AsyncIterator<Frame> = {
@@ -50,7 +50,7 @@ function fixture(frames: Frame[]) {
   }
   const tools = [{ name: "bash", description: "Run shell command" }]
   const session = sessionFixture({
-    sessionId: "parallel-pump", conversationId: "parallel-conversation",
+    sessionId, conversationId: "parallel-conversation",
     stream: {
       write(data) { writes.push(data) }, end() {}, destroy() {}, isClosed: () => false,
       onTerminal: () => () => {},
@@ -691,8 +691,8 @@ describe("parallel tool-call pump", () => {
       ...(kind === "correlated" ? { tool_call_id: "write-call" } : {}),
     } } })
     const tools = [{ name: "cursor_image_save", description: "Save an image" }]
-    const run = (frames: Frame[]) => {
-      const { session } = fixture(frames)
+    const run = (frames: Frame[], sessionId?: string) => {
+      const { session } = fixture(frames, sessionId)
       session.toolCatalog = tools
       session.toolDescriptors = toolsToDescriptors(tools, "opencode")
       session.requestContext.env = { workspace_paths: [workspace] }
@@ -710,7 +710,7 @@ describe("parallel tool-call pump", () => {
     }
     const session = run([imageWrite(), frame({ conversation_checkpoint_update: checkpoint }), text("after the write")])
     // Resuming a checkpoint from before the save has Cursor send the same write again.
-    const replacement = run([imageWrite(), ended()])
+    const replacement = run([imageWrite(), ended()], "parallel-pump-resumed")
     try {
       const first = collect()
       await pump(session, first.controller, ids)
@@ -725,9 +725,12 @@ describe("parallel tool-call pump", () => {
         expect(await recovered).toBe(replacement)
         expect(session.unacknowledgedHostResults?.length ?? 0).toBe(0)
         expect(recoveries).toEqual([{ kind: "resume", conversationId: session.conversationId, checkpoint }])
+        expect(replacement.replaySafety?.attempt?.unrebuildable).toBeUndefined()
+        expect(replacement.replaySafety?.historyRebaseUnsafe).toBeUndefined()
+        expect(replacement.replaySafety?.execs?.map(exec => [exec.sessionId, exec.id, exec.host]))
+          .toEqual([["parallel-pump", 1, true], ["parallel-pump-resumed", 1, true]])
         await save(replacement, resumed.parts)
         await pump(replacement, resumed.controller, ids)
-        expect(replacement.replaySafety?.attempt?.unrebuildable).toBeUndefined()
         expect(replacement.pending.size).toBe(0)
         expect(finishes(resumed.parts).map(part => part.finishReason.unified)).toEqual(["tool-calls", "stop"])
       } else {
