@@ -10,6 +10,7 @@ import { sessionManager, type Frame } from "../src/session.js"
 import { setActiveCursorMode, resetActiveCursorModesForTests } from "../src/protocol/switch-mode.js"
 import { getHostCacheDirOverride, setHostCacheDirOverride } from "../src/context/paths.js"
 import { discardPendingCursorImage } from "../src/image-staging.js"
+import { IMAGE_PERMISSION_DENIED_PREFIX } from "../src/image-save.js"
 import { sessionFixture } from "./session-fixture.js"
 
 function frame(message: Record<string, unknown>): Frame {
@@ -679,50 +680,63 @@ describe("parallel tool-call pump", () => {
     expect(recoveries).toEqual([{ kind: "resume", conversationId: session.conversationId, checkpoint }])
   })
 
-  it.each(["uncorrelated", "correlated"] as const)("%s image write: holds checkpoints for Cursor's completion only when the write names a call", async kind => {
+  it.each(["uncorrelated", "correlated", "refused"] as const)("%s image write: a checkpoint after its result needs Cursor's completion unless the write was saved without a call", async kind => {
     const checkpoint = Uint8Array.of(10, 1, 6)
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-image-ack-"))
     const previousCache = getHostCacheDirOverride()
     setHostCacheDirOverride(fs.mkdtempSync(path.join(os.tmpdir(), "cursor-image-ack-cache-")))
     const cacheDir = getHostCacheDirOverride()!
-    const { session } = fixture([
-      frame({ exec_server_message: { id: 1, write_args: {
-        path: path.join(workspace, "assets", "input.png"), file_bytes: Uint8Array.of(0x89, 0x50, 0x4e, 0x47),
-        ...(kind === "correlated" ? { tool_call_id: "write-call" } : {}),
-      } } }),
-      frame({ conversation_checkpoint_update: checkpoint }), text("after the write"),
-    ])
+    const imageWrite = () => frame({ exec_server_message: { id: 1, write_args: {
+      path: path.join(workspace, "assets", "input.png"), file_bytes: Uint8Array.of(0x89, 0x50, 0x4e, 0x47),
+      ...(kind === "correlated" ? { tool_call_id: "write-call" } : {}),
+    } } })
     const tools = [{ name: "cursor_image_save", description: "Save an image" }]
-    session.toolCatalog = tools
-    session.toolDescriptors = toolsToDescriptors(tools, "opencode")
-    session.requestContext.env = { workspace_paths: [workspace] }
-    let imageId: string | undefined
+    const run = (frames: Frame[]) => {
+      const { session } = fixture(frames)
+      session.toolCatalog = tools
+      session.toolDescriptors = toolsToDescriptors(tools, "opencode")
+      session.requestContext.env = { workspace_paths: [workspace] }
+      return session
+    }
+    const imageIds: string[] = []
+    const save = async (session: ReturnType<typeof run>, parts: LanguageModelV3StreamPart[], error?: string) => {
+      const call = toolCalls(parts).at(-1)!
+      expect(call.toolName).toBe("cursor_image_save")
+      imageIds.push(JSON.parse(call.input).image_id)
+      expect(await deliverContinuationResults(session, [{
+        toolCallId: call.toolCallId, sessionId: session.sessionId, execId: 1,
+        toolName: call.toolName, output: error ?? "saved", ...(error ? { error } : {}),
+      }])).toBe(session)
+    }
+    const session = run([imageWrite(), frame({ conversation_checkpoint_update: checkpoint }), text("after the write")])
+    // Resuming a checkpoint from before the save has Cursor send the same write again.
+    const replacement = run([imageWrite(), ended()])
     try {
       const first = collect()
       await pump(session, first.controller, ids)
-      const save = toolCalls(first.parts)[0]!
-      expect(save.toolName).toBe("cursor_image_save")
-      imageId = JSON.parse(save.input).image_id
-      expect(await deliverContinuationResults(session, [{
-        toolCallId: save.toolCallId, sessionId: session.sessionId, execId: 1,
-        toolName: save.toolName, output: "saved",
-      }])).toBe(session)
+      await save(session, first.parts, kind === "refused" ? `${IMAGE_PERMISSION_DENIED_PREFIX} denied` : undefined)
       const recoveries: unknown[] = []
-      const recovered = pumpWithRecovery({ initialSession: session, controller: collect().controller,
+      const resumed = collect()
+      const recovered = pumpWithRecovery({ initialSession: session, controller: resumed.controller,
         retryPolicy: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 },
-        recover: async recovery => { recoveries.push(recovery); return fixture([ended()]).session },
+        recover: async recovery => { recoveries.push(recovery); return replacement },
       })
       if (kind === "uncorrelated") {
-        await recovered
+        expect(await recovered).toBe(replacement)
         expect(session.unacknowledgedHostResults?.length ?? 0).toBe(0)
         expect(recoveries).toEqual([{ kind: "resume", conversationId: session.conversationId, checkpoint }])
+        await save(replacement, resumed.parts)
+        await pump(replacement, resumed.controller, ids)
+        expect(replacement.replaySafety?.attempt?.unrebuildable).toBeUndefined()
+        expect(replacement.pending.size).toBe(0)
+        expect(finishes(resumed.parts).map(part => part.finishReason.unified)).toEqual(["tool-calls", "stop"])
       } else {
         await expect(recovered).rejects.toThrow("automatic retry unsafe")
         expect(session.unacknowledgedHostResults).toHaveLength(1)
         expect(recoveries).toEqual([])
       }
     } finally {
-      if (imageId) discardPendingCursorImage(imageId)
+      for (const id of imageIds) discardPendingCursorImage(id)
       setHostCacheDirOverride(previousCache)
       fs.rmSync(workspace, { recursive: true, force: true })
       fs.rmSync(cacheDir, { recursive: true, force: true })
