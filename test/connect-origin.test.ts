@@ -1,7 +1,12 @@
 import { describe, it, expect } from "bun:test"
+import http2 from "node:http2"
+import type net from "node:net"
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import {
+  bidiRunStream,
   buildBaseHeaders,
+  cacheHttp2SessionForTests,
+  closeCachedHttp2SessionsForTests,
   cursorRunTerminationError,
   fetchAgentUrl,
   HTTP2_SESSION_MAX_AGE_MS,
@@ -265,6 +270,45 @@ describe("Run transport lifecycle", () => {
     expect(cursorRunTerminationError({ responseStatus: 200 }).message).toContain(
       "ended before turn_ended",
     )
+  })
+
+  it("advertises only the response compression it can decode", async () => {
+    const origin = "https://agentn.accept-encoding-test.cursor.sh"
+    const server = http2.createServer()
+    const sessions = new Set<http2.ServerHttp2Session>()
+    server.on("session", (session) => sessions.add(session))
+    const requestHeaders = new Promise<http2.IncomingHttpHeaders>((resolve) => {
+      server.on("stream", (stream, headers) => {
+        stream.on("error", () => {})
+        stream.respond({ ":status": 200, "content-type": "application/connect+proto" })
+        resolve(headers)
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+    const client = http2.connect(`http://127.0.0.1:${(server.address() as net.AddressInfo).port}`)
+    client.on("error", () => {})
+    await new Promise<void>((resolve, reject) => {
+      client.once("connect", () => resolve())
+      client.once("error", reject)
+    })
+    const savedClientVersion = process.env.CURSOR_CLIENT_VERSION
+    process.env.CURSOR_CLIENT_VERSION = "cli-accept-encoding-test"
+    resetClientVersionCache()
+    cacheHttp2SessionForTests(origin, client)
+    try {
+      const run = await bidiRunStream("token", { baseURL: origin })
+      const headers = await requestHeaders
+      run.destroy()
+      expect(headers[":path"]).toBe("/agent.v1.AgentService/Run")
+      expect(headers["connect-accept-encoding"]).toBe("gzip")
+    } finally {
+      closeCachedHttp2SessionsForTests()
+      for (const session of sessions) session.destroy()
+      await new Promise((resolve) => server.close(resolve))
+      if (savedClientVersion === undefined) delete process.env.CURSOR_CLIENT_VERSION
+      else process.env.CURSOR_CLIENT_VERSION = savedClientVersion
+      resetClientVersionCache()
+    }
   })
 })
 

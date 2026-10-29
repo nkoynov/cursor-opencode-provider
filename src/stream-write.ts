@@ -83,7 +83,7 @@ async function writeStreamMessageNow(
 ): Promise<void> {
   let accepted: boolean | void
   try {
-    accepted = stream.write(message)
+    accepted = await stream.write(message)
   } catch (cause) {
     throw toCursorProviderError(cause, {
       replaySafe: false,

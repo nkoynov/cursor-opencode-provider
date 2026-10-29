@@ -250,6 +250,7 @@ for (const [name, bytes, close] of [
   ["exit-after-end-destroy-blocked", 3_000_000, "end-then-destroy"],
 ]) {
   const script = `
+import { randomBytes } from "node:crypto"
 import http2 from "node:http2"
 import { bidiRunStream, cacheHttp2SessionForTests, resetRunCompressionForTests } from ${JSON.stringify(CONNECT_MODULE)}
 // Gzip would shrink the filled request below the stream's buffers, so it would never block.
@@ -268,7 +269,7 @@ await new Promise((resolve) => client.once("connect", resolve))
 cacheHttp2SessionForTests("https://agentn.node-exit-test.cursor.sh", client)
 void (async () => {
   const run = await bidiRunStream("token", { baseURL: "https://agentn.node-exit-test.cursor.sh" })
-  run.write(new Uint8Array(${bytes}).fill(5))
+  run.write(new Uint8Array(randomBytes(${bytes})))
   await arrived
   await new Promise((resolve) => setTimeout(resolve, 200))
   ${close !== "destroy" ? "run.end()" : ""}

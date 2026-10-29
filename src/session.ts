@@ -491,6 +491,8 @@ export type CursorSession = {
   allowModelSwitch?: boolean
   /** The model that answered an accepted switch. */
   servedBySwitch?: string
+  /** Send the current Run's request again on a new stream, which goes uncompressed once Cursor refused gzip. */
+  resendRunRequest?: (signal?: AbortSignal) => Promise<void>
 }
 
 export type ModelSwitchGuard = {

@@ -131,6 +131,13 @@ The **1.18 v2** API and **OpenCode 2.x** are source-incompatible:
   (`runUploadFailure`). A bare credential rejection there gets the call's one
   forced renewal, shared with the pump's (`openSession`). There is no upload deadline;
   errors, Run termination and the 120 s inbound read-idle watchdog settle waits.
+- Run messages of 1 KiB or more are gzipped like Cursor CLI's, with async
+  `zlib.gzip` and in write order: a Run stream's `write` returns a promise
+  while a message waits for compression. The opening request is compressed
+  before its stream opens, so it is written before Cursor can answer. A gzip
+  refusal is resent uncompressed once, only from the pass that opened the Run
+  while it is replay-safe, and latches that origin uncompressed for the
+  process. Fake Run servers decode frames with `decodeFramePayload`.
 - Initial and replacement uploads own temporary abort/host-Stop listeners;
   continuation delivery and the active pump use their current call's signal.
   Detach temporary listeners after upload so an ordinary tool-step abort keeps

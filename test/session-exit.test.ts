@@ -19,6 +19,7 @@ import {
 const CONNECT_MODULE = pathToFileURL(path.resolve(import.meta.dir, "../src/transport/connect.ts")).href
 
 const PRELUDE = `
+import { randomBytes } from "node:crypto"
 import http2 from "node:http2"
 import { bidiRunStream, cacheHttp2SessionForTests, resetRunCompressionForTests } from ${JSON.stringify(CONNECT_MODULE)}
 
@@ -109,7 +110,7 @@ const destroyedRun = (bytes: number, close: "destroy" | "end" | "end-then-destro
 // Gzip would shrink the filled request below the stream's buffers, so it would never block.
 resetRunCompressionForTests(ORIGIN)
 const run = await bidiRunStream("token", { baseURL: ORIGIN })
-run.write(new Uint8Array(${bytes}).fill(5))
+run.write(new Uint8Array(randomBytes(${bytes})))
 await serverStream(1)
 await new Promise((resolve) => setTimeout(resolve, 200))
 ${close !== "destroy" ? "run.end()" : ""}

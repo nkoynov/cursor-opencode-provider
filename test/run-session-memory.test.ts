@@ -8,6 +8,7 @@ import {
   bidiRunStream,
   closeCachedHttp2SessionsForTests,
   getSession,
+  resetRunCompressionForTests,
   type BidiStream,
 } from "../src/transport/connect.js"
 
@@ -104,10 +105,13 @@ beforeEach(async () => {
   }
   process.env.CURSOR_CLIENT_VERSION = "cli-session-memory-test-1"
   resetClientVersionCache()
+  // The filled requests would compress to a few kilobytes and never fill the session.
+  resetRunCompressionForTests(ORIGIN)
   cursor = await startBusyCursor()
 })
 
 afterEach(async () => {
+  resetRunCompressionForTests()
   closeCachedHttp2SessionsForTests()
   ;(http2 as { connect: unknown }).connect = realConnect
   ;(tls as { connect: unknown }).connect = realTlsConnect
