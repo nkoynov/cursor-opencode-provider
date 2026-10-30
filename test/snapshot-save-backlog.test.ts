@@ -11,7 +11,7 @@ import {
 } from "../src/protocol/conversation-persistence.js"
 import {
   clearPersistedConversationState, persistConversationState, resetSnapshotGenerationsForTests,
-  setSnapshotBlobLimitForTests,
+  setSnapshotBlobLimitForTests, setSnapshotCaptureHookForTests,
 } from "../src/protocol/conversation-state.js"
 import {
   compactConversationBlobs, conversationBlobCount, getConversationBlob, resetConversationBlobsForTests,
@@ -29,6 +29,7 @@ const root = () => {
 afterEach(() => {
   setConversationPersistenceHookForTests()
   setSnapshotBlobLimitForTests()
+  setSnapshotCaptureHookForTests()
   resetHostHistoryRewritesForTests()
   resetConversationPersistenceForTests()
   resetConversationBindingsForTests()
@@ -61,6 +62,35 @@ test("saves requested while a write runs leave one waiting save, which writes th
   await Promise.all([running, ...waiting])
   expect(writes).toBe(2)
   expect((await getPersistedConversation(cache, sessionKey))?.hostNote).toBe("note-5")
+})
+
+test("captures replaced while they wait are released before the running write ends", async () => {
+  const cache = root()
+  const sessionKey = "released"
+  const conversationId = peekConversationId(sessionKey)
+  setCheckpoint(conversationId, checkpoint())
+  setConversationBlob(conversationId, blobId(8), new Uint8Array(1000))
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let writes = 0
+  setConversationPersistenceHookForTests(async phase => {
+    if (phase === "before-write" && writes++ === 0) await gate
+  })
+  const captures: WeakRef<object>[] = []
+  setSnapshotCaptureHookForTests(blobs => captures.push(new WeakRef(blobs)))
+  const save = (hostNote: string) =>
+    persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true }, hostNote, runInProgress: true })
+  const running = save("note-0")
+  while (writes === 0) await new Promise(resolve => setTimeout(resolve, 1))
+  const waiting = [1, 2, 3, 4, 5].map(n => save(`note-${n}`))
+  for (let i = 0; i < 5; i++) {
+    Bun.gc(true)
+    await new Promise(resolve => setTimeout(resolve, 1))
+  }
+  const alive = captures.map(capture => capture.deref() !== undefined)
+  release()
+  await Promise.all([running, ...waiting])
+  expect(alive).toEqual([true, false, false, false, false, true])
 })
 
 test("a save queued after a delete still lands after it", async () => {

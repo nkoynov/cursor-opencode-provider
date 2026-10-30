@@ -340,33 +340,52 @@ export async function hydrateTurnProvenance(cacheDir: string, sessionKey: string
  * (`runInProgress`) so a Run the host interrupts, or a restart, resumes from
  * the latest checkpoint and still recognizes the step in progress.
  */
-export async function persistConversationState(
-  cacheDir: string,
-  input: {
-    sessionKey: string
-    conversationId: string
-    requestContext: Record<string, unknown>
-    toolCatalog?: OpencodeToolDef[]
-    postCompactionRebase?: boolean
-    hostAgent?: string
-    systemPromptHash?: string
-    hostNote?: string
-    runInProgress?: boolean
-    modelFallbackStop?: string
-  },
-): Promise<void> {
-  // A newer Run may have reset/superseded this conversation while its final
-  // frame was still in flight. Never let that late TurnEnded resurrect it.
-  const superseded = () => {
-    if (isActiveConversationBinding(input.sessionKey, input.conversationId)) return false
-    trace(
-      `conversation persistence: skipped superseded TurnEnded ` +
-        `sessionKey=${input.sessionKey} conversationId=${input.conversationId}`,
-    )
-    return true
+export async function persistConversationState(cacheDir: string, input: ConversationStateInput): Promise<void> {
+  if (supersededTurnEnd(input)) return
+  const key = snapshotKey(cacheDir, input.sessionKey)
+  const waiting = waitingSnapshotSaves.get(key)
+  if (waiting?.queued && isLastConversationStateWrite(cacheDir, input.sessionKey, waiting.queued)) {
+    // Held by the slot only: no local of a waiting call keeps a replaced capture alive.
+    waiting.save = captureSnapshotSave(cacheDir, input)
+    trace(`conversation persistence: replaced a waiting save sessionKey=${input.sessionKey} conversationId=${input.conversationId}`)
+    await trackedSnapshotWrite(cacheDir, input.sessionKey, () => waiting.queued!)
+    return
   }
-  if (superseded()) return
-  // Fork: capture now, as turn-end saves are not awaited; a queued capture could compact away a later Run's blobs.
+  const slot: WaitingSnapshotSave = { save: captureSnapshotSave(cacheDir, input) }
+  waitingSnapshotSaves.set(key, slot)
+  await trackedSnapshotWrite(cacheDir, input.sessionKey, () => slot.queued = queueConversationStateWrite(
+    cacheDir, input.sessionKey, () => {
+      if (waitingSnapshotSaves.get(key) === slot) waitingSnapshotSaves.delete(key)
+      return slot.save()
+    }))
+}
+
+type ConversationStateInput = {
+  sessionKey: string
+  conversationId: string
+  requestContext: Record<string, unknown>
+  toolCatalog?: OpencodeToolDef[]
+  postCompactionRebase?: boolean
+  hostAgent?: string
+  systemPromptHash?: string
+  hostNote?: string
+  runInProgress?: boolean
+  modelFallbackStop?: string
+}
+
+// A newer Run may have reset/superseded this conversation while its final
+// frame was still in flight. Never let that late TurnEnded resurrect it.
+function supersededTurnEnd(input: ConversationStateInput): boolean {
+  if (isActiveConversationBinding(input.sessionKey, input.conversationId)) return false
+  trace(
+    `conversation persistence: skipped superseded TurnEnded ` +
+      `sessionKey=${input.sessionKey} conversationId=${input.conversationId}`,
+  )
+  return true
+}
+
+/** Fork: capture now, as turn-end saves are not awaited; a queued capture could compact away a later Run's blobs. */
+function captureSnapshotSave(cacheDir: string, input: ConversationStateInput): () => Promise<boolean> {
   const checkpoint = getCheckpoint(input.conversationId)
   const blobCompaction = compactConversationBlobs(input.conversationId, checkpoint, {
     keepInMemory: input.runInProgress,
@@ -396,8 +415,9 @@ export async function persistConversationState(
       ? { turnProvenance: serializeTurnProvenance(provenance) }
       : {}),
   }
-  const save = async (): Promise<boolean> => {
-    if (superseded()) return false
+  snapshotCaptureHook?.(blobCompaction.blobs)
+  return async (): Promise<boolean> => {
+    if (supersededTurnEnd(input)) return false
     if (blobCompaction.oversized) {
       // A restore would reject the snapshot; the one on disk is older than this state.
       await discardPersistedConversation(cacheDir, input.sessionKey)
@@ -421,21 +441,6 @@ export async function persistConversationState(
     )
     return true
   }
-  const key = snapshotKey(cacheDir, input.sessionKey)
-  const waiting = waitingSnapshotSaves.get(key)
-  if (waiting?.queued && isLastConversationStateWrite(cacheDir, input.sessionKey, waiting.queued)) {
-    waiting.save = save
-    trace(`conversation persistence: replaced a waiting save sessionKey=${input.sessionKey} conversationId=${input.conversationId}`)
-    await trackedSnapshotWrite(cacheDir, input.sessionKey, () => waiting.queued!)
-    return
-  }
-  const slot: WaitingSnapshotSave = { save }
-  waitingSnapshotSaves.set(key, slot)
-  await trackedSnapshotWrite(cacheDir, input.sessionKey, () => slot.queued = queueConversationStateWrite(
-    cacheDir, input.sessionKey, () => {
-      if (waitingSnapshotSaves.get(key) === slot) waitingSnapshotSaves.delete(key)
-      return slot.save()
-    }))
 }
 
 // Fork: a save still waiting behind the session's running write takes this module copy's newest capture instead of
@@ -445,8 +450,14 @@ type WaitingSnapshotSave = { save: () => Promise<boolean>; queued?: Promise<bool
 const waitingSnapshotSaves = new Map<string, WaitingSnapshotSave>()
 let snapshotBlobLimit = MAX_CONVERSATION_SNAPSHOT_BLOB_BYTES
 
+let snapshotCaptureHook: ((blobs: readonly object[]) => void) | undefined
+
 export function setSnapshotBlobLimitForTests(bytes = MAX_CONVERSATION_SNAPSHOT_BLOB_BYTES): void {
   snapshotBlobLimit = bytes
+}
+
+export function setSnapshotCaptureHookForTests(hook?: (blobs: readonly object[]) => void): void {
+  snapshotCaptureHook = hook
 }
 
 /**
