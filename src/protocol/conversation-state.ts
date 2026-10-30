@@ -49,6 +49,7 @@ import {
 import { moveSessionEditsDenySent, restoreSessionEditsDenySent, sessionEditsDenySent } from "./session-edits.js"
 import {
   deletePersistedConversation,
+  discardPersistedConversation,
   forgetCachedConversation,
   getPersistedTurnProvenance,
   loadPersistedConversation,
@@ -398,10 +399,8 @@ export async function persistConversationState(
   const save = async (): Promise<boolean> => {
     if (superseded()) return false
     if (blobCompaction.oversized) {
-      // A restore would reject the snapshot; the one on disk is older than this state. Another copy may have
-      // written it since this copy last read the file, so read its header again.
-      await forgetCachedConversation(cacheDir, input.sessionKey)
-      await deletePersistedConversation(cacheDir, input.sessionKey)
+      // A restore would reject the snapshot; the one on disk is older than this state.
+      await discardPersistedConversation(cacheDir, input.sessionKey)
       trace(
         `conversation persistence: not saved${input.runInProgress ? " in-progress" : ""} sessionKey=${input.sessionKey} ` +
           `conversationId=${input.conversationId} blobBytes=${blobCompaction.afterBytes} ` +

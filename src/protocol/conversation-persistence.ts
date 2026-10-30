@@ -742,28 +742,32 @@ function queueWrite(store: ConversationStore, value: PersistedConversation): Pro
   return write
 }
 
-function queueDelete(store: ConversationStore, expectedConversationId: string): Promise<void> {
-  const write = store.writeChain.catch(() => {}).then(async () => {
-    const filePath = conversationCacheFilePath(store.cacheDir, store.sessionKey)
-    await withFileOperation(filePath, async () => {
-      const opened = await openConversationFile(filePath)
-      if (!opened) return
-      try {
-        const stat = await opened.handle.stat({ bigint: true })
-        const header = await readConversationCacheHeader(opened.handle)
-        if (header.status !== "metadata" || header.value.sessionKey !== store.sessionKey ||
-            header.value.conversationId !== expectedConversationId) return
-        if (opened.sourcePath === filePath) await discardCacheCandidate(filePath, stat)
-        else await unlink(opened.sourcePath).catch((error) => {
-          if (errorCode(error) !== "ENOENT") throw error
-        })
-      } finally {
-        await opened.handle.close()
-      }
-    })
-  })
+function queueDelete(store: ConversationStore, expectedConversationId?: string): Promise<void> {
+  const write = store.writeChain.catch(() => {}).then(() =>
+    deleteSnapshotFile(store.cacheDir, store.sessionKey, expectedConversationId))
   store.writeChain = write
   return write
+}
+
+/** Remove the session's snapshot if its header names the session (and the conversation, when one is given). */
+async function deleteSnapshotFile(cacheDir: string, sessionKey: string, expectedConversationId?: string): Promise<void> {
+  const filePath = conversationCacheFilePath(cacheDir, sessionKey)
+  await withFileOperation(filePath, async () => {
+    const opened = await openConversationFile(filePath)
+    if (!opened) return
+    try {
+      const stat = await opened.handle.stat({ bigint: true })
+      const header = await readConversationCacheHeader(opened.handle)
+      if (header.status !== "metadata" || header.value.sessionKey !== sessionKey ||
+          (expectedConversationId !== undefined && header.value.conversationId !== expectedConversationId)) return
+      if (opened.sourcePath === filePath) await discardCacheCandidate(filePath, stat)
+      else await unlink(opened.sourcePath).catch((error) => {
+        if (errorCode(error) !== "ENOENT") throw error
+      })
+    } finally {
+      await opened.handle.close()
+    }
+  })
 }
 
 async function recoverQuarantine(filePath: string, now: number, signal: AbortSignal): Promise<void> {
@@ -1114,6 +1118,20 @@ export async function persistConversation(
   await testHook?.("before-write", conversationCacheFilePath(cacheDir, value.sessionKey))
   await queueWrite(store, snapshot)
   scheduleMaintenance(path.resolve(cacheDir), now)
+}
+
+/**
+ * Fork: drop the session's snapshot whatever this module copy has cached about it (another copy may have written
+ * it since), reading only the file's header rather than loading the snapshot.
+ */
+export async function discardPersistedConversation(cacheDir: string, sessionKey: string): Promise<void> {
+  const root = path.resolve(cacheDir)
+  const store = await stores.get(`${root}\0${sessionKey}`)?.catch(() => undefined)
+  if (!store) return deleteSnapshotFile(root, sessionKey)
+  store.head = undefined
+  store.value = undefined
+  store.loadStatus = "missing"
+  await queueDelete(store)
 }
 
 /** Delete only the expected binding so an overlapping newer turn cannot be removed. */

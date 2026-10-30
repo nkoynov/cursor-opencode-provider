@@ -123,8 +123,13 @@ test("an oversized save drops a snapshot another module copy wrote after this co
   expect(existsSync(conversationCacheFilePath(cache, sessionKey))).toBe(true)
   setSnapshotBlobLimitForTests(5)
   setConversationBlob(conversationId, blobId(7), new Uint8Array(10))
+  let decodes = 0
+  setConversationPersistenceHookForTests(phase => {
+    if (phase === "full-decode") decodes++
+  })
   await persistConversationState(cache, { ...input, runInProgress: true })
   expect(existsSync(conversationCacheFilePath(cache, sessionKey))).toBe(false)
+  expect(decodes).toBe(0)
 })
 
 test("compaction over maxBytes copies no blobs and still compacts the store", () => {
