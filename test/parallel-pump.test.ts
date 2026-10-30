@@ -806,6 +806,27 @@ describe("parallel tool-call pump", () => {
       expect(JSON.stringify(resultFrames)).toContain("RAN-ONCE")
     })
 
+    it("lets an answered call ask again while another call's result is still owed", async () => {
+      await noteToolRequestsListedSeen()
+      const before = [arrived(shell(1, "call-1")), arrived(shell(2, "call-2")), arrived(listed(2)),
+        arrived(frame({ conversation_checkpoint_update: stepCheckpoint }))]
+      const { session } = fixture(before)
+      const first = collect()
+      await pump(session, first.controller, ids)
+      const calls = toolCalls(first.parts)
+      expect(await deliverContinuationResults(session, calls.map((call, index) => ({
+        toolCallId: call.toolCallId, sessionId: session.sessionId, execId: index + 1, toolName: call.toolName, output: `RAN-${index + 1}`,
+      })))).toBe(session)
+      const again = (id: number, callId: string) => frame({
+        exec_server_message: { id, shell_stream_args: { command: "echo test", tool_call_id: callId } },
+      })
+      const { outcome, runs, parts } = await recoverWith(session, [[again(7, "call-1"), again(8, "call-1")]])
+      expect(outcome).toBe("completed")
+      expect(JSON.stringify(shellReplies(runs[0]!.writes, 7))).toContain("RAN-1")
+      expect(shellReplies(runs[0]!.writes, 8)).toEqual([])
+      expect(toolCalls(parts).map(call => JSON.parse(call.input).command)).toEqual(["echo test"])
+    })
+
     it("resumes the same checkpoint again when the resumed Run is cut after answering Cursor's repeat", async () => {
       const { session, resultFrames } = await cutAfterResult()
       const { outcome, recoveries, runs, parts } = await recoverWith(session, [[shellAgain()], [shellAgain(), ended()]])
@@ -968,6 +989,15 @@ describe("parallel tool-call pump", () => {
       const { outcome, parts } = await recoverWith(session, [[shellAgain(), shellAgain("echo second")]])
       expect(outcome).toBe("completed")
       expect(toolCalls(parts).map(call => JSON.parse(call.input).command)).toEqual(["echo second"])
+    })
+
+    it("answers the repeat from the written result once, and the same request asked again after it on the host", async () => {
+      const { session, resultFrames } = await cutAfterResult()
+      const { outcome, runs, parts } = await recoverWith(session, [[shellAgain(), shellAgain("echo test", 8)]])
+      expect(outcome).toBe("completed")
+      expect(shellReplies(runs[0]!.writes, 7)).toEqual(asResumed(resultFrames))
+      expect(shellReplies(runs[0]!.writes, 8)).toEqual([])
+      expect(toolCalls(parts).map(call => JSON.parse(call.input).command)).toEqual(["echo test"])
     })
 
     it("resumes again with the same answer when the resumed Run is cut before Cursor asks", async () => {
