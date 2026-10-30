@@ -6909,6 +6909,8 @@ export async function pump(
         }
         const updates = iu ? Object.keys(iu).filter(key => iu[key]) : []
         const passes = isSoleControlFrame(payload)
+          // A call already answered asking again (an await's next poll) while another result is still owed.
+          || (!!esm && entryKey !== undefined && !!resultReplay.replayed?.has(entryKey))
           || (!!esm && !replayFrame.barrier && !!(esm.request_context_args || esm.mcp_state_exec_args))
           || (!esm && !kv && !execControl && !interactionQuery && !replayFrame.barrier && updates.length > 0
             && updates.every(key => key === "step_started" || key === "tool_requests_listed" || key === "heartbeat"))
