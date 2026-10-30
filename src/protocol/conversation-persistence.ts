@@ -82,6 +82,8 @@ const stores = new Map<string, Promise<ConversationStore>>()
 const initializedRoots = new Map<string, Promise<void>>()
 const startupDiscardedStatuses = new Map<string, Map<string, "invalid" | "expired">>()
 const MAX_CONVERSATION_CACHE_BYTES = 256 * 1024 * 1024
+/** Fork: blobs above this make a snapshot a restore rejects; everything else in one is a few hundred KB. */
+export const MAX_CONVERSATION_SNAPSHOT_BLOB_BYTES = MAX_CONVERSATION_CACHE_BYTES - 16 * 1024 * 1024
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true })
 const gunzipAsync = promisify(gunzip)
 const gzipAsync = promisify(gzip)

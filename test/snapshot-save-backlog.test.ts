@@ -1,0 +1,120 @@
+import { afterEach, expect, test } from "bun:test"
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { resetHostHistoryRewritesForTests } from "../src/host-history-rewrite.js"
+import { peekConversationId, resetConversationBindingsForTests } from "../src/protocol/conversation-bind.js"
+import {
+  getPersistedConversation, resetConversationPersistenceForTests, setConversationPersistenceHookForTests,
+} from "../src/protocol/conversation-persistence.js"
+import {
+  clearPersistedConversationState, persistConversationState, resetSnapshotGenerationsForTests,
+  setSnapshotBlobLimitForTests,
+} from "../src/protocol/conversation-state.js"
+import {
+  compactConversationBlobs, conversationBlobCount, getConversationBlob, resetConversationBlobsForTests,
+  setConversationBlob,
+} from "../src/protocol/blob-store.js"
+import { resetCheckpointsForTests, setCheckpoint } from "../src/protocol/checkpoint.js"
+import { encodeMessage } from "../src/protocol/messages.js"
+
+const roots: string[] = []
+const root = () => {
+  const value = mkdtempSync(join(tmpdir(), "cursor-snapshot-backlog-"))
+  roots.push(value)
+  return value
+}
+afterEach(() => {
+  setConversationPersistenceHookForTests()
+  setSnapshotBlobLimitForTests()
+  resetHostHistoryRewritesForTests()
+  resetConversationPersistenceForTests()
+  resetConversationBindingsForTests()
+  resetSnapshotGenerationsForTests()
+  resetConversationBlobsForTests()
+  resetCheckpointsForTests()
+  for (const value of roots.splice(0)) rmSync(value, { recursive: true, force: true })
+})
+
+const blobId = (seed: number) => Uint8Array.from({ length: 32 }, (_, i) => (seed * 31 + i) & 0xff)
+const checkpoint = () => encodeMessage("ConversationStateStructure", { token_details: { used_tokens: 1, max_tokens: 2 } })
+
+test("saves requested while a write runs leave one waiting save, which writes the newest state", async () => {
+  const cache = root()
+  const sessionKey = "backlog"
+  const conversationId = peekConversationId(sessionKey)
+  setCheckpoint(conversationId, checkpoint())
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let writes = 0
+  setConversationPersistenceHookForTests(async phase => {
+    if (phase === "before-write" && writes++ === 0) await gate
+  })
+  const save = (hostNote: string) =>
+    persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true }, hostNote, runInProgress: true })
+  const running = save("note-0")
+  while (writes === 0) await new Promise(resolve => setTimeout(resolve, 1))
+  const waiting = [1, 2, 3, 4, 5].map(n => save(`note-${n}`))
+  release()
+  await Promise.all([running, ...waiting])
+  expect(writes).toBe(2)
+  expect((await getPersistedConversation(cache, sessionKey))?.hostNote).toBe("note-5")
+})
+
+test("a save queued after a delete still lands after it", async () => {
+  const cache = root()
+  const sessionKey = "ordered"
+  const conversationId = peekConversationId(sessionKey)
+  setCheckpoint(conversationId, checkpoint())
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let writes = 0
+  setConversationPersistenceHookForTests(async phase => {
+    if (phase === "before-write" && writes++ === 0) await gate
+  })
+  const save = (hostNote: string) =>
+    persistConversationState(cache, { sessionKey, conversationId, requestContext: { rules_info_complete: true }, hostNote })
+  const running = save("first")
+  while (writes === 0) await new Promise(resolve => setTimeout(resolve, 1))
+  const waiting = save("second")
+  const cleared = clearPersistedConversationState(cache, sessionKey)
+  const last = save("third")
+  release()
+  await Promise.all([running, waiting, cleared, last])
+  expect(writes).toBe(3)
+  expect((await getPersistedConversation(cache, sessionKey))?.hostNote).toBe("third")
+})
+
+test("a conversation whose blobs pass the restore limit drops its older snapshot instead of saving", async () => {
+  const cache = root()
+  const sessionKey = "oversized"
+  const conversationId = peekConversationId(sessionKey)
+  setSnapshotBlobLimitForTests(100)
+  const input = { sessionKey, conversationId, requestContext: { rules_info_complete: true } }
+  setConversationBlob(conversationId, blobId(1), new Uint8Array(40))
+  await persistConversationState(cache, input)
+  expect((await getPersistedConversation(cache, sessionKey))?.blobs.length).toBe(1)
+  setConversationBlob(conversationId, blobId(2), new Uint8Array(80))
+  let writes = 0
+  setConversationPersistenceHookForTests(phase => {
+    if (phase === "before-write") writes++
+  })
+  await persistConversationState(cache, { ...input, runInProgress: true })
+  expect(writes).toBe(0)
+  expect(await getPersistedConversation(cache, sessionKey)).toBeUndefined()
+  expect(getConversationBlob(conversationId, blobId(2))).toEqual(new Uint8Array(80))
+})
+
+test("compaction over maxBytes copies no blobs and still compacts the store", () => {
+  const conversationId = "compact-oversized"
+  setConversationBlob(conversationId, blobId(3), new Uint8Array(60))
+  setConversationBlob(conversationId, blobId(4), new Uint8Array(60))
+  const unreachable = compactConversationBlobs(conversationId, checkpoint(), { maxBytes: 10 })
+  expect(unreachable.oversized).toBeUndefined()
+  expect(unreachable.afterCount).toBe(0)
+  expect(conversationBlobCount(conversationId)).toBe(0)
+  setConversationBlob(conversationId, blobId(5), new Uint8Array(60))
+  const fallback = compactConversationBlobs(conversationId, undefined, { maxBytes: 10, keepInMemory: true })
+  expect(fallback).toMatchObject({ oversized: true, blobs: [], beforeBytes: 60 })
+  expect(conversationBlobCount(conversationId)).toBe(1)
+})

@@ -71,6 +71,8 @@ export type ConversationBlobCompaction = {
   afterBytes: number
   compacted: boolean
   fallbackReason?: string
+  /** Fork: the retained blobs exceed `maxBytes`, so none were copied. */
+  oversized?: boolean
 }
 
 export type ConversationBlobGraphStats = {
@@ -130,24 +132,27 @@ export function snapshotConversationBlobs(conversationId: string): ConversationB
  * every blob: cache size must never come at the cost of restart correctness.
  * `keepInMemory`: snapshot only, for a Run still in progress, whose next
  * checkpoint may reference blobs this one does not.
+ * `maxBytes`: copy nothing when the retained blobs are larger (`oversized`).
  */
 export function compactConversationBlobs(
   conversationId: string,
   checkpoint: Uint8Array | undefined,
-  options?: { keepInMemory?: boolean },
+  options?: { keepInMemory?: boolean; maxBytes?: number },
 ): ConversationBlobCompaction {
   const current = byConversation.get(conversationId) ?? new Map<string, Uint8Array>()
   const before = retainedBlobStats(current)
   const beforeCount = before.count
   const beforeBytes = before.bytes
+  const over = (bytes: number) => options?.maxBytes !== undefined && bytes > options.maxBytes
   const fallback = (reason: string): ConversationBlobCompaction => ({
-    blobs: snapshotConversationBlobs(conversationId),
+    blobs: over(beforeBytes) ? [] : snapshotConversationBlobs(conversationId),
     beforeCount,
     beforeBytes,
     afterCount: beforeCount,
     afterBytes: beforeBytes,
     compacted: false,
     fallbackReason: reason,
+    ...(over(beforeBytes) ? { oversized: true } : {}),
   })
 
   if (!checkpoint?.length) return fallback("checkpoint unavailable")
@@ -168,12 +173,13 @@ export function compactConversationBlobs(
     }
     const afterBytes = [...retained.values()].reduce((total, data) => total + data.length, 0)
     return {
-      blobs: [...retained].map(([id, data]) => ({ id, data: Uint8Array.from(data) })),
+      blobs: over(afterBytes) ? [] : [...retained].map(([id, data]) => ({ id, data: Uint8Array.from(data) })),
       beforeCount,
       beforeBytes,
       afterCount: retained.size,
       afterBytes,
       compacted: true,
+      ...(over(afterBytes) ? { oversized: true } : {}),
     }
   } catch (error) {
     return fallback(errorMessage(error))

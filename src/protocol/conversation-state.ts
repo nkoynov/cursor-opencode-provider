@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto"
 import path from "node:path"
-import { hasHostHistoryRewrite, queueConversationStateWrite, settleConversationStateWrites } from "../host-history-rewrite.js"
+import {
+  hasHostHistoryRewrite,
+  isLastConversationStateWrite,
+  queueConversationStateWrite,
+  settleConversationStateWrites,
+} from "../host-history-rewrite.js"
 import { processShared } from "../process-shared.js"
 import { trace } from "../debug.js"
 import { restoreEarlySteers, serializeEarlySteers } from "../host-steer.js"
@@ -47,6 +52,7 @@ import {
   forgetCachedConversation,
   getPersistedTurnProvenance,
   loadPersistedConversation,
+  MAX_CONVERSATION_SNAPSHOT_BLOB_BYTES,
   persistConversation,
   type PersistedConversationLoad,
 } from "./conversation-persistence.js"
@@ -194,6 +200,7 @@ function adoptUnboundState(key: string, generation: number, sessionKey: string, 
 export function resetSnapshotGenerationsForTests(): void {
   snapshots.next = 0
   snapshots.bySession.clear()
+  waitingSnapshotSaves.clear()
 }
 
 export function snapshotGenerationRecordsForTests(): number {
@@ -362,6 +369,7 @@ export async function persistConversationState(
   const checkpoint = getCheckpoint(input.conversationId)
   const blobCompaction = compactConversationBlobs(input.conversationId, checkpoint, {
     keepInMemory: input.runInProgress,
+    maxBytes: snapshotBlobLimit,
   })
   const requestContext = getFrozenRequestContext(input.conversationId) ?? input.requestContext
   const provenance = getTurnProvenance(input.sessionKey)
@@ -387,8 +395,18 @@ export async function persistConversationState(
       ? { turnProvenance: serializeTurnProvenance(provenance) }
       : {}),
   }
-  await trackedSnapshotWrite(cacheDir, input.sessionKey, () => queueConversationStateWrite(cacheDir, input.sessionKey, async () => {
+  const save = async (): Promise<boolean> => {
     if (superseded()) return false
+    if (blobCompaction.oversized) {
+      // A restore would reject the snapshot; the one on disk is older than this state.
+      await deletePersistedConversation(cacheDir, input.sessionKey)
+      trace(
+        `conversation persistence: not saved${input.runInProgress ? " in-progress" : ""} sessionKey=${input.sessionKey} ` +
+          `conversationId=${input.conversationId} blobBytes=${blobCompaction.afterBytes} ` +
+          `over limit=${snapshotBlobLimit}; dropped the saved snapshot`,
+      )
+      return true
+    }
     await persistConversation(cacheDir, {
       ...snapshot,
       postCompactionRebase: input.postCompactionRebase || hasHostHistoryRewrite(cacheDir, input.sessionKey),
@@ -401,7 +419,32 @@ export async function persistConversationState(
         (blobCompaction.fallbackReason ? ` compactionFallback=${blobCompaction.fallbackReason}` : ""),
     )
     return true
-  }))
+  }
+  const key = snapshotKey(cacheDir, input.sessionKey)
+  const waiting = waitingSnapshotSaves.get(key)
+  if (waiting?.queued && isLastConversationStateWrite(cacheDir, input.sessionKey, waiting.queued)) {
+    waiting.save = save
+    trace(`conversation persistence: replaced a waiting save sessionKey=${input.sessionKey} conversationId=${input.conversationId}`)
+    await trackedSnapshotWrite(cacheDir, input.sessionKey, () => waiting.queued!)
+    return
+  }
+  const slot: WaitingSnapshotSave = { save }
+  waitingSnapshotSaves.set(key, slot)
+  await trackedSnapshotWrite(cacheDir, input.sessionKey, () => slot.queued = queueConversationStateWrite(
+    cacheDir, input.sessionKey, () => {
+      if (waitingSnapshotSaves.get(key) === slot) waitingSnapshotSaves.delete(key)
+      return slot.save()
+    }))
+}
+
+// Fork: a save still waiting behind the session's running write takes the newest capture instead of queueing
+// another, so a backlog of saves holds at most one copy of the conversation's blobs.
+type WaitingSnapshotSave = { save: () => Promise<boolean>; queued?: Promise<boolean> }
+const waitingSnapshotSaves = new Map<string, WaitingSnapshotSave>()
+let snapshotBlobLimit = MAX_CONVERSATION_SNAPSHOT_BLOB_BYTES
+
+export function setSnapshotBlobLimitForTests(bytes = MAX_CONVERSATION_SNAPSHOT_BLOB_BYTES): void {
+  snapshotBlobLimit = bytes
 }
 
 /**

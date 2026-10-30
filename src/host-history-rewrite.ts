@@ -23,6 +23,11 @@ export function queueConversationStateWrite<T>(
   return next
 }
 
+/** Whether `write` (as returned by `queueConversationStateWrite`) is still the last one queued for the session. */
+export function isLastConversationStateWrite(cacheDir: string, sessionKey: string, write: Promise<unknown>): boolean {
+  return state.writes.get(keyFor(cacheDir, sessionKey)) === write
+}
+
 /** Wait until every snapshot write queued for the session, by any module copy, has finished or failed. */
 export function settleConversationStateWrites(cacheDir: string, sessionKey: string): Promise<void> {
   return (state.writes.get(keyFor(cacheDir, sessionKey)) ?? Promise.resolve()).then(() => {}, () => {})
