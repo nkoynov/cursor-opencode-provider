@@ -970,6 +970,15 @@ describe("parallel tool-call pump", () => {
       expect(toolCalls(parts).map(call => JSON.parse(call.input).command)).toEqual(["echo second"])
     })
 
+    it("answers the repeat from the written result once, and the same request asked again after it on the host", async () => {
+      const { session, resultFrames } = await cutAfterResult()
+      const { outcome, runs, parts } = await recoverWith(session, [[shellAgain(), shellAgain("echo test", 8)]])
+      expect(outcome).toBe("completed")
+      expect(shellReplies(runs[0]!.writes, 7)).toEqual(asResumed(resultFrames))
+      expect(shellReplies(runs[0]!.writes, 8)).toEqual([])
+      expect(toolCalls(parts).map(call => JSON.parse(call.input).command)).toEqual(["echo test"])
+    })
+
     it("resumes again with the same answer when the resumed Run is cut before Cursor asks", async () => {
       const { session, resultFrames } = await cutAfterResult()
       const { outcome, recoveries, runs, parts } = await recoverWith(session, [[], [shellAgain(), ended()]])

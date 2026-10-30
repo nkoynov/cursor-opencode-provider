@@ -6874,8 +6874,9 @@ export async function pump(
       const execCallId = esm ? extractExecDisplayCallId(esm) : undefined
       const execKey = esm ? execReplayKey(payload) : undefined
       const entryKey = execCallId && execKey !== undefined ? replayEntryKey(execCallId, execKey) : undefined
-      const written = entryKey ? resultReplay.results.get(entryKey) : undefined
+      const written = entryKey && !resultReplay.replayed?.has(entryKey) ? resultReplay.results.get(entryKey) : undefined
       if (esm && written && execCallId && entryKey && typeof esm.id === "number") {
+        ;(resultReplay.replayed ??= new Set()).add(entryKey)
         replaySafety.markBarrier("non-control-exec")
         replaySafety.recordExec(esm.id, execCallId)
         toolStep.resolved.add(execCallId)

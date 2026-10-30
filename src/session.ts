@@ -271,8 +271,9 @@ export type CursorSession = {
   /**
    * Results a resumed Run answers from what the host already returned when Cursor asks for the same call again
    * (same call id and request). Until every `required` call is answered, anything else Cursor sends ends the turn.
+   * Each result answers once per Run (`replayed`); a later identical request is a new one, such as an await's next poll.
    */
-  resultReplay?: { results: Map<string, WrittenHostResult>; required: Set<string> }
+  resultReplay?: { results: Map<string, WrittenHostResult>; required: Set<string>; replayed?: Set<string> }
   /** Stateful replay barriers survive host tool-step boundaries on this Run. */
   replaySafety?: ReplaySafetyState
   /** A delivered plan result refused execution; terminate this Run without continuing. */
