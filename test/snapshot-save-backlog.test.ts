@@ -1,11 +1,13 @@
 import { afterEach, expect, test } from "bun:test"
-import { mkdtempSync, rmSync } from "node:fs"
+import { cpSync, existsSync, mkdtempSync, rmSync, symlinkSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, resolve } from "node:path"
+import { pathToFileURL } from "node:url"
 import { resetHostHistoryRewritesForTests } from "../src/host-history-rewrite.js"
 import { peekConversationId, resetConversationBindingsForTests } from "../src/protocol/conversation-bind.js"
 import {
-  getPersistedConversation, resetConversationPersistenceForTests, setConversationPersistenceHookForTests,
+  conversationCacheFilePath, getPersistedConversation, getPersistedTurnProvenance, resetConversationPersistenceForTests,
+  setConversationPersistenceHookForTests,
 } from "../src/protocol/conversation-persistence.js"
 import {
   clearPersistedConversationState, persistConversationState, resetSnapshotGenerationsForTests,
@@ -103,6 +105,26 @@ test("a conversation whose blobs pass the restore limit drops its older snapshot
   expect(writes).toBe(0)
   expect(await getPersistedConversation(cache, sessionKey)).toBeUndefined()
   expect(getConversationBlob(conversationId, blobId(2))).toEqual(new Uint8Array(80))
+})
+
+test("an oversized save drops a snapshot another module copy wrote after this copy found none", async () => {
+  const cache = root()
+  const graph = root()
+  cpSync(resolve(import.meta.dir, "../src"), join(graph, "src"), { recursive: true })
+  symlinkSync(resolve(import.meta.dir, "../node_modules"), join(graph, "node_modules"), "dir")
+  const otherState = await import(pathToFileURL(join(graph, "src/protocol/conversation-state.ts")).href) as typeof import("../src/protocol/conversation-state.js")
+  const otherBlobs = await import(pathToFileURL(join(graph, "src/protocol/blob-store.ts")).href) as typeof import("../src/protocol/blob-store.js")
+  const sessionKey = "copies"
+  const conversationId = peekConversationId(sessionKey)
+  const input = { sessionKey, conversationId, requestContext: { rules_info_complete: true } }
+  expect(await getPersistedTurnProvenance(cache, sessionKey)).toBeUndefined()
+  otherBlobs.setConversationBlob(conversationId, blobId(6), new Uint8Array(10))
+  await otherState.persistConversationState(cache, input)
+  expect(existsSync(conversationCacheFilePath(cache, sessionKey))).toBe(true)
+  setSnapshotBlobLimitForTests(5)
+  setConversationBlob(conversationId, blobId(7), new Uint8Array(10))
+  await persistConversationState(cache, { ...input, runInProgress: true })
+  expect(existsSync(conversationCacheFilePath(cache, sessionKey))).toBe(false)
 })
 
 test("compaction over maxBytes copies no blobs and still compacts the store", () => {

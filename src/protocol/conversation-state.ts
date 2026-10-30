@@ -398,7 +398,9 @@ export async function persistConversationState(
   const save = async (): Promise<boolean> => {
     if (superseded()) return false
     if (blobCompaction.oversized) {
-      // A restore would reject the snapshot; the one on disk is older than this state.
+      // A restore would reject the snapshot; the one on disk is older than this state. Another copy may have
+      // written it since this copy last read the file, so read its header again.
+      await forgetCachedConversation(cacheDir, input.sessionKey)
       await deletePersistedConversation(cacheDir, input.sessionKey)
       trace(
         `conversation persistence: not saved${input.runInProgress ? " in-progress" : ""} sessionKey=${input.sessionKey} ` +
@@ -437,8 +439,9 @@ export async function persistConversationState(
     }))
 }
 
-// Fork: a save still waiting behind the session's running write takes the newest capture instead of queueing
-// another, so a backlog of saves holds at most one copy of the conversation's blobs.
+// Fork: a save still waiting behind the session's running write takes this module copy's newest capture instead of
+// queueing another, so a backlog holds at most one copy of the conversation's blobs per module copy. Captures stay
+// per copy: each copy's generations record its own writes.
 type WaitingSnapshotSave = { save: () => Promise<boolean>; queued?: Promise<boolean> }
 const waitingSnapshotSaves = new Map<string, WaitingSnapshotSave>()
 let snapshotBlobLimit = MAX_CONVERSATION_SNAPSHOT_BLOB_BYTES
