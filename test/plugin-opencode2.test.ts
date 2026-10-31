@@ -1744,7 +1744,7 @@ describe("opencode2 setup", () => {
       try {
         await setupPlugin(ctx)
         const window = Number(/timed out after (\d+)ms/.exec(String(warning.mock.calls[0]?.[0]))?.[1])
-        expect(window).toBeGreaterThan(unaryWorstCaseMs())
+        expect(window).toBe(Math.max(10_000, unaryWorstCaseMs() + 2_000))
         credentials.release()
         await Bun.sleep(10)
         expect(requests).toBe(0)

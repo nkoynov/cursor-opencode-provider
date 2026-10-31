@@ -165,7 +165,7 @@ async function resolveRemoteVersion(): Promise<string | undefined> {
   const generation = cache.generation
   const fetched = fetchInstallerVersion().then(
     (version) => {
-      if (version) writeVersionCache({ version, fetchedAt: Date.now() })
+      if (version && cache.generation === generation) writeVersionCache({ version, fetchedAt: Date.now() })
       return version
     },
     () => undefined,

@@ -194,6 +194,8 @@ describe("resolveClientVersion with a slow installer", () => {
     const installer = slowInstaller()
     expect(await resolveClientVersion()).toBe("cli-cached-999")
     installer.answer()
+    await new Promise<void>((resolve) => setTimeout(resolve, 20))
+    expect(await resolveClientVersion()).toBe("cli-2026.07.09-a3815c0")
   })
 
   it("does not let a late answer outlive a reset", async () => {
@@ -204,5 +206,6 @@ describe("resolveClientVersion with a slow installer", () => {
     installer.answer()
     await new Promise<void>((resolve) => setTimeout(resolve, 20))
     expect(await resolveClientVersion()).toBe("cli-after-reset-1")
+    expect(fs.existsSync(versionCacheFile())).toBe(false)
   })
 })
