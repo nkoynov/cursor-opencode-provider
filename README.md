@@ -56,7 +56,7 @@ OpenCode driving a Cursor-routed Grok model through this provider:
 - **Thinking / reasoning** — surfaces extended-thinking deltas where the model supports it
 
 OpenCode 2.1.4 waits for cold-cache model discovery and publication during plugin
-activation, with a 10-second readiness budget. Warm-cache startup uses the saved
+activation, with a 14.5-second readiness budget (longer with `CURSOR_PROVIDER_RPC_TIMEOUT_MS`). Warm-cache startup uses the saved
 inventory. Discovery failures leave authentication and later retries available;
 see [model startup and diagnostics](docs/opencode-2.md#how-models-register-current).
 
@@ -410,6 +410,7 @@ OpenCode's own retry limits.
 |----------|-------------|
 | `CURSOR_WEBSITE_URL` | Override OAuth login base URL (default `https://cursor.com`) |
 | `CURSOR_API_BASE_URL` | Override API base for auth, model discovery, and `GetServerConfig` agent URL resolution (default `https://api2.cursor.sh`) |
+| `CURSOR_PROVIDER_RPC_TIMEOUT_MS` | Budget in ms of each attempt of model discovery (`AvailableModels`) and the agent URL lookup (`GetServerConfig`); default 5000, at most 600000. A timed-out or failed attempt is tried once more, and the OpenCode 2 cold-start readiness budget grows with it. A value that isn't a whole number in range keeps the default |
 | `CURSOR_GET_SERVER_CONFIG_TELEMETRY` | Set to `1` or `true` to opt the `GetServerConfig` lookup into telemetry in OpenCode/plugin usage |
 | `CURSOR_ALLOW_MODEL_FALLBACK` | Set to `1` or `true` to let a turn go on when Cursor's safety filter answers with another model, as before. By default the turn stops instead (see [Known limitations](#known-limitations)) |
 | `HTTPS_PROXY` / `https_proxy` | HTTP CONNECT proxy for HTTPS. Bun `fetch` uses this for unary RPCs; the Run HTTP/2 session also tunnels through it (see `NO_PROXY`). The Run tunnel supports only `http://` proxy URLs (Basic auth via userinfo); `https://` and SOCKS proxy URLs leave the Run on a direct connection. `HTTP_PROXY` is not used for HTTPS |

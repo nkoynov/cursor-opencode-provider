@@ -23,6 +23,8 @@ import { openProxiedTlsSocket, proxyEndpoint, resolveHttpsProxyUrl } from "./htt
 const API_BASE = `https://${CURSOR_API_HOST}`
 const DEFAULT_UNARY_TIMEOUT_MS = 5_000
 const MAX_TIMER_MS = 2_147_483_647
+// Keeps the plugin's readiness window, about twice this, a valid timer.
+export const MAX_RPC_TIMEOUT_MS = 600_000
 export const UNARY_ATTEMPTS = 2
 export const UNARY_RETRY_DELAY_MS = 500
 
@@ -31,9 +33,21 @@ export function defaultUnaryTimeoutMs(): number {
   const raw = process.env.CURSOR_PROVIDER_RPC_TIMEOUT_MS?.trim()
   if (!raw) return DEFAULT_UNARY_TIMEOUT_MS
   const value = Number(raw)
-  if (/^\d+$/.test(raw) && value > 0 && value <= MAX_TIMER_MS) return value
-  trace(`CURSOR_PROVIDER_RPC_TIMEOUT_MS=${JSON.stringify(raw)} is not a positive integer of ms; using ${DEFAULT_UNARY_TIMEOUT_MS}`)
+  if (/^\d+$/.test(raw) && value > 0 && value <= MAX_RPC_TIMEOUT_MS) return value
+  trace(`CURSOR_PROVIDER_RPC_TIMEOUT_MS=${JSON.stringify(raw)} is not a whole number of ms from 1 to ${MAX_RPC_TIMEOUT_MS}; using ${DEFAULT_UNARY_TIMEOUT_MS}`)
   return DEFAULT_UNARY_TIMEOUT_MS
+}
+
+function unaryBodyError(operation: string, cause: unknown): CursorProviderError {
+  if (cause instanceof SyntaxError) {
+    return new CursorProtocolError(`${operation} returned malformed JSON`, { cause })
+  }
+  return new CursorTransportError(`${operation} response read failed`, {
+    transient: true,
+    replaySafe: true,
+    code: errorCode(cause),
+    cause,
+  })
 }
 
 /** How long an AvailableModels or GetServerConfig call can take before it fails: version wait, attempts, retry delays. */
@@ -163,7 +177,7 @@ export async function unaryAvailableModels(
       try {
         return (await res.json()) as Record<string, unknown>
       } catch (cause) {
-        throw new CursorProtocolError("AvailableModels returned malformed JSON", { cause })
+        throw unaryBodyError("AvailableModels", cause)
       }
     },
   )
@@ -261,7 +275,7 @@ export async function fetchAgentUrl(
       try {
         body = (await res.json()) as Record<string, unknown>
       } catch (cause) {
-        throw new CursorProtocolError("GetServerConfig returned malformed JSON", { cause })
+        throw unaryBodyError("GetServerConfig", cause)
       }
       const cfg = body.agentUrlConfig as { agentnUrl?: string; agentUrl?: string } | undefined
       const raw = cfg?.agentnUrl || cfg?.agentUrl

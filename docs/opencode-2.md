@@ -17,7 +17,9 @@ Cache seed (and `/connect` afterwards) refill the inventory. An empty first tran
 
 On OpenCode 2.1.4, session requests wait for plugin activation before resolving
 their model. With no usable cache, setup waits for authenticated discovery and
-inventory publication, sharing a 10-second readiness budget. A populated cache
+inventory publication, sharing a 14.5-second readiness budget: one `AvailableModels`
+call with its retry and the client-version wait, plus 2 seconds (it grows with
+`CURSOR_PROVIDER_RPC_TIMEOUT_MS`). A populated cache
 publishes immediately without waiting for credential renewal or fresh discovery.
 Endpoint warmup runs separately from catalog readiness.
 

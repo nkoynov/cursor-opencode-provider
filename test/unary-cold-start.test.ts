@@ -5,12 +5,13 @@ import path from "node:path"
 import {
   defaultUnaryTimeoutMs,
   fetchAgentUrl,
+  MAX_RPC_TIMEOUT_MS,
   UNARY_ATTEMPTS,
   unaryAvailableModels,
   unaryWorstCaseMs,
 } from "../src/transport/connect.js"
 import { INSTALLER_WAIT_MS, resetClientVersionCache } from "../src/protocol/client-version.js"
-import { CursorServerError, CursorTransportError } from "../src/errors.js"
+import { CursorProtocolError, CursorServerError, CursorTransportError } from "../src/errors.js"
 
 const INSTALLER_FIXTURE = `var x="https://downloads.cursor.com/lab/2026.07.09-a3815c0/";`
 const AGENT_CONFIG = { agentUrlConfig: { agentnUrl: "https://agentn.us.api5.cursor.sh" } }
@@ -87,7 +88,10 @@ describe("unary budget", () => {
     process.env.CURSOR_PROVIDER_RPC_TIMEOUT_MS = "12000"
     expect(defaultUnaryTimeoutMs()).toBe(12_000)
     expect(unaryWorstCaseMs()).toBeGreaterThan(UNARY_ATTEMPTS * 12_000)
-    for (const bad of ["0", "-5", "1.5", "5s", "99999999999"]) {
+    process.env.CURSOR_PROVIDER_RPC_TIMEOUT_MS = String(MAX_RPC_TIMEOUT_MS)
+    expect(defaultUnaryTimeoutMs()).toBe(MAX_RPC_TIMEOUT_MS)
+    expect(unaryWorstCaseMs()).toBeLessThan(2_147_483_647)
+    for (const bad of ["0", "-5", "1.5", "5s", String(MAX_RPC_TIMEOUT_MS + 1), "99999999999"]) {
       process.env.CURSOR_PROVIDER_RPC_TIMEOUT_MS = bad
       expect(defaultUnaryTimeoutMs()).toBe(5_000)
     }
@@ -124,6 +128,37 @@ describe("unary retry", () => {
 
     expect(await fetchAgentUrl("token", { timeoutMs: 1_000 })).toBe("https://agentn.us.api5.cursor.sh")
     expect(calls).toBe(2)
+  })
+
+  it("tries again when a successful response's body fails to arrive", async () => {
+    for (const call of [
+      () => unaryAvailableModels("token", { timeoutMs: 1_000 }),
+      () => fetchAgentUrl("token", { timeoutMs: 1_000 }),
+    ]) {
+      let calls = 0
+      globalThis.fetch = (async () => {
+        calls++
+        if (calls > 1) return Response.json(AGENT_CONFIG)
+        const response = Response.json({})
+        Object.defineProperty(response, "json", { value: () => Promise.reject(new TypeError("socket closed")) })
+        return response
+      }) as unknown as typeof fetch
+      await call()
+      expect(calls).toBe(2)
+    }
+  })
+
+  it("does not repeat a request whose body is malformed JSON", async () => {
+    let calls = 0
+    globalThis.fetch = (async () => {
+      calls++
+      return new Response("{not json", { status: 200, headers: { "content-type": "application/json" } })
+    }) as unknown as typeof fetch
+
+    const error = await fetchAgentUrl("token", { timeoutMs: 1_000 }).then(() => undefined, (cause) => cause)
+    expect(error).toBeInstanceOf(CursorProtocolError)
+    expect(error.message).toBe("GetServerConfig returned malformed JSON")
+    expect(calls).toBe(1)
   })
 
   it("gives up after the last attempt with the timeout error", async () => {
