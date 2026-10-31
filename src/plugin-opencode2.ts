@@ -9,6 +9,7 @@ import { createSdk, cursorApiBaseURL, cursorGetServerConfigTelemetryEnabled, isC
 import { opencode2PlanDir, opencodeGlobalCacheDir, setNativePlansDir } from "./context/paths.js"
 import { discoverModels, isCacheFresh, readCache, type ModelInfo } from "./models.js"
 import { resolveAgentUrl } from "./agent-url.js"
+import { unaryWorstCaseMs } from "./transport/connect.js"
 import { applyHostPromptEvent, applyHostToolEvent, sessionActivity } from "./activity.js"
 import { notifyHostInterrupt } from "./host-interrupt.js"
 import {
@@ -738,7 +739,8 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
 }
 
 const SHUTDOWN_SAVE_TIMEOUT_MS = 2_000
-const MODEL_READINESS_TIMEOUT_MS = 10_000
+// Outlasts one AvailableModels call with its retry, plus the token and the catalog publication.
+const MODEL_READINESS_TIMEOUT_MS = Math.max(10_000, unaryWorstCaseMs() + 2_000)
 
 function modelReadinessTimeout(): CursorTransportError {
   return new CursorTransportError(

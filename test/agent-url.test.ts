@@ -183,20 +183,20 @@ describe("resolveAgentUrl", () => {
       return new Response(INSTALLER_FIXTURE, { status: 200 })
     }) as unknown as typeof fetch
 
-    // First call fails and is not memoized.
+    // First call fails on both attempts and is not memoized.
     await expect(resolveAgentUrl(fakeJwt(3600))).rejects.toThrow(
       "GetServerConfig network request failed",
     )
-    expect(getServerConfigCalls).toHaveLength(1)
+    expect(getServerConfigCalls).toHaveLength(2)
 
     // Backend recovers → second call resolves the real region and memoizes it.
     fail = false
     expect(await resolveAgentUrl(fakeJwt(3600))).toBe("https://agentn.us.api5.cursor.sh")
-    expect(getServerConfigCalls).toHaveLength(2)
+    expect(getServerConfigCalls).toHaveLength(3)
 
     // Third call reuses the memo — no further fetch.
     expect(await resolveAgentUrl(fakeJwt(3600))).toBe("https://agentn.us.api5.cursor.sh")
-    expect(getServerConfigCalls).toHaveLength(2)
+    expect(getServerConfigCalls).toHaveLength(3)
   })
 
 

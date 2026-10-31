@@ -11,16 +11,22 @@ import { processShared } from "../process-shared.js"
 
 const INSTALL_URL = "https://cursor.com/install"
 const REMOTE_TIMEOUT_MS = 5_000
+// A cold process with no cached version waits this long for cursor.com before answering with the fallback.
+export const INSTALLER_WAIT_MS = 2_000
 const BUILD_RE = /^\d{4}\.\d{2}\.\d{2}-[0-9A-Za-z][0-9A-Za-z.-]*$/
 const CLIENT_VERSION_RE = /^cli-[0-9A-Za-z][0-9A-Za-z._-]*$/
 
 type VersionCache = { version: string; fetchedAt: number }
 
 // Once per process, not per copy of this package the host loads.
-const cache = processShared("client-version.v1", (): { resolution?: Promise<string> } => ({}))
+const cache = processShared(
+  "client-version.v2",
+  (): { resolution?: Promise<string>; generation: number } => ({ generation: 0 }),
+)
 
 export function resetClientVersionCache(): void {
   cache.resolution = undefined
+  cache.generation++
 }
 
 export function resolveClientVersion(): Promise<string> {
@@ -156,15 +162,24 @@ async function resolveRemoteVersion(): Promise<string | undefined> {
     return cached.version
   }
 
-  try {
-    const version = await fetchInstallerVersion()
-    if (version) {
-      writeVersionCache({ version, fetchedAt: Date.now() })
+  const generation = cache.generation
+  const fetched = fetchInstallerVersion().then(
+    (version) => {
+      if (version) writeVersionCache({ version, fetchedAt: Date.now() })
       return version
-    }
-  } catch {
-    // Use stale cache or the fallback below.
-  }
+    },
+    () => undefined,
+  )
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const waited = new Promise<"waited">((resolve) => {
+    timer = setTimeout(() => resolve("waited"), INSTALLER_WAIT_MS)
+    timer.unref?.()
+  })
+  const version = await Promise.race([fetched, waited]).finally(() => clearTimeout(timer))
+  if (version !== "waited") return version ?? cached?.version
 
+  void fetched.then((late) => {
+    if (late && cache.generation === generation) cache.resolution = Promise.resolve(late)
+  })
   return cached?.version
 }

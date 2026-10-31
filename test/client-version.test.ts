@@ -7,6 +7,7 @@ import {
   cursorAgentVersionsDir,
   discoverLocalVersion,
   extractVersionFromInstaller,
+  INSTALLER_WAIT_MS,
   resetClientVersionCache,
   resolveClientVersion,
 } from "../src/protocol/client-version.js"
@@ -160,5 +161,48 @@ describe("resolveClientVersion", () => {
     expect(await resolveClientVersion()).toBe("cli-2026.07.09-a3815c0")
     expect(await resolveClientVersion()).toBe("cli-2026.07.09-a3815c0")
     expect(fetchCalls).toBe(1)
+  })
+})
+
+describe("resolveClientVersion with a slow installer", () => {
+  function slowInstaller(): { answer: () => void } {
+    let answer!: () => void
+    const answered = new Promise<void>((resolve) => { answer = resolve })
+    globalThis.fetch = (async () => {
+      await answered
+      return new Response(INSTALLER_FIXTURE, { status: 200 })
+    }) as unknown as typeof fetch
+    return { answer }
+  }
+
+  it("answers with the fallback after the wait, then switches to the installer's late version", async () => {
+    const installer = slowInstaller()
+    const started = Date.now()
+    expect(await resolveClientVersion()).toBe(FALLBACK_CLIENT_VERSION)
+    const waited = Date.now() - started
+    expect(waited).toBeGreaterThanOrEqual(INSTALLER_WAIT_MS - 50)
+    expect(waited).toBeLessThan(INSTALLER_WAIT_MS + 1_000)
+
+    installer.answer()
+    await new Promise<void>((resolve) => setTimeout(resolve, 20))
+    expect(await resolveClientVersion()).toBe("cli-2026.07.09-a3815c0")
+    expect(JSON.parse(fs.readFileSync(versionCacheFile(), "utf8")).version).toBe("cli-2026.07.09-a3815c0")
+  })
+
+  it("answers with an expired cache entry after the wait", async () => {
+    writeVersionCache("cli-cached-999", 0)
+    const installer = slowInstaller()
+    expect(await resolveClientVersion()).toBe("cli-cached-999")
+    installer.answer()
+  })
+
+  it("does not let a late answer outlive a reset", async () => {
+    const installer = slowInstaller()
+    expect(await resolveClientVersion()).toBe(FALLBACK_CLIENT_VERSION)
+    resetClientVersionCache()
+    process.env.CURSOR_CLIENT_VERSION = "cli-after-reset-1"
+    installer.answer()
+    await new Promise<void>((resolve) => setTimeout(resolve, 20))
+    expect(await resolveClientVersion()).toBe("cli-after-reset-1")
   })
 })

@@ -2,7 +2,7 @@ import { CURSOR_API_HOST, CONNECT_PROTOCOL_VERSION, SERVER_CONFIG_PATH } from ".
 import { decodeFramePayload, encodeFrame, encodeGzipFrame, FLAG_END_STREAM, streamFrames } from "../protocol/framing.js"
 import { createCursorChecksumHeader } from "../protocol/checksum.js"
 import { getDeviceIds } from "../protocol/device-id.js"
-import { resolveClientVersion } from "../protocol/client-version.js"
+import { INSTALLER_WAIT_MS, resolveClientVersion } from "../protocol/client-version.js"
 import { errorMessage, trace } from "../debug.js"
 import {
   CursorLocalCancellationError,
@@ -23,9 +23,26 @@ import { openProxiedTlsSocket, proxyEndpoint, resolveHttpsProxyUrl } from "./htt
 const API_BASE = `https://${CURSOR_API_HOST}`
 const DEFAULT_UNARY_TIMEOUT_MS = 5_000
 const MAX_TIMER_MS = 2_147_483_647
+export const UNARY_ATTEMPTS = 2
+export const UNARY_RETRY_DELAY_MS = 500
+
+/** Per-attempt budget of AvailableModels and GetServerConfig: `CURSOR_PROVIDER_RPC_TIMEOUT_MS`, else 5 s. */
+export function defaultUnaryTimeoutMs(): number {
+  const raw = process.env.CURSOR_PROVIDER_RPC_TIMEOUT_MS?.trim()
+  if (!raw) return DEFAULT_UNARY_TIMEOUT_MS
+  const value = Number(raw)
+  if (/^\d+$/.test(raw) && value > 0 && value <= MAX_TIMER_MS) return value
+  trace(`CURSOR_PROVIDER_RPC_TIMEOUT_MS=${JSON.stringify(raw)} is not a positive integer of ms; using ${DEFAULT_UNARY_TIMEOUT_MS}`)
+  return DEFAULT_UNARY_TIMEOUT_MS
+}
+
+/** How long an AvailableModels or GetServerConfig call can take before it fails: version wait, attempts, retry delays. */
+export function unaryWorstCaseMs(timeoutMs = defaultUnaryTimeoutMs()): number {
+  return INSTALLER_WAIT_MS + UNARY_ATTEMPTS * timeoutMs + (UNARY_ATTEMPTS - 1) * UNARY_RETRY_DELAY_MS
+}
 
 function unaryTimeoutMs(operation: string, value: number | undefined): number {
-  const timeoutMs = value ?? DEFAULT_UNARY_TIMEOUT_MS
+  const timeoutMs = value ?? defaultUnaryTimeoutMs()
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_TIMER_MS) {
     throw new CursorProtocolError(
       `${operation} timeout must be a positive integer no greater than ${MAX_TIMER_MS}`,
@@ -35,21 +52,33 @@ function unaryTimeoutMs(operation: string, value: number | undefined): number {
   return timeoutMs
 }
 
-async function withUnaryDeadline<T>(
+/**
+ * Each attempt gets its own budget, counted from after the client version is known. A timeout or
+ * network failure is tried once more on a fresh request; Cursor's HTTP answers are not.
+ */
+async function withUnaryAttempts<T>(
   operation: string,
   timeoutMs: number,
   timeoutCode: string,
   run: (signal: AbortSignal) => Promise<T>,
 ): Promise<T> {
-  return withAbortDeadline(
-    timeoutMs,
-    () => new CursorTransportError(`${operation} timed out after ${timeoutMs}ms`, {
-      transient: true,
-      replaySafe: true,
-      code: timeoutCode,
-    }),
-    run,
-  )
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await withAbortDeadline(
+        timeoutMs,
+        () => new CursorTransportError(`${operation} timed out after ${timeoutMs}ms`, {
+          transient: true,
+          replaySafe: true,
+          code: timeoutCode,
+        }),
+        run,
+      )
+    } catch (error) {
+      if (attempt >= UNARY_ATTEMPTS || !(error instanceof CursorTransportError) || !error.transient) throw error
+      trace(`${operation}: attempt ${attempt} failed (${errorMessage(error)}); retrying in ${UNARY_RETRY_DELAY_MS}ms`)
+      await new Promise((resolve) => setTimeout(resolve, UNARY_RETRY_DELAY_MS))
+    }
+  }
 }
 
 function resolveApiBaseURL(options: { apiBaseURL?: string; baseURL?: string }): string {
@@ -94,12 +123,12 @@ export async function unaryAvailableModels(
   const base = resolveApiBaseURL(options)
   const url = `${base}/aiserver.v1.AiService/AvailableModels`
   const timeoutMs = unaryTimeoutMs("AvailableModels", options.timeoutMs)
-  return withUnaryDeadline(
+  const clientVersion = await resolveClientVersion()
+  return withUnaryAttempts(
     "AvailableModels",
     timeoutMs,
     "CURSOR_AVAILABLE_MODELS_TIMEOUT",
     async (signal) => {
-      const clientVersion = await resolveClientVersion()
       const headers = buildBaseHeaders(token, clientVersion, options.headers)
       let res: Response
       try {
@@ -193,12 +222,12 @@ export async function fetchAgentUrl(
   const base = resolveApiBaseURL(options)
   const url = `${base}${SERVER_CONFIG_PATH}`
   const timeoutMs = unaryTimeoutMs("GetServerConfig", options.timeoutMs)
-  return withUnaryDeadline(
+  const clientVersion = await resolveClientVersion()
+  return withUnaryAttempts(
     "GetServerConfig",
     timeoutMs,
     "CURSOR_AGENT_URL_TIMEOUT",
     async (signal) => {
-      const clientVersion = await resolveClientVersion()
       // Match Cursor CLI: GetServerConfig uses base headers only — session headers belong on Run.
       const headers = buildBaseHeaders(token, clientVersion)
 

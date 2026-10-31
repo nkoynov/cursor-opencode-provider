@@ -24,6 +24,7 @@ import {
 import { resetAuthRenewalState } from "../src/auth-renewal.js"
 import { decodeJwtExpiryMs } from "../src/auth.js"
 import { CursorAuthError } from "../src/errors.js"
+import { unaryWorstCaseMs } from "../src/transport/connect.js"
 import { clearCompactionSessions, isCompactionSession, markCompactionSession } from "../src/compaction-marker.js"
 import {
   clearSessionDirectories,
@@ -1742,13 +1743,14 @@ describe("opencode2 setup", () => {
       globalThis.fetch = (async (_input: RequestInfo | URL) => { requests++; return modelResponse() }) as typeof fetch
       try {
         await setupPlugin(ctx)
-        expect(String(warning.mock.calls[0]?.[0])).toContain("timed out after 10000ms")
+        const window = Number(/timed out after (\d+)ms/.exec(String(warning.mock.calls[0]?.[0]))?.[1])
+        expect(window).toBeGreaterThan(unaryWorstCaseMs())
         credentials.release()
         await Bun.sleep(10)
         expect(requests).toBe(0)
         expect(inventory.models.size).toBe(0)
       } finally { credentials.release(); warning.mockRestore() }
-    }, 15_000)
+    }, 20_000)
 
     test("cleanup prevents an in-flight discovery from publishing", async () => {
       await writeCache(cacheDir, { models: [baseModel], fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION })
