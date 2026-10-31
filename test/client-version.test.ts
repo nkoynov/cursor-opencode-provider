@@ -198,6 +198,16 @@ describe("resolveClientVersion with a slow installer", () => {
     expect(await resolveClientVersion()).toBe("cli-2026.07.09-a3815c0")
   })
 
+  it("does not let a background refresh write after a reset", async () => {
+    writeVersionCache("cli-cached-123", Date.now())
+    const installer = slowInstaller()
+    expect(await resolveClientVersion()).toBe("cli-cached-123")
+    resetClientVersionCache()
+    installer.answer()
+    await new Promise<void>((resolve) => setTimeout(resolve, 20))
+    expect(JSON.parse(fs.readFileSync(versionCacheFile(), "utf8")).version).toBe("cli-cached-123")
+  })
+
   it("does not let a late answer outlive a reset", async () => {
     const installer = slowInstaller()
     expect(await resolveClientVersion()).toBe(FALLBACK_CLIENT_VERSION)

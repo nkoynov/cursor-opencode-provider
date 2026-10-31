@@ -332,7 +332,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
     // Bound cache publication too: a stalled host reload must not hang setup.
     const readinessStartedAt = Date.now()
     try {
-      await withAbortDeadline(MODEL_READINESS_TIMEOUT_MS, modelReadinessTimeout, async (signal) => {
+      await withAbortDeadline(CACHE_PUBLICATION_TIMEOUT_MS, () => modelReadinessTimeout(CACHE_PUBLICATION_TIMEOUT_MS), async (signal) => {
         const cached = await readCache(cacheDir)
         if (cached?.models.length && !signal.aborted) {
           await publishModels(cached.models, () => !disposed && !signal.aborted)
@@ -739,12 +739,13 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
 }
 
 const SHUTDOWN_SAVE_TIMEOUT_MS = 2_000
+const CACHE_PUBLICATION_TIMEOUT_MS = 10_000
 // Outlasts one AvailableModels call with its retry, plus the token and the catalog publication.
-const MODEL_READINESS_TIMEOUT_MS = Math.max(10_000, unaryWorstCaseMs() + 2_000)
+const MODEL_READINESS_TIMEOUT_MS = Math.max(CACHE_PUBLICATION_TIMEOUT_MS, unaryWorstCaseMs() + 2_000)
 
-function modelReadinessTimeout(): CursorTransportError {
+function modelReadinessTimeout(timeoutMs = MODEL_READINESS_TIMEOUT_MS): CursorTransportError {
   return new CursorTransportError(
-    `Cursor model discovery/publication timed out after ${MODEL_READINESS_TIMEOUT_MS}ms`,
+    `Cursor model discovery/publication timed out after ${timeoutMs}ms`,
     { code: "CURSOR_MODEL_READINESS_TIMEOUT", transient: true, replaySafe: true },
   )
 }
