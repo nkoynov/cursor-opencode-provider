@@ -207,8 +207,8 @@ const READ_ONLY_COMMANDS = new Set([
   "cd", "pwd", "ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "stat", "du",
   "df", "which", "type", "jq", "cut", "tr", "diff", "cmp", "realpath", "readlink", "basename",
   "dirname", "whoami", "id", "uname", "nproc", "uptime", "ps", "true", "false", "test", "[",
-  "nl", "tac", "rev", "fold", "paste", "comm", "expand", "strings", "od", "hexdump", "base64",
-  "sha256sum", "sha1sum", "md5sum", "cksum", "column", "printenv", "echo", "printf", "sleep", "free", "pgrep",
+  "nl", "tac", "rev", "fold", "paste", "comm", "expand", "strings", "od", "hexdump",
+  "sha256sum", "sha1sum", "md5sum", "cksum", "column", "printenv", "echo", "sleep", "free", "pgrep",
 ])
 
 const GIT_READ_ONLY = new Set([
@@ -308,22 +308,38 @@ function readOnlyInvocation(segment: string): boolean {
   if (words.some((word) => word.leading || (word.expands && word.text.startsWith("-")))) return false
   if (command === "git") return readOnlyGit(args)
   if (command === "find") return !args.some((arg) => /^-(?:delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls)$/.test(arg))
-  if (command === "rg") return !args.some((arg) => arg.startsWith("--pre"))
-  if (command === "fd") return !args.some((arg) => /^(?:-[^-]*[xX]|--exec)/.test(arg))
-  if (command === "sort") return !args.some((arg) => /^(?:-[^-]*o|--output)/.test(arg))
+  if (command === "rg") return !args.some((arg) => abbreviatesLongOption(arg, ["--pre", "--pre-glob", "--hostname-bin"]))
+  if (command === "fd") return !refusesOption(args, /^-[^-]*[xX]/, ["--exec", "--exec-batch"])
+  if (command === "sort") return !refusesOption(args, /^-[^-]*o/, ["--output", "--compress-program"])
   if (command === "uniq") return args.every((arg) => arg.startsWith("-"))
-  if (command === "tree") return !args.some((arg) => /^(?:-[^-]*o|--output)/.test(arg))
-  if (command === "file") return !args.some((arg) => /^(?:-[^-]*C|--compile)/.test(arg))
-  if (command === "date") return !args.some((arg) => /^(?:-[^-]*s|--set)/.test(arg))
+  if (command === "tree" || command === "base64") return !refusesOption(args, /^-[^-]*o/, ["--output"])
+  if (command === "file") return !refusesOption(args, /^-[^-]*C/, ["--compile"])
+  if (command === "printf") return !args.some((arg) => /^-[^-]*v/.test(arg))
+  if (command === "date") return readOnlyDate(args)
   if (command === "sed") return readOnlySed(segment, args)
   if (command === "command") return args[0] === "-v"
-  if (command === "sqlite3") return !words.some((word) => word.expands) && readOnlySqlite(segment, args)
+  if (command === "sqlite3") return !words.some((word) => word.expands) && readOnlySqlite(args)
   if (command === "journalctl") return !args.some((arg) => abbreviatesLongOption(arg, JOURNALCTL_WRITING_OPTIONS, ["--cursor"]))
   if (command === "systemctl") return readOnlySystemctl(args)
   if (command === "gh" || command === "glab") return readOnlyForgeCli(command, args)
   if (command === "tailscale") return args[0] === "status" && args.slice(1).every((arg) => /^--?(?:json|active|peers|self)(?:=(?:true|false))?$/.test(arg))
   if (command === "ss") return !args.some((arg) => /^-[^-]*[KD]/.test(arg) || abbreviatesLongOption(arg, ["--kill", "--diag"]))
   return false
+}
+
+function refusesOption(args: string[], short: RegExp, long: string[]): boolean {
+  return args.some((arg) => short.test(arg) || abbreviatesLongOption(arg, long))
+}
+
+/** Display only: an operand other than `+FORMAT` sets the clock (`date MMDDhhmm`), as does `--set`. */
+function readOnlyDate(args: string[]): boolean {
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!
+    if (arg === "-d" || arg === "-r" || arg === "--date" || arg === "--reference") index++
+    else if (/^-[^-]*s/.test(arg) || abbreviatesLongOption(arg, ["--set"])) return false
+    else if (!arg.startsWith("-") && !arg.startsWith("+")) return false
+  }
+  return true
 }
 
 /** getopt_long takes any unambiguous prefix of a long option, so `--rot` is `--rotate`. */
@@ -360,8 +376,8 @@ const SQLITE_WRITING_SQL = /\b(?:insert|update|delete|replace|upsert|create|drop
  * `sqlite3 -readonly db 'sql'…`: at least one SQL argument, since without one
  * sqlite3 runs whatever arrives on stdin; dot-commands only from a reading set.
  */
-function readOnlySqlite(segment: string, args: string[]): boolean {
-  if (!args.includes("-readonly") || SQLITE_WRITING_SQL.test(segment)) return false
+function readOnlySqlite(args: string[]): boolean {
+  if (!args.includes("-readonly") || SQLITE_WRITING_SQL.test(args.join(" "))) return false
   if (args.some((arg) => arg.startsWith("-") && !SQLITE_FLAGS.has(arg))) return false
   const operands = args.filter((arg) => !arg.startsWith("-"))
   return operands.length >= 2 && operands.slice(1).every((sql) => !sql.startsWith(".") || SQLITE_DOT_COMMANDS.has(sql.split(/\s+/)[0]!))
@@ -413,7 +429,7 @@ function readOnlyGit(args: string[]): boolean {
   }
   const sub = args[index]
   const rest = args.slice(index + 1)
-  if (!sub || rest.some((arg) => /^(?:--output|--open-files-in-pager|-O)/.test(arg))) return false
+  if (!sub || refusesOption(rest, /^-O/, ["--output", "--open-files-in-pager"])) return false
   if (GIT_READ_ONLY.has(sub)) return true
   if (sub === "branch") return rest.every((arg) => /^(?:-a|-r|-v|-vv|-l|--list|--all|--remotes|--verbose|--show-current)$/.test(arg))
   if (sub === "tag") return rest.every((arg) => arg === "-l" || arg === "--list")

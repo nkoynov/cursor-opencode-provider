@@ -379,6 +379,19 @@ describe("tool call classification", () => {
       "file -C -m magic",
       "date -s 2020-01-01",
       "git -C $W commit -m x",
+      "date --se=2020-01-01",
+      "date 110103002026",
+      "date -us 2020-01-01",
+      "rg --hyperlink-format='file://{host}{path}' --hostname-bin=./payload needle file",
+      "rg --pr=sh needle",
+      "sort --compress-program=./payload big",
+      "sort --out=result input",
+      "fd --exec-b rm",
+      "file --comp -m ./magic",
+      "printf -v PATH /tmp/x && ls",
+      "base64 -i input -o output",
+      "git diff --out=patch",
+      "git grep --open-files-in foo",
     ]) {
       expect(readOnlyShellCommand(command)).toBe(false)
     }
@@ -398,6 +411,11 @@ describe("tool call classification", () => {
       "tree -L 2 src",
       "file -b x.png",
       "date +%s",
+      "date -u -d @1700000000 +%F",
+      "date -r file.txt --iso-8601=seconds",
+      "printf '%s\\n' a b",
+      "base64 -d blob.txt | head",
+      "rg --hidden -n foo",
     ]) {
       expect(readOnlyShellCommand(command)).toBe(true)
     }
@@ -437,6 +455,9 @@ describe("tool call classification", () => {
       "sqlite3 -readonly db select*",
       "sqlite3 -readonly db {.shell,touch}",
       "sqlite3 -readonly db '.sh'{ell,}",
+      "sqlite3 -readonly db \"select write\"\"file('/tmp/pwn','x')\"",
+      "sqlite3 -readonly db \"select load_\"exten\\sion\"('/tmp/payload')\"",
+      "sqlite3 -readonly db 'select \"WriteFile\"(1, 2)'",
     ]) {
       expect(readOnlyShellCommand(command)).toBe(false)
     }
