@@ -1499,13 +1499,15 @@ describe("display-only ToolCall pump bridge", () => {
       const finish = parts.find((part) => part.type === "finish" && part.finishReason?.unified === "tool-calls")
       const output = Math.ceil(parts.find((part) => part.type === "tool-call").input.length / 4)
       expect(finish.usage.outputTokens.total).toBe(output)
-      expect(finish.usage.inputTokens).toEqual({
-        total: 29_467 - output, noCache: 6_523 - output, cacheRead: 22_944, cacheWrite: 0,
-      })
-      const usd = ((6_523 - output) * 2 + 22_944 * 0.5 + output * 6) / 1e6
-      expect(finish.providerMetadata.copilot.totalNanoAiu / 1e11).toBeCloseTo(usd, 9)
+      expect(finish.usage.inputTokens.total).toBe(29_467 - output)
+      // The estimate costs what a one-call step with a single output token did; the split carries the output.
+      const usd = (6_522 * 2 + 22_944 * 0.5 + 6) / 1e6
+      const input = finish.usage.inputTokens
+      const tokenUsd = (input.noCache * 2 + input.cacheRead * 0.5 + output * 6) / 1e6
+      expect(Math.abs(tokenUsd - usd)).toBeLessThan(2e-6)
+      expect(finish.providerMetadata.copilot.totalNanoAiu / 1e11).toBeCloseTo(tokenUsd, 9)
       expect(finish.providerMetadata.cursor.billing).toEqual({
-        stepUsd: usd, estimate: true, sessionRealUsd: 0, sessionBilledUsd: usd, sessionEstimatedUsd: usd,
+        stepUsd: tokenUsd, estimate: true, sessionRealUsd: 0, sessionBilledUsd: tokenUsd, sessionEstimatedUsd: tokenUsd,
       })
       // The next step reads this step's context from cache.
       expect(session.billing.prefixTokens).toBe(29_467)

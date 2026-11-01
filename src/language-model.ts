@@ -6382,6 +6382,19 @@ export async function pump(
     const stepOutputTokens = occupancyDetails
       ? Math.min(occupancyDetails.usedTokens, Math.max(1, stepOutput.output))
       : 0
+    // A tool step costs what a one-call estimate with a single output token
+    // would: held Runs split into many steps already overstate cached input,
+    // and pricing the estimated output on top would bill ahead of TurnEnded.
+    const targetUsd = !billing.cost || !occupancyDetails
+      ? undefined
+      : te
+        ? billingLedger.outstanding(billing.key)
+        : shapeStepUsage({
+            usedTokens: occupancyDetails.usedTokens,
+            prefixTokens: billing.prefixTokens,
+            outputTokens: 1,
+            prices: hostStepPrices(billing.cost, occupancyDetails.usedTokens - 1),
+          }).costUsd
     const shaped = occupancyDetails && !settledUsage
       ? shapeStepUsage({
           usedTokens: occupancyDetails.usedTokens,
@@ -6389,7 +6402,7 @@ export async function pump(
           outputTokens: stepOutputTokens,
           reasoningTokens: stepOutput.reasoning,
           prices: hostStepPrices(billing.cost, occupancyDetails.usedTokens - stepOutputTokens),
-          ...(te && billing.cost ? { targetUsd: billingLedger.outstanding(billing.key) } : {}),
+          ...(targetUsd !== undefined ? { targetUsd } : {}),
         })
       : undefined
     const stepCostUsd = shaped?.costUsd ?? 0
@@ -7109,6 +7122,8 @@ export async function pump(
       }
       const turnEnded = iu.turn_ended as Record<string, unknown>
       recordTurnEndedCost(session, turnEnded)
+      // TurnEnded counts what this Run streamed; a reopened Run estimates only its own output.
+      stepOutputChars = 0
       session.toolCallOrder = undefined
       settleOpenEarlyRows()
       // A checkpoint from before the step's results (or from an earlier Run) would drop the step
