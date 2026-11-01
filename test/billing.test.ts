@@ -51,6 +51,10 @@ describe("pricing a Run", () => {
     expect(turnEndedCostUsd(GROK, {
       inputTokens: 200_000, outputTokens: 1_000, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0,
     }, 201_000)).toBeCloseTo(0.406, 12)
+    // The settling step's prompt (occupancy less output) is what hosts tier on.
+    expect(turnEndedCostUsd(GROK, {
+      inputTokens: 300_000, outputTokens: 2_000, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0,
+    }, 201_000)).toBeCloseTo(300_000 * 2e-6 + 2_000 * 6e-6, 12)
   })
 
   it("bounds cache counters to the input partition before pricing them", () => {
@@ -275,6 +279,15 @@ describe("BillingLedger", () => {
     ledger.recordBilled("s", 0, undefined, { output: 8_118, reasoning: 8_118 })
     ledger.recordReal("s", 0, {}, { output: 100, reasoning: 0 })
     expect(ledger.outstandingOutput("s")).toEqual({ output: 100, reasoning: 0 })
+  })
+
+  it("carries reasoning with output an occupancy could not hold", () => {
+    const ledger = new BillingLedger()
+    ledger.recordReal("s", 0, {}, { output: 100_000, reasoning: 80_000 })
+    ledger.recordBilled("s", 0, undefined, { output: 10_000, reasoning: 10_000 })
+    expect(ledger.outstandingOutput("s")).toEqual({ output: 90_000, reasoning: 70_000 })
+    ledger.recordBilled("s", 0, undefined, { output: 90_000, reasoning: 70_000 })
+    expect(ledger.outputTotals("s").reported).toEqual({ output: 100_000, reasoning: 80_000 })
   })
 
   it("carries output reported by no step to the next settling step", () => {

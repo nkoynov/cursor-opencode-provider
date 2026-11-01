@@ -78,8 +78,8 @@ export function hostUsageCostUsd(prices: StepPrices, usage: LanguageModelV3Usage
 
 /**
  * Catalog-priced Run cost from aggregate `TurnEnded` counters. The final
- * context approximates the prompt tier, bounded by total input so output alone
- * cannot select a higher tier. Per-call tiers are unavailable: a Run crossing
+ * context less the Run's output approximates the prompt tier, as hosts choose
+ * it for the settling step, bounded by total input. Per-call tiers are unavailable: a Run crossing
  * tiers or compacting internally cannot be priced exactly from these totals.
  * A cache category without its own published rate is priced as input.
  */
@@ -93,7 +93,7 @@ export function turnEndedCostUsd(
   // create billable input beyond input_tokens. Keep the raw fields diagnostic.
   const usage = buildLanguageModelV3UsageFromCounters(counters)
   const input = usage.inputTokens
-  const promptTokens = Math.min(input.total ?? 0, Math.max(0, contextTokens))
+  const promptTokens = Math.min(input.total ?? 0, Math.max(0, contextTokens - (usage.outputTokens.total ?? 0)))
   const tier = cost.context_over_200k && promptTokens > CONTEXT_TIER_TOKENS ? cost.context_over_200k : cost
   return ((input.noCache ?? 0) * tier.input
     + (input.cacheRead ?? 0) * (tier.cache_read ?? tier.input)
@@ -294,9 +294,10 @@ export class BillingLedger {
       run.estimatedUsd = (run.estimatedUsd ?? 0) + billedUsd
       entry.estimatedOutputTokens += reported.output
       run.estimatedOutputTokens = (run.estimatedOutputTokens ?? 0) + reported.output
-    } else {
+    } else if (entry.realOutput.output + entry.estimatedOutputTokens <= entry.reportedOutput.output) {
       // Estimates report no reasoning, so a settling step's output can be too
-      // small for Cursor's reasoning; carrying the rest would skew later turns.
+      // small for Cursor's reasoning; once no output is left to carry it, the
+      // rest would skew later turns.
       entry.reportedOutput.reasoning = Math.max(entry.reportedOutput.reasoning, entry.realOutput.reasoning)
     }
   }
