@@ -348,4 +348,246 @@ describe("tool call classification", () => {
       expect(readOnlyShellCommand(command)).toBe(false)
     }
   })
+
+  it("reads a flag through quotes, and sed options after the script", () => {
+    for (const command of [
+      "find . '-delete'",
+      "find . -de'le'te",
+      "rg '--pre=sh' foo",
+      "sort \"-o\" out in",
+      "sed -n 1,5p -i file",
+      "sed -n 1,5p file --in-place",
+      "sed -n 1,5p -e 'w out' file",
+      "sed -n 1,$p file",
+      "sed -n '/a/w out' file",
+      "sed -n '/a/,/b/p;w out' file",
+      "sed -n /a/p file",
+      "cat a 2>/dev/null'x'",
+      "cat a >/dev/null'x' b",
+    ]) {
+      expect(readOnlyShellCommand(command)).toBe(false)
+    }
+  })
+
+  it("accepts read-only sed ranges, sleep, free and pgrep", () => {
+    for (const command of [
+      "sed -n '/Rules in force/,/^## [^R]/p' RUNBOOK.md",
+      "sed -n '1,/## r8/p' REVIEW.md | head -120",
+      "sed -n '5,$p' a b",
+      "sed -n \"10,40p\" file.ts",
+      "sleep 5 && tail -5 log.txt",
+      "free -g | head -2",
+      "pgrep -af pytest | head -3",
+    ]) {
+      expect(readOnlyShellCommand(command)).toBe(true)
+    }
+  })
+
+  it("accepts sqlite3 only with -readonly, an SQL argument and no writing SQL or dot-command", () => {
+    for (const command of [
+      "sqlite3 -readonly opencode.db \".tables\"",
+      "sqlite3 -readonly opencode.db \".schema session_v2\" | head -30",
+      "cd ~/.local/share/opencode; sqlite3 -readonly -header opencode.db \"select date(time_created/1000,'unixepoch') d, count(*) from session_v2 group by d\"",
+      "sqlite3 -readonly -json db 'select 1' 'select 2'",
+    ]) {
+      expect(readOnlyShellCommand(command)).toBe(true)
+    }
+    for (const command of [
+      "sqlite3 opencode.db 'select 1'",
+      "sqlite3 -readonly opencode.db",
+      "echo .shell rm x | sqlite3 -readonly db",
+      "sqlite3 -readonly \"my db.sqlite\"",
+      "sqlite3 -readonly db \"$Q\"",
+      "sqlite3 -readonly db '.shell rm -rf x'",
+      "sqlite3 -readonly db '.sh rm -rf x'",
+      "sqlite3 -readonly db '.output out.txt' 'select 1'",
+      "sqlite3 -readonly db '.once out.txt' 'select 1'",
+      "sqlite3 -readonly db '.system touch x'",
+      "sqlite3 -readonly db '.read cmds.sql'",
+      "sqlite3 -readonly db '.open other.db' 'select 1'",
+      "sqlite3 -readonly db \"select writefile('x', 'y')\"",
+      "sqlite3 -readonly db \"select load_extension('./evil')\"",
+      "sqlite3 -readonly db \"attach 'other.db' as o\"",
+      "sqlite3 -readonly db \"vacuum into 'copy.db'\"",
+      "sqlite3 -readonly db \"create virtual table temp.z using zipfile('a.zip')\" \"insert into z(name, data) values ('x', 'y')\"",
+      "sqlite3 -readonly -cmd '.shell rm x' db 'select 1'",
+      "sqlite3 -readonly -init cmds.sql db 'select 1'",
+      "sqlite3 -readonly db \"select 1; .shell rm x\"",
+      "sqlite3 -readonly db 'select 1' -A",
+    ]) {
+      expect(readOnlyShellCommand(command)).toBe(false)
+    }
+  })
+
+  it("accepts journalctl unless an option writes, abbreviated or not", () => {
+    for (const command of [
+      "journalctl --user -u imgrec-review-shadow-worker -n 15 --no-pager 2>&1 | tail -12",
+      "journalctl -b -1 -n 15 --no-pager -o short-iso | cut -c1-200",
+      "journalctl --list-boots --no-pager",
+      "journalctl --since today -t t3-restart --no-pager --cursor=s=abc",
+      "journalctl --follow --file=x.journal --reverse",
+    ]) {
+      expect(readOnlyShellCommand(command)).toBe(true)
+    }
+    for (const command of [
+      "journalctl --rotate",
+      "journalctl --rot",
+      "journalctl --vacuum-size=1G",
+      "journalctl --vacuum-time 1d",
+      "journalctl --vac",
+      "journalctl --flush",
+      "journalctl --fl",
+      "journalctl --sync",
+      "journalctl --setup-keys",
+      "journalctl --relinquish-var",
+      "journalctl --smart-relinquish-var",
+      "journalctl --cursor-file=c.txt -n 5",
+      "journalctl --cursor-f c.txt",
+      "journalctl --update-catalog",
+      "journalctl '--rotate'",
+    ]) {
+      expect(readOnlyShellCommand(command)).toBe(false)
+    }
+  })
+
+  it("accepts systemctl only for reading verbs, with nothing before the verb that could take it as a value", () => {
+    for (const command of [
+      "systemctl status nginx --no-pager",
+      "systemctl --user is-active opencode",
+      "systemctl --user --no-pager status t3 -n 20",
+      "systemctl show opencode -p ActiveState --value",
+      "systemctl list-timers --all",
+      "systemctl --user cat t3.service",
+      "systemctl is-enabled x; systemctl is-failed y",
+    ]) {
+      expect(readOnlyShellCommand(command)).toBe(true)
+    }
+    for (const command of [
+      "systemctl restart nginx",
+      "systemctl --user stop t3",
+      "systemctl edit x",
+      "systemctl -p status restart nginx",
+      "systemctl -H status restart nginx",
+      "systemctl --property status restart nginx",
+      "systemctl daemon-reload",
+      "systemctl",
+    ]) {
+      expect(readOnlyShellCommand(command)).toBe(false)
+    }
+  })
+
+  it("accepts gh and glab read subcommands and plain GET api calls", () => {
+    for (const command of [
+      "glab mr view 64 -R teachxai/game-sxs 2>&1 | head -40",
+      "glab mr list -R teachxai/imgrec-review --merged -P 1",
+      "glab mr diff 74",
+      "glab ci list",
+      "gh pr view 12 --comments",
+      "gh pr checks 12 --watch",
+      "gh run view 123 --log",
+      "gh release list -L 5",
+      "gh api repos/oakimov/cursor-opencode-provider/pulls --paginate --jq .[].number",
+      "glab api projects/1/merge_requests",
+    ]) {
+      expect(readOnlyShellCommand(command)).toBe(true)
+    }
+    for (const command of [
+      "gh pr view 12 --web",
+      "gh pr view 12 -w",
+      "glab mr view 64 -w",
+      "glab repo view --web",
+      "gh pr merge 12",
+      "gh pr create --fill",
+      "gh pr checkout 12",
+      "gh run rerun 123",
+      "gh run download 123",
+      "glab mr approve 64",
+      "glab mr note 64 -m x",
+      "glab ci view",
+      "glab ci status",
+      "glab ci retry 1",
+      "gh api -X POST repos/o/r/issues",
+      "gh api --method=PATCH repos/o/r",
+      "gh api repos/o/r/issues -f title=x",
+      "gh api repos/o/r/issues -F title=x",
+      "gh api repos/o/r/issues --raw-field title=x",
+      "gh api repos/o/r/issues --input body.json",
+      "gh api repos/o/r -H 'X-HTTP-Method-Override: DELETE'",
+      "gh api graphql",
+      "glab api PUT projects/1",
+      "glab api -XPUT projects/1",
+      "glab api projects/1/issues --field title=x",
+    ]) {
+      expect(readOnlyShellCommand(command)).toBe(false)
+    }
+  })
+
+  it("accepts tailscale status and ss without their writing options", () => {
+    for (const command of [
+      "tailscale status | head -3",
+      "tailscale status --json | jq -r .BackendState",
+      "ss -ltnp | rg 8763",
+      "ss -tinp --dccp",
+    ]) {
+      expect(readOnlyShellCommand(command)).toBe(true)
+    }
+    for (const command of [
+      "tailscale up",
+      "tailscale status --web",
+      "tailscale status --listen=0.0.0.0:80 --web",
+      "ss -K dst 10.0.0.1",
+      "ss -tK",
+      "ss --kill",
+      "ss --ki",
+      "ss -D out.raw",
+      "ss --diag=out.raw",
+      "ss --di=out.raw",
+    ]) {
+      expect(readOnlyShellCommand(command)).toBe(false)
+    }
+  })
+
+  it("accepts ssh host 'command' when the remote command passes the same check", () => {
+    for (const command of [
+      "ssh game-sxs 'journalctl -u ttl-game-sxs-pods --since today --no-pager | tail -25'",
+      "ssh -q tedo@10.77.0.2 'ls -la /home/tedo/.tmp'",
+      "ssh -T -q vm3 'cd /etc/nixos && git log --oneline -3'",
+      "ssh vm3 'sqlite3 -readonly db .tables 2>/dev/null'",
+    ]) {
+      expect(readOnlyShellCommand(command)).toBe(true)
+    }
+    for (const command of [
+      "ssh game-sxs 'rm -rf /opt/x'",
+      "ssh game-sxs 'ls; rm x'",
+      "ssh game-sxs 'ls > out'",
+      "ssh game-sxs 'echo $(rm x)'",
+      "ssh game-sxs 'sleep 5 &'",
+      "ssh game-sxs 'echo (rm x)'",
+      "ssh game-sxs ls",
+      "ssh game-sxs \"ls\"",
+      "ssh game-sxs 'ls' 'rm x'",
+      "ssh game-sxs 'ls' | tail",
+      "ssh game-sxs 'ls'; rm x",
+      "ssh game-sxs 'ls'x",
+      "ssh -L 8080:localhost:80 game-sxs 'ls'",
+      "ssh -R 8080:localhost:80 game-sxs 'ls'",
+      "ssh -D 1080 game-sxs 'ls'",
+      "ssh -W host:22 game-sxs 'ls'",
+      "ssh -o ProxyCommand=x game-sxs 'ls'",
+      "ssh -oPermitLocalCommand=yes game-sxs 'ls'",
+      "ssh -F cfg game-sxs 'ls'",
+      "ssh -t game-sxs 'ls'",
+      "ssh -f game-sxs 'ls'",
+      "ssh -N game-sxs 'ls'",
+      "ssh -J jump game-sxs 'ls'",
+      "ssh -p 2222 game-sxs 'ls'",
+      "ssh -qv game-sxs 'ls'",
+      "ssh -oLocalCommand=touch game-sxs 'ls'",
+      "ssh game-sxs 'ssh other rm x'",
+      "cd x && ssh game-sxs 'ls'",
+      "ssh game-sxs '",
+    ]) {
+      expect(readOnlyShellCommand(command)).toBe(false)
+    }
+  })
 })

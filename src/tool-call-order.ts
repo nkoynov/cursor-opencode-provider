@@ -207,7 +207,7 @@ const READ_ONLY_COMMANDS = new Set([
   "df", "which", "type", "tree", "jq", "cut", "tr", "diff", "cmp", "realpath", "readlink", "basename",
   "dirname", "date", "whoami", "id", "uname", "nproc", "uptime", "ps", "true", "false", "test", "[",
   "nl", "tac", "rev", "fold", "paste", "comm", "expand", "strings", "od", "hexdump", "base64",
-  "sha256sum", "sha1sum", "md5sum", "cksum", "column", "printenv", "echo", "printf",
+  "sha256sum", "sha1sum", "md5sum", "cksum", "column", "printenv", "echo", "printf", "sleep", "free", "pgrep",
 ])
 
 const GIT_READ_ONLY = new Set([
@@ -223,14 +223,30 @@ const GIT_READ_ONLY = new Set([
  */
 export function readOnlyShellCommand(command: unknown): boolean {
   if (typeof command !== "string") return false
-  const text = command.trim().replace(/\s+\d?>\s*\/dev\/null(?=\s|$)/g, " ").replace(/\s+2>&1(?=\s|$)/g, " ")
+  const text = command.trim().replace(/\s+\d?>\s*\/dev\/null(?=\s|$|'$)/g, " ").replace(/\s+2>&1(?=\s|$|'$)/g, " ")
   if (!text || text.length > 2_000) return false
   if (/[`\n\r<>]|\$\(|(?:^|[^&])&(?!&)/.test(text)) return false
-  return text.split(/&&|\|\||;|\|/).every((segment) => readOnlyInvocation(segment.trim().split(/\s+/)))
+  const remote = sshRemoteCommand(text)
+  if (remote !== undefined) return !/[()]/.test(remote) && readOnlyShellCommand(remote)
+  return text.split(/&&|\|\||;|\|/).every((segment) => readOnlyInvocation(segment.trim()))
 }
 
-function readOnlyInvocation(words: string[]): boolean {
-  const [command, ...args] = words
+/**
+ * `ssh [-q] [-T] host 'command'` and nothing else: the remote shell parses the
+ * quoted command again, so it gets the same check. Parentheses are refused
+ * because a non-POSIX remote shell (fish) substitutes `(…)`.
+ */
+function sshRemoteCommand(text: string): string | undefined {
+  return /^ssh(?:\s+-(?:q|T|qT|Tq))*\s+[A-Za-z0-9_][\w.@-]*\s+'([^']*)'$/.exec(text)?.[1]
+}
+
+/** Quote characters dropped, so a quoted flag (`'-delete'`) still reads as a flag. */
+function unquotedWords(segment: string): string[] {
+  return segment.split(/\s+/).map((word) => word.replace(/['"\\]/g, ""))
+}
+
+function readOnlyInvocation(segment: string): boolean {
+  const [command, ...args] = unquotedWords(segment)
   if (!command) return false
   if (command === "git") return readOnlyGit(args)
   if (command === "find") return !args.some((arg) => /^-(?:delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls)$/.test(arg))
@@ -238,9 +254,103 @@ function readOnlyInvocation(words: string[]): boolean {
   if (command === "fd") return !args.some((arg) => /^(?:-[a-zA-Z]*[xX]|--exec)/.test(arg))
   if (command === "sort") return !args.some((arg) => /^(?:-[a-zA-Z]*o|--output)/.test(arg))
   if (command === "uniq") return args.every((arg) => arg.startsWith("-"))
-  if (command === "sed") return args.length >= 2 && args[0] === "-n" && /^['"]?(?:\d+|\$)(?:,(?:\d+|\$))?p['"]?$/.test(args[1]!)
+  if (command === "sed") return readOnlySed(segment)
   if (command === "command") return args[0] === "-v"
+  if (command === "sqlite3") return readOnlySqlite(segment)
+  if (command === "journalctl") return !args.some((arg) => abbreviatesLongOption(arg, JOURNALCTL_WRITING_OPTIONS, ["--cursor"]))
+  if (command === "systemctl") return readOnlySystemctl(args)
+  if (command === "gh" || command === "glab") return readOnlyForgeCli(command, args)
+  if (command === "tailscale") return args[0] === "status" && args.slice(1).every((arg) => /^--?(?:json|active|peers|self)(?:=(?:true|false))?$/.test(arg))
+  if (command === "ss") return !args.some((arg) => /^-[a-zA-Z]*[KD]/.test(arg) || abbreviatesLongOption(arg, ["--kill", "--diag"]))
   return READ_ONLY_COMMANDS.has(command)
+}
+
+/** getopt_long takes any unambiguous prefix of a long option, so `--rot` is `--rotate`. */
+function abbreviatesLongOption(arg: string, options: string[], exact: string[] = []): boolean {
+  const name = arg.split("=")[0]!
+  return name.startsWith("--") && name.length > 2 && !exact.includes(name) && options.some((option) => option.startsWith(name))
+}
+
+/** `sed -n` printing a line range or a `/regex/` range, with no further options (`-i` may follow the script). */
+function readOnlySed(segment: string): boolean {
+  const match = /^sed\s+-n\s+('[^']*'|"[^"]*"|\S+)(?:\s+(.*))?$/.exec(segment)
+  if (!match) return false
+  const [, script, files = ""] = match
+  const address = script!.startsWith("'") ? String.raw`(?:\d+|\$|/[^/\\]*/)` : String.raw`\d+`
+  const body = script!.startsWith("'") ? script!.slice(1, -1) : script!.replace(/"/g, "")
+  return new RegExp(`^${address}(?:,${address})?p$`).test(body) && unquotedWords(files).every((word) => !word.startsWith("-"))
+}
+
+const JOURNALCTL_WRITING_OPTIONS = [
+  "--rotate", "--vacuum-size", "--vacuum-files", "--vacuum-time", "--flush", "--sync", "--setup-keys",
+  "--relinquish-var", "--smart-relinquish-var", "--cursor-file", "--update-catalog",
+]
+
+const SQLITE_FLAGS = new Set([
+  "-readonly", "-safe", "-header", "-noheader", "-csv", "-json", "-line", "-list", "-column", "-box", "-table",
+  "-markdown", "-tabs", "-quote", "-html", "-ascii", "-batch", "-bail",
+])
+const SQLITE_DOT_COMMANDS = new Set([
+  ".tables", ".schema", ".fullschema", ".indexes", ".indices", ".headers", ".mode", ".databases", ".print",
+  ".width", ".nullvalue", ".separator", ".show",
+])
+/** `-readonly` guards the database, not the CLI's file and program functions or a temp table such as zipfile. */
+const SQLITE_WRITING_SQL = /\b(?:insert|update|delete|replace|upsert|create|drop|alter|attach|detach|vacuum|reindex|analyze|writefile|edit|load_extension|fts3_tokenizer)\b/i
+
+/**
+ * `sqlite3 -readonly db 'sql'…`: at least one SQL argument, since without one
+ * sqlite3 runs whatever arrives on stdin; dot-commands only from a reading set.
+ */
+function readOnlySqlite(segment: string): boolean {
+  const words = shellWords(segment)
+  if (!words || !words.includes("-readonly") || SQLITE_WRITING_SQL.test(segment)) return false
+  const args = words.slice(1)
+  if (args.some((arg) => arg.startsWith("-") && !SQLITE_FLAGS.has(arg))) return false
+  const operands = args.filter((arg) => !arg.startsWith("-"))
+  return operands.length >= 2 && operands.slice(1).every((sql) => !sql.startsWith(".") || SQLITE_DOT_COMMANDS.has(sql.split(/\s+/)[0]!))
+}
+
+/** Arguments of a segment with only plain single or double quotes; undefined when expansion or escapes could change them. */
+function shellWords(segment: string): string[] | undefined {
+  if (/[\\$]/.test(segment)) return undefined
+  const tokens = segment.match(/(?:[^\s'"]+|'[^']*'|"[^"]*")+/g) ?? []
+  if (tokens.join("").replace(/\s/g, "").length !== segment.replace(/\s/g, "").length) return undefined
+  return tokens.map((token) => token.replace(/'([^']*)'|"([^"]*)"/g, "$1$2"))
+}
+
+const SYSTEMCTL_READ_ONLY = new Set(["status", "is-active", "is-enabled", "is-failed", "show", "list-units", "list-timers", "cat"])
+
+/** The verb is the first operand, so every word before it must be an option that takes no separate value. */
+function readOnlySystemctl(args: string[]): boolean {
+  const index = args.findIndex((arg) => !arg.startsWith("-"))
+  return index >= 0
+    && SYSTEMCTL_READ_ONLY.has(args[index]!)
+    && args.slice(0, index).every((arg) => /^(?:--user|--system|--no-pager|--full|-l|--all|-a|--quiet|-q|--no-legend|--plain|--failed|--value|--[a-z-]+=.*)$/.test(arg))
+}
+
+const FORGE_READ_ONLY = {
+  gh: new Set(["pr view", "pr list", "pr diff", "pr checks", "pr status", "issue view", "issue list", "issue status", "run view", "run list", "repo view", "release view", "release list"]),
+  glab: new Set(["mr view", "mr list", "mr diff", "issue view", "issue list", "repo view", "ci list", "ci get", "release view", "release list"]),
+}
+
+/** Listed read subcommands without `--web`/`-w`, and `api` as a plain GET (any field or input makes it a POST). */
+function readOnlyForgeCli(command: "gh" | "glab", args: string[]): boolean {
+  if (args.some((arg) => /^-[a-zA-Z]*w/.test(arg) || /^--web(?:=|$)/.test(arg))) return false
+  if (args[0] === "api") return readOnlyForgeApi(args.slice(1))
+  return FORGE_READ_ONLY[command].has(`${args[0]} ${args[1]}`)
+}
+
+/** One endpoint and only flags that neither add a body nor set a method or header. */
+function readOnlyForgeApi(args: string[]): boolean {
+  if (args.some((arg) => /graphql/i.test(arg))) return false
+  let endpoints = 0
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!
+    if (!arg.startsWith("-")) endpoints++
+    else if (/^(?:-[qtp]|--(?:jq|template|hostname|cache|preview))$/.test(arg)) index++
+    else if (!/^(?:-i|--(?:paginate|slurp|include|silent|verbose)|--(?:jq|template|hostname|cache|preview)=.*)$/.test(arg)) return false
+  }
+  return endpoints === 1
 }
 
 function readOnlyGit(args: string[]): boolean {
