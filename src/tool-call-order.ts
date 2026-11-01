@@ -331,13 +331,14 @@ function refusesOption(args: string[], short: RegExp, long: string[]): boolean {
   return args.some((arg) => short.test(arg) || abbreviatesLongOption(arg, long))
 }
 
-/** Display only: an operand other than `+FORMAT` sets the clock (`date MMDDhhmm`), as does `--set`. */
+/** Display only: an operand other than `+FORMAT` sets the clock (`date MMDDhhmm`), as do `--set` and BSD `-a`. */
 function readOnlyDate(args: string[]): boolean {
   for (let index = 0; index < args.length; index++) {
     const arg = args[index]!
     if (arg === "-d" || arg === "-r" || arg === "--date" || arg === "--reference") index++
-    else if (/^-[^-]*s/.test(arg) || abbreviatesLongOption(arg, ["--set"])) return false
-    else if (!arg.startsWith("-") && !arg.startsWith("+")) return false
+    else if (arg.startsWith("-")
+      ? !/^(?:-u|--utc|--universal|-R|--rfc-email|-I[a-z]*|--iso-8601(?:=[a-z]+)?|--rfc-3339=[a-z]+|--date=.*|--reference=.*)$/.test(arg)
+      : !arg.startsWith("+")) return false
   }
   return true
 }
@@ -377,7 +378,8 @@ const SQLITE_WRITING_SQL = /\b(?:insert|update|delete|replace|upsert|create|drop
  * sqlite3 runs whatever arrives on stdin; dot-commands only from a reading set.
  */
 function readOnlySqlite(args: string[]): boolean {
-  if (!args.includes("-readonly") || SQLITE_WRITING_SQL.test(args.join(" "))) return false
+  const database = args.findIndex((arg) => !arg.startsWith("-"))
+  if (!args.slice(0, database).includes("-readonly") || SQLITE_WRITING_SQL.test(args.join(" "))) return false
   if (args.some((arg) => arg.startsWith("-") && !SQLITE_FLAGS.has(arg))) return false
   const operands = args.filter((arg) => !arg.startsWith("-"))
   return operands.length >= 2 && operands.slice(1).every((sql) => !sql.startsWith(".") || SQLITE_DOT_COMMANDS.has(sql.split(/\s+/)[0]!))

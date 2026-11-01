@@ -382,6 +382,8 @@ describe("tool call classification", () => {
       "date --se=2020-01-01",
       "date 110103002026",
       "date -us 2020-01-01",
+      "date -a -1",
+      "date -t 202601010000",
       "rg --hyperlink-format='file://{host}{path}' --hostname-bin=./payload needle file",
       "rg --pr=sh needle",
       "sort --compress-program=./payload big",
@@ -458,6 +460,7 @@ describe("tool call classification", () => {
       "sqlite3 -readonly db \"select write\"\"file('/tmp/pwn','x')\"",
       "sqlite3 -readonly db \"select load_\"exten\\sion\"('/tmp/payload')\"",
       "sqlite3 -readonly db 'select \"WriteFile\"(1, 2)'",
+      "sqlite3 db 'PRAGMA user_version=1' -readonly",
     ]) {
       expect(readOnlyShellCommand(command)).toBe(false)
     }
