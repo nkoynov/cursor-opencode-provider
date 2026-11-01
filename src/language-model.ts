@@ -433,6 +433,7 @@ import {
   billingLedger,
   cursorRunCost,
   hostStepPrices,
+  maxOutputWithinUsd,
   nanoAiuForUsd,
   shapeStepUsage,
   turnEndedCostUsd,
@@ -6379,12 +6380,12 @@ export async function pump(
       ? billingLedger.outstandingOutput(billing.key)
       : { output: estimateTokens(stepOutputChars), reasoning: 0 }
     stepOutputChars = 0
-    const stepOutputTokens = occupancyDetails
-      ? Math.min(occupancyDetails.usedTokens, Math.max(1, stepOutput.output))
-      : 0
     // A tool step costs what a one-call estimate with a single output token
     // would: held Runs split into many steps already overstate cached input,
     // and pricing the estimated output on top would bill ahead of TurnEnded.
+    const estimatePrices = !te && occupancyDetails
+      ? hostStepPrices(billing.cost, occupancyDetails.usedTokens - 1)
+      : undefined
     const targetUsd = !billing.cost || !occupancyDetails
       ? undefined
       : te
@@ -6393,8 +6394,18 @@ export async function pump(
             usedTokens: occupancyDetails.usedTokens,
             prefixTokens: billing.prefixTokens,
             outputTokens: 1,
-            prices: hostStepPrices(billing.cost, occupancyDetails.usedTokens - 1),
+            prices: estimatePrices,
           }).costUsd
+    // Estimated output that target cannot carry is left for TurnEnded to report.
+    const stepOutputTokens = !occupancyDetails
+      ? 0
+      : Math.min(
+          occupancyDetails.usedTokens,
+          Math.max(1, stepOutput.output),
+          estimatePrices && targetUsd !== undefined
+            ? maxOutputWithinUsd(occupancyDetails.usedTokens, estimatePrices, targetUsd)
+            : Number.POSITIVE_INFINITY,
+        )
     const shaped = occupancyDetails && !settledUsage
       ? shapeStepUsage({
           usedTokens: occupancyDetails.usedTokens,

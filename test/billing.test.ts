@@ -6,6 +6,7 @@ import {
   cursorPricingId,
   hostStepPrices,
   hostUsageCostUsd,
+  maxOutputWithinUsd,
   nanoAiuForUsd,
   shapeStepUsage,
   turnEndedCostUsd,
@@ -130,6 +131,23 @@ describe("shapeStepUsage", () => {
       expect(Math.abs(openCode2Cost(GROK, usage) - target)).toBeLessThan(2e-6)
       expect(costUsd).toBeCloseTo(openCode2Cost(GROK, usage), 12)
     }
+  })
+
+  it("caps estimated output to what a step's one-token cost can carry", () => {
+    const prices = hostStepPrices(CLAUDE, 9_999)!
+    const target = shapeStepUsage({ usedTokens: 10_000, prefixTokens: 9_000, outputTokens: 1, prices }).costUsd
+    expect(target).toBeCloseTo((999 * 3 + 9_000 * 0.3 + 15) / 1e6, 12)
+    const cap = maxOutputWithinUsd(10_000, prices, target)
+    expect(cap).toBe(184)
+    const capped = shapeStepUsage({ usedTokens: 10_000, prefixTokens: 9_000, outputTokens: cap, prices, targetUsd: target })
+    expect(capped.usage.outputTokens.total).toBe(184)
+    expect(Math.abs(capped.costUsd - target)).toBeLessThan(1e-6)
+    expect(shapeStepUsage({
+      usedTokens: 10_000, prefixTokens: 9_000, outputTokens: 1_000, prices, targetUsd: target,
+    }).costUsd).toBeGreaterThan(3 * target)
+    // A free cache-write rate leaves no floor below the output's own cost.
+    expect(maxOutputWithinUsd(40_000, hostStepPrices(GROK, 39_999)!, 0.06)).toBe(10_000)
+    expect(maxOutputWithinUsd(40_000, { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 }, 0)).toBe(40_000)
   })
 
   it("settles a target net of the output it reports", () => {

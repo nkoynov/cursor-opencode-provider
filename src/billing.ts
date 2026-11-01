@@ -190,6 +190,19 @@ export function shapeStepUsage(input: {
   return { usage, costUsd: prices ? hostUsageCostUsd(prices, usage) : 0 }
 }
 
+/**
+ * The most output a step of `usedTokens` can report while {@link shapeStepUsage}
+ * can still keep its cost at `targetUsd`: the rest of the step at the cheapest
+ * input category, the output at the output rate.
+ */
+export function maxOutputWithinUsd(usedTokens: number, prices: StepPrices, targetUsd: number): number {
+  const used = wholeTokens(usedTokens)
+  const cheapestInput = Math.min(prices.input, prices.cacheRead, prices.cacheWrite)
+  const premium = prices.output - cheapestInput
+  if (premium <= 0) return used
+  return Math.min(used, Math.max(1, Math.floor((targetUsd - used * cheapestInput) / premium)))
+}
+
 function wholeTokens(value: number): number {
   return Number.isFinite(value) && value > 0 ? Math.trunc(value) : 0
 }
