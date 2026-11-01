@@ -364,6 +364,21 @@ describe("tool call classification", () => {
       "sed -n /a/p file",
       "cat a 2>/dev/null'x'",
       "cat a >/dev/null'x' b",
+      "journalctl --rot{ate,ate}",
+      "rg --{pre=sh,no-heading} needle .",
+      "sed -n 1p {-n,-i} victim",
+      "find . -name x -del*",
+      "find . *",
+      "find . $X",
+      "find . \"$X\"",
+      "find . $'\\x2ddelete'",
+      "rg 'x|ls' --pre=sh f",
+      "fd -1x rm",
+      "tree -o out.txt",
+      "tree -aJo out.json",
+      "file -C -m magic",
+      "date -s 2020-01-01",
+      "git -C $W commit -m x",
     ]) {
       expect(readOnlyShellCommand(command)).toBe(false)
     }
@@ -378,6 +393,11 @@ describe("tool call classification", () => {
       "sleep 5 && tail -5 log.txt",
       "free -g | head -2",
       "pgrep -af pytest | head -3",
+      "ls *.md && wc -l src/*.ts",
+      "find . -name '*.ts' -newer \"a b\"",
+      "tree -L 2 src",
+      "file -b x.png",
+      "date +%s",
     ]) {
       expect(readOnlyShellCommand(command)).toBe(true)
     }
@@ -414,6 +434,9 @@ describe("tool call classification", () => {
       "sqlite3 -readonly -init cmds.sql db 'select 1'",
       "sqlite3 -readonly db \"select 1; .shell rm x\"",
       "sqlite3 -readonly db 'select 1' -A",
+      "sqlite3 -readonly db select*",
+      "sqlite3 -readonly db {.shell,touch}",
+      "sqlite3 -readonly db '.sh'{ell,}",
     ]) {
       expect(readOnlyShellCommand(command)).toBe(false)
     }
@@ -469,6 +492,9 @@ describe("tool call classification", () => {
       "systemctl -p status restart nginx",
       "systemctl -H status restart nginx",
       "systemctl --property status restart nginx",
+      "systemctl --host=box status nginx",
+      "systemctl --machine=box status nginx",
+      "systemctl {status,restart} nginx",
       "systemctl daemon-reload",
       "systemctl",
     ]) {
@@ -517,6 +543,9 @@ describe("tool call classification", () => {
       "glab api PUT projects/1",
       "glab api -XPUT projects/1",
       "glab api projects/1/issues --field title=x",
+      "gh api repos/o/r --cache 1h",
+      "gh pr view 1 -1w",
+      "gh pr {view,merge} 1",
     ]) {
       expect(readOnlyShellCommand(command)).toBe(false)
     }
@@ -542,6 +571,8 @@ describe("tool call classification", () => {
       "ss -D out.raw",
       "ss --diag=out.raw",
       "ss --di=out.raw",
+      "ss -4K dst 127.0.0.1",
+      "ss -6D diag.raw",
     ]) {
       expect(readOnlyShellCommand(command)).toBe(false)
     }
