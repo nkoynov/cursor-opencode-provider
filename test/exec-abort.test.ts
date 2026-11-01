@@ -24,8 +24,8 @@ const kvSet = (id: number) => frame({
 })
 const listed = (count: number) => frame({ interaction_update: { tool_requests_listed: { call_count: count } } })
 const shell = (id: number, callId: string) => [
-  frame({ interaction_update: { tool_call_started: { call_id: callId, tool_call: { shell_tool_call: { args: { command: "sleep 60", tool_call_id: callId } } } } } }),
-  frame({ exec_server_message: { id, shell_stream_args: { command: "sleep 60", tool_call_id: callId } } }),
+  frame({ interaction_update: { tool_call_started: { call_id: callId, tool_call: { shell_tool_call: { args: { command: "touch built && sleep 60", tool_call_id: callId } } } } } }),
+  frame({ exec_server_message: { id, shell_stream_args: { command: "touch built && sleep 60", tool_call_id: callId } } }),
 ]
 
 /** Frames in order; a read past the end waits for `push` (Cursor is quiet). */
