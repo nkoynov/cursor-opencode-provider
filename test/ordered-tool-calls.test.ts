@@ -469,6 +469,11 @@ describe("tool call classification", () => {
       "sort $TMPDIR{-o,./out} /dev/null",
       "sort ${HOME}{-o,./out} /dev/null",
       "sort $HOME* in",
+      "find . $XDG_STATE_HOME\"\"{-exec,touch,victim} \\;",
+      "sort $XDG_STATE_HOME\"\"{-o,./out} /dev/null",
+      "sort $TMPDIR\"\"-o out in",
+      "sort \"$TMPDIR\"-o out in",
+      "sort $HOME$TMPDIR-o out in",
     ]) {
       expect(readOnlyShellCommand(command)).toBe(false)
     }

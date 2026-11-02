@@ -288,10 +288,10 @@ const PARAMETER_EXPANSION = /\$\{(?!(?:HOME|TMPDIR|PWD|XDG_(?:RUNTIME_DIR|CACHE_
 
 /**
  * Variables that hold an absolute path, so they never expand to a flag. They
- * may be unset, so only where a `/`, a quote, a space or the end follows:
- * `$TMPDIR{-o,x}` is `-o x` without one.
+ * may be unset, so `segmentWords` trusts one only where `/` or the word's end
+ * comes next: unset, `$TMPDIR{-o,x}` and `$TMPDIR""-o` are flags.
  */
-const PATH_VARIABLE = /^\$(?:\{(?:HOME|TMPDIR|PWD|XDG_(?:RUNTIME_DIR|CACHE_HOME|CONFIG_HOME|DATA_HOME|STATE_HOME))\}|(?:HOME|TMPDIR|PWD|XDG_(?:RUNTIME_DIR|CACHE_HOME|CONFIG_HOME|DATA_HOME|STATE_HOME))(?!\w))(?=[/"'\s]|$)/
+const PATH_VARIABLE = /^\$(?:\{(?:HOME|TMPDIR|PWD|XDG_(?:RUNTIME_DIR|CACHE_HOME|CONFIG_HOME|DATA_HOME|STATE_HOME))\}|(?:HOME|TMPDIR|PWD|XDG_(?:RUNTIME_DIR|CACHE_HOME|CONFIG_HOME|DATA_HOME|STATE_HOME))(?!\w))/
 
 /**
  * The words of one segment with quoting removed, so `'-delete'` reads as a
@@ -301,40 +301,51 @@ function segmentWords(segment: string): ShellWord[] | undefined {
   const words: ShellWord[] = []
   let word: ShellWord | undefined
   let quote: string | undefined
+  let afterPathVariable = false
   const expansion = (current: ShellWord) => {
     current.expands = true
     if (!current.text) current.leading = true
+  }
+  const append = (current: ShellWord, text: string) => {
+    if (afterPathVariable && !text.startsWith("/")) {
+      current.expands = true
+      current.leading = true
+    }
+    afterPathVariable = false
+    current.text += text
   }
   for (let index = 0; index < segment.length; index++) {
     const char = segment[index]!
     const pathVariable = char === "$" && quote !== "'" ? PATH_VARIABLE.exec(segment.slice(index))?.[0] : undefined
     if (pathVariable) {
       word ??= { text: "", expands: false, leading: false }
-      word.text += pathVariable
+      append(word, pathVariable)
+      afterPathVariable = true
       index += pathVariable.length - 1
       continue
     }
     if (!quote && /\s/.test(char)) {
       if (word) words.push(word)
       word = undefined
+      afterPathVariable = false
       continue
     }
     word ??= { text: "", expands: false, leading: false }
     if (quote === "'") {
       if (char === "'") quote = undefined
-      else word.text += char
+      else append(word, char)
     } else if (quote === '"') {
       if (char === '"') quote = undefined
-      else if (char === "\\" && /[$`"\\]/.test(segment[index + 1] ?? "")) word.text += segment[++index]
+      else if (char === "\\" && /[$`"\\]/.test(segment[index + 1] ?? "")) append(word, segment[++index]!)
       else {
         if (char === "$") expansion(word)
-        word.text += char
+        append(word, char)
       }
     } else if (char === "'" || char === '"') quote = char
-    else if (char === "\\") word.text += segment[++index] ?? ""
+    else if (char === "\\") append(word, segment[++index] ?? "")
     else {
       if (/[*?[{$]/.test(char)) expansion(word)
-      word.text += char
+      append(word, char)
     }
   }
   if (quote) return undefined
