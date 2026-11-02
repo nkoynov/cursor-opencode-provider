@@ -235,8 +235,10 @@ export function readOnlyShellCommand(command: unknown): boolean {
 /**
  * The line split at `&&`, `||`, `;` and `|` outside quotes, so `rg 'a|b'` stays
  * one command; quotes and backslashes read as `segmentWords` reads them.
- * Undefined for an unbalanced quote, and for `$'…'`, where `\'` does not end
- * the quote, so this scan would read it differently from the shell.
+ * Undefined for an unbalanced quote; for `$'…'`, where `\'` does not end the
+ * quote, so this scan would read it differently from the shell; and for an
+ * unquoted parenthesis (a subshell, or zsh's `=(…)` and glob qualifiers, which
+ * run commands).
  */
 function unquotedSegments(text: string): string[] | undefined {
   const segments: string[] = []
@@ -251,7 +253,7 @@ function unquotedSegments(text: string): string[] | undefined {
       else if (char === '"') quote = undefined
     } else if (char === "'" || char === '"') quote = char
     else if (char === "\\") index++
-    else if (char === "$" && text[index + 1] === "'") return undefined
+    else if ((char === "$" && text[index + 1] === "'") || char === "(" || char === ")") return undefined
     else if (char === ";" || char === "|" || char === "&") {
       segments.push(text.slice(start, index))
       if (char !== ";" && text[index + 1] === char) index++
@@ -284,8 +286,12 @@ type ShellWord = { text: string; expands: boolean; leading: boolean }
  */
 const PARAMETER_EXPANSION = /\$\{(?!(?:HOME|TMPDIR|PWD|XDG_(?:RUNTIME_DIR|CACHE_HOME|CONFIG_HOME|DATA_HOME|STATE_HOME))\})|\$\[/
 
-/** Variables that hold an absolute path, so they never expand to a flag. */
-const PATH_VARIABLE = /^\$(?:\{(?:HOME|TMPDIR|PWD|XDG_(?:RUNTIME_DIR|CACHE_HOME|CONFIG_HOME|DATA_HOME|STATE_HOME))\}|(?:HOME|TMPDIR|PWD|XDG_(?:RUNTIME_DIR|CACHE_HOME|CONFIG_HOME|DATA_HOME|STATE_HOME))(?!\w))/
+/**
+ * Variables that hold an absolute path, so they never expand to a flag. They
+ * may be unset, so only where a `/`, a quote, a space or the end follows:
+ * `$TMPDIR{-o,x}` is `-o x` without one.
+ */
+const PATH_VARIABLE = /^\$(?:\{(?:HOME|TMPDIR|PWD|XDG_(?:RUNTIME_DIR|CACHE_HOME|CONFIG_HOME|DATA_HOME|STATE_HOME))\}|(?:HOME|TMPDIR|PWD|XDG_(?:RUNTIME_DIR|CACHE_HOME|CONFIG_HOME|DATA_HOME|STATE_HOME))(?!\w))(?=[/"'\s]|$)/
 
 /**
  * The words of one segment with quoting removed, so `'-delete'` reads as a

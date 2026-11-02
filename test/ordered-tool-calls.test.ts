@@ -463,6 +463,12 @@ describe("tool call classification", () => {
       "echo $[1+1]",
       "tree -R -L 2 -H .",
       "tree -aR",
+      "cat =(touch victim)",
+      "ls *(e:'touch x':)",
+      "(rm x)",
+      "sort $TMPDIR{-o,./out} /dev/null",
+      "sort ${HOME}{-o,./out} /dev/null",
+      "sort $HOME* in",
     ]) {
       expect(readOnlyShellCommand(command)).toBe(false)
     }
