@@ -226,10 +226,40 @@ export function readOnlyShellCommand(command: unknown): boolean {
   if (typeof command !== "string") return false
   const text = command.trim().replace(/\s+\d?>\s*\/dev\/null(?=\s|$|'$)/g, " ").replace(/\s+2>&1(?=\s|$|'$)/g, " ")
   if (!text || text.length > 2_000) return false
-  if (/[`\n\r<>]|\$\(|(?:^|[^&])&(?!&)/.test(text)) return false
+  // `$'…'` is refused because `\'` does not end it, so the split below would read its quotes differently from the shell.
+  if (/[`\n\r<>]|\$\(|\$'|(?:^|[^&])&(?!&)/.test(text)) return false
   const remote = sshRemoteCommand(text)
   if (remote !== undefined) return !/[()]/.test(remote) && readOnlyShellCommand(remote)
-  return text.split(/&&|\|\||;|\|/).every((segment) => readOnlyInvocation(segment.trim()))
+  return unquotedSegments(text)?.every((segment) => readOnlyInvocation(segment.trim())) ?? false
+}
+
+/**
+ * The line split at `&&`, `||`, `;` and `|` outside quotes, so `rg 'a|b'` stays
+ * one command; quotes and backslashes read as `segmentWords` reads them.
+ * Undefined for an unbalanced quote.
+ */
+function unquotedSegments(text: string): string[] | undefined {
+  const segments: string[] = []
+  let start = 0
+  let quote: string | undefined
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index]!
+    if (quote === "'") {
+      if (char === "'") quote = undefined
+    } else if (quote === '"') {
+      if (char === "\\" && /[$`"\\]/.test(text[index + 1] ?? "")) index++
+      else if (char === '"') quote = undefined
+    } else if (char === "'" || char === '"') quote = char
+    else if (char === "\\") index++
+    else if (char === ";" || char === "|" || char === "&") {
+      segments.push(text.slice(start, index))
+      if (char !== ";" && text[index + 1] === char) index++
+      start = index + 1
+    }
+  }
+  if (quote) return undefined
+  segments.push(text.slice(start))
+  return segments
 }
 
 /**
@@ -252,8 +282,7 @@ const PATH_VARIABLE = /^\$(?:\{(?:HOME|TMPDIR|PWD|XDG_(?:RUNTIME_DIR|CACHE_HOME|
 
 /**
  * The words of one segment with quoting removed, so `'-delete'` reads as a
- * flag; undefined for an unbalanced quote, which means the line split inside
- * a quoted string and the segment is not a command of its own.
+ * flag; undefined for an unbalanced quote.
  */
 function segmentWords(segment: string): ShellWord[] | undefined {
   const words: ShellWord[] = []
@@ -382,7 +411,8 @@ function readOnlySqlite(args: string[]): boolean {
   if (!args.slice(0, database).includes("-readonly") || SQLITE_WRITING_SQL.test(args.join(" "))) return false
   if (args.some((arg) => arg.startsWith("-") && !SQLITE_FLAGS.has(arg))) return false
   const operands = args.filter((arg) => !arg.startsWith("-"))
-  return operands.length >= 2 && operands.slice(1).every((sql) => !sql.startsWith(".") || SQLITE_DOT_COMMANDS.has(sql.split(/\s+/)[0]!))
+  return operands.length >= 2
+    && operands.slice(1).every((sql) => !/;\s*\./.test(sql) && (!sql.startsWith(".") || SQLITE_DOT_COMMANDS.has(sql.split(/\s+/)[0]!)))
 }
 
 const SYSTEMCTL_READ_ONLY = new Set(["status", "is-active", "is-enabled", "is-failed", "show", "list-units", "list-timers", "cat"])

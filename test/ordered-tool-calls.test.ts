@@ -423,6 +423,41 @@ describe("tool call classification", () => {
     }
   })
 
+  it("splits a line only at operators outside quotes", () => {
+    for (const command of [
+      "rg -n \"def a|def b\" src/x.py",
+      "rg -n 'a|b' src | rg -v 'test|spec' | head -30",
+      "cat f | rg -n \"x|y\"",
+      "grep -n \"a\\|b\" f",
+      "jq -r '.items[] | .name' f.json",
+      "git log --format='%h;%s' -3",
+      "sed -n '/a|b/p' f",
+      "echo \"x\\\"; rm y\"",
+      "echo 'a&&b' && ls",
+      "sqlite3 -readonly db \"select 1; select 2\"",
+      "gh api repos/o/r/pulls --jq '.[] | .number'",
+      "ssh vm3 'rg -n \"a|b\" /etc/x | head'",
+    ]) {
+      expect(readOnlyShellCommand(command)).toBe(true)
+    }
+    for (const command of [
+      "echo \"a\" | rm z",
+      "cat 'a;b'; rm c",
+      "echo \\\"; rm y",
+      "echo '\\'; rm y",
+      "echo \"\\\\\"; rm y",
+      "echo $'a\\' b' ; rm z ; echo $'c\\' d'",
+      "echo \"a; rm z",
+      "rg 'x' || rm -rf y",
+      "rg 'x' && rm -rf y",
+      "find . -name x -exec rm {} \\;",
+      "jq -r '.a' f | sh",
+      "ssh vm3 'rg \"a\" f; rm x'",
+    ]) {
+      expect(readOnlyShellCommand(command)).toBe(false)
+    }
+  })
+
   it("accepts sqlite3 only with -readonly, an SQL argument and no writing SQL or dot-command", () => {
     for (const command of [
       "sqlite3 -readonly opencode.db \".tables\"",
