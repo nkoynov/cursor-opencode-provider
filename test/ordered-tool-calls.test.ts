@@ -437,6 +437,10 @@ describe("tool call classification", () => {
       "sqlite3 -readonly db \"select 1; select 2\"",
       "gh api repos/o/r/pulls --jq '.[] | .number'",
       "ssh vm3 'rg -n \"a|b\" /etc/x | head'",
+      "cat ${HOME}/a \"${TMPDIR}/b\" | rg 'x|y'",
+      "tree -L 2 -a src",
+      "fd -a '^python3?$' ~/x | sort",
+      "rg -n 'end$' f; echo \"$'\"",
     ]) {
       expect(readOnlyShellCommand(command)).toBe(true)
     }
@@ -453,6 +457,12 @@ describe("tool call classification", () => {
       "find . -name x -exec rm {} \\;",
       "jq -r '.a' f | sh",
       "ssh vm3 'rg \"a\" f; rm x'",
+      "echo \"${q:=${d:=$}${l:=\"(\"}touch x${r:=\")\"}}${q@P}|ok\"",
+      "echo \"${q:=${d:=$}${l:=\"(\"}touch x${r:=\")\"}}${q@P}\"",
+      "echo ${y:=a[${d:=$}${l:=(}touch x)]} ${z:${y}}",
+      "echo $[1+1]",
+      "tree -R -L 2 -H .",
+      "tree -aR",
     ]) {
       expect(readOnlyShellCommand(command)).toBe(false)
     }

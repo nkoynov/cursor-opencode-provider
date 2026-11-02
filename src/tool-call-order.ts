@@ -226,8 +226,7 @@ export function readOnlyShellCommand(command: unknown): boolean {
   if (typeof command !== "string") return false
   const text = command.trim().replace(/\s+\d?>\s*\/dev\/null(?=\s|$|'$)/g, " ").replace(/\s+2>&1(?=\s|$|'$)/g, " ")
   if (!text || text.length > 2_000) return false
-  // `$'…'` is refused because `\'` does not end it, so the split below would read its quotes differently from the shell.
-  if (/[`\n\r<>]|\$\(|\$'|(?:^|[^&])&(?!&)/.test(text)) return false
+  if (/[`\n\r<>]|\$\(|(?:^|[^&])&(?!&)/.test(text) || PARAMETER_EXPANSION.test(text)) return false
   const remote = sshRemoteCommand(text)
   if (remote !== undefined) return !/[()]/.test(remote) && readOnlyShellCommand(remote)
   return unquotedSegments(text)?.every((segment) => readOnlyInvocation(segment.trim())) ?? false
@@ -236,7 +235,8 @@ export function readOnlyShellCommand(command: unknown): boolean {
 /**
  * The line split at `&&`, `||`, `;` and `|` outside quotes, so `rg 'a|b'` stays
  * one command; quotes and backslashes read as `segmentWords` reads them.
- * Undefined for an unbalanced quote.
+ * Undefined for an unbalanced quote, and for `$'…'`, where `\'` does not end
+ * the quote, so this scan would read it differently from the shell.
  */
 function unquotedSegments(text: string): string[] | undefined {
   const segments: string[] = []
@@ -251,6 +251,7 @@ function unquotedSegments(text: string): string[] | undefined {
       else if (char === '"') quote = undefined
     } else if (char === "'" || char === '"') quote = char
     else if (char === "\\") index++
+    else if (char === "$" && text[index + 1] === "'") return undefined
     else if (char === ";" || char === "|" || char === "&") {
       segments.push(text.slice(start, index))
       if (char !== ";" && text[index + 1] === char) index++
@@ -276,6 +277,12 @@ function sshRemoteCommand(text: string): string | undefined {
  * turn it into other words; `leading`: the word starts with one.
  */
 type ShellWord = { text: string; expands: boolean; leading: boolean }
+
+/**
+ * `${…}` other than a path variable, and `$[…]`: assignments (`${x:=…}`), the
+ * `@P` transform and arithmetic subscripts can assemble a `$(…)` and run it.
+ */
+const PARAMETER_EXPANSION = /\$\{(?!(?:HOME|TMPDIR|PWD|XDG_(?:RUNTIME_DIR|CACHE_HOME|CONFIG_HOME|DATA_HOME|STATE_HOME))\})|\$\[/
 
 /** Variables that hold an absolute path, so they never expand to a flag. */
 const PATH_VARIABLE = /^\$(?:\{(?:HOME|TMPDIR|PWD|XDG_(?:RUNTIME_DIR|CACHE_HOME|CONFIG_HOME|DATA_HOME|STATE_HOME))\}|(?:HOME|TMPDIR|PWD|XDG_(?:RUNTIME_DIR|CACHE_HOME|CONFIG_HOME|DATA_HOME|STATE_HOME))(?!\w))/
@@ -341,7 +348,8 @@ function readOnlyInvocation(segment: string): boolean {
   if (command === "fd") return !refusesOption(args, /^-[^-]*[xX]/, ["--exec", "--exec-batch"])
   if (command === "sort") return !refusesOption(args, /^-[^-]*o/, ["--output", "--compress-program"])
   if (command === "uniq") return args.every((arg) => arg.startsWith("-"))
-  if (command === "tree" || command === "base64") return !refusesOption(args, /^-[^-]*o/, ["--output"])
+  if (command === "tree") return !refusesOption(args, /^-[^-]*[oR]/, ["--output"])
+  if (command === "base64") return !refusesOption(args, /^-[^-]*o/, ["--output"])
   if (command === "file") return !refusesOption(args, /^-[^-]*C/, ["--compile"])
   if (command === "printf") return !args.some((arg) => /^-[^-]*v/.test(arg))
   if (command === "date") return readOnlyDate(args)
