@@ -501,6 +501,14 @@ describe("a generated image's write", () => {
     expect(run.session.resumeCheckpoint).toEqual(completesFirst ? resume : undefined)
   })
 
+  // Resumed, Cursor generates the image again and writes other bytes, so the saved result cannot answer that write.
+  it("is not offered for a result replay after a cut", async () => {
+    const run = imageRun([generateImageStarted("gen-1"), imageWrite(1, PNG_B), ended()])
+    await saveStep(run, 1, "saved")
+    expect(run.session.writtenResults).toHaveLength(1)
+    expect(run.session.writtenResults![0]!.callId).toBeUndefined()
+  })
+
   it("stays uncorrelated while two GenerateImage calls are open", async () => {
     const run = imageRun([generateImageStarted("gen-1"), generateImageStarted("gen-2"), imageWrite(1, PNG_B), ended()])
     const metadata = await saveStep(run, 1, "saved")

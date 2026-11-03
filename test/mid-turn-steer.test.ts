@@ -211,6 +211,20 @@ describe("mid-turn user message after a complete step", () => {
     }
   })
 
+  it("keeps the message for a follow-up when Cursor already ended the held Run's stream", () => {
+    // An answered step (an input image's copy) keeps a Run Cursor closed cleanly; nothing can be written to it.
+    const held = heldSession("ended")
+    sessionManager.registerPending(1, held, "write_result", "cursor_image_save", false, { inputImage: true }, undefined, true)
+    held.stream.isClosed = () => true
+    const prompt = [
+      user("what is in the picture?"),
+      calls("ended", [1], "cursor_image_save"),
+      toolResult("ended", 1, "Saved the image", "cursor_image_save"),
+      user("also check 3.ts"),
+    ] as Prompt
+    expect(steered(prompt)).toMatchObject({ messages: [], reaches: false })
+  })
+
   it("keeps the message for a follow-up while a later call of the step is still deferred", () => {
     const held = heldReads("deferred")
     held.toolCallOrder = {

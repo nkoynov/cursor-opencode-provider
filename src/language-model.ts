@@ -5023,8 +5023,10 @@ async function deliverContinuationResultsNow(
         const unacknowledged = session.unacknowledgedHostResults ??= []
         unacknowledged.push({ callId, afterFrame: beforeResultWrite })
         const rebuild = replayable && !pending.bridged ? execReplyRebuilder(frames, r.execId) : undefined
+        // A generated image's write is not a call Cursor asks for again: resumed, it generates other bytes.
+        const replayCallId = callId === generateImageCallId ? undefined : callId
         ;(session.writtenResults ??= []).push({
-          callId, replayKey: pending.replayKey, execArrival: pending.execArrival, afterFrame: beforeResultWrite,
+          callId: replayCallId, replayKey: pending.replayKey, execArrival: pending.execArrival, afterFrame: beforeResultWrite,
           ...(rebuild ? { rebuild } : {}),
           ...(deliveredImageHashes.length > 0 ? { imageHashes: deliveredImageHashes } : {}),
         })
@@ -5635,7 +5637,8 @@ export function continuationAfterEarlySteers(
     || (held.toolCallOrder?.calls ?? []).some((call) => !answeredCalls.has(call.callId))
     || [...held.announcedCallIds ?? []].some((callId) => !answeredCalls.has(callId))
     || (held.carriedToolStep?.listed !== undefined && held.carriedToolStep.resolved.size < held.carriedToolStep.listed)
-  const injectNew = takesSteers && !laterCalls
+  // A Run Cursor already ended (kept for an answered step's queued frames) takes nothing more.
+  const injectNew = takesSteers && !laterCalls && !held.stream.isClosed()
   // The host has already promoted these messages. Inject them, or keep them for a follow-up after the
   // held turn, rather than superseding its tool results or dropping all but the last user message.
   const added: EarlySteer[] = []
