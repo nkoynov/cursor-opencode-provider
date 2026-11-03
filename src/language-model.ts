@@ -2388,9 +2388,7 @@ export async function sendRunRequest(
   } catch (error) {
     const verdict = await endStreamVerdict(next)
     try { next.destroy() } catch { /* already closed */ }
-    const failure = runUploadFailure(error, operation, verdict)
-    failure.cursorAnswered = true
-    throw failure
+    throw failedAfterCursorAnswered(runUploadFailure(error, operation, verdict), `Cursor ${operation} failed`)
   }
 }
 

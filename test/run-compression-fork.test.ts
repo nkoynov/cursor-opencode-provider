@@ -315,14 +315,17 @@ describe("sendRunRequest", () => {
 
   it("reports a resend that cannot connect as a failure after Cursor answered", async () => {
     const log: string[] = []
+    // Every open waiting on the same connection attempt gets this one error.
+    const shared = new CursorTransportError("getaddrinfo ENOTFOUND agentn.cursor.sh", {
+      transient: true, replaySafe: true, cause: Object.assign(new Error("getaddrinfo"), { code: "ENOTFOUND" }),
+    })
     const failure = await sendRunRequest(writeStream("first", log, "fail", true), request, "initial Run request", async () => {
-      throw new CursorTransportError("getaddrinfo ENOTFOUND agentn.cursor.sh", {
-        transient: true, replaySafe: true, cause: Object.assign(new Error("getaddrinfo"), { code: "ENOTFOUND" }),
-      })
+      throw shared
     }).catch((error: unknown) => error)
     expect(failure).toBeInstanceOf(CursorProviderError)
     expect(isUnreachableFailure(failure as CursorProviderError)).toBe(true)
     expect((failure as CursorProviderError).cursorAnswered).toBe(true)
+    expect(shared.cursorAnswered).toBeUndefined()
   })
 
   it("does not resend after a failure Cursor did not tie to compression", async () => {

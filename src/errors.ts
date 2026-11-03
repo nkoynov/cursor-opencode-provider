@@ -549,11 +549,22 @@ export function errorCode(error: unknown): string | undefined {
   return typeof code === "string" ? code : undefined
 }
 
-/** A failure that came after Cursor answered the same Run, as the provider error it is reported as. */
+/**
+ * A failure that came after Cursor answered the same Run. An unreachable one is reported as a new error marked
+ * `cursorAnswered`: the original can be shared by every open that waited on the same connection attempt.
+ */
 export function failedAfterCursorAnswered(error: unknown, fallback: string): CursorProviderError {
   const failure = toCursorProviderError(error, { replaySafe: true, fallback })
-  failure.cursorAnswered = true
-  return failure
+  if (!isUnreachableFailure(failure)) return failure
+  const answered = new CursorTransportError(failure.message, {
+    transient: failure.transient,
+    replaySafe: failure.replaySafe,
+    code: failure.code,
+    retryAfterMs: failure.retryAfterMs,
+    cause: failure,
+  })
+  answered.cursorAnswered = true
+  return answered
 }
 
 export function toCursorProviderError(
