@@ -104,6 +104,27 @@ export function extraRetries(budget: RetryBudget): number {
   return (budget.capacity ?? 0) + (budget.unreachable ?? 0)
 }
 
+/** How long a turn waits for Cursor to become reachable again, from the first unreachable failure in a row. */
+export const DEFAULT_UNREACHABLE_WINDOW_MS = 10 * 60_000
+
+/**
+ * Fork: no Run started, so wait out a lost network or name lookup instead of spending the CLI's ten
+ * transport retries in half a minute. Throws once the window since the series began has passed.
+ */
+export function reserveUnreachableRetry(
+  budget: RetryBudget,
+  failure: CursorProviderError,
+  options: { windowMs?: number; maxAttempts?: number; attempts: number },
+  now = Date.now(),
+): void {
+  const since = budget.unreachableSince ??= now
+  if (!endlessRetriesEnabled() && (now - since >= (options.windowMs ?? DEFAULT_UNREACHABLE_WINDOW_MS)
+    || (options.maxAttempts !== undefined && budget.retries + extraRetries(budget) >= options.maxAttempts - 1))) {
+    throw new CursorRetryExhaustedError(options.attempts, failure, now - since)
+  }
+  budget.unreachable = (budget.unreachable ?? 0) + 1
+}
+
 /** Reserve one retry before either reopening locally or handing it to OpenCode. */
 export function reserveRetry(budget: RetryBudget, failure: CursorProviderError, maxAttempts?: number, now = Date.now()): void {
   const category = retryCategory(failure)

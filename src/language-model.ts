@@ -4,7 +4,7 @@ import path from "node:path"
 import { createHash } from "node:crypto"
 import { APICallError } from "@ai-sdk/provider"
 import protobuf from "protobufjs"
-import { endlessRetriesEnabled, extraRetries, newRetryBudget, turnRetryBudget, forgetRetryBudget, noteRunFailure, reserveRetry, resetRetryBudgetsForTests, type RetryBudget } from "./retry-budget.js"
+import { endlessRetriesEnabled, extraRetries, newRetryBudget, turnRetryBudget, forgetRetryBudget, noteRunFailure, reserveRetry, reserveUnreachableRetry, resetRetryBudgetsForTests, type RetryBudget } from "./retry-budget.js"
 import type { LanguageModelV3, LanguageModelV3CallOptions, LanguageModelV3StreamResult, LanguageModelV3GenerateResult, LanguageModelV3StreamPart, LanguageModelV3Usage, LanguageModelV3FinishReason } from "@ai-sdk/provider"
 import type { CreateCursorOptions, CursorRetryOptions } from "./index.js"
 import {
@@ -485,8 +485,6 @@ const MAX_RETRY_DELAY_MS = 30_000
 const DEFAULT_CAPACITY_MAX_ATTEMPTS = 6
 /** Capacity retries start this many times `baseDelayMs` above the normal backoff. */
 const CAPACITY_DELAY_FACTOR = 4
-/** How long a turn waits for Cursor to become reachable again, from its first unreachable failure in a row. */
-const DEFAULT_UNREACHABLE_WINDOW_MS = 10 * 60_000
 const RUN_REQUEST_DECODE_FAILED = "CURSOR_RUN_REQUEST_DECODE_FAILED"
 const RUN_REQUEST_UNSUPPORTED = "CURSOR_RUN_REQUEST_UNSUPPORTED"
 const RUN_REPLY_FAILED = "CURSOR_RUN_REPLY_FAILED"
@@ -1405,6 +1403,22 @@ export function createCursorLanguageModel(
           throw retrySuppressedError(failure, "while opening the Run", retryBudget.retries + 1, retryPolicy.maxAttempts ?? 14)
         }
         if (!failure.transient) throw failure
+        if (isUnreachableFailure(failure)) {
+          reserveUnreachableRetry(retryBudget, failure, {
+            windowMs: retryPolicy.unreachableWindowMs,
+            maxAttempts: retryPolicy.maxAttempts,
+            attempts: retryBudget.retries + extraRetries(retryBudget) + 1,
+          })
+          retryBudget.hostRetryPending = true
+          throw hostRetryError(new CursorTransportError(failure.message, {
+            transient: true,
+            replaySafe: true,
+            code: failure.code,
+            retryAfterMs: retryDelayMs(failure, retryBudget.unreachable ?? 1, retryPolicy),
+            cause: failure,
+          }), true)
+        }
+        retryBudget.unreachableSince = undefined
         reserveRetry(retryBudget, failure, retryPolicy.maxAttempts)
         retryBudget.hostRetryPending = true
         throw hostRetryError(failure, true)
@@ -2228,16 +2242,11 @@ export async function pumpWithRecovery(input: {
         }
         retryBudget.capacity = capacityRetries + 1
       } else if (unreachable) {
-        // Fork: no Run started, so wait out a lost network or name lookup instead of spending the CLI's
-        // ten transport retries in half a minute; the turn resumes its checkpoint once Cursor answers.
-        const since = retryBudget.unreachableSince ??= Date.now()
-        const unreachableRetries = retryBudget.unreachable ?? 0
-        const window = retryPolicy.unreachableWindowMs ?? DEFAULT_UNREACHABLE_WINDOW_MS
-        if (!endlessRetriesEnabled() && (Date.now() - since >= window || (retryPolicy.maxAttempts !== undefined
-          && retryBudget.retries + extraRetries(retryBudget) >= retryPolicy.maxAttempts - 1))) {
-          throw new CursorRetryExhaustedError(attempt + 1, failure, Date.now() - since)
-        }
-        retryBudget.unreachable = unreachableRetries + 1
+        reserveUnreachableRetry(retryBudget, failure, {
+          windowMs: retryPolicy.unreachableWindowMs,
+          maxAttempts: retryPolicy.maxAttempts,
+          attempts: attempt + 1,
+        })
       } else {
         reserveRetry(retryBudget, failure, retryPolicy.maxAttempts)
       }

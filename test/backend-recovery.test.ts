@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test"
+import { describe, expect, it, setSystemTime } from "bun:test"
 import {
   pump,
   pumpWithRecovery,
@@ -689,6 +689,11 @@ describe("Cursor unreachable from this machine", () => {
     expect(isUnreachableFailure(new CursorTransportError("x", { transient: true, replaySafe: false, code: "ENOTFOUND" }))).toBe(false)
     expect(isUnreachableFailure(new CursorServerError("x", { transient: true, replaySafe: true, code: "ENOTFOUND" }))).toBe(false)
     expect(isCapacityFailure(unreachable())).toBe(false)
+    const proxyDial = (cause?: unknown) => new CursorTransportError("HTTPS CONNECT proxy TCP connect to proxy:3128 failed",
+      { transient: true, replaySafe: true, code: "CURSOR_PROXY_CONNECT_FAILED", cause })
+    expect(isUnreachableFailure(proxyDial(Object.assign(new Error("getaddrinfo ENOTFOUND proxy"), { code: "ENOTFOUND" })))).toBe(true)
+    expect(isUnreachableFailure(proxyDial(Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" })))).toBe(false)
+    expect(isUnreachableFailure(proxyDial())).toBe(false)
   })
 
   it("spaces its retries like capacity refusals", () => {
@@ -720,18 +725,21 @@ describe("Cursor unreachable from this machine", () => {
     expect(Array.from((recoveries.at(-1) as { checkpoint: Uint8Array }).checkpoint)).toEqual(first)
   })
 
+  const minutes = (start: number, n: number) => setSystemTime(new Date(start + n * 60_000))
+
   it("gives up when the window ends, in words OpenCode does not retry", async () => {
+    const start = Date.now()
     let recoveries = 0
     const failure = await pumpWithRecovery({
       initialSession: checkpointed("down"),
       controller: controller(),
-      retryPolicy: { baseDelayMs: 1, maxDelayMs: 1, unreachableWindowMs: 40 },
+      retryPolicy: { baseDelayMs: 0, maxDelayMs: 0 },
       recover: async () => {
-        recoveries++
+        minutes(start, 4 * ++recoveries)
         throw unreachable()
       },
-    }).catch((error: unknown) => error)
-    expect(recoveries).toBeGreaterThan(1)
+    }).catch((error: unknown) => error).finally(() => setSystemTime())
+    expect(recoveries).toBe(4)
     expect(failure).toBeInstanceOf(CursorRetryExhaustedError)
     expect(failure).toMatchObject({ code: "ENOTFOUND", transient: false, retryable: false })
     const message = (failure as Error).message
@@ -741,23 +749,21 @@ describe("Cursor unreachable from this machine", () => {
   })
 
   it("starts a new window after Cursor answered in between", async () => {
+    const start = Date.now()
     const retryBudget = newRetryBudget()
     let calls = 0
     const final = await pumpWithRecovery({
       initialSession: checkpointed("flaky"),
       controller: controller(),
-      retryPolicy: { baseDelayMs: 0, maxDelayMs: 0, unreachableWindowMs: 150 },
+      retryPolicy: { baseDelayMs: 0, maxDelayMs: 0 },
       retryBudget,
       recover: async () => {
-        calls++
+        minutes(start, 4 * ++calls)
         if (calls === 4) return fakeSession("answered", [{ frame: text(" more") }, { frame: endStreamError("internal") }])
-        if (calls < 8) {
-          await new Promise((resolve) => setTimeout(resolve, 30))
-          throw unreachable()
-        }
+        if (calls < 8) throw unreachable()
         return fakeSession("done", [{ frame: turnEnded() }])
       },
-    })
+    }).finally(() => setSystemTime())
     expect(final.sessionId).toBe("done")
     expect(retryBudget.unreachable).toBe(6)
   })
