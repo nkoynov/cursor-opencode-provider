@@ -394,7 +394,12 @@ export class CursorRetryExhaustedError extends CursorProviderError {
       isCapacityFailure(last)
         ? `Cursor has no capacity for this model right now (capacity_limit): a limit on Cursor's side, not on ` +
           `your key. The Run was refused ${attempts} times${over}; send the message again later or pick another model.`
-        : `Cursor Run failed after ${attempts} attempts: ${sanitizeHostTerminalMessage(last.message)}`,
+        : isUnreachableFailure(last)
+          ? sanitizeHostTerminalMessage(
+            `Cursor could not be reached from this machine (${last.code}) in ${attempts} attempts${over}: ${last.message}. ` +
+              `Check this machine's network, then send a message such as "continue" to resume from the last saved state`,
+          )
+          : `Cursor Run failed after ${attempts} attempts: ${sanitizeHostTerminalMessage(last.message)}`,
       {
         origin: last.origin,
         transient: false,
@@ -455,6 +460,25 @@ export function isCapacityFailure(error: CursorProviderError): boolean {
   if (error.statusCode === 429 || error.statusCode === 503) return true
   return [error.code, error.grpcStatus].some((value) =>
     value !== undefined && CAPACITY_CODES.has(String(value).toLowerCase().replaceAll("-", "_")))
+}
+
+export const CONNECT_TIMEOUT_CODE = "CURSOR_HTTP2_CONNECT_TIMEOUT"
+const UNREACHABLE_CODES = new Set([
+  "EAI_AGAIN",
+  "ECONNREFUSED",
+  "EHOSTUNREACH",
+  "ENETDOWN",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  CONNECT_TIMEOUT_CODE,
+])
+
+/**
+ * Fork: no connection to Cursor could be opened (name lookup, route, refusal or connect timeout),
+ * so no Run started and the attempt can be repeated as it was.
+ */
+export function isUnreachableFailure(error: CursorProviderError): boolean {
+  return error.origin === "transport" && error.replaySafe && error.code !== undefined && UNREACHABLE_CODES.has(error.code)
 }
 
 export function isAuthGrpcStatus(status: number | string): boolean {

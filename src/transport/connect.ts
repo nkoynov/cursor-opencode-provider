@@ -5,6 +5,7 @@ import { getDeviceIds } from "../protocol/device-id.js"
 import { INSTALLER_WAIT_MS, resolveClientVersion } from "../protocol/client-version.js"
 import { errorMessage, trace } from "../debug.js"
 import {
+  CONNECT_TIMEOUT_CODE,
   CursorLocalCancellationError,
   CursorProtocolError,
   CursorTransportError,
@@ -1067,7 +1068,11 @@ function connectSession(key: string): Promise<http2.ClientHttp2Session> {
       resolve(session)
     }
     const timer = setTimeout(() => {
-      fail(new CursorTransportError(`HTTP/2 connect to ${origin} timed out after ${CONNECT_TIMEOUT_MS}ms`))
+      fail(new CursorTransportError(`HTTP/2 connect to ${origin} timed out after ${CONNECT_TIMEOUT_MS}ms`, {
+        transient: true,
+        replaySafe: true,
+        code: CONNECT_TIMEOUT_CODE,
+      }))
     }, CONNECT_TIMEOUT_MS)
     timer.unref?.()
 

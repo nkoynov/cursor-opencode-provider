@@ -9,10 +9,12 @@ import {
 import { encodeMessage } from "../src/protocol/messages.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import {
+  CONNECT_TIMEOUT_CODE,
   CursorRetryExhaustedError,
   CursorServerError,
   CursorTransportError,
   isCapacityFailure,
+  isUnreachableFailure,
 } from "../src/errors.js"
 import { newRetryBudget } from "../src/retry-budget.js"
 import { sessionFixture } from "./session-fixture.js"
@@ -666,4 +668,112 @@ describe("capacity failures", () => {
     }
   })
 
+})
+
+describe("Cursor unreachable from this machine", () => {
+  const unreachable = (code = "ENOTFOUND") =>
+    new CursorTransportError("Cursor HTTP/2 connection failed", { transient: true, replaySafe: true, code })
+  const first = [0x0a, 0x01, 0x07]
+  const checkpointed = (id: string) => fakeSession(id, [
+    { frame: text("partial") },
+    { frame: checkpoint(first) },
+    { frame: endStreamError("internal") },
+  ])
+
+  it("recognizes failures to open a connection, and only those", () => {
+    for (const code of ["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "ENETDOWN", CONNECT_TIMEOUT_CODE]) {
+      expect(isUnreachableFailure(unreachable(code))).toBe(true)
+    }
+    expect(isUnreachableFailure(unreachable("ECONNRESET"))).toBe(false)
+    expect(isUnreachableFailure(unreachable("ETIMEDOUT"))).toBe(false)
+    expect(isUnreachableFailure(new CursorTransportError("x", { transient: true, replaySafe: false, code: "ENOTFOUND" }))).toBe(false)
+    expect(isUnreachableFailure(new CursorServerError("x", { transient: true, replaySafe: true, code: "ENOTFOUND" }))).toBe(false)
+    expect(isCapacityFailure(unreachable())).toBe(false)
+  })
+
+  it("spaces its retries like capacity refusals", () => {
+    const policy = resolveRetryPolicy(undefined)
+    for (let i = 0; i < 100; i++) {
+      expect(retryDelayMs(unreachable(), 1, policy)).toBeGreaterThanOrEqual(1_000)
+      expect(retryDelayMs(unreachable(), 1, policy)).toBeLessThanOrEqual(2_000)
+      expect(retryDelayMs(unreachable(), 9, policy)).toBeGreaterThanOrEqual(15_000)
+      expect(retryDelayMs(unreachable(), 9, policy)).toBeLessThanOrEqual(30_000)
+    }
+  })
+
+  it("waits out an outage longer than the transport budget and resumes the turn's checkpoint", async () => {
+    let failures = 15
+    const recoveries: CursorRunRecovery[] = []
+    const final = await pumpWithRecovery({
+      initialSession: checkpointed("cut"),
+      controller: controller(),
+      retryPolicy: { baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async (recovery) => {
+        recoveries.push(recovery)
+        if (failures-- > 0) throw unreachable(failures % 2 ? "ENOTFOUND" : CONNECT_TIMEOUT_CODE)
+        return fakeSession("back", [{ frame: text(" rest") }, { frame: turnEnded() }])
+      },
+    })
+    expect(final.sessionId).toBe("back")
+    expect(recoveries).toHaveLength(16)
+    expect(recoveries.every((recovery) => recovery.kind === "resume")).toBe(true)
+    expect(Array.from((recoveries.at(-1) as { checkpoint: Uint8Array }).checkpoint)).toEqual(first)
+  })
+
+  it("gives up when the window ends, in words OpenCode does not retry", async () => {
+    let recoveries = 0
+    const failure = await pumpWithRecovery({
+      initialSession: checkpointed("down"),
+      controller: controller(),
+      retryPolicy: { baseDelayMs: 1, maxDelayMs: 1, unreachableWindowMs: 40 },
+      recover: async () => {
+        recoveries++
+        throw unreachable()
+      },
+    }).catch((error: unknown) => error)
+    expect(recoveries).toBeGreaterThan(1)
+    expect(failure).toBeInstanceOf(CursorRetryExhaustedError)
+    expect(failure).toMatchObject({ code: "ENOTFOUND", transient: false, retryable: false })
+    const message = (failure as Error).message
+    expect(message).toStartWith("Cursor could not be reached from this machine")
+    expect(message).toContain("resume from the last saved state")
+    expect(message).not.toMatch(/enotfound|unavailable|exhausted|connection error|try again/i)
+  })
+
+  it("starts a new window after Cursor answered in between", async () => {
+    const retryBudget = newRetryBudget()
+    let calls = 0
+    const final = await pumpWithRecovery({
+      initialSession: checkpointed("flaky"),
+      controller: controller(),
+      retryPolicy: { baseDelayMs: 0, maxDelayMs: 0, unreachableWindowMs: 150 },
+      retryBudget,
+      recover: async () => {
+        calls++
+        if (calls === 4) return fakeSession("answered", [{ frame: text(" more") }, { frame: endStreamError("internal") }])
+        if (calls < 8) {
+          await new Promise((resolve) => setTimeout(resolve, 30))
+          throw unreachable()
+        }
+        return fakeSession("done", [{ frame: turnEnded() }])
+      },
+    })
+    expect(final.sessionId).toBe("done")
+    expect(retryBudget.unreachable).toBe(6)
+  })
+
+  it("stays under an explicit maxAttempts", async () => {
+    let recoveries = 0
+    const failure = await pumpWithRecovery({
+      initialSession: checkpointed("capped"),
+      controller: controller(),
+      retryPolicy: resolveRetryPolicy({ maxAttempts: 3, baseDelayMs: 1, maxDelayMs: 1 }),
+      recover: async () => {
+        recoveries++
+        throw unreachable()
+      },
+    }).catch((error: unknown) => error)
+    expect(recoveries).toBe(2)
+    expect(failure).toBeInstanceOf(CursorRetryExhaustedError)
+  })
 })
