@@ -2197,6 +2197,8 @@ export async function pumpWithRecovery(input: {
       try {
         await pumpPass()
       } catch (error) {
+        // Cursor's gzip refusal proves it reachable: an outage after it starts its own series.
+        if (pumpedSession.stream.compressionRejected?.()) retryBudget.unreachableSince = undefined
         if (!await resendRefusedGzipRun(pumpedSession, error, input.abortSignal)) throw error
         await pumpPass()
       } finally {
@@ -2225,6 +2227,8 @@ export async function pumpWithRecovery(input: {
         `attempt=${attempt} elapsedMs=${Date.now() - pumpStartedAt} code=${failure.code} transient=${failure.transient} ` +
         `replaySafe=${failure.replaySafe} barrier=${failure.replayBarrier ?? "none"} ` +
         `checkpoint=${!!pumpedSession.resumeCheckpoint} revoked=${!!pumpedSession.checkpointRevoked} pending=${pumpedSession.pending.size}`)
+      // Once: a reopen that keeps failing comes back here with the same cut Run.
+      if (streamsAfterGzipRefusal.delete(pumpedSession.stream)) retryBudget.unreachableSince = undefined
       noteRunFailure(retryBudget, failure, pumpedSession.checkpointAcceptedAt)
       // A renewable credential error may follow a checkpoint too. Retain it
       // before either recovery path so a later attempt can still resume it.
@@ -2353,6 +2357,9 @@ export async function pumpWithRecovery(input: {
   }
 }
 
+/** Streams that carry a request Cursor refused for gzip, which proves it was reachable when that Run opened. */
+const streamsAfterGzipRefusal = new WeakSet<BidiStream>()
+
 /**
  * Send a new Run's request. Cursor may refuse a gzip Run before the upload finishes; the same request then goes
  * once more on a new stream, which the transport opens uncompressed.
@@ -2376,6 +2383,7 @@ export async function sendRunRequest(
   })
   try {
     await writeWithBackpressure(next, request, operation)
+    streamsAfterGzipRefusal.add(next)
     return next
   } catch (error) {
     const verdict = await endStreamVerdict(next)
@@ -2502,9 +2510,7 @@ async function resendRefusedGzipRun(session: CursorSession, error: unknown, sign
   trace(`Run compression: sessionId=${session.sessionId} refused before Cursor acted on it; resending once uncompressed`)
   // A heartbeat on the refused stream would fail and close the session while the resend uploads.
   session.heartbeatCancel?.()
-  await session.resendRunRequest(signal).catch((error: unknown) => {
-    throw failedAfterCursorAnswered(error, "Cursor uncompressed Run resend failed")
-  })
+  await session.resendRunRequest(signal)
   // As for a new Run, Cursor's silence is timed from the end of the upload.
   sessionManager.recordSemanticProgress(session)
   // The refused pass did nothing; the resent Run counts as the first, which may still reseed a checkpoint.
