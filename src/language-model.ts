@@ -1375,6 +1375,8 @@ function resultReplayPlan(session: CursorSession): ResultReplayPlan | undefined 
     : session.resultsAfterCheckpoint ? "steer-results"
     : session.queuedCreatePlanAction || session.planReviewDeclined ? "plan-review"
     : (session.lastActivityArrival ?? 0) > base.arrival ? "activity-after-checkpoint"
+    // Resumed from before it, Cursor sends that exec again, and nothing can match a reply that names no call.
+    : base.arrival <= (session.anonymousReplyAfterFrame ?? 0) ? "anonymous-reply-after-checkpoint"
     : !written.some(result => result.afterFrame >= base.arrival) ? "no-result-after-checkpoint"
     : lacking.some(result => !result.callId || !result.rebuild || result.replayKey === undefined
       || result.execArrival === undefined || result.execArrival >= base.arrival) ? "unreplayable-result"
@@ -7871,6 +7873,7 @@ export async function pump(
                     `answer input image write id=${parsed.id}`,
                   )) return
                   invalidateResumeCheckpoint(session, beforeReply, true)
+                  session.anonymousReplyAfterFrame = beforeReply
                 }
               } catch (error) {
                 if (!session.stream.isClosed()) throw error

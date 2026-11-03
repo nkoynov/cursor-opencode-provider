@@ -275,6 +275,8 @@ export type CursorSession = {
   /** Arrival of the last frame on this Run that was more than KV, a heartbeat, a checkpoint or a completion of a written result. */
   lastActivityArrival?: number
   writtenResults?: WrittenHostResult[]
+  /** The last frame arrival before the provider answered an exec that names no call (an input image's copy). */
+  anonymousReplyAfterFrame?: number
   /** This Run's correlated exec requests by exec id, with the reply frames the provider wrote for each itself. */
   execRequests?: Map<number, { callId: string; replayKey: string; frames: Uint8Array[] }>
   /**

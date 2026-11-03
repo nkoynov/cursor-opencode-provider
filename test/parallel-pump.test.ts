@@ -12,7 +12,8 @@ import { getHostCacheDirOverride, setHostCacheDirOverride } from "../src/context
 import { discardPendingCursorImage } from "../src/image-staging.js"
 import { IMAGE_PERMISSION_DENIED_PREFIX } from "../src/image-save.js"
 import { noteFrameArrivalForTests } from "../src/transport/connect.js"
-import { runHistoryImages } from "../src/protocol/sent-history-images.js"
+import { noteHistoryImagesSent, runHistoryImages } from "../src/protocol/sent-history-images.js"
+import { imageContentHash } from "../src/image-input.js"
 import { sessionFixture } from "./session-fixture.js"
 
 function frame(message: Record<string, unknown>): Frame {
@@ -776,6 +777,48 @@ describe("parallel tool-call pump", () => {
       }).then(() => "completed", (error: Error) => error.message)
       return { outcome, recoveries, runs, parts: resumed.parts }
     }
+
+    it("does not resume a checkpoint that arrived before an input image's copy was answered", async () => {
+      const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-image-replay-"))
+      const previousCache = getHostCacheDirOverride()
+      setHostCacheDirOverride(fs.mkdtempSync(path.join(os.tmpdir(), "cursor-image-replay-cache-")))
+      const cacheDir = getHostCacheDirOverride()!
+      const image = Uint8Array.of(0x89, 0x50, 0x4e, 0x47)
+      const imageWrite = () => frame({ exec_server_message: { id: 5, write_args: {
+        path: path.join(workspace, "assets", "input.png"), file_bytes: image,
+      } } })
+      const imageIds: string[] = []
+      try {
+        // One burst: the image's copy, the step's call and the checkpoint, all read before the copy was answered.
+        const { session } = fixture([arrived(imageWrite()), arrived(shell(1)), arrived(listed(1)),
+          arrived(frame({ conversation_checkpoint_update: stepCheckpoint }))])
+        const tools = [{ name: "bash", description: "Run shell command" }, { name: "cursor_image_save", description: "Save an image" }]
+        session.toolCatalog = tools
+        session.toolDescriptors = toolsToDescriptors(tools, "opencode")
+        session.requestContext.env = { workspace_paths: [workspace] }
+        session.historyImages = runHistoryImages()
+        noteHistoryImagesSent(session.historyImages, [imageContentHash(image)], 0)
+        for (const [toolName, execId, output] of [["cursor_image_save", 5, "saved"], ["bash", 1, "RAN-ONCE"]] as const) {
+          const step = collect()
+          await pump(session, step.controller, ids)
+          const call = toolCalls(step.parts).at(-1)!
+          expect(call.toolName).toBe(toolName)
+          if (toolName === "cursor_image_save") imageIds.push(JSON.parse(call.input).image_id)
+          expect(await deliverContinuationResults(session, [{
+            toolCallId: call.toolCallId, sessionId: session.sessionId, execId, toolName, output,
+          }])).toBe(session)
+        }
+        // Resumed from that checkpoint, Cursor writes the copy again before it asks for the call.
+        const { outcome, recoveries } = await recoverWith(session, [[imageWrite(), shellAgain(), text("done"), ended()]])
+        expect(recoveries).toEqual([])
+        expect(outcome).toContain("automatic retry unsafe")
+      } finally {
+        for (const id of imageIds) discardPendingCursorImage(id)
+        setHostCacheDirOverride(previousCache)
+        fs.rmSync(workspace, { recursive: true, force: true })
+        fs.rmSync(cacheDir, { recursive: true, force: true })
+      }
+    })
 
     it("resumes the checkpoint sent after the call and answers Cursor's repeat from the written result", async () => {
       const { session, resultFrames } = await cutAfterResult()
