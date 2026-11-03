@@ -2000,6 +2000,8 @@ export async function pumpWithRecovery(input: {
   let resumedAttempt = false
   let noProgressResumes = 0
   let openingFailure: CursorProviderError | undefined
+  /** The result replay of a resume whose Run could not be opened; the cut Run it came from is revoked. */
+  let openingReplay: ResultReplayPlan | undefined
   let historyRebuild: Extract<CursorRunRecovery, { kind: "rebase" }> | undefined
   input.onSession?.(session)
 
@@ -2147,12 +2149,15 @@ export async function pumpWithRecovery(input: {
       }
       if (!failure.transient) throw error
       openingFailure = failure
+      openingReplay = replay
     }
   }
 
   for (let attempt = 0; ; attempt++) {
     const pumpedSession = session
     const pumpStartedAt = Date.now()
+    const retriedReplay = openingFailure ? openingReplay : undefined
+    openingReplay = undefined
     const pumpOwner = Symbol("cursor-pump")
     if (!openingFailure) sessionManager.beginPump(pumpedSession, pumpOwner)
     // OpenCode 1.x stops a turn by aborting the signal, before the AI SDK cancels
@@ -2275,9 +2280,10 @@ export async function pumpWithRecovery(input: {
       }
       // The interrupted step's own output and provider-answered execs do not bar it: the rebuild generates them again.
       const historyRecovery = input.canRebaseFromHistory?.(pumpedSession)
-      const resultReplay = !failure.replaySafe && !checkpoint && !historyRecovery && !failure.checkpointUnusable
-        ? resultReplayPlan(pumpedSession)
-        : undefined
+      const resultReplay = retriedReplay
+        ?? (!failure.replaySafe && !checkpoint && !historyRecovery && !failure.checkpointUnusable
+          ? resultReplayPlan(pumpedSession)
+          : undefined)
       if (resultReplay) {
         checkpoint = turnCheckpoint = resultReplay.checkpoint
         turnCheckpointArrival = resultReplay.arrival
