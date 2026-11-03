@@ -366,6 +366,7 @@ export type BidiStream = {
   /** Frames received that no reader has taken yet, removed from the stream; `destroy()` would discard them. */
   takeBufferedFrames?(): Array<{ flags: number; payload: Uint8Array }>
   destroy(): void
+  /** Nothing more can be written: Cursor ended or reset the stream, or it was closed locally. */
   isClosed(): boolean
   onTerminal(listener: (event: BidiTerminalEvent) => void): () => void
 }
@@ -1909,7 +1910,8 @@ export async function bidiRunStream(
     },
     isClosed() {
       if (resending) return locallyClosed
-      return remotelyClosed || locallyClosed || stream.closed || stream.destroyed
+      // `end` (Cursor finished the response) stops writes before the stream's `close`.
+      return !writable || remotelyClosed || locallyClosed || stream.closed || stream.destroyed
     },
     onTerminal(listener) {
       if (terminalEvent) {

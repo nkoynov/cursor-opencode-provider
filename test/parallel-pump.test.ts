@@ -683,7 +683,8 @@ describe("parallel tool-call pump", () => {
     expect(recoveries).toEqual([{ kind: "resume", conversationId: session.conversationId, checkpoint }])
   })
 
-  it.each(["uncorrelated", "correlated", "refused"] as const)("%s image write: a checkpoint after its result needs Cursor's completion unless the write was saved without a call", async kind => {
+  // A Run's input images are answered at once (test/input-image-write.test.ts); any other image write waits.
+  it.each(["uncorrelated", "correlated", "refused"] as const)("%s image write that is not one of the Run's input images: a checkpoint after its result needs Cursor's completion", async kind => {
     const checkpoint = Uint8Array.of(10, 1, 6)
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-image-ack-"))
     const previousCache = getHostCacheDirOverride()
@@ -712,35 +713,18 @@ describe("parallel tool-call pump", () => {
       }])).toBe(session)
     }
     const session = run([imageWrite(), frame({ conversation_checkpoint_update: checkpoint }), text("after the write")])
-    // Resuming a checkpoint from before the save has Cursor send the same write again.
-    const replacement = run([imageWrite(), ended()], "parallel-pump-resumed")
     try {
       const first = collect()
       await pump(session, first.controller, ids)
       await save(session, first.parts, kind === "refused" ? `${IMAGE_PERMISSION_DENIED_PREFIX} denied` : undefined)
       const recoveries: unknown[] = []
-      const resumed = collect()
-      const recovered = pumpWithRecovery({ initialSession: session, controller: resumed.controller,
+      const recovered = pumpWithRecovery({ initialSession: session, controller: collect().controller,
         retryPolicy: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 },
-        recover: async recovery => { recoveries.push(recovery); return replacement },
+        recover: async recovery => { recoveries.push(recovery); return run([ended()], "parallel-pump-resumed") },
       })
-      if (kind === "uncorrelated") {
-        expect(await recovered).toBe(replacement)
-        expect(session.unacknowledgedHostResults?.length ?? 0).toBe(0)
-        expect(recoveries).toEqual([{ kind: "resume", conversationId: session.conversationId, checkpoint }])
-        expect(replacement.replaySafety?.attempt?.unrebuildable).toBeUndefined()
-        expect(replacement.replaySafety?.historyRebaseUnsafe).toBeUndefined()
-        expect(replacement.replaySafety?.execs?.map(exec => [exec.sessionId, exec.id, exec.host]))
-          .toEqual([["parallel-pump", 1, true], ["parallel-pump-resumed", 1, true]])
-        await save(replacement, resumed.parts)
-        await pump(replacement, resumed.controller, ids)
-        expect(replacement.pending.size).toBe(0)
-        expect(finishes(resumed.parts).map(part => part.finishReason.unified)).toEqual(["tool-calls", "stop"])
-      } else {
-        await expect(recovered).rejects.toThrow("automatic retry unsafe")
-        expect(session.unacknowledgedHostResults).toHaveLength(1)
-        expect(recoveries).toEqual([])
-      }
+      await expect(recovered).rejects.toThrow("automatic retry unsafe")
+      expect(session.unacknowledgedHostResults).toHaveLength(1)
+      expect(recoveries).toEqual([])
     } finally {
       for (const id of imageIds) discardPendingCursorImage(id)
       setHostCacheDirOverride(previousCache)
