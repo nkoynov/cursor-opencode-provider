@@ -9,6 +9,9 @@ import {
   RUN_SESSION_WINDOW_BYTES,
   RUN_STREAM_WINDOW_BYTES,
 } from "../src/transport/connect.js"
+import { useTempHostCache } from "./host-cache.js"
+
+useTempHostCache()
 
 const ORIGIN = "https://agentn.window-test.cursor.sh"
 const BLOB_BYTES = 3 * 1024 * 1024

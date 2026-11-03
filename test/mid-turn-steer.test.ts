@@ -21,6 +21,9 @@ import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { analyzeReplayFrame } from "../src/replay-safety.js"
 import { resetCursorShellCalls } from "../src/shell-timeout.js"
 import { CURSOR_COMPACTION_OPTION } from "../src/shared.js"
+import { useTempHostCache } from "./host-cache.js"
+
+useTempHostCache()
 
 type Prompt = LanguageModelV3CallOptions["prompt"]
 type HeldSession = CursorSession & { writes: Uint8Array[] }

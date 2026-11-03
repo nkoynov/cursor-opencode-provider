@@ -18,6 +18,9 @@ import {
 } from "../src/protocol/conversation-bind.js"
 import { buildExecClientMessages } from "../src/protocol/tools.js"
 import { decodeMessage } from "../src/protocol/messages.js"
+import { useTempHostCache } from "./host-cache.js"
+
+useTempHostCache()
 
 describe("computeAllowTools", () => {
   it("is false when OpenCode advertises no tools (compaction/summary)", () => {

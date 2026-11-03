@@ -15,6 +15,9 @@ import { pumpWithRecovery, resetTurnStateForTests } from "../src/language-model.
 import { toolsToDescriptors } from "../src/protocol/tools.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { resetCursorShellCalls } from "../src/shell-timeout.js"
+import { useTempHostCache } from "./host-cache.js"
+
+useTempHostCache()
 
 // A Cursor account refusal as Cursor renders it in the JSON envelope: the
 // details' `debug` carries the message, so it must be read without `value`.
