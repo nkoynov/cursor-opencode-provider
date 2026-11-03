@@ -1546,6 +1546,13 @@ describe("retry limits across OpenCode calls", () => {
       expect(final).toMatchObject({ isRetryable: false, responseHeaders: { "x-should-retry": "false" } })
       expect(final.message).toStartWith("Cursor could not be reached from this machine")
       expect(runs).toBe(0)
+      // OpenCode 2's stateless generate.text has no session id, so no budget outlives one call: keep the transport budget.
+      const sessionless = await Promise.resolve(model.doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "Title?" }] }],
+        headers: { "x-opencode-session": "ses_stateless" },
+      })).catch((error: unknown) => error as any)
+      expect(sessionless).toMatchObject({ isRetryable: true })
+      expect(sessionless.responseHeaders["retry-after-ms"]).toBeUndefined()
     } finally {
       setSystemTime()
       setHostCacheDirOverride(undefined)

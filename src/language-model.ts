@@ -1403,7 +1403,8 @@ export function createCursorLanguageModel(
           throw retrySuppressedError(failure, "while opening the Run", retryBudget.retries + 1, retryPolicy.maxAttempts ?? 14)
         }
         if (!failure.transient) throw failure
-        if (isUnreachableFailure(failure)) {
+        // A sessionless call gets a fresh budget on every host retry, so its window would never end.
+        if (isUnreachableFailure(failure) && opencodeSessionKey(callOptions) !== undefined) {
           reserveUnreachableRetry(retryBudget, failure, {
             windowMs: retryPolicy.unreachableWindowMs,
             maxAttempts: retryPolicy.maxAttempts,
