@@ -7687,16 +7687,21 @@ export async function pump(
           session.announcedCallIds?.delete(ownRequestCallId)
         }
         if (parsed) {
+          // A generated image's write names no call but runs inside one of the open GenerateImage calls, which Cursor
+          // completes only after reading the write's result: it takes the first one's place, not a place behind them.
+          const orderCallId = displayCallId ?? (binaryWritePayload(parsed)
+            ? [...session.displayToolCalls].find(([, toolCall]) => toolCall.generate_image_tool_call)?.[0]
+            : undefined)
           execMutates = noteToolCallExec(
             order,
-            displayCallId,
+            orderCallId,
             toolExecMutates(parsed.toolName, parsed.args, parsed.resultField),
             isShellResultField(parsed.resultField),
           )
-          if (!released?.forced && toolExecMustWait(order, displayCallId, execMutates)) {
-            deferToolExec(order, { execId: parsed.id, callId: displayCallId, mutating: execMutates, read: next })
+          if (!released?.forced && toolExecMustWait(order, orderCallId, execMutates)) {
+            deferToolExec(order, { execId: parsed.id, callId: orderCallId, mutating: execMutates, read: next })
             trace(
-              `exec order: held execId=${parsed.id} callId=${displayCallId ?? "-"} toolName=${parsed.toolName} ` +
+              `exec order: held execId=${parsed.id} callId=${orderCallId ?? "-"} toolName=${parsed.toolName} ` +
                 `mutating=${execMutates} behind=[${order.calls.map((entry) => entry.callId).join(",")}]`,
             )
             if (toolStep.hostCalls > 0) {
