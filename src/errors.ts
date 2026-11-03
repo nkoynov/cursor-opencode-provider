@@ -51,6 +51,8 @@ export class CursorProviderError extends Error {
    * Recovery must reseed a new conversation instead of resuming that checkpoint.
    */
   checkpointUnusable?: boolean
+  /** Fork: Cursor answered this Run (a gzip refusal) before it failed, so the failure starts a new outage series. */
+  cursorAnswered?: boolean
   readonly statusCode?: number
   readonly grpcStatus?: number | string
   readonly rstCode?: number
@@ -545,6 +547,13 @@ export function errorCode(error: unknown): string | undefined {
   if (!error || typeof error !== "object") return undefined
   const code = (error as { code?: unknown }).code
   return typeof code === "string" ? code : undefined
+}
+
+/** A failure that came after Cursor answered the same Run, as the provider error it is reported as. */
+export function failedAfterCursorAnswered(error: unknown, fallback: string): CursorProviderError {
+  const failure = toCursorProviderError(error, { replaySafe: true, fallback })
+  failure.cursorAnswered = true
+  return failure
 }
 
 export function toCursorProviderError(

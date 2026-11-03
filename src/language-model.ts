@@ -321,6 +321,7 @@ import {
   CursorRetryExhaustedError,
   CursorServerError,
   CursorTransportError,
+  failedAfterCursorAnswered,
   hostFacingError,
   hostRetryError,
   isCapacityFailure,
@@ -1452,7 +1453,7 @@ export function createCursorLanguageModel(
         // status so the host compacts instead of retrying.
         if (APICallError.isInstance(error)) throw error
         const failure = toCursorProviderError(error, { replaySafe: true, fallback: "Cursor Run setup failed" })
-        if (!isUnreachableFailure(failure)) retryBudget.unreachableSince = undefined
+        if (!isUnreachableFailure(failure) || failure.cursorAnswered) retryBudget.unreachableSince = undefined
         if (!failure.replaySafe && (failure.transient || failure.origin === "transport")) {
           throw retrySuppressedError(failure, "while opening the Run", retryBudget.retries + 1, retryPolicy.maxAttempts ?? 14)
         }
@@ -2370,14 +2371,18 @@ export async function sendRunRequest(
   }
   try { stream.destroy() } catch { /* already closed */ }
   trace(`Run compression: ${operation} refused while uploading — sending it once more uncompressed`)
-  const next = await reopen()
+  const next = await reopen().catch((error: unknown) => {
+    throw failedAfterCursorAnswered(error, `Cursor ${operation} failed`)
+  })
   try {
     await writeWithBackpressure(next, request, operation)
     return next
   } catch (error) {
     const verdict = await endStreamVerdict(next)
     try { next.destroy() } catch { /* already closed */ }
-    throw runUploadFailure(error, operation, verdict)
+    const failure = runUploadFailure(error, operation, verdict)
+    failure.cursorAnswered = true
+    throw failure
   }
 }
 
@@ -2497,7 +2502,9 @@ async function resendRefusedGzipRun(session: CursorSession, error: unknown, sign
   trace(`Run compression: sessionId=${session.sessionId} refused before Cursor acted on it; resending once uncompressed`)
   // A heartbeat on the refused stream would fail and close the session while the resend uploads.
   session.heartbeatCancel?.()
-  await session.resendRunRequest(signal)
+  await session.resendRunRequest(signal).catch((error: unknown) => {
+    throw failedAfterCursorAnswered(error, "Cursor uncompressed Run resend failed")
+  })
   // As for a new Run, Cursor's silence is timed from the end of the upload.
   sessionManager.recordSemanticProgress(session)
   // The refused pass did nothing; the resent Run counts as the first, which may still reseed a checkpoint.

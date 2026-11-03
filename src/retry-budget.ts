@@ -96,7 +96,7 @@ export function noteRunFailure(budget: RetryBudget, failure: CursorProviderError
   const progressed = checkpointAcceptedAt !== undefined && budget.stallStartedAt !== undefined
     && checkpointAcceptedAt > budget.stallStartedAt
   if (progressed || failure.code !== "CURSOR_SEMANTIC_IDLE_TIMEOUT") budget.stallStartedAt = undefined
-  if (!isUnreachableFailure(failure)) budget.unreachableSince = undefined
+  if (!isUnreachableFailure(failure) || failure.cursorAnswered) budget.unreachableSince = undefined
 }
 
 /** Retries spent outside the CLI counts, which an explicit maxAttempts still caps. */

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import http2 from "node:http2"
 import net from "node:net"
-import { CursorProviderError, CursorTransportError } from "../src/errors.js"
+import { CursorProviderError, CursorTransportError, isUnreachableFailure } from "../src/errors.js"
 import { connectFrameError, pumpWithRecovery, sendRunRequest } from "../src/language-model.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
 import { decodeFramePayload, encodeFrame, FLAG_GZIP, streamFrames } from "../src/protocol/framing.js"
@@ -279,6 +279,18 @@ describe("sendRunRequest", () => {
     const sent = await sendRunRequest(writeStream("first", log, "fail", true), request, "initial Run request", async () => next)
     expect(sent).toBe(next)
     expect(log).toEqual(["first write 4096", "first destroy", "next write 4096"])
+  })
+
+  it("reports a resend that cannot connect as a failure after Cursor answered", async () => {
+    const log: string[] = []
+    const failure = await sendRunRequest(writeStream("first", log, "fail", true), request, "initial Run request", async () => {
+      throw new CursorTransportError("getaddrinfo ENOTFOUND agentn.cursor.sh", {
+        transient: true, replaySafe: true, cause: Object.assign(new Error("getaddrinfo"), { code: "ENOTFOUND" }),
+      })
+    }).catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(CursorProviderError)
+    expect(isUnreachableFailure(failure as CursorProviderError)).toBe(true)
+    expect((failure as CursorProviderError).cursorAnswered).toBe(true)
   })
 
   it("does not resend after a failure Cursor did not tie to compression", async () => {
