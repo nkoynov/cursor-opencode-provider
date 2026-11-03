@@ -1,4 +1,4 @@
-import { CursorRetryExhaustedError, type CursorProviderError } from "./errors.js"
+import { CursorRetryExhaustedError, isUnreachableFailure, type CursorProviderError } from "./errors.js"
 import { processShared } from "./process-shared.js"
 
 /** Plain data shared by the plugin and SDK copies, for one logical user turn. */
@@ -8,6 +8,10 @@ export type RetryBudget = {
   retries: number
   /** Fork: capacity retries, outside the CLI counts but under an explicit maxAttempts. */
   capacity?: number
+  /** Fork: retries while Cursor could not be reached, also outside the CLI counts. */
+  unreachable?: number
+  /** When the current unbroken series of unreachable failures began. */
+  unreachableSince?: number
   stallStartedAt?: number
   /** A plain-text host continuation is admitted only after we requested a host retry. */
   hostRetryPending?: boolean
@@ -92,6 +96,33 @@ export function noteRunFailure(budget: RetryBudget, failure: CursorProviderError
   const progressed = checkpointAcceptedAt !== undefined && budget.stallStartedAt !== undefined
     && checkpointAcceptedAt > budget.stallStartedAt
   if (progressed || failure.code !== "CURSOR_SEMANTIC_IDLE_TIMEOUT") budget.stallStartedAt = undefined
+  if (!isUnreachableFailure(failure)) budget.unreachableSince = undefined
+}
+
+/** Retries spent outside the CLI counts, which an explicit maxAttempts still caps. */
+export function extraRetries(budget: RetryBudget): number {
+  return (budget.capacity ?? 0) + (budget.unreachable ?? 0)
+}
+
+/** How long a turn waits for Cursor to become reachable again, from the first unreachable failure in a row. */
+export const DEFAULT_UNREACHABLE_WINDOW_MS = 10 * 60_000
+
+/**
+ * Fork: no Run started, so wait out a lost network or name lookup instead of spending the CLI's ten
+ * transport retries in half a minute. Throws once the window since the series began has passed.
+ */
+export function reserveUnreachableRetry(
+  budget: RetryBudget,
+  failure: CursorProviderError,
+  options: { windowMs?: number; maxAttempts?: number; attempts: number },
+  now = Date.now(),
+): void {
+  const since = budget.unreachableSince ??= now
+  if (!endlessRetriesEnabled() && (now - since >= (options.windowMs ?? DEFAULT_UNREACHABLE_WINDOW_MS)
+    || (options.maxAttempts !== undefined && budget.retries + extraRetries(budget) >= options.maxAttempts - 1))) {
+    throw new CursorRetryExhaustedError(options.attempts, failure, now - since)
+  }
+  budget.unreachable = (budget.unreachable ?? 0) + 1
 }
 
 /** Reserve one retry before either reopening locally or handing it to OpenCode. */
@@ -102,7 +133,7 @@ export function reserveRetry(budget: RetryBudget, failure: CursorProviderError, 
   const stallExpired = stalled && budget.stallStartedAt !== undefined && now - budget.stallStartedAt >= 180_000
   if (stallExpired || (!endlessRetriesEnabled() && (
     budget[category] >= (category === "server" ? 3 : 10)
-    || (maxAttempts !== undefined && budget.retries + (budget.capacity ?? 0) >= maxAttempts - 1)
+    || (maxAttempts !== undefined && budget.retries + extraRetries(budget) >= maxAttempts - 1)
   ))) throw new CursorRetryExhaustedError(budget.retries + 1, failure)
   if (stalled) budget.stallStartedAt ??= now
   budget[category]++

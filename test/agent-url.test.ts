@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "bun:test"
 import { resolveAgentUrl, resetAgentUrlCache } from "../src/agent-url.js"
 import { CURSOR_API_HOST, SERVER_CONFIG_PATH } from "../src/shared.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
+import { isUnreachableFailure, type CursorProviderError } from "../src/errors.js"
 import { useTempHostCache } from "./host-cache.js"
 
 useTempHostCache()
@@ -137,6 +138,15 @@ describe("resolveAgentUrl", () => {
     await expect(resolveAgentUrl(fakeJwt(3600))).rejects.toThrow(
       "GetServerConfig network request failed",
     )
+  })
+
+  it("keeps a name-lookup failure Node's fetch nests in cause, so the turn waits for the network", async () => {
+    globalThis.fetch = (async () => {
+      throw new TypeError("fetch failed", { cause: Object.assign(new Error("getaddrinfo ENOTFOUND api2.cursor.sh"), { code: "ENOTFOUND" }) })
+    }) as unknown as typeof fetch
+    const failure = await resolveAgentUrl(fakeJwt(3600)).catch((error: unknown) => error)
+    expect(failure).toMatchObject({ origin: "transport", replaySafe: true, code: "ENOTFOUND" })
+    expect(isUnreachableFailure(failure as CursorProviderError)).toBe(true)
   })
 
   it("does not memoize empty agentUrlConfig — the next call retries and self-heals", async () => {
