@@ -10,6 +10,7 @@ import {
   CursorServerError,
   CursorTransportError,
   toCursorProviderError,
+  unreachableCode,
   type CursorProviderErrorOptions,
 } from "./errors.js"
 
@@ -111,7 +112,8 @@ export async function resolveAgentUrl(
         statusCode: failure.statusCode,
         grpcStatus: failure.grpcStatus,
         rstCode: failure.rstCode,
-        code: failure.code,
+        // Node's fetch keeps ENOTFOUND on `cause`, which this record does not carry.
+        code: unreachableCode(failure) ?? failure.code,
         retryAfterMs: failure.retryAfterMs,
       } }
     } finally {

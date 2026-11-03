@@ -1512,10 +1512,11 @@ describe("retry limits across OpenCode calls", () => {
   it("lets the host retry a setup that cannot reach Cursor for the unreachable window, spaced by retry-after-ms", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-setup-unreachable-"))
     let code = "ENOTFOUND"
+    let transientSetup = true
     const model = createCursor({
       name: "cursor", agentBaseURL: ORIGIN, cacheDir: root,
       getAccessToken: async () => {
-        throw new CursorTransportError("Cursor HTTP/2 connection failed", { transient: true, replaySafe: true, code })
+        throw new CursorTransportError("Cursor HTTP/2 connection failed", { transient: transientSetup, replaySafe: true, code })
       },
     }).languageModel("composer-2.5")
     const attempt = async (): Promise<any> => {
@@ -1553,6 +1554,22 @@ describe("retry limits across OpenCode calls", () => {
       })).catch((error: unknown) => error as any)
       expect(sessionless).toMatchObject({ isRetryable: true })
       expect(sessionless.responseHeaders["retry-after-ms"]).toBeUndefined()
+      // A failure that ends the turn also ends the outage series, so a later outage gets its own window.
+      const second = (text: string) => Promise.resolve(model.doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text }] }],
+        headers: { "x-opencode-session-id": "ses_setup_unreachable_2" },
+      })).catch((error: unknown) => error as any)
+      code = "ENOTFOUND"
+      setSystemTime(new Date(start + 60 * 60_000))
+      expect(await second("Again")).toMatchObject({ isRetryable: true })
+      code = "CURSOR_SOMETHING_ELSE"
+      transientSetup = false
+      setSystemTime(new Date(start + 65 * 60_000))
+      expect(await second("Again")).toMatchObject({ transient: false, code: "CURSOR_SOMETHING_ELSE" })
+      transientSetup = true
+      code = "ENOTFOUND"
+      setSystemTime(new Date(start + 71 * 60_000))
+      expect(await second("Again")).toMatchObject({ isRetryable: true })
     } finally {
       setSystemTime()
       setHostCacheDirOverride(undefined)

@@ -1399,6 +1399,7 @@ export function createCursorLanguageModel(
         // status so the host compacts instead of retrying.
         if (APICallError.isInstance(error)) throw error
         const failure = toCursorProviderError(error, { replaySafe: true, fallback: "Cursor Run setup failed" })
+        if (!isUnreachableFailure(failure)) retryBudget.unreachableSince = undefined
         if (!failure.replaySafe && (failure.transient || failure.origin === "transport")) {
           throw retrySuppressedError(failure, "while opening the Run", retryBudget.retries + 1, retryPolicy.maxAttempts ?? 14)
         }
@@ -1419,7 +1420,6 @@ export function createCursorLanguageModel(
             cause: failure,
           }), true)
         }
-        retryBudget.unreachableSince = undefined
         reserveRetry(retryBudget, failure, retryPolicy.maxAttempts)
         retryBudget.hostRetryPending = true
         throw hostRetryError(failure, true)

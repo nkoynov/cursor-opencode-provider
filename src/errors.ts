@@ -478,13 +478,17 @@ const UNREACHABLE_CODES = new Set([
  * so no Run started and the attempt can be repeated as it was. A proxy dial keeps the socket's code on `cause`.
  */
 export function isUnreachableFailure(error: CursorProviderError): boolean {
-  if (error.origin !== "transport" || !error.replaySafe) return false
+  return error.origin === "transport" && error.replaySafe && unreachableCode(error) !== undefined
+}
+
+/** The nearest code along `error`'s causes that says no connection could be opened. */
+export function unreachableCode(error: unknown): string | undefined {
   for (let current: unknown = error, depth = 0; current && depth < 4; depth++) {
     const code = errorCode(current)
-    if (code !== undefined && UNREACHABLE_CODES.has(code)) return true
+    if (code !== undefined && UNREACHABLE_CODES.has(code)) return code
     current = (current as { cause?: unknown }).cause
   }
-  return false
+  return undefined
 }
 
 export function isAuthGrpcStatus(status: number | string): boolean {
