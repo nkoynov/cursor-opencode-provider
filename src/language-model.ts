@@ -211,7 +211,7 @@ import {
 } from "./protocol/generate-image.js"
 import { distinctInputImagePath, stageCursorImage } from "./image-staging.js"
 import { IMAGE_PERMISSION_DENIED_PREFIX } from "./image-save.js"
-import { checkpointTokenDetails, clearCheckpoint, getCheckpoint, setCheckpoint } from "./protocol/checkpoint.js"
+import { checkpointTokenDetails, dropResumeCheckpoint, getCheckpoint, setCheckpoint } from "./protocol/checkpoint.js"
 import {
   EarlyToolRows,
   cursorEditAnnouncement,
@@ -3025,6 +3025,9 @@ async function startSession(
       userText = stop.checkpointHoldsTurn && conversationState
         ? "Continue the request above from where it stopped. Do not repeat completed work."
         : stop.userText || "."
+      // The reply's own text is dropped; host notes that arrived with it still go out with the resent request.
+      const notes = collectHostNoteBodies(prompt.slice(liveTurn!.start).map((message) => hostTailNote(message)?.text))
+      if (notes.length > 0) userText = `${userText}\n\n${notes.join("\n\n")}`
     }
     const note = unrecordedToolsNote(stop.unrecordedTools)
     if (note) userText = `${userText}\n\n${note}`
@@ -7415,7 +7418,7 @@ export async function pump(
         || (steers.undelivered.length > 0 && !session.resumeCheckpoint?.length)
       if (checkpointPredatesStep) {
         trace(`checkpoint: dropped for conversationId=${session.conversationId} — it predates this step's results`)
-        clearCheckpoint(session.conversationId)
+        dropResumeCheckpoint(session.conversationId)
         session.resumeCheckpoint = undefined
         session.resumeCheckpointImages = undefined
       }

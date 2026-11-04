@@ -97,6 +97,11 @@ export function clearCheckpoint(conversationId: string): void {
   occupancyGuards.delete(conversationId)
 }
 
+/** Fork: drop only the resumable state; the conversation goes on, so its accepted occupancy and guard stay. */
+export function dropResumeCheckpoint(conversationId: string): void {
+  byConversationId.delete(conversationId)
+}
+
 /** Test helper — wipe all stored checkpoints. */
 export function resetCheckpointsForTests(): void {
   byConversationId.clear()

@@ -185,6 +185,24 @@ describe("checkpoint occupancy confirmation", () => {
     expect(checkpointTokenDetails(toId, spike)).toMatchObject({ usedTokens: 120_000, rawUsedTokens: 240_000 })
   })
 
+  it("keeps the accepted occupancy and a held spike when the turn end drops a checkpoint older than the step's results", async () => {
+    const spike = details(240_000, 121_000)
+    const run = session([updateFrame(details(120_000)), updateFrame(spike), terminalFrame()])
+    const next = run.frames.next.bind(run.frames)
+    let read = 0
+    run.frames.next = async () => {
+      // A host result written after the last checkpoint: the turn end must not keep that checkpoint.
+      if (++read === 3) run.resultsAfterCheckpoint = { toolCallIds: new Set(["cursor_after_checkpoint"]) }
+      return next()
+    }
+    const controller = { desiredSize: 1, enqueue() {}, close() {}, error(e: unknown) { throw e } }
+    await pump(run, controller, { textId: "text", reasoningId: "reasoning" })
+    expect(getCheckpoint("conv")).toBeUndefined()
+    expect(decodeConversationTokenDetails(getCheckpointOccupancy("conv"))?.usedTokens).toBe(120_000)
+    expect(parseOccupancyGuard(serializeCheckpointOccupancyGuard("conv"))?.pending?.details.usedTokens).toBe(240_000)
+    expect(checkpointTokenDetails("conv", wire(spike))).toMatchObject({ usedTokens: 120_000, rawUsedTokens: 240_000 })
+  })
+
   it.each([false, true])("applies the same observation policy while draining (next step: %s)", async nextStep => {
     const high = details(240_000, 121_000)
     const run = session([

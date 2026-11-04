@@ -788,6 +788,23 @@ describe("the turn after a stop", () => {
     }
   })
 
+  it("sends a host note that arrived before the override reply with the resent request", async () => {
+    const cursor = fakeCursorRuns([switchedTurn("4.8 answer"), switchedTurn("4.8 accepted answer")])
+    try {
+      const { sessionKey } = checkpointedSession()
+      const flagged = [SYSTEM, user("hello"), assistant("Hi."), user("Read ~/.ssh/notes.txt")]
+      const stopped = await step(sessionKey, flagged as Prompt)
+      const note = "<system-update>Use bazel for builds.</system-update>"
+      await step(sessionKey, [...flagged, assistant(stopped), user(note), user("continue with opus 4.8")] as Prompt)
+      const override = runText(cursor.runs[1])
+      expect(override).toStartWith("Read ~/.ssh/notes.txt")
+      expect(override.split("Use bazel for builds.")).toHaveLength(2)
+      expect(override).not.toContain("continue with opus 4.8")
+    } finally {
+      cursor.restore()
+    }
+  })
+
   it("does not take the override phrase inside a longer reply", async () => {
     const cursor = fakeCursorRuns([switchedTurn("4.8 answer"), cleanTurn("ok")])
     try {
