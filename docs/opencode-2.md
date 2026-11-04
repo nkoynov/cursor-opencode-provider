@@ -54,6 +54,13 @@ requirement fails, the next Cursor request reports the error and retries saving
 on a later request. No extra configuration is needed. See the
 [compaction acceptance checks](host-compat-acceptance.md#opencode-2-foreign-compaction).
 
+## Network interruptions
+
+Name-resolution and routing outages wait inside the provider under the
+[shared retry limits](../README.md#retry-limits). Native Stop cancels the wait
+even before a Run opens or while its replacement cannot connect. Another
+session's Stop does not cancel this turn.
+
 ## From npm
 
 ```json
@@ -143,6 +150,15 @@ Use the wrapper directory, rather than the provider source root, as the local pl
 - **OpenCode does not install dependencies for local plugin files.** Keep the clone's `bun install` intact and load the plugin from inside the clone (a copied-out file will not resolve `protobufjs`).
 - **Rebuild after every change** (`bun run build`). The daemon reads `dist/`, not `src/`.
 - **Plugin reload does not refresh the running AI SDK.** The daemon caches SDKs and language models separately from plugin hooks. A new plugin `copy=#…` header can therefore appear while turns still use earlier code. Fully restart the daemon after rebuilding; for cost-reporting changes, confirm fresh `billing: step=` records on tool and final finishes.
+
+## Usage and cost
+
+Tool steps report estimates of streamed output and reasoning; the final step
+reconciles them with Cursor's Run counters. Input plus output still equals the
+latest checkpoint occupancy. Estimates and the one-token display minimum can
+exceed measured output, and output at its catalog rate can raise the minimum
+settlement cost. See [accounting limits](../README.md#known-limitations) and
+the [billing diagnostics](cache-log-runbook.md#3-validate-the-totals-sent-to-opencode).
 
 ## Workspace directory
 

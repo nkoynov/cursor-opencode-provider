@@ -1,13 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import http2 from "node:http2"
 import net from "node:net"
-import { CursorProviderError, CursorTransportError, isUnreachableFailure } from "../src/errors.js"
+import { CursorProviderError, CursorTransportError } from "../src/errors.js"
 import { connectFrameError, pumpWithRecovery, sendRunRequest } from "../src/language-model.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
 import { decodeFramePayload, encodeFrame, FLAG_GZIP, streamFrames } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { describeTtftBreakdown } from "../src/protocol/ttft.js"
-import { newRetryBudget } from "../src/retry-budget.js"
+import { isOfflineFailure } from "../src/offline.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import type { BidiStream } from "../src/transport/connect.js"
 import { sessionFixture } from "./session-fixture.js"
@@ -240,37 +240,6 @@ describe("a gzip Run Cursor refuses after its request went out", () => {
     expect(final.sessionId).toBe("resumed-refused")
   })
 
-  it("starts a new outage series when the resent Run loses Cursor after the refusal", async () => {
-    const session = refusedSession("refused-then-unreachable")
-    const unreachable = new CursorTransportError("getaddrinfo ENOTFOUND agentn.cursor.sh", {
-      transient: true, replaySafe: true, cause: Object.assign(new Error("getaddrinfo"), { code: "ENOTFOUND" }),
-    })
-    session.resendRunRequest = async () => {
-      sessionManager.replaceStream(session, {
-        ...frameStream([]),
-        frames: () => ({ async *[Symbol.asyncIterator]() { throw unreachable } }),
-      })
-    }
-    const retryBudget = newRetryBudget()
-    retryBudget.unreachableSince = Date.now() - 11 * 60_000
-    let recoveries = 0
-    const final = await pumpWithRecovery({
-      initialSession: session,
-      controller: discard,
-      retryBudget,
-      retryPolicy: { maxAttempts: 3, baseDelayMs: 1, maxDelayMs: 1 },
-      recover: async () => {
-        recoveries++
-        const next = refusedSession("after-outage")
-        next.stream = frameStream([turnEnded()])
-        next.frames = next.stream.frames()[Symbol.asyncIterator]()
-        return next
-      },
-    })
-    expect(recoveries).toBe(1)
-    expect(final.sessionId).toBe("after-outage")
-  })
-
   it("leaves the refusal behind with the stream it came on", () => {
     const session = refusedSession("refusal-stays")
     session.closeError = connectFrameError(JSON.stringify({ error: unsupported }))
@@ -323,7 +292,7 @@ describe("sendRunRequest", () => {
       throw shared
     }).catch((error: unknown) => error)
     expect(failure).toBeInstanceOf(CursorProviderError)
-    expect(isUnreachableFailure(failure as CursorProviderError)).toBe(true)
+    expect(isOfflineFailure(failure)).toBe(true)
     expect((failure as CursorProviderError).cursorAnswered).toBe(true)
     expect(shared.cursorAnswered).toBeUndefined()
   })

@@ -396,12 +396,7 @@ export class CursorRetryExhaustedError extends CursorProviderError {
       isCapacityFailure(last)
         ? `Cursor has no capacity for this model right now (capacity_limit): a limit on Cursor's side, not on ` +
           `your key. The Run was refused ${attempts} times${over}; send the message again later or pick another model.`
-        : isUnreachableFailure(last)
-          ? sanitizeHostTerminalMessage(
-            `Cursor could not be reached from this machine (${last.code}) in ${attempts} attempts${over}: ${last.message}. ` +
-              `Check this machine's network, then send a message such as "continue" to resume from the last saved state`,
-          )
-          : `Cursor Run failed after ${attempts} attempts: ${sanitizeHostTerminalMessage(last.message)}`,
+        : `Cursor Run failed after ${attempts} attempts: ${sanitizeHostTerminalMessage(last.message)}`,
       {
         origin: last.origin,
         transient: false,
@@ -421,15 +416,38 @@ export class CursorRetryExhaustedError extends CursorProviderError {
   }
 }
 
+export const CONNECT_TIMEOUT_CODE = "CURSOR_HTTP2_CONNECT_TIMEOUT"
+
+const OFFLINE_NETWORK_CODES = new Set([
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ENETDOWN",
+  "ENETUNREACH",
+  "EHOSTDOWN",
+  "EHOSTUNREACH",
+  // Fork: a refused connection or a silent one (a blocked 443) waits for the network too.
+  "ECONNREFUSED",
+  CONNECT_TIMEOUT_CODE,
+])
+
+/** A local name-resolution/routing failure, refusal or connect timeout, including a fetch wrapper's cause. */
+export function offlineNetworkCode(error: unknown): string | undefined {
+  const seen = new Set<unknown>()
+  while (error && typeof error === "object" && !seen.has(error)) {
+    seen.add(error)
+    const code = errorCode(error)
+    if (code && OFFLINE_NETWORK_CODES.has(code)) return code
+    error = (error as { cause?: unknown }).cause
+  }
+  return undefined
+}
+
 const TRANSIENT_NETWORK_CODES = new Set([
+  ...OFFLINE_NETWORK_CODES,
   "ECONNABORTED",
   "ECONNREFUSED",
   "ECONNRESET",
-  "EHOSTUNREACH",
-  "ENETDOWN",
   "ENETRESET",
-  "ENETUNREACH",
-  "ENOTFOUND",
   "EPIPE",
   "ERR_HTTP2_GOAWAY_SESSION",
   "ERR_HTTP2_SESSION_ERROR",
@@ -462,35 +480,6 @@ export function isCapacityFailure(error: CursorProviderError): boolean {
   if (error.statusCode === 429 || error.statusCode === 503) return true
   return [error.code, error.grpcStatus].some((value) =>
     value !== undefined && CAPACITY_CODES.has(String(value).toLowerCase().replaceAll("-", "_")))
-}
-
-export const CONNECT_TIMEOUT_CODE = "CURSOR_HTTP2_CONNECT_TIMEOUT"
-const UNREACHABLE_CODES = new Set([
-  "EAI_AGAIN",
-  "ECONNREFUSED",
-  "EHOSTUNREACH",
-  "ENETDOWN",
-  "ENETUNREACH",
-  "ENOTFOUND",
-  CONNECT_TIMEOUT_CODE,
-])
-
-/**
- * Fork: no connection to Cursor could be opened (name lookup, route, refusal or connect timeout),
- * so no Run started and the attempt can be repeated as it was. A proxy dial keeps the socket's code on `cause`.
- */
-export function isUnreachableFailure(error: CursorProviderError): boolean {
-  return error.origin === "transport" && error.replaySafe && unreachableCode(error) !== undefined
-}
-
-/** The nearest code along `error`'s causes that says no connection could be opened. */
-export function unreachableCode(error: unknown): string | undefined {
-  for (let current: unknown = error, depth = 0; current && depth < 4; depth++) {
-    const code = errorCode(current)
-    if (code !== undefined && UNREACHABLE_CODES.has(code)) return code
-    current = (current as { cause?: unknown }).cause
-  }
-  return undefined
 }
 
 export function isAuthGrpcStatus(status: number | string): boolean {
@@ -550,12 +539,12 @@ export function errorCode(error: unknown): string | undefined {
 }
 
 /**
- * A failure that came after Cursor answered the same Run. An unreachable one is reported as a new error marked
+ * A failure that came after Cursor answered the same Run. An offline one is reported as a new error marked
  * `cursorAnswered`: the original can be shared by every open that waited on the same connection attempt.
  */
 export function failedAfterCursorAnswered(error: unknown, fallback: string): CursorProviderError {
   const failure = toCursorProviderError(error, { replaySafe: true, fallback })
-  if (!isUnreachableFailure(failure)) return failure
+  if (offlineNetworkCode(failure) === undefined) return failure
   const answered = new CursorTransportError(failure.message, {
     transient: failure.transient,
     replaySafe: failure.replaySafe,
@@ -576,7 +565,7 @@ export function toCursorProviderError(
     return error
   }
 
-  const code = errorCode(error)
+  const code = errorCode(error) ?? offlineNetworkCode(error)
   const name = error instanceof Error ? error.name : "Error"
   const message = error instanceof Error ? error.message : ""
   if (name.startsWith("Auth") || /access token|api key|authentication/i.test(message)) {

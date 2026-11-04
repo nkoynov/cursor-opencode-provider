@@ -1,9 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from "bun:test"
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test"
 import { resolveAgentUrl, resetAgentUrlCache } from "../src/agent-url.js"
 import { CURSOR_API_HOST, SERVER_CONFIG_PATH } from "../src/shared.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
-import { isUnreachableFailure, type CursorProviderError } from "../src/errors.js"
 import { useTempHostCache } from "./host-cache.js"
+import { isOfflineFailure } from "../src/offline.js"
 
 useTempHostCache()
 
@@ -140,13 +140,32 @@ describe("resolveAgentUrl", () => {
     )
   })
 
-  it("keeps a name-lookup failure Node's fetch nests in cause, so the turn waits for the network", async () => {
+  it("keeps a refused connection Node's fetch nests in cause, so the turn waits for the network", async () => {
     globalThis.fetch = (async () => {
-      throw new TypeError("fetch failed", { cause: Object.assign(new Error("getaddrinfo ENOTFOUND api2.cursor.sh"), { code: "ENOTFOUND" }) })
+      throw new TypeError("fetch failed", { cause: Object.assign(new Error("connect ECONNREFUSED 1.2.3.4:443"), { code: "ECONNREFUSED" }) })
     }) as unknown as typeof fetch
     const failure = await resolveAgentUrl(fakeJwt(3600)).catch((error: unknown) => error)
-    expect(failure).toMatchObject({ origin: "transport", replaySafe: true, code: "ENOTFOUND" })
-    expect(isUnreachableFailure(failure as CursorProviderError)).toBe(true)
+    expect(failure).toMatchObject({ origin: "transport", transient: true, replaySafe: true })
+    expect(isOfflineFailure(failure)).toBe(true)
+  })
+
+  it("retains nested DNS failure codes for concurrent callers' offline waits", async () => {
+    const mock = spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("fetch failed", {
+      cause: Object.assign(new Error("getaddrinfo ENOTFOUND"), { code: "ENOTFOUND" }),
+    }))
+    try {
+      const failures = await Promise.all([
+        resolveAgentUrl(fakeJwt(3600)).catch((error: unknown) => error),
+        resolveAgentUrl(fakeJwt(3600)).catch((error: unknown) => error),
+      ])
+      for (const failure of failures) {
+        expect(failure).toMatchObject({ origin: "transport", transient: true, replaySafe: true })
+        expect(isOfflineFailure(failure)).toBe(true)
+      }
+      expect(failures[0]).not.toBe(failures[1])
+    } finally {
+      mock.mockRestore()
+    }
   })
 
   it("does not memoize empty agentUrlConfig — the next call retries and self-heals", async () => {

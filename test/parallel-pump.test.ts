@@ -13,6 +13,7 @@ import { discardPendingCursorImage } from "../src/image-staging.js"
 import { IMAGE_PERMISSION_DENIED_PREFIX } from "../src/image-save.js"
 import { noteFrameArrivalForTests } from "../src/transport/connect.js"
 import { CursorTransportError } from "../src/errors.js"
+import { setOfflineClockForTests } from "../src/offline.js"
 import { noteHistoryImagesSent, runHistoryImages } from "../src/protocol/sent-history-images.js"
 import { imageContentHash } from "../src/image-input.js"
 import { sessionFixture } from "./session-fixture.js"
@@ -834,16 +835,20 @@ describe("parallel tool-call pump", () => {
       expect(JSON.stringify(resultFrames)).toContain("RAN-ONCE")
     })
 
-    it("keeps the replay when the resumed Run cannot be opened at first", async () => {
+    it.each([
+      ["retry budget", 3, 1],
+      ["offline wait", undefined, 2],
+    ])("keeps the replay when the resumed Run cannot be opened at first (%s)", async (_, maxAttempts, failedOpens) => {
       const { session, resultFrames } = await cutAfterResult()
       const recoveries: unknown[] = []
       let resumed: ReturnType<typeof fixture> | undefined
       const parts = collect()
+      setOfflineClockForTests({ now: () => 0, sleep: async () => {} })
       const outcome = await pumpWithRecovery({ initialSession: session, controller: parts.controller,
-        retryPolicy: { maxAttempts: 3, baseDelayMs: 1, maxDelayMs: 1 },
+        retryPolicy: { maxAttempts, baseDelayMs: 1, maxDelayMs: 1 },
         recover: async recovery => {
           recoveries.push(recovery)
-          if (recoveries.length === 1) {
+          if (recoveries.length <= failedOpens) {
             throw new CursorTransportError("getaddrinfo ENOTFOUND agentn.cursor.sh", {
               transient: true, replaySafe: true, cause: Object.assign(new Error("getaddrinfo"), { code: "ENOTFOUND" }),
             })
@@ -851,10 +856,10 @@ describe("parallel tool-call pump", () => {
           resumed = fixture([shellAgain(), text("done"), ended()], "parallel-pump-resumed-late", true)
           return resumed.session
         },
-      }).then(() => "completed", (error: Error) => error.message)
+      }).then(() => "completed", (error: Error) => error.message).finally(() => setOfflineClockForTests(undefined))
       expect(outcome).toBe("completed")
       const resume = { kind: "resume", conversationId: session.conversationId, checkpoint: stepCheckpoint }
-      expect(recoveries).toEqual([resume, resume])
+      expect(recoveries).toEqual(Array(failedOpens + 1).fill(resume))
       expect(shellReplies(resumed!.writes, 7)).toEqual(asResumed(resultFrames))
     })
 

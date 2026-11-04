@@ -161,18 +161,4 @@ describe("Cursor CLI retry budgets", () => {
     noteRunFailure(budget, server(), undefined)
     expect(budget.stallStartedAt).toBeUndefined()
   })
-
-  it("starts a new outage series when Cursor answered the Run before it became unreachable again", () => {
-    const unreachable = () => new CursorTransportError("getaddrinfo ENOTFOUND agentn.cursor.sh", {
-      transient: true, replaySafe: true, cause: Object.assign(new Error("getaddrinfo"), { code: "ENOTFOUND" }),
-    })
-    const budget = newRetryBudget()
-    budget.unreachableSince = 100
-    noteRunFailure(budget, unreachable(), undefined)
-    expect(budget.unreachableSince).toBe(100)
-    const answered = unreachable()
-    answered.cursorAnswered = true
-    noteRunFailure(budget, answered, undefined)
-    expect(budget.unreachableSince).toBeUndefined()
-  })
 })

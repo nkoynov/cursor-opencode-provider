@@ -1,6 +1,6 @@
 import { hasHostHistoryRewrite, noteHostHistoryRewrite, resetHostHistoryRewritesForTests } from "../src/host-history-rewrite.js"
 import { onCopyStateReplaced } from "../src/protocol/conversation-state.js"
-import { afterAll, afterEach, beforeAll, describe, expect, it, setSystemTime } from "bun:test"
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test"
 import fs from "node:fs"
 import http2 from "node:http2"
 import net from "node:net"
@@ -9,7 +9,7 @@ import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { APICallError, type LanguageModelV3, type LanguageModelV3CallOptions, type LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
-import { CONNECT_TIMEOUT_CODE, CursorAuthError, CursorRetryExhaustedError, CursorServerError, CursorTransportError } from "../src/errors.js"
+import { CursorAuthError, CursorRetryExhaustedError, CursorServerError, CursorTransportError } from "../src/errors.js"
 import { decodeFramePayload } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests, CursorRunInterruptedError, frameArrival, lastFrameArrival } from "../src/transport/connect.js"
@@ -1503,75 +1503,6 @@ describe("retry limits across OpenCode calls", () => {
       expect(await attempt()).toMatchObject({ isRetryable: false, responseHeaders: { "x-should-retry": "false" } })
       expect(runs).toBe(0)
     } finally {
-      setHostCacheDirOverride(undefined)
-      await settleRunSavesForTests()
-      fs.rmSync(root, { recursive: true, force: true })
-    }
-  })
-
-  it("lets the host retry a setup that cannot reach Cursor for the unreachable window, spaced by retry-after-ms", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-setup-unreachable-"))
-    let code = "ENOTFOUND"
-    let transientSetup = true
-    const model = createCursor({
-      name: "cursor", agentBaseURL: ORIGIN, cacheDir: root,
-      getAccessToken: async () => {
-        throw new CursorTransportError("Cursor HTTP/2 connection failed", { transient: transientSetup, replaySafe: true, code })
-      },
-    }).languageModel("composer-2.5")
-    const attempt = async (): Promise<any> => {
-      try {
-        return await model.doStream({
-          prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
-          headers: { "x-opencode-session-id": "ses_setup_unreachable" },
-        })
-      } catch (error) { return error }
-    }
-    const start = Date.now()
-    try {
-      for (let i = 0; i < 15; i++) {
-        setSystemTime(new Date(start + i * 30_000))
-        const error = await attempt()
-        expect(error).toMatchObject({ isRetryable: true, responseHeaders: { "x-should-retry": "true" } })
-        expect(Number(error.responseHeaders["retry-after-ms"])).toBeGreaterThanOrEqual(1_000)
-      }
-      code = "ECONNRESET"
-      expect(await attempt()).toMatchObject({ isRetryable: true })
-      code = CONNECT_TIMEOUT_CODE
-      setSystemTime(new Date(start + 15 * 30_000))
-      expect(await attempt()).toMatchObject({ isRetryable: true })
-      setSystemTime(new Date(start + 15 * 30_000 + 9 * 60_000))
-      expect(await attempt()).toMatchObject({ isRetryable: true })
-      setSystemTime(new Date(start + 15 * 30_000 + 10 * 60_000))
-      const final = await attempt()
-      expect(final).toMatchObject({ isRetryable: false, responseHeaders: { "x-should-retry": "false" } })
-      expect(final.message).toStartWith("Cursor could not be reached from this machine")
-      expect(runs).toBe(0)
-      // OpenCode 2's stateless generate.text has no session id, so no budget outlives one call: keep the transport budget.
-      const sessionless = await Promise.resolve(model.doStream({
-        prompt: [{ role: "user", content: [{ type: "text", text: "Title?" }] }],
-        headers: { "x-opencode-session": "ses_stateless" },
-      })).catch((error: unknown) => error as any)
-      expect(sessionless).toMatchObject({ isRetryable: true })
-      expect(sessionless.responseHeaders["retry-after-ms"]).toBeUndefined()
-      // A failure that ends the turn also ends the outage series, so a later outage gets its own window.
-      const second = (text: string) => Promise.resolve(model.doStream({
-        prompt: [{ role: "user", content: [{ type: "text", text }] }],
-        headers: { "x-opencode-session-id": "ses_setup_unreachable_2" },
-      })).catch((error: unknown) => error as any)
-      code = "ENOTFOUND"
-      setSystemTime(new Date(start + 60 * 60_000))
-      expect(await second("Again")).toMatchObject({ isRetryable: true })
-      code = "CURSOR_SOMETHING_ELSE"
-      transientSetup = false
-      setSystemTime(new Date(start + 65 * 60_000))
-      expect(await second("Again")).toMatchObject({ transient: false, code: "CURSOR_SOMETHING_ELSE" })
-      transientSetup = true
-      code = "ENOTFOUND"
-      setSystemTime(new Date(start + 71 * 60_000))
-      expect(await second("Again")).toMatchObject({ isRetryable: true })
-    } finally {
-      setSystemTime()
       setHostCacheDirOverride(undefined)
       await settleRunSavesForTests()
       fs.rmSync(root, { recursive: true, force: true })
