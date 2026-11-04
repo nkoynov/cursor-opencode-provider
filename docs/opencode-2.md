@@ -47,12 +47,26 @@ OpenCode commits that summary, the next normal Cursor request starts from the
 compacted host history, keeping the recent messages and completed tool results.
 The conversation group stays stable; subsequent turns reuse the new checkpoint.
 Preparing a background summary or failing a summary does not reset Cursor.
+Host notes the interrupted Run carried, such as system reminders or
+background-job notices, are sent again with that request unless the compacted
+history still holds them. A helper call on the same session, such as a memory
+or task child with a smaller tool list, stays isolated and leaves the rebase to
+the next normal request.
 
 The rebase requirement is saved with the conversation snapshot and survives a
-server restart, including a shutdown save from a held tool Run. If saving that
+server restart, including a shutdown save from a held tool Run, which also
+keeps that Run's host notes. A warm request retains those notes for recovery:
+if Cursor cannot load its saved checkpoint, the rebuilt request carries them.
+If saving that
 requirement fails, the next Cursor request reports the error and retries saving
 on a later request. No extra configuration is needed. See the
 [compaction acceptance checks](host-compat-acceptance.md#opencode-2-foreign-compaction).
+
+If a full conversation save fails, the provider invalidates the older snapshot
+and its quarantine copies without allocating a directory or inode. After a
+restart, the next turn builds from host history until a successful save lands.
+A returning Location that cannot read the latest snapshot also drops its own
+older checkpoint. See [conversation persistence](../README.md#known-limitations).
 
 ## Network interruptions
 
@@ -155,7 +169,9 @@ Use the wrapper directory, rather than the provider source root, as the local pl
 
 Tool steps report estimates of streamed output and reasoning; the final step
 reconciles them with Cursor's Run counters. Input plus output still equals the
-latest checkpoint occupancy. Estimates and the one-token display minimum can
+accepted checkpoint occupancy. Unexplained isolated jumps can retain the prior
+measurement with `checkpoint-held-spike` metadata; see the [confirmation policy](checkpoint-occupancy.md).
+Estimates and the one-token display minimum can
 exceed measured output, and output at its catalog rate can raise the minimum
 settlement cost. See [accounting limits](../README.md#known-limitations) and
 the [billing diagnostics](cache-log-runbook.md#3-validate-the-totals-sent-to-opencode).
@@ -239,7 +255,8 @@ the notice is the whole result. Native signal and timeout notices also start on
 their own line. Other text blocks retain their exact bytes.
 
 Terminal-record headers and footers stay out of command stdout, including
-when completion races a timeout or background handoff.
+when completion races a timeout or background handoff. A handoff result holds
+only the foreground window's output; later output stays in the terminal file.
 
 Shell output keeps path-like text, whitespace and successful timeout-shaped
 text unchanged. Internal wrapper markers are removed without trimming command

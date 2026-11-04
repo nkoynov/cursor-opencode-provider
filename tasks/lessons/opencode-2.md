@@ -46,13 +46,20 @@ Operator setup: [OpenCode 2.x](../../docs/opencode-2.md).
   it; when it cannot (failed latest save, missing snapshot, writes that never
   settle) it drops its own checkpoint and seeds host history. A per-copy
   checkpoint outlives an evicted shared record, so "never held a generation"
-  does not mean "holds no older checkpoint"; whether another copy wrote the
-  latest generation decides. It also outlives an evicted binding: an unbound
-  session's default conversation id comes back, so a copy restoring it from
-  disk, or finding no snapshot, drops its checkpoint unless it holds the
-  latest generation. Tests need a copy that served the session before, and
-  one whose record was evicted since, not only one that never did
-  (`hydrateConversationState`, `test/host-history-rewrite.test.ts`).
+  does not mean "holds no older checkpoint"; whether another copy holds the
+  latest generation (wrote, restored or adopted it) decides. It also outlives
+  an evicted binding: an unbound session's default conversation id comes back,
+  so a copy restoring it from disk, or finding no snapshot, drops its
+  checkpoint unless it holds the latest generation. The unbound path once
+  skipped the bound path's write wait, failed-save check and full state reset
+  (#135); key those on "this copy is behind", not on "bound", and keep a failed
+  save's record past the cap so the eviction cannot erase it. An I/O exception
+  during restore must drop an unchanged older checkpoint before the caller
+  continues from host history, while retaining checkpoints received during the
+  read or still owned by this copy. Tests need a copy
+  that served the session before, and one whose record or binding was evicted
+  since, not only one that never did (`hydrateConversationState`,
+  `test/host-history-rewrite.test.ts`).
 - **`isRetryable: false` does not stop a retry.** 2.x classifies an
   `APICallError` by status and retries 408/409/429/5xx; only `x-should-retry:
   false` overrides it. An unrecognized failure without a status also retries:
@@ -126,6 +133,20 @@ Operator setup: [OpenCode 2.x](../../docs/opencode-2.md).
   saves across module graphs, and consume it only when replacing the binding
   (`test/plugin-opencode2.test.ts`, committed foreign compaction outcomes;
   `test/host-history-rewrite.test.ts`, `test/run-error-host.test.ts`).
+  Closing the held Run for that rebase dropped the host notes only it carried,
+  and a restart lost them too, even without a rewrite: a late tool result
+  rebuilds from host history. Save a held Run's own notes in its in-progress
+  snapshot and deliver them only to a Run without that checkpoint. A warm
+  request must still own the restored notes: a missing-blob recovery can rebase
+  that same request without its checkpoint. Transfer ownership only after the
+  opening upload succeeds (`keeps restored request notes` in
+  `test/run-error-host.test.ts`). An
+  unacknowledged injection may be missing from the checkpoint, so it is
+  deferred; a compaction Run defers the restored notes too, or its snapshot
+  drops them. Decide
+  helper isolation before closing held Runs, or a helper takes the rebase.
+  Keep consumed receipts as bounded tombstones: another copy can deliver the
+  same event late (#131, `foreign compaction follow-ups`).
 - **Inbox admission precedes the model boundary.** A Cursor-side AwaitShell
   could postpone a host steer until the background job finished. Inject eligible
   plain text into the actively pumping Run, with backpressure and admission

@@ -20,11 +20,11 @@ import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { sessionManager } from "../src/session.js"
 import { notifyHostInterrupt } from "../src/host-interrupt.js"
 import { resetTurnStateForTests, restorePersistedHostNotes, settleRunSavesForTests } from "../src/language-model.js"
-import { encodePersistedHostNotes } from "../src/protocol/host-notes.js"
+import { decodePersistedHostNotes, encodePersistedHostNotes } from "../src/protocol/host-notes.js"
 import { getActiveCursorMode, resetActiveCursorModesForTests, setActiveCursorMode, takeActiveCursorModeReminder } from "../src/protocol/switch-mode.js"
 import { peekConversationId, resetConversationBindingsForTests, sessionIdToUuid } from "../src/protocol/conversation-bind.js"
 import { getCheckpoint, resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
-import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
+import { getPersistedConversation, resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
 import { resetConversationBlobsForTests } from "../src/protocol/blob-store.js"
 import { resetFrozenRequestContextsForTests } from "../src/context/frozen.js"
 import { resetTurnProvenanceForTests } from "../src/protocol/turn-provenance.js"
@@ -692,6 +692,134 @@ describe("history images through a full provider Run", () => {
     expect(sentCheckpoint(2)).toBeUndefined()
     expect(sentImages(2)).toEqual([IMAGE_A])
   }), 30_000)
+
+  /** Complete synthetic categories, so only the conversation's token density changes. */
+  const measured = (usedTokens: number, conversationChars: number) => encodeMessage("ConversationStateStructure", {
+    token_details: {
+      used_tokens: usedTokens,
+      max_tokens: 1_000_000,
+      breakdown: {
+        total_used_tokens: usedTokens,
+        max_tokens: 1_000_000,
+        categories: [
+          { id: "system_prompt", label: "System prompt", estimated_tokens: 20_000, character_count: 80_000 },
+          { id: "conversation", label: "Conversation", estimated_tokens: usedTokens - 20_000, character_count: conversationChars },
+        ],
+      },
+    },
+  })
+  const contextOf = (parts: LanguageModelV3StreamPart[]) => {
+    const finish = parts.find((part) => part.type === "finish")
+    if (finish?.type !== "finish") throw new Error("Expected finish")
+    return finish.providerMetadata?.cursor?.context as Record<string, unknown>
+  }
+  /** The media reading is a new baseline; a later unexplained jump in the same Run still waits. */
+  function admitMediaThenJump(run: FakeRun): void {
+    run.send({ conversation_checkpoint_update: measured(240_000, 404_000) })
+    run.send({ interaction_update: { step_started: {} } })
+    run.send({ conversation_checkpoint_update: measured(480_000, 410_000) })
+    run.send({ interaction_update: { text_delta: { text: "Done." } } })
+    run.send({ interaction_update: { turn_ended: { input_tokens: 10, output_tokens: 2 } } })
+  }
+  const heldAfterMedia = { source: "checkpoint-held-spike", stale: true, usedTokens: 240_000, rawUsedTokens: 480_000 }
+
+  it("admits one reading after a prompt image as the occupancy baseline, then holds a later jump", () => withRoot(async (root) => {
+    const sessionKey = "ses_images_occupancy_prompt"
+    onRun = (run, message) => {
+      if (!message.run_request) return
+      if (runs.indexOf(run) === 0) {
+        run.send({ conversation_checkpoint_update: measured(120_000, 400_000) })
+        endTurnOn(run, undefined)
+      } else admitMediaThenJump(run)
+    }
+    const turn1: Prompt = [user("First question.")]
+    await collect(model(root), turn1, sessionKey)
+    const second = await collect(model(root), [...turn1, assistant("Done."), user("Here is the screenshot.", IMAGE_A)], sessionKey)
+
+    expect(sentImages(1)).toEqual([IMAGE_A])
+    expect(contextOf(second)).toMatchObject(heldAfterMedia)
+  }), 30_000)
+
+  it("admits a prompt image's checkpoint received before the opening upload drains", () => withRoot(async (root) => {
+    const sessionKey = "ses_images_occupancy_upload"
+    onRun = (run, message) => {
+      if (!message.run_request) return
+      if (runs.indexOf(run) === 0) {
+        run.send({ conversation_checkpoint_update: measured(120_000, 400_000) })
+        endTurnOn(run, undefined)
+      } else admitMediaThenJump(run)
+    }
+    const turn1: Prompt = [user("First question.")]
+    await collect(model(root), turn1, sessionKey)
+    // Force opening backpressure without delaying the inbound response. The
+    // server's measured checkpoints arrive before the upload promise settles.
+    const request = client.request
+    let checkpointBeforeDrain = false
+    client.request = function (...args: Parameters<typeof request>) {
+      const stream = Reflect.apply(request, client, args)
+      const write = stream.write
+      stream.write = (...writeArgs: unknown[]) => {
+        stream.write = write
+        Reflect.apply(write, stream, writeArgs)
+        stream.once("data", () => setImmediate(() => {
+          checkpointBeforeDrain = true
+          stream.emit("drain")
+        }))
+        return false
+      }
+      return stream
+    }
+    try {
+      const turn2: Prompt = [...turn1, assistant("Done."), user("Here is the screenshot.", IMAGE_A)]
+      const second = await collect(model(root), turn2, sessionKey)
+      expect(checkpointBeforeDrain).toBe(true)
+      expect(sentImages(1)).toEqual([IMAGE_A])
+      expect(contextOf(second)).toMatchObject(heldAfterMedia)
+      client.request = request
+      await collect(model(root), [...turn2, assistant("Done."), user("Next question.")], sessionKey)
+      expect(sentCheckpoint(2)).toEqual(Uint8Array.from(measured(480_000, 410_000)))
+      expect(sentImages(2)).toEqual([])
+    } finally {
+      client.request = request
+    }
+  }), 30_000)
+
+  it("admits a tool-result image's reading only from a checkpoint after the result, then holds a later jump", () => withRoot(async (root) => {
+    const sessionKey = "ses_images_occupancy_tool"
+    const file = path.join(root, "shot.png")
+    fs.writeFileSync(file, Buffer.from(IMAGE_B, "base64"))
+    onRun = (run, message) => {
+      const index = runs.indexOf(run)
+      if (message.run_request && index === 0) {
+        run.send({ conversation_checkpoint_update: measured(120_000, 400_000) })
+        endTurnOn(run, undefined)
+      } else if (message.run_request) {
+        run.send({ exec_server_message: { id: 1, read_args: { path: file, tool_call_id: "read-image" } } })
+        // Queued while the tool runs; it cannot hold the image.
+        run.send({ conversation_checkpoint_update: measured(121_000, 401_000) })
+      } else if (message.exec_client_message?.read_result) {
+        run.send({ interaction_update: { tool_call_completed: { call_id: "read-image" } } })
+        admitMediaThenJump(run)
+      }
+    }
+    const turn1: Prompt = [user("First question.")]
+    await collect(model(root), turn1, sessionKey)
+    const turn2: Prompt = [...turn1, assistant("Done."), user("Read shot.png.")]
+    const call = (await collect(model(root), turn2, sessionKey)).find((part) => part.type === "tool-call")
+    if (call?.type !== "tool-call") throw new Error("Expected read")
+    await Bun.sleep(100)
+    const third = await collect(model(root), [
+      ...turn2,
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: call.toolCallId, toolName: "read", input: JSON.parse(call.input) }] },
+      { role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: "read",
+        output: { type: "content", value: [{ type: "text", text: "Image read successfully" },
+          { type: "image-data", mediaType: "image/png", data: IMAGE_B }] } }] },
+    ] as Prompt, sessionKey)
+
+    const result = runs[1]!.received.find((message) => message.exec_client_message?.read_result)!
+    expect(Buffer.from(result.exec_client_message.read_result.success.data).toString("base64")).toBe(IMAGE_B)
+    expect(contextOf(third)).toMatchObject(heldAfterMedia)
+  }), 30_000)
 })
 
 describe("compaction Runs through a full provider Run", () => {
@@ -1183,6 +1311,49 @@ describe("host notes through a full provider Run", () => {
       expect(text.split("Use bazel.")).toHaveLength(2)
       expect(text).toContain("<system_reminder>")
     } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
+  }, 30_000)
+
+  it("saves an unacknowledged injection with the deferred notes, not with the held Run's own", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-host-notes-run-"))
+    cacheHttp2SessionForTests(ORIGIN, client)
+    try {
+      const file = path.join(root, "probe.txt")
+      fs.writeFileSync(file, "The build uses make.\n")
+      const carried = "<system-update>Use bazel for builds.</system-update>"
+      const instructions = `Instructions from: ${path.join(root, "AGENTS.md")}\nThis project builds with bazel.`
+      const sessionKey = `ses_unacked_${Date.now()}`
+      const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      onRun = (run, message) => {
+        if (message.run_request) {
+          run.send({ exec_server_message: { id: 0, exec_id: "exec-0", read_args: { path: file, tool_call_id: "tc-0" } } })
+        } else if (message.conversation_action?.inject_context_action) {
+          // No acknowledgement: the injection may never reach the checkpoint.
+          run.send({ exec_server_message: { id: 1, exec_id: "exec-1", read_args: { path: file, tool_call_id: "tc-1" } } })
+        }
+      }
+      restorePersistedHostNotes(sessionKey, encodePersistedHostNotes([carried]))
+      const system = { role: "system", content: "Host system prompt." } as Prompt[number]
+      const ask = { role: "user", content: [{ type: "text", text: "Read probe.txt twice." }] } as Prompt[number]
+      const call = (await collect(model, [system, ask], sessionKey)).find((part) => part.type === "tool-call") as { toolCallId: string; input: string }
+      const second = await collect(model, [
+        system, ask,
+        { role: "assistant", content: [{ type: "tool-call", toolCallId: call.toolCallId, toolName: "read", input: JSON.parse(call.input) }] },
+        { role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: "read", output: { type: "text", value: "The build uses make." } }] },
+        { role: "user", content: [{ type: "text", text: instructions }] },
+      ] as Prompt, sessionKey)
+      expect(second.some((part) => part.type === "tool-call")).toBe(true)
+      expect(runs[0]!.received.some((message) => message.conversation_action?.inject_context_action)).toBe(true)
+
+      await notifyHostInterrupt(sessionKey, "shutdown")
+      await settleRunSavesForTests()
+      const saved = await getPersistedConversation(root, sessionKey)
+      expect(decodePersistedHostNotes(saved?.runHostNote)).toEqual([carried])
+      expect(decodePersistedHostNotes(saved?.hostNote)).toEqual([instructions])
+    } finally {
+      sessionManager.dispose()
+      await settleRunSavesForTests()
+      fs.rmSync(root, { recursive: true, force: true })
+    }
   }, 30_000)
 
   it("injects a mid-step OpenCode 2 instruction once and carries a between-turns update with the next message", async () => {

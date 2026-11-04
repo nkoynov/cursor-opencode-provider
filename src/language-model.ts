@@ -428,6 +428,7 @@ import {
   cursorUsageCountersFromTurnEnded,
   emptyLanguageModelV3Usage,
   formatCursorCacheDiagnostics,
+  formatCursorCategoryCharacters,
   formatCursorTokenCategories,
   formatFinishTrace,
   formatTurnUsageValidation,
@@ -468,6 +469,13 @@ const undeliveredHostNotesBySession = new Map<string, HostNoteBatch[]>()
  * longer deliver them.
  */
 const hostNoteInjectionsBySession = new Map<string, Map<string, HostNoteBatch & { session: CursorSession }>>()
+/**
+ * Notes an interrupted Run delivered with its own request, restored from its
+ * in-progress save. Its checkpoint holds them; a next Run that starts without
+ * that checkpoint (a host history rewrite, a late tool result rebuilt from
+ * host history) delivers them again.
+ */
+const interruptedRunHostNotesBySession = new Map<string, HostNoteBatch>()
 // A compaction Run uses its own summary-agent system prompt. Its opaque Cursor
 // checkpoint must never become the base for the resumed normal agent: doing so
 // suppresses OpenCode's compacted prompt/system seed and makes Cursor narrate
@@ -1566,16 +1574,23 @@ async function doStreamImpl(
 ): Promise<LanguageModelV3StreamResult> {
   await restoreSessionState(opencodeSessionKey(callOptions), opencodeGlobalCacheDir())
   const rewriteSessionKey = opencodeSessionKey(callOptions)
+  const rewriteTools = extractTools(callOptions)
   const hostHistoryRewrite = rewriteSessionKey
     && !isCompactionCall(callOptions, rewriteSessionKey)
-    && computeAllowTools(extractTools(callOptions).length, callOptions.toolChoice)
+    && computeAllowTools(rewriteTools.length, callOptions.toolChoice)
+    // An in-session helper is isolated below and must leave the held parent,
+    // and the rebase, to the main turn.
+    && !shouldIsolateInSessionHelper(rewriteSessionKey, rewriteTools, extractToolResults(callOptions.prompt))
     && await awaitHostHistoryRewrite(opencodeGlobalCacheDir(), rewriteSessionKey)
   if (hostHistoryRewrite) {
     // A held exec belongs to the history the host just replaced. Its results
     // must seed the compacted prompt, never continue the old server Run.
     for (const held of sessionManager.openSessionsStoppedWith(rewriteSessionKey)) {
-      // Fork: the compacted seed keeps only the notes it holds; the next Run's setup leaves those out again.
-      if (held.userTurnHostNotes?.length) appendUndeliveredHostNotes(rewriteSessionKey, held.userTurnHostNotes)
+      // Notes its user turn carried live only on this Run; the rebased seed
+      // carries them again unless its history already holds them.
+      if (held.openCodeSessionId) {
+        appendUndeliveredHostNotes(held.openCodeSessionId, [...(held.userTurnHostNotes ?? []), ...takeHostNoteInjections(held)])
+      }
       sessionManager.close(held, "superseded-by-new-run")
     }
   }
@@ -2752,6 +2767,7 @@ async function writeExecHeartbeats(session: CursorSession, generation: number): 
 onCopyStateReplaced((sessionKey) => {
   postCompactionRebaseBySession.delete(sessionKey)
   undeliveredHostNotesBySession.delete(sessionKey)
+  interruptedRunHostNotesBySession.delete(sessionKey)
   steerAnsweringRuns.delete(sessionKey)
   promptIdentityBySession.delete(sessionKey)
   toolCatalogBySession.delete(sessionKey)
@@ -2778,6 +2794,7 @@ async function restoreSessionState(sessionKey: string | undefined, cacheDir: str
       })
     }
     if (restored?.postCompactionRebase) rememberPostCompactionRebase(sessionKey)
+    if (restored) restoreInterruptedRunHostNotes(sessionKey, restored.runHostNote, restored.hostNote)
     restorePersistedHostNotes(sessionKey, restored?.hostNote)
     if (restored?.modelFallbackStop && !peekModelFallbackStop(sessionKey)) {
       const stop = parseModelFallbackStop(restored.modelFallbackStop)
@@ -3400,6 +3417,9 @@ async function startSession(
   trace(`hash requestContext sha256=${requestContextHash}`)
   if (conversationState) trace(`hash checkpoint sha256=${sha(conversationState)}`)
 
+  // Cursor may send checkpoints while the opening upload waits for drain.
+  // Capture the receipt boundary before opening, rather than after the wait.
+  const requestAfterFrame = lastFrameArrival()
   const stream = await openRunWithRequest(token, {
     baseURL: agentBaseUrl, headers: options.headers,
   }, reqBytes, "initial Run request", {
@@ -3411,7 +3431,7 @@ async function startSession(
   if (sessionKey && fallbackReply) forgetModelFallbackStop(sessionKey, fallbackReply.stop)
   if (!isCompaction && !lifecycle && !resuming) recordSessionEditsGuidance(conversationId, sessionEditsDenied)
   const historyImages = sessionKey && !ephemeralRun ? runHistoryImages(heldImages) : undefined
-  if (historyImages) noteHistoryImagesSent(historyImages, imageExtraction.hashes, lastFrameArrival())
+  if (historyImages) noteHistoryImagesSent(historyImages, imageExtraction.hashes, requestAfterFrame)
 
   const hostToolDialect = hostToolDialectFromTools(tools, options.defaultDialect)
   trace(
@@ -3435,6 +3455,7 @@ async function startSession(
     ...(historyImages ? { historyImages } : {}),
     tokenDetails: priorTokenDetails,
     tokenDetailsFresh: false,
+    ...(images.length > 0 ? { occupancyMediaAfterFrame: requestAfterFrame } : {}),
     cacheDiagnostics: {
       sessionKey,
       conversationId,
@@ -4065,7 +4086,7 @@ function persistRunInProgress(session: CursorSession, where: string): Promise<vo
     postCompactionRebase: session.postCompactionRebase,
     hostAgent: session.hostAgent,
     systemPromptHash: session.stableSystemPromptHash,
-    hostNote: encodePersistedHostNotes(persistableHostNotes(sessionKey)),
+    ...heldRunHostNotes(session, sessionKey),
     runInProgress: true,
   }).catch((error) => {
     trace(`conversation persistence: ${where} save failed sessionKey=${sessionKey}: ${String(error)}`)
@@ -4092,7 +4113,7 @@ async function persistPlanOperations(session: CursorSession): Promise<void> {
     postCompactionRebase: session.postCompactionRebase,
     hostAgent: session.hostAgent,
     systemPromptHash: session.stableSystemPromptHash,
-    hostNote: encodePersistedHostNotes(persistableHostNotes(session.openCodeSessionId)),
+    ...heldRunHostNotes(session, session.openCodeSessionId),
     runInProgress: true,
   })
   assertOwner()
@@ -4418,12 +4439,15 @@ export async function drainSessionUntilTurnEnded(
         if (bytes && bytes.length > 0) {
           cancellationCheckpoint = true
           if (session.cacheDiagnostics) session.cacheDiagnostics.checkpointUpdates++
-          setCheckpoint(session.conversationId, bytes)
+          const observation = checkpointObservation(session, frame)
+          setCheckpoint(session.conversationId, bytes, observation)
           noteCheckpoint(session.openCodeSessionId, bytes)
           acceptResumeCheckpoint(session, bytes, frame)
           noteRunImageCheckpoint(session, bytes, frame)
           markEarlySteersCheckpointed(session.openCodeSessionId, session.sessionId)
-          const tokenDetails = decodeConversationTokenDetails(bytes)
+          const rawTokenDetails = decodeConversationTokenDetails(bytes)
+          if (observation.bypass && rawTokenDetails) session.occupancyMediaAfterFrame = undefined
+          const tokenDetails = rawTokenDetails?.usedTokens === 0 ? rawTokenDetails : checkpointTokenDetails(session.conversationId, bytes)
           if (tokenDetails && !(cancelling && tokenDetails.usedTokens === 0
             && (session.tokenDetails?.usedTokens ?? 0) > 0)) {
             if (session.cacheDiagnostics) session.cacheDiagnostics.tokenDetailUpdates++
@@ -4533,6 +4557,8 @@ export async function drainSessionUntilTurnEnded(
         outcome = "busy"
         break
       }
+      if (iu?.step_started && session.cacheDiagnostics) session.cacheDiagnostics.stepStarts++
+      if (iu?.step_completed && session.cacheDiagnostics) session.cacheDiagnostics.stepCompletes++
       if (iu?.heartbeat || iu?.step_started || iu?.step_completed) continue
       if (iu?.tool_call_completed) {
         // Display close of a call Cursor already has its answer for (the
@@ -4824,6 +4850,7 @@ async function deliverContinuationResultsNow(
     let endTurnAfterDelivery = false
     let deliveredCreatePlan: { approved: boolean; emulated: boolean; endTurn: boolean } | undefined
     let deliveredImageHashes: string[] = []
+    let resultHasImages = false
     let completedPlanOperation: string | undefined
     if (pending.resultField === ASK_QUESTION_RESULT_FIELD) {
       // A bridged Cursor AskQuestion. The host tool result carries the user's
@@ -5066,6 +5093,7 @@ async function deliverContinuationResultsNow(
           frames = buildExecClientMessages(input)
           if (directPlanStage || directPlanExit) replayable = false
           if (images.length > 0) {
+            resultHasImages = true
             deliveredImageHashes = r.imageHashes?.slice(0, images.length) ?? []
             trace(`continuation: ${images.length} tool-result image(s) on ${pending.resultField} execId=${r.execId}`)
           }
@@ -5099,6 +5127,7 @@ async function deliverContinuationResultsNow(
       return undefined
     }
     deliveredResults++
+    if (resultHasImages) session.occupancyMediaAfterFrame = beforeResultWrite
     if (completedPlanOperation) {
       clearPlanOperation(session.openCodeSessionId, completedPlanOperation)
       await persistPlanOperations(session)
@@ -5427,6 +5456,20 @@ function takeHostNoteInjections(owner: CursorSession): HostNoteBatch[] {
   return notes.sort((a, b) => a.order - b.order)
 }
 
+/** Notes the interrupted Run's own request delivered, older than the deferred ones. */
+export function restoreInterruptedRunHostNotes(sessionKey: string, persisted: string | undefined, deferred: string | undefined): void {
+  const later = new Set(decodePersistedHostNotes(deferred))
+  const notes = decodePersistedHostNotes(persisted).filter((note) => !later.has(note))
+  interruptedRunHostNotesBySession.delete(sessionKey)
+  if (notes.length === 0) return
+  interruptedRunHostNotesBySession.set(sessionKey, { notes, order: nextHostNoteOrder++ })
+  while (interruptedRunHostNotesBySession.size > MAX_TURN_STATE_SESSIONS) {
+    const oldest = interruptedRunHostNotesBySession.keys().next().value as string | undefined
+    if (!oldest) break
+    interruptedRunHostNotesBySession.delete(oldest)
+  }
+}
+
 /** Notes the restart snapshot kept for this session's next user turn. */
 export function restorePersistedHostNotes(sessionKey: string, persisted: string | undefined): void {
   const notes = decodePersistedHostNotes(persisted)
@@ -5455,6 +5498,17 @@ export function prepareUserTurnHostNotes(input: {
   // Notes injected into a Run that closed without acknowledging them can no
   // longer be delivered there; a still-open Run keeps its own.
   if (sessionKey && !isCompaction && !ephemeralRun) releaseHostNoteInjections(sessionKey, "run-closed")
+  const interrupted = sessionKey && !ephemeralRun ? interruptedRunHostNotesBySession.get(sessionKey) : undefined
+  const checkpointedNotes = interrupted && !isCompaction && (startedWithCheckpoint || resuming) ? [interrupted] : []
+  if (interrupted) {
+    // A Run on the interrupted Run's checkpoint already holds them. A
+    // compaction does not deliver them, but the main Run after it rebases from
+    // the summary, so they wait with the deferred notes every snapshot saves.
+    if (checkpointedNotes.length === 0) {
+      interruptedRunHostNotesBySession.delete(sessionKey!)
+      appendUndeliveredHostNotes(sessionKey!, [interrupted])
+    }
+  }
   // An interrupted-turn resume carries no user message; notes wait for the next one.
   const undelivered = isCompaction || ephemeralRun || resuming || !sessionKey
     ? undefined
@@ -5473,10 +5527,18 @@ export function prepareUserTurnHostNotes(input: {
   const pending = undelivered?.flatMap((batch) => batch.notes).filter((note) => !turnText.includes(note.trim())) ?? []
   const deferred = pending.filter((note) => !seededText.includes(note.trim()))
   return {
-    carriedNotes: [...(undelivered ?? [])],
+    carriedNotes: [
+      // Its checkpoint holds these notes, but a later recovery may have to
+      // rebuild without that checkpoint. Transfer their ownership to the Run.
+      ...checkpointedNotes,
+      ...(undelivered ?? []),
+    ],
     reminders: wrapHostNotesForCursor(deferred),
     seededNotes: pending.filter((note) => seededText.includes(note.trim())),
     sent: () => {
+      if (sessionKey && interruptedRunHostNotesBySession.get(sessionKey) === interrupted) {
+        interruptedRunHostNotesBySession.delete(sessionKey)
+      }
       if (sessionKey && undelivered?.length) {
         forgetUndeliveredHostNotes(sessionKey, undelivered, startedWithCheckpoint ? "user-turn" : "seed-history")
       }
@@ -5484,13 +5546,18 @@ export function prepareUserTurnHostNotes(input: {
   }
 }
 
-/** What a restart while the Run is held would lose: deferred notes and notes not yet acknowledged, in order. */
-function persistableHostNotes(sessionKey: string): string[] {
-  const inFlight = [...(hostNoteInjectionsBySession.get(sessionKey)?.values() ?? [])]
-    .map(({ notes, order }) => ({ notes, order }))
-  return [...(undeliveredHostNotesBySession.get(sessionKey) ?? []), ...inFlight]
-    .sort((a, b) => a.order - b.order)
-    .flatMap((batch) => batch.notes)
+/**
+ * An in-progress save's notes. Only those the Run's own request delivered are
+ * known to be in its checkpoint; an unacknowledged injection may not be, so it
+ * is deferred like one released from a closed Run.
+ */
+function heldRunHostNotes(session: CursorSession, sessionKey: string): { hostNote?: string; runHostNote?: string } {
+  const injected = [...(hostNoteInjectionsBySession.get(sessionKey)?.values() ?? [])].filter((entry) => entry.session === session)
+  const deferred = [...(undeliveredHostNotesBySession.get(sessionKey) ?? []), ...injected].sort((a, b) => a.order - b.order)
+  return {
+    hostNote: encodePersistedHostNotes(deferred.flatMap((batch) => batch.notes)),
+    runHostNote: encodePersistedHostNotes((session.userTurnHostNotes ?? []).flatMap((batch) => batch.notes)),
+  }
 }
 
 function undeliveredHostNotes(sessionKey: string): string[] {
@@ -6553,7 +6620,9 @@ export async function pump(
     const occupancyDetails =
       tokenDetails && tokenDetails.usedTokens > 0 ? tokenDetails : undefined
     const contextSource: CursorContextUsageSource | undefined = tokenDetails
-      ? session.tokenDetailsFresh
+      ? tokenDetails.rawUsedTokens !== undefined
+        ? "checkpoint-held-spike"
+        : session.tokenDetailsFresh
         ? "checkpoint-current-run"
         : "checkpoint-previous-turn"
       : undefined
@@ -7206,7 +7275,8 @@ export async function pump(
       const bytes = normalizeCheckpointBytes(checkpointRaw)
       if (bytes && bytes.length > 0) {
         cacheDiagnostics.checkpointUpdates++
-        setCheckpoint(session.conversationId, bytes)
+        const observation = checkpointObservation(session, frame)
+        setCheckpoint(session.conversationId, bytes, observation)
         noteCheckpoint(session.openCodeSessionId, bytes)
         const arrival = frameArrival(frame)
         if (arrival !== undefined && arrival > (session.latestCheckpointFrame?.arrival ?? 0)) {
@@ -7220,16 +7290,21 @@ export async function pump(
         noteRunImageCheckpoint(session, bytes, frame)
         if (accepted) session.resultsAfterCheckpoint = undefined
         markEarlySteersCheckpointed(session.openCodeSessionId, session.sessionId)
-        const tokenDetails = decodeConversationTokenDetails(bytes)
+        const rawTokenDetails = decodeConversationTokenDetails(bytes)
+        // A zero reading leaves the reset on the guard until the next positive one.
+        if (observation.bypass && rawTokenDetails) session.occupancyMediaAfterFrame = undefined
+        const tokenDetails = rawTokenDetails?.usedTokens === 0 ? rawTokenDetails : checkpointTokenDetails(session.conversationId, bytes)
         if (tokenDetails && !(isPlanTurnEnding() && tokenDetails.usedTokens === 0
           && (session.tokenDetails?.usedTokens ?? 0) > 0)) {
           cacheDiagnostics.tokenDetailUpdates++
           session.tokenDetails = tokenDetails
           session.tokenDetailsFresh = true
         }
-        const context = tokenDetails
-          ? ` context=${tokenDetails.usedTokens}/${tokenDetails.maxTokens} ` +
-            `categories=${formatCursorTokenCategories(tokenDetails)}`
+        const context = rawTokenDetails
+          ? ` context=${rawTokenDetails.usedTokens}/${rawTokenDetails.maxTokens} ` +
+            `categories=${formatCursorTokenCategories(rawTokenDetails)} ` +
+            `characters=${formatCursorCategoryCharacters(rawTokenDetails)}` +
+            (tokenDetails?.rawUsedTokens !== undefined ? ` acceptedContext=${tokenDetails.usedTokens} source=checkpoint-held-spike` : "")
           : " context=unavailable"
         trace(
           `checkpoint: stored ${bytes.length}B for conversationId=${session.conversationId}${context}`,
@@ -9485,6 +9560,20 @@ function streamedOutputChars(part: V3Part): number {
   return 0
 }
 
+function checkpointObservation(session: CursorSession, frame: Frame) {
+  const arrived = frameArrival(frame)
+  const mediaAfter = session.occupancyMediaAfterFrame
+  return {
+    // A pump can resume on a queued duplicate received before host results.
+    // Only an inbound step-start or a different Run advances the observation.
+    boundary: `${session.runId ?? session.sessionId}:${session.cacheDiagnostics?.stepStarts ?? 0}`,
+    model: session.cacheDiagnostics?.modelId,
+    // Like a resume checkpoint, only a later, acknowledged checkpoint holds the media.
+    bypass: mediaAfter !== undefined && (arrived === undefined || arrived > mediaAfter)
+      && !session.unacknowledgedHostResults?.length,
+  }
+}
+
 /**
  * Add the catalog-priced cost and output tokens for a finished Run to its
  * session's ledger. Called once per `TurnEnded`, including Runs no OpenCode step
@@ -10281,6 +10370,7 @@ export function resetTurnStateForTests(): void {
   mirroredTodosBySession.clear()
   resetHeldHistoryImagesForTests()
   undeliveredHostNotesBySession.clear()
+  interruptedRunHostNotesBySession.clear()
   steerAnsweringRuns.clear()
   resetHostSteersForTests()
   hostNoteInjectionsBySession.clear()

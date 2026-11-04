@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test"
-import { cpSync, existsSync, mkdtempSync, rmSync, symlinkSync } from "node:fs"
+import { cpSync, existsSync, mkdtempSync, rmSync, statSync, symlinkSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
@@ -158,8 +158,32 @@ test("an oversized save drops a snapshot another module copy wrote after this co
     if (phase === "full-decode") decodes++
   })
   await persistConversationState(cache, { ...input, runInProgress: true })
-  expect(existsSync(conversationCacheFilePath(cache, sessionKey))).toBe(false)
+  expect(statSync(conversationCacheFilePath(cache, sessionKey)).size).toBe(0)
   expect(decodes).toBe(0)
+})
+
+test("an oversized save in a copy that never read the session invalidates the snapshot by its header", async () => {
+  const cache = root()
+  const graph = root()
+  cpSync(resolve(import.meta.dir, "../src"), join(graph, "src"), { recursive: true })
+  symlinkSync(resolve(import.meta.dir, "../node_modules"), join(graph, "node_modules"), "dir")
+  const otherState = await import(pathToFileURL(join(graph, "src/protocol/conversation-state.ts")).href) as typeof import("../src/protocol/conversation-state.js")
+  const otherBlobs = await import(pathToFileURL(join(graph, "src/protocol/blob-store.ts")).href) as typeof import("../src/protocol/blob-store.js")
+  const sessionKey = "never-read"
+  const conversationId = peekConversationId(sessionKey)
+  const input = { sessionKey, conversationId, requestContext: { rules_info_complete: true } }
+  otherBlobs.setConversationBlob(conversationId, blobId(8), new Uint8Array(10))
+  await otherState.persistConversationState(cache, input)
+  setSnapshotBlobLimitForTests(5)
+  setConversationBlob(conversationId, blobId(9), new Uint8Array(10))
+  let decodes = 0
+  setConversationPersistenceHookForTests(phase => {
+    if (phase === "full-decode") decodes++
+  })
+  await persistConversationState(cache, { ...input, runInProgress: true })
+  expect(statSync(conversationCacheFilePath(cache, sessionKey)).size).toBe(0)
+  expect(decodes).toBe(0)
+  expect(await getPersistedConversation(cache, sessionKey)).toBeUndefined()
 })
 
 test("compaction over maxBytes copies no blobs and still compacts the store", () => {

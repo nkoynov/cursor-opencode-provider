@@ -25,6 +25,8 @@ export type PersistedConversation = {
   checkpoint?: Uint8Array
   /** Last measured occupancy, as a token-details-only checkpoint; separate from resumable state. */
   occupancyCheckpoint?: Uint8Array
+  /** Versioned checkpoint measurement confirmation state, independent of Cursor's wire state. */
+  occupancyGuard?: string
   blobs: ConversationBlobSnapshot[]
   requestContext: Record<string, unknown>
   toolCatalog: OpencodeToolDef[]
@@ -40,6 +42,12 @@ export type PersistedConversation = {
   hostNote?: string
   /** JSON-encoded ModelFallbackStop (field 101): the last turn stopped on a model switch and awaits the user's reply. */
   modelFallbackStop?: string
+  /**
+   * Host notes the in-progress Run delivered with its own request (encoded like
+   * `hostNote`). Its checkpoint holds them; a rebase after a host history
+   * rewrite does not, so only that rebase delivers them again.
+   */
+  runHostNote?: string
   /** Content hashes of the history images `sentImagesCheckpoint` holds. */
   sentImageHashes?: string[]
   /** SHA-256 hex of the checkpoint `sentImageHashes` belongs to; without it no image counts as held. */
@@ -107,6 +115,7 @@ const fileOperations = new Map<string, Promise<void>>()
 const WRITER_TEMP_FILE = /^\..+\.pb\.gz\.\d+\.[^.]+\.tmp$/
 type PersistenceTestPhase =
   | "maintenance-start" | "before-quarantine" | "after-quarantine" | "full-decode" | "directory-opened" | "before-write"
+  | "before-invalidate" | "after-invalidate-open"
 let testHook: ((phase: PersistenceTestPhase, filePath: string) => Promise<void> | void) | undefined
 
 function errorCode(error: unknown): unknown {
@@ -213,7 +222,8 @@ function cloneConversation(value: PersistedConversation): PersistedConversation 
  * turn_provenance_json=12, host_note=13, early_steers_json=14,
  * lost_request_json=15, sent_image_hashes=16 (repeated), sent_images_checkpoint_sha256=17,
  * occupancy_checkpoint=18 (token-details-only checkpoint, never Run state),
- * session_edits_deny_sent=19, plan_operations_json=20, model_fallback_stop_json=101 (fork). Older fork builds
+ * session_edits_deny_sent=19, plan_operations_json=20, occupancy_guard_json=21,
+ * run_host_note=22, model_fallback_stop_json=101 (fork). Older fork builds
  * wrote field 14 as repeated answered-steer strings, ignored on read, and the model-fallback stop
  * as field 15, read as that stop when it is not a lost-request record.
  * Blob: id=1, data=2. Tool: name=1, description=2,
@@ -352,6 +362,8 @@ function encodeCacheFile(value: PersistedConversation): {
   if (value.occupancyCheckpoint?.length) writer.uint32(fieldTag(18, 2)).bytes(value.occupancyCheckpoint)
   if (value.sessionEditsDenySent) writer.uint32(fieldTag(19, 0)).bool(true)
   if (value.planOperations) writer.uint32(fieldTag(20, 2)).string(value.planOperations)
+  if (value.occupancyGuard) writer.uint32(fieldTag(21, 2)).string(value.occupancyGuard)
+  if (value.runHostNote) writer.uint32(fieldTag(22, 2)).string(value.runHostNote)
   return { protobufBytes: writer.finish(), requestContextBytes: requestContext.length }
 }
 
@@ -378,6 +390,8 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
   const earlySteerValues: string[] = []
   let sessionEditsDenySent = false
   let planOperations: string | undefined
+  let occupancyGuard: string | undefined
+  let runHostNote: string | undefined
   while (reader.pos < reader.len) {
     const tag = reader.uint32()
     const wireType = tag & 7
@@ -466,6 +480,14 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
         if (wireType !== 2) throw new Error("invalid plan operations")
         planOperations = reader.string()
         break
+      case 21:
+        if (wireType !== 2) throw new Error("invalid occupancy guard")
+        occupancyGuard = reader.string()
+        break
+      case 22:
+        if (wireType !== 2) throw new Error("invalid run host note")
+        runHostNote = reader.string()
+        break
       default:
         reader.skipType(wireType)
     }
@@ -502,6 +524,8 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
     ...(lostRequest ? { lostRequest } : {}),
     ...(sessionEditsDenySent ? { sessionEditsDenySent } : {}),
     ...(planOperations ? { planOperations } : {}),
+    ...(occupancyGuard ? { occupancyGuard } : {}),
+    ...(runHostNote ? { runHostNote } : {}),
   }
 }
 
@@ -742,32 +766,88 @@ function queueWrite(store: ConversationStore, value: PersistedConversation): Pro
   return write
 }
 
-function queueDelete(store: ConversationStore, expectedConversationId?: string): Promise<void> {
-  const write = store.writeChain.catch(() => {}).then(() =>
-    deleteSnapshotFile(store.cacheDir, store.sessionKey, expectedConversationId))
-  store.writeChain = write
-  return write
+/**
+ * Invalidate through a checked descriptor: truncation needs no new directory or
+ * inode, and an atomic replacement at the same name cannot redirect the write.
+ * Leave the empty file for ordinary maintenance rather than unlinking a name
+ * that another process may have replaced since the identity check.
+ */
+async function invalidateCacheCandidate(filePath: string, identity: FileIdentity): Promise<void> {
+  await testHook?.("before-invalidate", filePath)
+  let handle
+  try {
+    handle = await open(filePath, fsConstants.O_WRONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0))
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return
+    throw error
+  }
+  try {
+    const stat = await handle.stat({ bigint: true })
+    if (stat.isFile() && sameFile(identity, stat)) {
+      await testHook?.("after-invalidate-open", filePath)
+      await handle.truncate(0)
+    }
+  } finally {
+    await handle.close()
+  }
 }
 
-/** Remove the session's snapshot if its header names the session (and the conversation, when one is given). */
-async function deleteSnapshotFile(cacheDir: string, sessionKey: string, expectedConversationId?: string): Promise<void> {
-  const filePath = conversationCacheFilePath(cacheDir, sessionKey)
-  await withFileOperation(filePath, async () => {
-    const opened = await openConversationFile(filePath)
-    if (!opened) return
+/** A reader can recover a quarantined copy after the live snapshot disappears. Invalidate those copies too. */
+async function invalidateSessionSnapshots(sessionKey: string, filePath: string): Promise<void> {
+  const invalidate = async (candidate: string) => {
+    let handle
     try {
-      const stat = await opened.handle.stat({ bigint: true })
-      const header = await readConversationCacheHeader(opened.handle)
-      if (header.status !== "metadata" || header.value.sessionKey !== sessionKey ||
-          (expectedConversationId !== undefined && header.value.conversationId !== expectedConversationId)) return
-      if (opened.sourcePath === filePath) await discardCacheCandidate(filePath, stat)
-      else await unlink(opened.sourcePath).catch((error) => {
-        if (errorCode(error) !== "ENOENT") throw error
-      })
-    } finally {
-      await opened.handle.close()
+      handle = await openSnapshot(candidate)
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return
+      throw error
     }
+    try {
+      const stat = await handle.stat({ bigint: true })
+      const header = await readConversationCacheHeader(handle)
+      if (header.status === "metadata" && header.value.sessionKey === sessionKey) {
+        await invalidateCacheCandidate(candidate, stat)
+      }
+    } finally {
+      await handle.close()
+    }
+  }
+  try {
+    const directory = quarantineDirectory(filePath)
+    for await (const entry of removableDirectoryEntries(directory)) {
+      if (entry.isFile() && entry.name.endsWith(".snapshot")) await invalidate(path.join(directory, entry.name))
+    }
+  } finally {
+    // A collector can restore and unlink a quarantine entry during iteration;
+    // inspect the live name last, even if inspection of quarantine failed.
+    await invalidate(filePath)
+  }
+}
+
+/** Without `expectedConversationId`, invalidate any snapshot of the session. */
+function queueDelete(store: ConversationStore, expectedConversationId?: string): Promise<void> {
+  const write = store.writeChain.catch(() => {}).then(async () => {
+    const filePath = conversationCacheFilePath(store.cacheDir, store.sessionKey)
+    await withFileOperation(filePath, async () => {
+      if (expectedConversationId === undefined) return invalidateSessionSnapshots(store.sessionKey, filePath)
+      const opened = await openConversationFile(filePath)
+      if (!opened) return
+      try {
+        const stat = await opened.handle.stat({ bigint: true })
+        const header = await readConversationCacheHeader(opened.handle)
+        if (header.status !== "metadata" || header.value.sessionKey !== store.sessionKey ||
+            header.value.conversationId !== expectedConversationId) return
+        if (opened.sourcePath === filePath) await discardCacheCandidate(filePath, stat)
+        else await unlink(opened.sourcePath).catch((error) => {
+          if (errorCode(error) !== "ENOENT") throw error
+        })
+      } finally {
+        await opened.handle.close()
+      }
+    })
   })
+  store.writeChain = write
+  return write
 }
 
 async function recoverQuarantine(filePath: string, now: number, signal: AbortSignal): Promise<void> {
@@ -1121,13 +1201,17 @@ export async function persistConversation(
 }
 
 /**
- * Fork: drop the session's snapshot whatever this module copy has cached about it (another copy may have written
- * it since), reading only the file's header rather than loading the snapshot.
+ * A failed save left the snapshot on disk behind the state it was saving, whichever conversation that snapshot
+ * holds: invalidate it so a restart starts from host history instead of resuming it. The snapshot may be one a
+ * restore would reject for its size, so a copy without a store for the session reads headers only, never the snapshot.
  */
 export async function discardPersistedConversation(cacheDir: string, sessionKey: string): Promise<void> {
   const root = path.resolve(cacheDir)
   const store = await stores.get(`${root}\0${sessionKey}`)?.catch(() => undefined)
-  if (!store) return deleteSnapshotFile(root, sessionKey)
+  if (!store) {
+    const filePath = conversationCacheFilePath(root, sessionKey)
+    return withFileOperation(filePath, () => invalidateSessionSnapshots(sessionKey, filePath))
+  }
   store.head = undefined
   store.value = undefined
   store.loadStatus = "missing"

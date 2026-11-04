@@ -515,6 +515,18 @@ These are failure lessons shared by both hosts, not a replacement for
   add step costs; Run-wide generation inflated tok/s. Use checkpoint occupancy,
   retain stale markers, and keep raw counters distinct from synthetic billing
   partitions (`test/usage-from-turn-ended.test.ts`).
+  Checkpoint pairs can carry identical token readings while other state changes;
+  a second pair member does not confirm an occupancy jump. Confirmation needs
+  an independent observation, and a pending reading must survive a zero-token
+  terminal state and restart. Keep the accepted count separate from resume
+  bytes, and match recovery readings by their full token evidence. A media
+  reset is one-shot: a sticky Run flag let every later spike in an image Run
+  through. Capture a prompt image's arrival cutoff before opening its upload:
+  a response can arrive before drain completes, and an after-drain cutoff both
+  misses the baseline and resends checkpointed images. Consume it only on a
+  checkpoint that arrived after the media and its
+  acknowledged result (`test/checkpoint-occupancy.test.ts`,
+  `test/checkpoint-occupancy-run.test.ts`, `test/host-notes-run.test.ts`).
 - **Book charges only after accepted delivery.** Cancelled estimates must not
   credit another Run. Aggregate counters cannot prove per-call tiers; compare
   both hosts' pricing formulas (`test/billing.test.ts`).
@@ -547,6 +559,17 @@ These are failure lessons shared by both hosts, not a replacement for
   session; gzip protobuf bytes rather than base64 JSON. Revalidate cleanup
   candidates, expire loaded sessions too, and avoid decoded snapshot duplicates
   (`test/conversation-maintenance.test.ts`).
+- **A failed save leaves a stale snapshot, not an old-but-valid one.** The
+  atomic rename keeps the previous file, whose checkpoint lacks the turns since;
+  an in-memory "unsaved" mark is lost on restart or record eviction (#135).
+  Invalidate that snapshot and recoverable quarantine copies in the same write
+  lane, whatever conversation they hold. Allocating quarantine directories can
+  fail for the same full-disk condition as the save: truncate through an
+  identity-checked descriptor and leave empty files for maintenance, preserving
+  atomic replacements. Inspect the live name after quarantine so a collector
+  restoring a candidate cannot escape invalidation. A receipt rewrite of the
+  old snapshot is not a full save (`persistConversationState`,
+  `test/host-history-rewrite.test.ts`, `test/conversation-maintenance.test.ts`).
 - **Bound indexes without discarding warm state.** Soft binding eviction must
   retain checkpoint/blobs/context and allow disk hydration; a process cap must
   not close pumping or pending Runs (`test/session.test.ts`).
@@ -562,10 +585,15 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Completion markers do not freeze a growing record.** A launcher sampled
   file size before `done` while the supervisor appended its footer. Read the
   final output-byte bound after sampling live size, so timeout and background
-  results contain command bytes only. A fixed delay before `done` did not
-  guarantee the launcher sampled a footer: coordinate footer readiness and
-  sampling explicitly, and assert the sampled size exceeds command bytes
-  (`test/terminal-runner.test.ts`, finalized record footer).
+  results contain command bytes only. That bound may only trim the sample: a
+  command finishing between sample and read published a larger one, and a
+  soft handoff then carried output from after its window (#130). A fixed
+  delay before `done` did not guarantee the launcher sampled a footer:
+  coordinate readiness and sampling explicitly, and assert the sampled size
+  differs from the bound in the direction under test. Opening `output-bytes`
+  exposes an empty file before its number is written; wait for the later
+  `done` marker before reading that bound in the soft-handoff regression
+  (`test/terminal-runner.test.ts`, finalized record footer; soft handoff).
 - **Read native execution before emulating it.** Both hosts own shell choice,
   permission and process-group cancellation. Preserve native background support;
   the remaining redesign is tracked in [todo](../todo.md).

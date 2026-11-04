@@ -104,10 +104,19 @@ reselect the dedicated 500k entry to use its full host context budget.
 
 Tool steps report estimates of streamed output and reasoning; the final step
 reconciles them with Cursor's Run counters. Input plus output still equals the
-latest checkpoint occupancy. Estimates and the one-token display minimum can
+accepted checkpoint occupancy. Unexplained isolated jumps can retain the prior
+measurement with `checkpoint-held-spike` metadata; see the [confirmation policy](checkpoint-occupancy.md).
+Estimates and the one-token display minimum can
 exceed measured output, and output at its catalog rate can raise the minimum
 settlement cost. See [accounting limits](../README.md#known-limitations) and
 the [billing diagnostics](cache-log-runbook.md#3-validate-the-totals-sent-to-opencode).
+
+## Conversation recovery
+
+If a full conversation save fails, the provider invalidates the older snapshot
+and its quarantine copies without allocating a directory or inode. After a
+restart, the next turn builds from host history until a successful save lands.
+See [conversation persistence](../README.md#known-limitations).
 
 ## Planning and session edit rules
 
@@ -174,7 +183,8 @@ command status from `metadata.exit` for history rebuilds and removes that
 notice from live stdout while preserving command bytes.
 
 Terminal-record headers and footers stay out of command stdout, including
-when completion races a timeout or background handoff.
+when completion races a timeout or background handoff. A handoff result holds
+only the foreground window's output; later output stays in the terminal file.
 
 Shell output keeps path-like text, whitespace and successful timeout-shaped
 text unchanged. Internal wrapper markers are removed without trimming command

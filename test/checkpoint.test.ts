@@ -7,7 +7,9 @@ import {
   getCheckpointOccupancy,
   restoreCheckpointOccupancy,
   resetCheckpointsForTests,
+  serializeCheckpointOccupancyGuard,
 } from "../src/protocol/checkpoint.js"
+import { parseOccupancyGuard } from "../src/checkpoint-occupancy.js"
 import { rekeyConversation } from "../src/protocol/conversation-state.js"
 import { recordSessionEditsGuidance, sessionEditsDenySent, sessionEditsGuidance } from "../src/protocol/session-edits.js"
 import { buildRunRequest } from "../src/protocol/request.js"
@@ -91,6 +93,14 @@ describe("checkpoint token details", () => {
     const toId = rekeyConversation("ses_rekey_occupancy", "conv-1", terminal)
     expect(checkpointTokenDetails(toId, terminal)).toEqual({ usedTokens: 40_000, maxTokens: 256_000 })
     expect(getCheckpointOccupancy("conv-1")).toBeUndefined()
+  })
+
+  it("carries an image's occupancy reset to a rekeyed conversation", () => {
+    setCheckpoint("conv-media", withTokens(40_000))
+    setCheckpoint("conv-media", withTokens(0), { bypass: true })
+    const toId = rekeyConversation("ses_rekey_guard", "conv-media", getCheckpoint("conv-media"))
+    expect(parseOccupancyGuard(serializeCheckpointOccupancyGuard(toId))?.needsFreshBaseline).toBe(true)
+    expect(serializeCheckpointOccupancyGuard("conv-media")).toBeUndefined()
   })
 
   it("keeps a rolled-back checkpoint's own occupancy across a rekey", () => {
