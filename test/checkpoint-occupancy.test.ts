@@ -10,6 +10,7 @@ import {
   restoreCheckpointOccupancy, restoreCheckpointOccupancyGuard, serializeCheckpointOccupancyGuard, setCheckpoint,
 } from "../src/protocol/checkpoint.js"
 import { encodeMessage } from "../src/protocol/messages.js"
+import { rekeyConversation } from "../src/protocol/conversation-state.js"
 import { cursorContextUsageMetadata, decodeConversationTokenDetails, type CursorConversationTokenDetails } from "../src/protocol/token-details.js"
 
 // Totals from issue #139; category/character evidence below is explicitly synthetic.
@@ -174,6 +175,14 @@ describe("checkpoint occupancy confirmation", () => {
     clearCheckpoint("conv")
     expect(serializeCheckpointOccupancyGuard("conv")).toBeUndefined()
     expect(update(details(240_000)).usedTokens).toBe(240_000)
+  })
+
+  it("keeps a held spike held through a conversation rekey", () => {
+    update(details(120_000))
+    const spike = wire(details(240_000, 121_000))
+    setCheckpoint("conv", spike, { boundary: "run:step-1", model: "example-model" })
+    const toId = rekeyConversation("ses_rekey_held_spike", "conv", spike)
+    expect(checkpointTokenDetails(toId, spike)).toMatchObject({ usedTokens: 120_000, rawUsedTokens: 240_000 })
   })
 
   it.each([false, true])("applies the same observation policy while draining (next step: %s)", async nextStep => {

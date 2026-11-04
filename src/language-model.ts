@@ -3120,6 +3120,7 @@ async function startSession(
     resuming,
     ...(startedWithCheckpoint || isCompaction || ephemeralRun || resuming ? {} : { seedHistory: extractPromptHistory(prompt, historyOptions) }),
     turnText: userText,
+    ...(liveTurn ? { liveTurnStart: liveTurn.start } : {}),
   })
   const editGuidance = isCompaction || lifecycle || resuming
     ? undefined
@@ -5493,6 +5494,8 @@ export function prepareUserTurnHostNotes(input: {
   seedHistory?: readonly SeedHistoryMessage[]
   /** The Run's user text: every user message since the model's last output, notes among them. */
   turnText?: string
+  /** Where `turnText`'s messages start in the prompt. */
+  liveTurnStart?: number
 }): { reminders: string[]; seededNotes: string[]; carriedNotes: HostNoteBatch[]; sent: () => void } {
   const { sessionKey, startedWithCheckpoint, isCompaction, ephemeralRun, resuming } = input
   // Notes injected into a Run that closed without acknowledging them can no
@@ -5526,12 +5529,17 @@ export function prepareUserTurnHostNotes(input: {
   const turnText = input.turnText ?? ""
   const pending = undelivered?.flatMap((batch) => batch.notes).filter((note) => !turnText.includes(note.trim())) ?? []
   const deferred = pending.filter((note) => !seededText.includes(note.trim()))
+  // The user text carries them, but a rebase after a host history rewrite would not: the Run owns them too.
+  const turnNotes = !isCompaction && !ephemeralRun && !resuming && input.liveTurnStart !== undefined
+    ? collectHostNoteBodies(input.prompt.slice(input.liveTurnStart).map((message) => hostTailNote(message)?.text))
+    : []
   return {
     carriedNotes: [
       // Its checkpoint holds these notes, but a later recovery may have to
       // rebuild without that checkpoint. Transfer their ownership to the Run.
       ...checkpointedNotes,
       ...(undelivered ?? []),
+      ...(turnNotes.length ? [{ notes: turnNotes, order: nextHostNoteOrder++ }] : []),
     ],
     reminders: wrapHostNotesForCursor(deferred),
     seededNotes: pending.filter((note) => seededText.includes(note.trim())),

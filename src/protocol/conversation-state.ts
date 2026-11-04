@@ -516,10 +516,12 @@ export function rekeyConversation(
   transferFrozenRequestContext(fromId, toId)
   if (checkpoint?.length) {
     restoreConversationBlobs(toId, snapshotConversationBlobs(fromId))
-    setCheckpoint(toId, checkpoint)
+    // Accepted occupancy and its guard first: the checkpoint's own reading then goes through the guard, which keeps a
+    // held spike held and takes a rolled-back checkpoint's lower reading.
     const occupancy = getCheckpointOccupancy(fromId)
-    if (occupancy && !getCheckpointOccupancy(toId)) restoreCheckpointOccupancy(toId, occupancy)
+    if (occupancy) restoreCheckpointOccupancy(toId, occupancy)
     restoreCheckpointOccupancyGuard(toId, serializeCheckpointOccupancyGuard(fromId))
+    setCheckpoint(toId, checkpoint)
     moveSessionEditsDenySent(fromId, toId)
     // The checkpoint already holds the system context; keep its rule instead of reasserting it.
     const kept = checkpointEpoch === undefined ? epoch : checkpointEpoch
