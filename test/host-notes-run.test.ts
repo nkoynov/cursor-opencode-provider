@@ -1313,7 +1313,7 @@ describe("host notes through a full provider Run", () => {
     } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
   }, 30_000)
 
-  it("saves a note that rode in the user turn as the held Run's own", async () => {
+  it.each(["its own message", "a part of the user's message"])("saves a note that rode in the user turn (%s) as the held Run's own", async (shape) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-host-notes-run-"))
     cacheHttp2SessionForTests(ORIGIN, client)
     try {
@@ -1327,10 +1327,12 @@ describe("host notes through a full provider Run", () => {
           run.send({ exec_server_message: { id: 0, exec_id: "exec-0", read_args: { path: file, tool_call_id: "tc-0" } } })
         }
       }
+      const turn = shape === "its own message"
+        ? [{ role: "user", content: [{ type: "text", text: note }] }, { role: "user", content: [{ type: "text", text: "Read probe.txt." }] }]
+        : [{ role: "user", content: [{ type: "text", text: "Read probe.txt." }, { type: "text", text: note }] }]
       const parts = await collect(model, [
         { role: "system", content: "Host system prompt." },
-        { role: "user", content: [{ type: "text", text: note }] },
-        { role: "user", content: [{ type: "text", text: "Read probe.txt." }] },
+        ...turn,
       ] as Prompt, sessionKey)
       expect(parts.some((part) => part.type === "tool-call")).toBe(true)
       const text = runs[0]!.received.find((message) => message.run_request)!.run_request.action.user_message_action.user_message.text as string

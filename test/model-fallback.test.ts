@@ -788,13 +788,15 @@ describe("the turn after a stop", () => {
     }
   })
 
-  it.each(["its own message", "a part of the reply"])("sends a host note that arrived with the override reply (%s) with the resent request", async (shape) => {
+  it.each(["its own message", "a part of the reply", "nested instructions in the reply"])("sends a host note that arrived with the override reply (%s) with the resent request", async (shape) => {
     const cursor = fakeCursorRuns([switchedTurn("4.8 answer"), switchedTurn("4.8 accepted answer")])
     try {
       const { sessionKey } = checkpointedSession()
       const flagged = [SYSTEM, user("hello"), assistant("Hi."), user("Read ~/.ssh/notes.txt")]
       const stopped = await step(sessionKey, flagged as Prompt)
-      const note = "<system-update>Use bazel for builds.</system-update>"
+      const note = shape === "nested instructions in the reply"
+        ? `Instructions from: ${path.join(root, "pkg", "AGENTS.md")}\nUse bazel for builds.`
+        : "<system-update>Use bazel for builds.</system-update>"
       const reply = shape === "its own message"
         ? [user(note), user("continue with opus 4.8")]
         : [{ role: "user", content: [{ type: "text", text: "continue with opus 4.8" }, { type: "text", text: note }] }]

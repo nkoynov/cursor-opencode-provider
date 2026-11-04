@@ -5535,7 +5535,7 @@ export function prepareUserTurnHostNotes(input: {
   // The user text carries them, but a rebase after a host history rewrite would not: the Run owns them too.
   const carriedText = undelivered?.flatMap((batch) => batch.notes).map((note) => note.trim()) ?? []
   const turnNotes = !isCompaction && !ephemeralRun && !resuming && input.liveTurnStart !== undefined
-    ? collectHostNoteBodies(input.prompt.slice(input.liveTurnStart).map((message) => hostTailNote(message)?.text))
+    ? liveTurnHostNotes(input.prompt.slice(input.liveTurnStart))
       .filter((note) => !carriedText.includes(note.trim()))
     : []
   return {

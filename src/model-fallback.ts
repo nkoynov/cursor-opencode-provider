@@ -278,10 +278,14 @@ function messageText(message: Prompt[number]): string {
 }
 
 const TAG_BLOCK = /^<([a-z][\w-]*)(?:\s[^>]*)?>[\s\S]*<\/\1>$/i
+// OpenCode's nested AGENTS.md note, the one host note it sends without a tag block.
+const OPENCODE_INSTRUCTIONS = /^Instructions from: (?:\/|[A-Za-z]:[\\/])/
 
 /** The user's own words: host plugins add tag blocks (an output-style `<system-reminder>`, notes) as text parts or messages. */
 function ownText(message: Prompt[number]): string {
-  return textParts(message).filter((text) => !TAG_BLOCK.test(text.trim())).join("").trim()
+  return textParts(message)
+    .filter((text) => !TAG_BLOCK.test(text.trim()) && !OPENCODE_INSTRUCTIONS.test(text.trim()))
+    .join("").trim()
 }
 
 export type ModelFallbackReply = {
