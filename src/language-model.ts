@@ -3026,7 +3026,7 @@ async function startSession(
         ? "Continue the request above from where it stopped. Do not repeat completed work."
         : stop.userText || "."
       // The reply's own text is dropped; host notes that arrived with it still go out with the resent request.
-      const notes = collectHostNoteBodies(prompt.slice(liveTurn!.start).map((message) => hostTailNote(message)?.text))
+      const notes = liveTurnHostNotes(prompt.slice(liveTurn!.start))
       if (notes.length > 0) userText = `${userText}\n\n${notes.join("\n\n")}`
     }
     const note = unrecordedToolsNote(stop.unrecordedTools)
@@ -8891,6 +8891,22 @@ function wrappedHostNote(text: string, open: string, close: string): boolean {
   return text.startsWith(open) && text.endsWith(close)
 }
 
+function isHostNoteText(text: string): boolean {
+  return wrappedHostNote(text, SYSTEM_UPDATE_OPEN, SYSTEM_UPDATE_CLOSE)
+    || OPENCODE_INSTRUCTIONS.test(text)
+    || OPENCODE_SHELL_NOTIFICATION.test(text)
+}
+
+/** Host note parts of the live turn: whole note messages, and note parts OpenCode attached to a user's message. */
+function liveTurnHostNotes(messages: LanguageModelV3CallOptions["prompt"]): string[] {
+  return messages.flatMap((message) => {
+    const whole = hostTailNote(message)
+    if (whole) return whole.text ? [whole.text] : []
+    if (message.role !== "user" || !Array.isArray(message.content)) return []
+    return message.content.flatMap((part) => part.type === "text" && isHostNoteText(part.text.trim()) ? [part.text.trim()] : [])
+  })
+}
+
 function hostTailNote(message: LanguageModelV3CallOptions["prompt"][number]): HostTailNote | undefined {
   if (message.role === "system") return { text: message.content }
   if (message.role !== "user" || !Array.isArray(message.content) || message.content.length === 0) return undefined
@@ -8902,11 +8918,7 @@ function hostTailNote(message: LanguageModelV3CallOptions["prompt"][number]): Ho
   for (const part of message.content) {
     if (part.type !== "text") return undefined
     const text = part.text.trim()
-    if (
-      wrappedHostNote(text, SYSTEM_UPDATE_OPEN, SYSTEM_UPDATE_CLOSE)
-      || OPENCODE_INSTRUCTIONS.test(text)
-      || OPENCODE_SHELL_NOTIFICATION.test(text)
-    ) {
+    if (isHostNoteText(text)) {
       texts.push(text)
       append = true
       continue
