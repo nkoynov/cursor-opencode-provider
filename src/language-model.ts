@@ -5530,8 +5530,10 @@ export function prepareUserTurnHostNotes(input: {
   const pending = undelivered?.flatMap((batch) => batch.notes).filter((note) => !turnText.includes(note.trim())) ?? []
   const deferred = pending.filter((note) => !seededText.includes(note.trim()))
   // The user text carries them, but a rebase after a host history rewrite would not: the Run owns them too.
+  const carriedText = undelivered?.flatMap((batch) => batch.notes).map((note) => note.trim()) ?? []
   const turnNotes = !isCompaction && !ephemeralRun && !resuming && input.liveTurnStart !== undefined
     ? collectHostNoteBodies(input.prompt.slice(input.liveTurnStart).map((message) => hostTailNote(message)?.text))
+      .filter((note) => !carriedText.includes(note.trim()))
     : []
   return {
     carriedNotes: [

@@ -1348,6 +1348,37 @@ describe("host notes through a full provider Run", () => {
     }
   }, 30_000)
 
+  it("carries a deferred note the user turn also holds once", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-host-notes-run-"))
+    cacheHttp2SessionForTests(ORIGIN, client)
+    try {
+      const file = path.join(root, "probe.txt")
+      fs.writeFileSync(file, "The build uses make.\n")
+      const note = "<system-update>Use bazel for builds.</system-update>"
+      const sessionKey = `ses_turn_note_twice_${Date.now()}`
+      const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      onRun = (run, message) => {
+        if (message.run_request) {
+          run.send({ exec_server_message: { id: 0, exec_id: "exec-0", read_args: { path: file, tool_call_id: "tc-0" } } })
+        }
+      }
+      restorePersistedHostNotes(sessionKey, encodePersistedHostNotes([note]))
+      await collect(model, [
+        { role: "system", content: "Host system prompt." },
+        { role: "user", content: [{ type: "text", text: note }] },
+        { role: "user", content: [{ type: "text", text: "Read probe.txt." }] },
+      ] as Prompt, sessionKey)
+      await notifyHostInterrupt(sessionKey, "shutdown")
+      await settleRunSavesForTests()
+      const saved = await getPersistedConversation(root, sessionKey)
+      expect(decodePersistedHostNotes(saved?.runHostNote)).toEqual([note])
+    } finally {
+      sessionManager.dispose()
+      await settleRunSavesForTests()
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
   it("saves an unacknowledged injection with the deferred notes, not with the held Run's own", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-host-notes-run-"))
     cacheHttp2SessionForTests(ORIGIN, client)
