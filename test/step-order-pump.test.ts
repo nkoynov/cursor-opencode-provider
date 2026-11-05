@@ -717,6 +717,59 @@ describe("model order in a step that changes a file", () => {
     expect(billingLedger.totals(f.session.billing.key).billedUsd).toBe(booked)
   }))
 
+  it("keeps a split Cursor step's count through a host step that books nothing", async () => withTempHostCache(async cacheDir => {
+    const root = workspace()
+    const target = path.join(root, "target.txt")
+    const a = path.join(root, "a.txt")
+    const c = path.join(root, "c.txt")
+    const d = path.join(root, "d.txt")
+    for (const file of [target, a, c, d]) fs.writeFileSync(file, `${path.basename(file)}\n`)
+    const f = fixture([
+      listed(4),
+      started("ra", { read_tool_call: { args: { path: a } } }),
+      readExec(1, a, "ra"),
+      editStarted("edit", target),
+      readExec(2, target, "edit"),
+    ], root)
+    f.session.cacheDir = cacheDir
+    f.session.openCodeSessionId = "ses_step_order_carry_unbilled"
+    f.session.tokenDetails = { usedTokens: 40_000, maxTokens: 256_000 }
+    f.session.tokenDetailsFresh = true
+    f.session.billing = { key: "ses_step_order_carry", cost: { input: 2, output: 6, cache_read: 0.5 }, prefixTokens: 30_000 }
+
+    await f.run()
+    expect(toolCalls(f.parts)).toHaveLength(1)
+    const booked = billingLedger.totals(f.session.billing.key).billedUsd
+    expect(booked).toBeGreaterThan(0)
+    await answer(f.session, toolCalls(f.parts)[0]!, 1)
+    await f.run()
+    // The edit's released private read ends its host step.
+    expect(toolCalls(f.parts)).toHaveLength(2)
+    await answer(f.session, toolCalls(f.parts)[1]!, 2)
+
+    f.push(
+      writeExec(3, target, "after\n", "edit"),
+      started("rc", { read_tool_call: { args: { path: c } } }),
+      readExec(4, c, "rc"),
+      started("rd", { read_tool_call: { args: { path: d } } }),
+      readExec(5, d, "rd"),
+    )
+    await f.run()
+    expect(toolCalls(f.parts).map((call) => call.toolName)).toEqual(["read", "read", "edit"])
+    expect(f.session.stepOrder?.held.map((held) => held.execId)).toEqual([4])
+    // The host step that books nothing still records that the Cursor step goes on.
+    expect(f.session.carriedToolStep?.listed).toBe(4)
+
+    await answer(f.session, toolCalls(f.parts)[2]!, 3)
+    await f.run()
+    expect(toolCalls(f.parts).map((call) => call.toolName)).toEqual(["read", "read", "edit", "read", "read"])
+    expect(finishes(f.parts)).toHaveLength(4)
+    for (const finish of finishes(f.parts).slice(1)) {
+      expect(finish.providerMetadata).toMatchObject({ cursor: { releasedStep: true } })
+    }
+    expect(billingLedger.totals(f.session.billing.key).billedUsd).toBe(booked)
+  }))
+
   it("keeps a held call owed to Cursor with the usual exec heartbeats", async () => {
     const root = workspace()
     const { frames } = editThenShell(root)

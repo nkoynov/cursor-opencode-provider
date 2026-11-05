@@ -42,6 +42,7 @@
 
 ### Fixed
 
+- A Cursor step the step order splits over several host steps keeps its call count when a host step that books nothing (one that continues an already booked step) closes on a held call. The step's later calls are no longer booked a second time, and a message sent mid-step still waits until every call of the step has arrived
 - A tool step no longer stays open for about 5 minutes when Cursor, waiting to deliver a host note such as a nested `AGENTS.md`, keeps asking to move the step's running shell to the background. Those requests concern a call already sent, so they no longer count as new tool activity, and the step closes in time for the shell's result and the note to arrive in the same turn. In this fork the held step's 1.5 s quiet window no longer restarts on those requests ([#155](https://github.com/oakimov/cursor-opencode-provider/issues/155), [@nkoynov](https://github.com/nkoynov)).
 - A host note (a background-job notice, a `<system-update>`) that arrives between a model-switch stop and the `continue with opus 4.8` reply now reaches Cursor with the resent request, instead of being dropped with the reply's text while counted as delivered
 - A turn end that drops a checkpoint older than the step's host results keeps the conversation's last accepted context occupancy and its spike guard, so a held occupancy spike is still held on the next reading instead of being accepted at once

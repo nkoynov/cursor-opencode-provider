@@ -6672,6 +6672,7 @@ export async function pump(
     settleOpenEarlyRows(reason.unified === "tool-calls" && emittedHostTools > 0)
     flushToollessText()
     closeOpenSpans()
+    if (reason.unified === "tool-calls" && hasHeldExecs(order)) carryToolStep()
     if (options?.unbilled && !te) {
       // Calls released from a hold belong to a Cursor step already booked with
       // the host step that held them. OpenCode 2 prices any reported token, so
@@ -6867,7 +6868,6 @@ export async function pump(
         `sessionRealOutput=${bookedOutput.real.output} sessionReportedOutput=${bookedOutput.reported.output} ` +
         `key=${billing.key}`,
     )
-    if (reason.unified === "tool-calls" && hasHeldExecs(order)) carryToolStep()
   }
 
   // The cancel path drains and closes the Run; a frame read here goes back to it.
