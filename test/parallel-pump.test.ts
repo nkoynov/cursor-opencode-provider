@@ -515,6 +515,61 @@ describe("parallel tool-call pump", () => {
     expect(decodeMessage<any>("AgentClientMessage", writes[0]!).exec_client_message.id).toBe(40)
   })
 
+  it("closes a shell's step while Cursor keeps asking to background it for a queued note", async () => {
+    const root = fs.mkdtempSync("/tmp/cursor-note-stall-")
+    const target = path.join(root, "data.txt")
+    fs.writeFileSync(target, "payload line\n")
+    // ExecServerMessage #30 is not in the decoder's schema; the pump finds it by raw field.
+    const forceBackground = (id: number): Frame => ({
+      flags: 0, payload: Uint8Array.of(0x12, 5, 0x08, id, 0xf2, 0x01, 0x00),
+    })
+    const requests = [2, 3, 4, 5, 6].map(forceBackground)
+    const frames = [
+      frame({ interaction_update: { tool_call_started: {
+        call_id: "read-call", tool_call: { read_tool_call: { args: { path: target } } },
+      } } }),
+      frame({ exec_server_message: { id: 0, read_args: { path: target, tool_call_id: "read-call" } } }),
+      frame({ interaction_update: { tool_call_started: {
+        call_id: "shell-call", tool_call: { shell_tool_call: { args: { command: "sleep 3; echo SLEPT" } } },
+      } } }),
+      listed(2), shell(1, "shell-call"),
+      ...requests, text("after"),
+    ]
+    const { session, writes } = fixture(frames)
+    const tools = [...session.toolCatalog!, { name: "read", description: "Read" }]
+    session.toolCatalog = tools
+    session.toolDescriptors = toolsToDescriptors(tools, "opencode")
+    session.requestContext.env = { workspace_paths: [root] }
+    const next = session.frames.next.bind(session.frames)
+    session.frames.next = async () => {
+      const result = await next()
+      if (!result.done && requests.includes(result.value) && session.parallelStep) {
+        session.parallelStep.lastProgressAt -= 1_000
+      }
+      return result
+    }
+    try {
+      const first = collect()
+      await pump(session, first.controller, ids)
+      expect(toolCalls(first.parts).map(p => p.toolName)).toEqual(["read"])
+      const read = toolCalls(first.parts)[0]!
+      expect(await deliverContinuationResults(session, [{
+        sessionId: session.sessionId, execId: 0, toolCallId: read.toolCallId, toolName: "read", output: "payload line",
+      }])).toBe(session)
+
+      const second = collect()
+      await pump(session, second.controller, ids)
+      expect(toolCalls(second.parts).map(p => p.toolName)).toEqual(["bash"])
+      expect(finishes(second.parts).map(p => p.finishReason.unified)).toEqual(["tool-calls"])
+      expect(session.pending.has(1)).toBe(true)
+      expect(frames.length).toBeGreaterThan(0)
+      const answered = writes.map(bytes => decodeMessage<any>("AgentClientMessage", bytes).exec_client_message?.id)
+      expect(answered).toContain(2)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it("clears an aborted step's emission state while retaining its pending exec", async () => {
     const abort = new AbortController()
     const { session } = fixture([listed(2), shell(1), listed(1), shell(2)])
