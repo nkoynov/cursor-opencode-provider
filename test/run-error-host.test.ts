@@ -966,7 +966,7 @@ describe("host calls still running when the Run dies", () => {
     { type: "function" as const, name: "read", inputSchema: { type: "object", properties: { filePath: { type: "string" } } } },
   ]
 
-  /** `held`: a state-changing command ends its step at once. `open`: a read waits in its step for the next listed call. */
+  /** The step's first call is a command (`held`) or a read (`open`); either waits in its step for the next listed call. */
   const setup = (step: "held" | "open",
     cut: "reset" | "clean-close" | "clean-end" | "trailers-end" | "null-error" | "reply-write" | "final" | "invalid-argument"
       | "kv-final" | "none", key: string,
@@ -1036,7 +1036,8 @@ describe("host calls still running when the Run dies", () => {
           send({ interaction_update: { tool_call_completed: { call_id: "own", tool_call: { get_mcp_tools_tool_call: {
             args: { server: "opencode", tool_name: "slack_read" }, result: { success: { content: "slack_read(channel: string)" } } } } } } })
         } else if (queued === "exec-abort") {
-          // Cursor sends the next call's exec and withdraws it; nothing ran it.
+          // After the host step closed, Cursor sends the next call's exec and withdraws it; nothing ran it.
+          send({ interaction_update: { text_delta: { text: "Next, the tests." } } })
           send({ exec_server_message: { id: 2, shell_stream_args: { command: "echo second", tool_call_id: "second" } } })
           send({ exec_server_control_message: { abort: { id: 2 } } })
         } else if (queued?.startsWith("catalog-")) {

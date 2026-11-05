@@ -6,12 +6,7 @@ import { encodeMessage } from "../src/protocol/messages.js"
 import { toolsToDescriptors } from "../src/protocol/tools.js"
 import { applyExecControl, deliverContinuationResults, pump, resetTurnStateForTests } from "../src/language-model.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
-import {
-  displayToolCallMutates,
-  readOnlyShellCommand,
-  readOnlyToolName,
-  toolCallOrderTiming,
-} from "../src/tool-call-order.js"
+import { readOnlyShellCommand, readOnlyToolName, toolExecMutates } from "../src/tool-call-order.js"
 
 const frame = (message: Record<string, unknown>): Frame => ({
   flags: 0,
@@ -121,7 +116,6 @@ describe("ordered tool calls", () => {
   afterEach(() => {
     sessionManager.dispose()
     resetTurnStateForTests()
-    toolCallOrderTiming.releaseQuietMs = 15_000
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true })
   })
 
@@ -146,7 +140,7 @@ describe("ordered tool calls", () => {
     const second = await pumpOnce(session)
     expect(calls(second)).toEqual(["bash#2"])
     expect(finishes(second)).toEqual(["tool-calls"])
-    expect(session.toolCallOrder?.deferred).toEqual([])
+    expect(session.stepOrder?.held).toEqual([])
     expect(session.replaySafety?.historyRebaseUnsafe).toBeFalsy()
     expect(session.replaySafety?.execs?.filter((exec) => exec.id === 2)).toHaveLength(1)
   })
@@ -182,7 +176,7 @@ describe("ordered tool calls", () => {
     expect(calls(third)).toEqual(["bash#2"])
   })
 
-  it("keeps read-only calls together and runs a state-changing call between them alone", async () => {
+  it("runs a step without a file change together", async () => {
     const script = scriptedFrames([])
     const session = fakeSession(script.frames)
     const root = rootOf(session)
@@ -196,14 +190,9 @@ describe("ordered tool calls", () => {
     ]) script.push(next)
 
     const first = await pumpOnce(session)
-    expect(calls(first)).toEqual(["read#1", "bash#2"])
-    await deliverAll(session)
-    const second = await pumpOnce(session)
-    expect(calls(second)).toEqual(["bash#3"])
-    await deliverAll(session)
-    const third = await pumpOnce(session)
-    expect(calls(third)).toEqual(["read#4"])
-    expect(finishes(third)).toEqual(["tool-calls"])
+    expect(calls(first)).toEqual(["read#1", "bash#2", "bash#3", "read#4"])
+    expect(finishes(first)).toEqual(["tool-calls"])
+    expect(session.stepOrder?.held).toEqual([])
   })
 
   it("closes a resumed step on Cursor's count instead of waiting for a quiet Run", async () => {
@@ -211,19 +200,21 @@ describe("ordered tool calls", () => {
     const session = fakeSession(script.frames)
     const root = rootOf(session)
     for (const name of ["a", "b"]) fs.writeFileSync(path.join(root, name), name)
+    const created = path.join(root, "created.md")
     // Live order: Cursor lists the count after the step's first execs.
     for (const next of [
       started("lookup", { get_mcp_tools_tool_call: {} }),
       listed(1),
       frame({ interaction_update: { tool_call_completed: { call_id: "lookup", tool_call: { get_mcp_tools_tool_call: {} } } } }),
-      ...shell(1, "mk", "mkdir -p out"),
+      editStarted("mk", created),
+      editWrite(1, "mk", created),
       ...read(2, "ra", path.join(root, "a")),
       listed(3),
       ...read(3, "rb", path.join(root, "b")),
     ]) script.push(next)
 
     const first = await pumpOnce(session)
-    expect(calls(first)).toEqual(["bash#1"])
+    expect(calls(first)).toEqual(["write#1"])
     await deliverAll(session)
     const startedAt = Date.now()
     const second = await pumpOnce(session)
@@ -231,7 +222,7 @@ describe("ordered tool calls", () => {
     expect(Date.now() - startedAt).toBeLessThan(1_000)
   })
 
-  it("runs the read-only calls held behind a state-changing call together", async () => {
+  it("runs the calls held behind a file change together", async () => {
     const script = scriptedFrames([])
     const session = fakeSession(script.frames)
     const root = rootOf(session)
@@ -249,7 +240,7 @@ describe("ordered tool calls", () => {
     ]) script.push(next)
 
     expect(calls(await pumpOnce(session))).toEqual(["write#5"])
-    expect(session.toolCallOrder?.deferred.map((exec) => exec.execId)).toEqual([2, 3, 4])
+    expect(session.stepOrder?.held.map((held) => held.execId)).toEqual([2, 3, 4])
     await deliverAll(session)
     const second = await pumpOnce(session)
     expect(calls(second)).toEqual(["read#2", "read#3", "read#4"])
@@ -257,38 +248,47 @@ describe("ordered tool calls", () => {
   })
 
   it("forgets a held exec that Cursor aborts", async () => {
-    const script = scriptedFrames([...shell(1, "a", "touch a"), ...shell(2, "b", "touch b"), listed(2)])
+    const created = path.join(os.tmpdir(), `ordered-abort-${process.pid}-${Date.now()}.md`)
+    const script = scriptedFrames([listed(2), editStarted("a", created), editWrite(1, "a", created), ...shell(2, "b", "touch b")])
     const session = fakeSession(script.frames)
 
     const first = await pumpOnce(session)
-    expect(calls(first)).toEqual(["bash#1"])
+    expect(calls(first)).toEqual(["write#1"])
+    expect(session.stepOrder?.held.map((held) => held.execId)).toEqual([2])
     const second = scriptedFrames([])
     session.frames = second.frames
     applyExecControl(session, { abort: { id: 2 } }, "test")
-    expect(session.toolCallOrder?.deferred).toEqual([])
-    expect(session.toolCallOrder?.calls.map((call) => call.callId)).toEqual(["a"])
+    expect(session.stepOrder?.held).toEqual([])
+    expect(session.stepOrder?.calls.get("b")?.state).toBe("done")
+    expect(session.stepOrder?.calls.get("a")?.state).toBe("running")
   })
 
-  it("releases a held exec when the Run makes no progress", async () => {
-    toolCallOrderTiming.releaseQuietMs = 100
-    // `x` never gets an exec or a completion, so nothing would release `y`.
-    const script = scriptedFrames([shellStarted("x", "touch x"), ...shell(1, "y", "touch y")])
+  it("keeps a held exec until its file change finishes, with no timer", async () => {
+    const created = path.join(os.tmpdir(), `ordered-quiet-${process.pid}-${Date.now()}.md`)
+    // `x` has no exec yet, so `y` waits for Cursor to finish or withdraw it.
+    const script = scriptedFrames([listed(2), editStarted("x", created), ...shell(1, "y", "touch y")])
     const session = fakeSession(script.frames)
 
-    const parts = await pumpOnce(session)
-    expect(calls(parts)).toEqual(["bash#1"])
+    const pumping = pumpOnce(session)
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(session.stepOrder?.held.map((held) => held.execId)).toEqual([1])
+    script.push(frame({ interaction_update: { tool_call_completed: { call_id: "x", tool_call: { edit_tool_call: { args: { path: created } } } } } }))
+    expect(calls(await pumping)).toEqual(["bash#1"])
   })
 })
 
 describe("tool call classification", () => {
-  it("treats reads, searches, subagents and waits as read-only", () => {
-    for (const variant of ["read_tool_call", "grep_tool_call", "glob_tool_call", "task_tool_call", "await_tool_call", "web_fetch_tool_call"]) {
-      expect(displayToolCallMutates(variant, {})).toBe(false)
+  it("treats reads, searches, subagents and read-only shell lines as read-only", () => {
+    for (const toolName of ["read", "grep", "glob", "task", "subagent", "webfetch"]) {
+      expect(toolExecMutates(toolName, {}, "mcp_result")).toBe(false)
     }
-    for (const variant of ["edit_tool_call", "delete_tool_call", "pi_write_tool_call", "generate_image_tool_call", "unknown_tool_call"]) {
-      expect(displayToolCallMutates(variant, {})).toBe(true)
+    for (const toolName of ["edit", "write", "apply_patch", "unknown_tool"]) {
+      expect(toolExecMutates(toolName, {}, "mcp_result")).toBe(true)
     }
-    expect(displayToolCallMutates("shell_tool_call", {})).toBeUndefined()
+    expect(toolExecMutates("shell", { command: "git status" }, "shell_stream_result")).toBe(false)
+    expect(toolExecMutates("shell", { command: "git status", background: true }, "shell_stream_result")).toBe(true)
+    expect(toolExecMutates("shell", {}, "shell_stream_result")).toBe(true)
+    expect(toolExecMutates("read", {}, "background_shell_spawn_result")).toBe(true)
   })
 
   it("classifies MCP tools by name, defaulting to state-changing", () => {
@@ -306,7 +306,7 @@ describe("tool call classification", () => {
     ]) {
       expect(readOnlyToolName(name)).toBe(false)
     }
-    expect(displayToolCallMutates("mcp_tool_call", {}, "linear_save_issue")).toBe(true)
+    expect(toolExecMutates("linear_save_issue", {}, "mcp_result")).toBe(true)
   })
 
   it("accepts only shell lines it can tell are read-only", () => {

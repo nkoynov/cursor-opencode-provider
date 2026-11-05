@@ -744,6 +744,7 @@ describe("early edit rows", () => {
 
   // A held parallel step keeps pumping after the host read, and a later
   // announcement may open a row while the step waits for its other calls.
+  // The second edit follows a file change, so it waits for the first.
   for (const order of ["outside first", "inside first"] as const) {
     for (const catalog of catalogs) {
       it(`opens no edit rows before either authorized read in a parallel step, ${order} (${catalog.label})`, async () => {
@@ -765,13 +766,22 @@ describe("early edit rows", () => {
         await run(session, parts)
 
         expectNoFailedRow(parts)
-        expect(parts.filter((part) => part.type === "tool-input-start")).toEqual([])
-        const calls = parts.filter((part) => part.type === "tool-call")
-        // Fork tool-call order: an edit waits for the calls written before it, so this pass
-        // carries only the first edit's authorized read.
-        expect(calls.map((call) => call.toolName)).toEqual(["read"])
-        expect(calls[0].toolCallId.startsWith("cursor_")).toBe(true)
-        expect(parts.filter((part) => part.type === "finish").map((part) => part.finishReason.unified))
+        expect(parts.filter(part => part.type === "tool-input-start")).toEqual([])
+        const calls = parts.filter(part => part.type === "tool-call")
+        if (order === "outside first") {
+          // The inside edit follows a file change: its read is held, still owed to Cursor.
+          expect(calls.map(call => call.toolName)).toEqual(["read"])
+          expect(calls[0]!.toolCallId).toBe(`cursor_${session.sessionId}_3`)
+          expect(session.stepOrder?.held.map(held => held.execId)).toEqual([5])
+        } else {
+          // The inside edit's early write is refused, which ends that edit; the outside edit runs.
+          expect(calls.map(call => call.toolName)).toEqual(["read", "read"])
+          expect(session.stepOrder?.held).toEqual([])
+        }
+        expect(session.pending.has(3)).toBe(true)
+        // Fork: a held exec is owed through the step order (heartbeats, aborts), not the pending map.
+        expect(session.pending.has(5)).toBe(order === "inside first")
+        expect(parts.filter(part => part.type === "finish").map(part => part.finishReason.unified))
           .toEqual(["tool-calls"])
         sessionManager.resolve(session.sessionId, 3)
         sessionManager.resolve(session.sessionId, 5)
@@ -1178,11 +1188,15 @@ describe("early edit rows", () => {
     expect(fs.existsSync(file)).toBe(false)
   })
 
-  it("fails an unexecuted parallel row when Cursor ends the Run before a call held behind it runs", async () => {
+  it("opens no row for an edit announced behind another unfinished call, which still runs when Cursor ends the Run", async () => {
     const workspace = tempDir()
     const file = path.join(workspace, "never-written.txt")
     const { session, parts } = pumpSession([
       encodeMessage("AgentServerMessage", { interaction_update: { tool_requests_listed: { call_count: 2 } } }),
+      // The shell comes first in the model's order, so it does not wait for the edit.
+      encodeMessage("AgentServerMessage", { interaction_update: { tool_call_started: {
+        call_id: "shell-other", tool_call: { shell_tool_call: { args: { command: "echo ok" } } },
+      } } }),
       partial("edit-terminal", file),
       started("edit-terminal", file),
       encodeMessage("AgentServerMessage", { exec_server_message: {
@@ -1192,10 +1206,11 @@ describe("early edit rows", () => {
     ], [{ name: "write", description: "Write" }, { name: "bash", description: "Shell" }])
     session.requestContext.env = { workspace_paths: [workspace] }
     await run(session, parts)
-    expect(parts.find(part => part.type === "tool-result"))
-      .toMatchObject({ result: EARLY_ROW_CLOSED, isError: true })
-    expect(parts.some(part => part.type === "tool-call" && part.toolName === "bash")).toBe(false)
-    expect(parts.at(-1)).toMatchObject({ type: "finish", finishReason: { unified: "stop" } })
+    // Fork early rows: no row opens while an earlier call of the step is unfinished.
+    expect(parts.filter(part => part.type === "tool-result")).toEqual([])
+    expect(parts.filter(part => part.type === "tool-call").map(part => part.toolName)).toEqual(["bash"])
+    expect(parts.at(-1)).toMatchObject({ type: "finish", finishReason: { unified: "tool-calls" } })
+    sessionManager.resolve(session.sessionId, 3)
   })
 
   it("shows Cursor's own failure on the row of an edit it finished without a write", async () => {

@@ -306,7 +306,7 @@ The **1.18 v2** API and **OpenCode 2.x** are source-incompatible:
   tool-call until every listed call has reached it (its exec, or its display
   completion when no exec claimed it; an edit's private read does not count).
   Model output, `turn_ended`, a Run failure or 1.5 s without frames
-  (`HELD_TOOL_STEP_QUIET_MS`) close it early, and so does the ordering below.
+  (`HELD_TOOL_STEP_QUIET_MS`) close it early, and so does the step order below.
   A Run that ends meanwhile closes it with `tool-calls`
   (`closeHeldToolStepAtRunEnd`), and a reply cut off with it leaves that to the
   next read: the calls still run and their results rebuild.
@@ -327,14 +327,17 @@ The **1.18 v2** API and **OpenCode 2.x** are source-incompatible:
   exec that is not the host's). The rebuild never resumes a checkpoint, so one
   Cursor sent before the results cannot ask for the calls again. Otherwise the
   Run's carried host notes go back to the next Run.
-- Fork tool-call order (`src/tool-call-order.ts`, Claude Code's rule): reads,
-  searches, subagents, read-only shell and MCP tools with read-only names run
-  together; an edit, write, other shell or other MCP call waits for the calls
-  written before it, and later calls wait for it. A state-changing call ends its
-  step, and a call that must wait closes the step so OpenCode runs the earlier
-  ones. A held-back exec is released anyway after 15 s without progress
-  (`toolCallOrderTiming.releaseQuietMs`), so a call Cursor never closes cannot
-  stall the Run.
+- In a step with a file change, keep `tool_call_started` order
+  (`src/step-order.ts`): later calls wait for it, and it waits for earlier
+  calls already running or held. Hold the exec frame, owed (heartbeats,
+  fresh-turn cancel), and dispatch it again in a later host step; release only
+  on its result, Cursor's completion or abort, never a timer. A host refusal or
+  interruption of the change cancels its followers. A released step books nothing.
+  Fork: a held exec stays out of `session.pending` (`stepOrder.held` is its
+  owner for heartbeats, aborts and the drain), a hold closes the host step once
+  it has host calls, and a released file change ends its host step.
+  `src/tool-call-order.ts` only classifies an exec's side effect for resume
+  safety (`sideEffectAfterCheckpoint`); it no longer orders calls.
 - Fork early rows: a row opens only while no other call of the step is announced
   or started and unfinished and no exec is held back; otherwise the earlier
   call's exec would close it as failed.

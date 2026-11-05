@@ -102,6 +102,7 @@ import {
   CUSTOM_LIST_MCP_RESOURCES_TOOL,
   CUSTOM_READ_MCP_RESOURCE_TOOL,
   hostToolDialectFromTools,
+  mapCursorArgsToOpencode,
   opencodePathArg,
   type OpencodeToolDef,
   type ParsedExecRequest,
@@ -406,22 +407,27 @@ import {
   type ReplayToolLifecycle,
 } from "./replay-safety.js"
 import { noteCursorWaitEnded, noteCursorWaitStarted } from "./cursor-waits.js"
+import { toolExecMutates } from "./tool-call-order.js"
 import {
-  deferToolExec,
-  deferredToolExecIds,
-  displayToolCallMutates,
-  dropDeferredToolExec,
-  forceReleaseToolExec,
-  hasDeferredToolExecs,
-  noteToolCallExec,
-  noteToolCallFinished,
-  noteToolCallStarted,
-  takeReadyToolExec,
-  toolCallOrder,
-  toolCallOrderTiming,
-  toolExecMustWait,
-  toolExecMutates,
-} from "./tool-call-order.js"
+  HELD_CALL_CANCELLED_REASON,
+  announceCall,
+  createStepOrder,
+  dropHeldExec,
+  finishCall as finishOrderedCall,
+  holdExec,
+  isFileChangeCall,
+  isFileChangeDisplay,
+  isFileChangeExec,
+  noteExecResult,
+  noteOrderedCallCount,
+  orderExec,
+  runExec,
+  startOrderedStep,
+  takeCancelledExecs,
+  takeReleasableExecs,
+  type HeldExec,
+  type StepOrderState,
+} from "./step-order.js"
 import { backgroundShellNoticesSupported, recordBackgroundShellRead } from "./background-shell-notice.js"
 import { readAllFieldsStrict, type StrictRawField } from "./protocol/struct.js"
 import {
@@ -462,13 +468,15 @@ const toolCatalogBySession = new Map<string, OpencodeToolDef[]>()
 let nextHostNoteOrder = 0
 const undeliveredHostNotesBySession = new Map<string, HostNoteBatch[]>()
 /**
- * Host notes injected into a Run and not yet acknowledged, per OpenCode session
- * and injection id. Cleared on `delivered`; anything else returns the notes to
+ * Host notes injected into a Run and not yet in a checkpoint it stored, per
+ * OpenCode session and injection id. `delivered` marks an entry; the Run's next
+ * stored checkpoint clears it, since Cursor stores the checkpoint holding the
+ * note after the ack. Anything else returns the notes to
  * `undeliveredHostNotesBySession`, as Cursor SDK `Run.steer` reverts to a
  * follow-up. The owning Run is kept so notes are released only once it can no
  * longer deliver them.
  */
-const hostNoteInjectionsBySession = new Map<string, Map<string, HostNoteBatch & { session: CursorSession }>>()
+const hostNoteInjectionsBySession = new Map<string, Map<string, HostNoteBatch & { session: CursorSession; delivered?: boolean }>>()
 /**
  * Notes an interrupted Run delivered with its own request, restored from its
  * in-progress save. Its checkpoint holds them; a next Run that starts without
@@ -2642,7 +2650,7 @@ export function applyExecControl(session: CursorSession, control: Record<string,
     trace(`exec control: unknown message ${JSON.stringify(Object.keys(control))} (${where}) sessionId=${session.sessionId}`)
     return
   }
-  if (dropDeferredToolExec(session.toolCallOrder, id)) {
+  if (dropHeldExec(session.stepOrder, id)) {
     trace(`exec control: Cursor aborted held execId=${id} (${where}) sessionId=${session.sessionId} — it will not run`)
     return
   }
@@ -2749,11 +2757,11 @@ async function writeExecHeartbeats(session: CursorSession, generation: number): 
       trace(`exec heartbeat: id=${execId} tool=${pending.toolName ?? "?"} n=${count} sessionId=${session.sessionId}`)
     }
     // Execs the tool-call ordering holds back are Cursor's to wait on as much as the running ones.
-    for (const execId of deferredToolExecIds(session.toolCallOrder)) {
+    for (const execId of heldExecIds(session.stepOrder)) {
       const stillHeld = () => !session.closed
         && session.stream === stream
         && isCurrentHeartbeatGeneration(session, generation)
-        && deferredToolExecIds(session.toolCallOrder).includes(execId)
+        && heldExecIds(session.stepOrder).includes(execId)
       if (!stillHeld()) continue
       await writeWithBackpressure(stream, buildExecHeartbeat(execId), `exec heartbeat id=${execId} (held)`, stillHeld)
     }
@@ -3975,7 +3983,7 @@ function isHeldRunIdle(session: CursorSession, frames: CursorSession["frames"]):
 /** An abort the reader may apply now: its exec is registered and still waits on the host, or is held back by the ordering. */
 function abortsPendingExec(session: CursorSession, control: Record<string, unknown>): boolean {
   const id = (control.abort as Record<string, unknown> | undefined)?.id
-  if (typeof id === "number" && deferredToolExecIds(session.toolCallOrder).includes(id)) return true
+  if (typeof id === "number" && heldExecIds(session.stepOrder).includes(id)) return true
   const pending = typeof id === "number" ? session.pending.get(id) : undefined
   return !!pending && isOwedCursorExec(pending) && pending.state === "pending" && !pending.aborted
 }
@@ -4347,7 +4355,7 @@ export async function drainSessionUntilTurnEnded(
   const cancelled = opts?.cancelled === true || opts?.cancelReason !== undefined
   if (session.closed) return "skipped"
   if (session.pending.size > 0 || sessionManager.isActivelyPumping(session)) return "busy"
-  if (!cancelled && hasDeferredToolExecs(session.toolCallOrder)) return "busy"
+  if (!cancelled && hasHeldExecs(session.stepOrder)) return "busy"
 
   const timeoutMs = Math.max(1, opts?.timeoutMs ?? FRESH_TURN_DRAIN_TIMEOUT_MS)
   const owner = Symbol(`fresh-turn-drain:${session.sessionId}`)
@@ -4449,6 +4457,7 @@ export async function drainSessionUntilTurnEnded(
           acceptResumeCheckpoint(session, bytes, frame)
           noteRunImageCheckpoint(session, bytes, frame)
           markEarlySteersCheckpointed(session.openCodeSessionId, session.sessionId)
+          forgetCheckpointedHostNotes(session)
           const rawTokenDetails = decodeConversationTokenDetails(bytes)
           if (observation.bypass && rawTokenDetails) session.occupancyMediaAfterFrame = undefined
           const tokenDetails = rawTokenDetails?.usedTokens === 0 ? rawTokenDetails : checkpointTokenDetails(session.conversationId, bytes)
@@ -5131,13 +5140,16 @@ async function deliverContinuationResultsNow(
       return undefined
     }
     deliveredResults++
+    if (noteExecResult(session.stepOrder, r.execId, r.refusal || r.interrupted ? "refused" : "done")) {
+      trace(`step-order: result execId=${r.execId} refused=${!!(r.refusal || r.interrupted)} held=${session.stepOrder?.held.length ?? 0}`)
+    }
     if (resultHasImages) session.occupancyMediaAfterFrame = beforeResultWrite
     if (completedPlanOperation) {
       clearPlanOperation(session.openCodeSessionId, completedPlanOperation)
       await persistPlanOperations(session)
     }
     if (endTurnAfterDelivery) session.planReviewDeclined = true
-    if (resultFinishesToolCall(session, pending)) noteToolCallFinished(session.toolCallOrder, pending.displayCallId)
+    if (resultFinishesToolCall(session, pending) && pending.displayCallId) finishOrderedCall(session.stepOrder, pending.displayCallId)
     // A host tool that ran after Cursor withdrew its exec still changed state the checkpoint before it lacks.
     if (outcome.framesWritten > 0 || replyDeferred || pending.bridged || pending.aborted) {
       invalidateResumeCheckpoint(session, beforeResultWrite, true)
@@ -5406,6 +5418,10 @@ function trackHostNoteInjection(
  * provider sent. Same outcomes as Cursor SDK `Run.steer`: `delivered` hands
  * the notes to the turn; `queued` waits; `queued_for_next_turn`, `cancelled`
  * and `rejected` keep them for the session's next user turn.
+ * A delivered note stays tracked until the Run stores a checkpoint after the
+ * ack (`forgetCheckpointedHostNotes`): the checkpoint stored before it lacks
+ * the note, and while the Run waits on a host tool the next one sits unread in
+ * `heldFrames`, so a restart saves the note with the deferred ones (#153).
  * Returns true when Cursor delivered an early steer: the model answers it next.
  */
 function applyContextInjectionState(session: CursorSession, value: unknown): boolean {
@@ -5421,12 +5437,28 @@ function applyContextInjectionState(session: CursorSession, value: unknown): boo
   const entries = sessionKey ? hostNoteInjectionsBySession.get(sessionKey) : undefined
   const entry = update.injection_id ? entries?.get(update.injection_id) : undefined
   if (!sessionKey || !entries || !entry || kind === "queued" || kind === "unknown") return false
+  if (kind === "delivered") {
+    entry.delivered = true
+    return false
+  }
   entries.delete(update.injection_id!)
   if (entries.size === 0) hostNoteInjectionsBySession.delete(sessionKey)
-  if (kind === "delivered") return false
   appendUndeliveredHostNotes(sessionKey, [{ notes: entry.notes, order: entry.order }])
   trace(`continuation: host note injection ${kind}; kept for the next user turn sessionKey=${sessionKey}`)
   return false
+}
+
+/** A checkpoint `session` stored after a delivery ack holds that note. */
+function forgetCheckpointedHostNotes(session: CursorSession): void {
+  const sessionKey = session.openCodeSessionId
+  const entries = sessionKey ? hostNoteInjectionsBySession.get(sessionKey) : undefined
+  if (!sessionKey || !entries) return
+  for (const [injectionId, entry] of entries) {
+    if (entry.session !== session || !entry.delivered) continue
+    entries.delete(injectionId)
+    trace(`continuation: delivered host note injection checkpointed id=${injectionId}`)
+  }
+  if (entries.size === 0) hostNoteInjectionsBySession.delete(sessionKey)
 }
 
 /**
@@ -5561,8 +5593,9 @@ export function prepareUserTurnHostNotes(input: {
 
 /**
  * An in-progress save's notes. Only those the Run's own request delivered are
- * known to be in its checkpoint; an unacknowledged injection may not be, so it
- * is deferred like one released from a closed Run.
+ * known to be in its checkpoint; an injection not yet in a stored checkpoint,
+ * acknowledged or not, may not be, so it is deferred like one released from a
+ * closed Run.
  */
 function heldRunHostNotes(session: CursorSession, sessionKey: string): { hostNote?: string; runHostNote?: string } {
   const injected = [...(hostNoteInjectionsBySession.get(sessionKey)?.values() ?? [])].filter((entry) => entry.session === session)
@@ -5815,12 +5848,15 @@ export function continuationAfterEarlySteers(
   const takesSteers = steers.length === 0 && heldRunTakesSteers(held, results, guard)
   if (steers.length === 0 && !takesSteers) return undefined
   // A later call of the step, deferred or still without its exec, would run after a message the model already sees.
-  const answeredCalls = new Set(results.map((result) => {
+  // An exec without a display id is ordered under its own id.
+  const answeredCalls = new Set(results.flatMap((result) => {
     const pending = held.pending.get(result.execId)
-    return pending && resultFinishesToolCall(held, pending) ? pending.displayCallId : undefined
+    return pending && resultFinishesToolCall(held, pending)
+      ? [pending.displayCallId, held.stepOrder?.execs.get(result.execId)?.callId]
+      : []
   }))
-  const laterCalls = hasDeferredToolExecs(held.toolCallOrder)
-    || (held.toolCallOrder?.calls ?? []).some((call) => !answeredCalls.has(call.callId))
+  const laterCalls = hasHeldExecs(held.stepOrder)
+    || unfinishedOrderedCalls(held.stepOrder).some((callId) => !answeredCalls.has(callId))
     || [...held.announcedCallIds ?? []].some((callId) => !answeredCalls.has(callId))
     || (held.carriedToolStep?.listed !== undefined && held.carriedToolStep.resolved.size < held.carriedToolStep.listed)
   // A Run Cursor already ended (kept for an answered step's queued frames) takes nothing more.
@@ -6103,26 +6139,38 @@ export async function pump(
   // reached us (exec request or display completion), and those sent to the host.
   const carried = session.carriedToolStep
   session.carriedToolStep = undefined
-  let toolStep = { listed: carried?.listed, resolved: carried?.resolved ?? new Set<string>(), hostCalls: 0 }
+  // `booked`: the step continues a Cursor step an earlier host step already booked.
+  let toolStep = { listed: carried?.listed, resolved: carried?.resolved ?? new Set<string>(), hostCalls: 0, booked: carried !== undefined }
   const toolStepComplete = () => toolStep.listed !== undefined && toolStep.resolved.size >= toolStep.listed
-  const order = toolCallOrder(session)
-  // The exec being handled can change state, so nothing after it may start in its step.
-  let execMutates = false
+  const order: StepOrder = session.stepOrder ??= createStepOrder()
+  /** The held exec whose frame this iteration handles. */
+  let released: HeldExec<Frame, ParsedExecRequest> | undefined
+  /** Host calls of this pass that came from a hold: their Cursor step was booked with the step that held them. */
+  let releasedHostCalls = 0
+  /** The ordered call whose exec this iteration dispatched, until the exec goes to the host: otherwise it was answered here. */
+  let answeredHere: string | undefined
   /** Count a host tool call; true when it must end the AI SDK step now. */
   const endsToolStep = (): boolean => {
     toolStep.hostCalls++
-    if (execMutates) {
+    if (released) releasedHostCalls++
+    // A released file change ends its host step: the rest of its Cursor step (its own write included) follows its result.
+    if (released && isFileChangeCall(order, released.callId)) {
       carryToolStep()
       return true
     }
     // Held calls count as received; the loop takes those that may join this step, then closes it.
-    return !cursorListsToolRequests || (toolStepComplete() && !hasDeferredToolExecs(order))
+    return !cursorListsToolRequests || (toolStepComplete() && !hasHeldExecs(order))
   }
   /** A step the ordering splits keeps Cursor's count, and the calls counted toward it, for the next pass. */
   const carryToolStep = (): void => {
-    if (hasDeferredToolExecs(order) || !toolStepComplete()) {
+    if (hasHeldExecs(order) || !toolStepComplete()) {
       session.carriedToolStep = { listed: toolStep.listed, resolved: toolStep.resolved }
     }
+  }
+  /** End the host step on tool calls; one that continues a booked Cursor step or ran only released calls books nothing. */
+  const finishToolStep = (): void => {
+    const unbilled = toolStep.hostCalls > 0 && (toolStep.booked || releasedHostCalls === toolStep.hostCalls)
+    emitFinish(undefined, { unified: "tool-calls", raw: undefined }, undefined, undefined, { unbilled })
   }
   /** End a held step; `requeue` is a frame read that belongs to the next pump pass. */
   const closeHeldToolStep = (reason: string, requeue?: IteratorResult<Frame>): void => {
@@ -6131,7 +6179,7 @@ export async function pump(
       `exec: tool step closed (${reason}) hostCalls=${toolStep.hostCalls} ` +
         `listed=${toolStep.listed ?? "-"} resolved=${toolStep.resolved.size}`,
     )
-    emitFinish(undefined, { unified: "tool-calls", raw: undefined })
+    finishToolStep()
   }
   /**
    * The Run ended after the held step's calls went out. They still run; the session closes when
@@ -6616,10 +6664,32 @@ export async function pump(
     reason: LanguageModelV3FinishReason,
     settledUsage?: LanguageModelV3Usage,
     settledSource?: string,
+    options?: { unbilled?: boolean },
   ) => {
     settleOpenEarlyRows(reason.unified === "tool-calls" && emittedHostTools > 0)
     flushToollessText()
     closeOpenSpans()
+    if (options?.unbilled && !te) {
+      // Calls released from a hold belong to a Cursor step already booked with
+      // the host step that held them. OpenCode 2 prices any reported token, so
+      // this step reports none and costs nothing; its output stays for TurnEnded.
+      trace(`billing: step=released pricing=${session.billing.cost ? "priced" : "unpriced"} stepUsd=0.000000 ` +
+        `key=${session.billing.key}`)
+      const delivered = safeEnqueue({
+        type: "finish",
+        usage: emptyLanguageModelV3Usage(),
+        finishReason: reason,
+        providerMetadata: {
+          copilot: { totalNanoAiu: 0 },
+          cursor: { usageVersion: 3, occupancyOnly: true, releasedStep: true },
+        },
+      } as V3Part)
+      if (delivered && session.openCodeSessionId) {
+        finishEmittedStep(session.openCodeSessionId, session.conversationId)
+        if (reason.unified === "tool-calls") scheduleHeldRunSave(session)
+      }
+      return
+    }
     const est = session.usageEstimate
     // OpenCode TUI/GUI replace each assistant message's tokens (they do not
     // sum occupancy) and the TUI footer requires tokens.output > 0. Cost and
@@ -6794,7 +6864,7 @@ export async function pump(
         `sessionRealOutput=${bookedOutput.real.output} sessionReportedOutput=${bookedOutput.reported.output} ` +
         `key=${billing.key}`,
     )
-    if (reason.unified === "tool-calls" && hasDeferredToolExecs(order)) carryToolStep()
+    if (reason.unified === "tool-calls" && hasHeldExecs(order)) carryToolStep()
   }
 
   // The cancel path drains and closes the Run; a frame read here goes back to it.
@@ -6893,6 +6963,9 @@ export async function pump(
   }
 
   while (true) {
+    released = undefined
+    if (answeredHere) finishOrderedCall(order, answeredHere)
+    answeredHere = undefined
     if (session.hostInterrupted) stopForHostInterrupt()
     // A declined review or a plan handoff ends this Run with its own cancellation.
     if (session.modelSwitch && !session.planReviewDeclined
@@ -6987,32 +7060,32 @@ export async function pump(
       continue
     }
 
-    if (toolStepComplete() && !hasDeferredToolExecs(order)) {
+    // Control frames already received take effect before a held call can run.
+    if (hasHeldExecs(order)) applyQueuedAborts(session)
+    // Calls held behind a file change that the host refused or the user stopped do not run.
+    for (const held of takeCancelledExecs(order)) {
+      const row = earlyRows.claim(held.callId)
+      if (row) closeEarlyRow(row, { kind: "outcome", ...cursorEditFailure(row.path, HELD_CALL_CANCELLED_REASON) })
+      trace(`step-order: cancelled held execId=${held.execId} callId=${held.callId.replace(/\r?\n/g, "\\n")}`)
+      if (!await replyExecRefusal(held.request, HELD_CALL_CANCELLED_REASON, "held call cancelled")) return
+    }
+
+    if (toolStepComplete() && !hasHeldExecs(order)) {
       if (toolStep.hostCalls > 0) {
         closeHeldToolStep("all listed calls received")
         return
       }
       // A step whose calls Cursor answered itself; the next calls belong to a new step.
-      toolStep = { listed: undefined, resolved: new Set(), hostCalls: 0 }
+      toolStep = { listed: undefined, resolved: new Set(), hostCalls: 0, booked: false }
     }
 
-    execMutates = false
-    let released = takeReadyToolExec(order)
-    let waitForOrderMs: number | undefined
-    if (!released && hasDeferredToolExecs(order)) {
-      if (toolStep.hostCalls > 0) {
-        closeHeldToolStep("the held calls wait for this step's results")
-        return
-      }
-      const quietMs = Date.now() - order.progressAt
-      if (session.pending.size === 0 && !session.cursorWaits?.size) {
-        if (quietMs >= toolCallOrderTiming.releaseQuietMs) {
-          released = forceReleaseToolExec(order)
-          trace(`exec order: released held execId=${released?.execId} after ${quietMs}ms without progress`)
-        } else {
-          waitForOrderMs = toolCallOrderTiming.releaseQuietMs - quietMs
-        }
-      }
+    // One held exec per iteration; the rest wait their turn, re-held so a pass that ends here keeps them.
+    const releasable = takeReleasableExecs(order)
+    released = releasable.shift()
+    for (const later of releasable) holdExec(order, later)
+    if (!released && hasHeldExecs(order) && toolStep.hostCalls > 0) {
+      closeHeldToolStep("the held calls wait for this step's results")
+      return
     }
 
     if (!planTurnCancellationRequested && session.pending.size === 0
@@ -7035,12 +7108,8 @@ export async function pump(
     let next: IteratorResult<Frame>
     try {
       if (released) {
-        trace(`exec order: running held execId=${released.execId} callId=${released.callId ?? "-"}`)
-        next = released.read
-      } else if (waitForOrderMs !== undefined) {
-        const read = await nextFrameWithin(session, waitForOrderMs)
-        if (!read) continue
-        next = read
+        trace(`step-order: released execId=${released.execId} callId=${released.callId.replace(/\r?\n/g, "\\n")}`)
+        next = { done: false, value: released.frame }
       } else if (toolStep.hostCalls > 0) {
         const held = await nextFrameWithin(session, HELD_TOOL_STEP_QUIET_MS)
         if (!held) {
@@ -7149,7 +7218,6 @@ export async function pump(
       continue
     }
     const iu = asm.interaction_update as Record<string, unknown> | undefined
-    if (!iu?.heartbeat) order.progressAt = Date.now()
     // Output after a step's tool calls belongs to the next step.
     if (toolStep.hostCalls > 0 && (iu?.text_delta || iu?.thinking_delta || iu?.turn_ended)) {
       // The Run is terminal even though the host still owes the step's results.
@@ -7193,7 +7261,7 @@ export async function pump(
         toolStep.resolved.add(execCallId)
         announcedCalls.delete(execCallId)
         session.announcedCallIds?.delete(execCallId)
-        noteToolCallFinished(order, execCallId)
+        finishOrderedCall(order, execCallId)
         session.displayToolCalls.delete(execCallId)
         const beforeWrite = lastFrameArrival()
         if (!await writeExecFrames(written.rebuild!(esm.id as number), `replayed result id=${esm.id}`)) return
@@ -7303,6 +7371,7 @@ export async function pump(
         noteRunImageCheckpoint(session, bytes, frame)
         if (accepted) session.resultsAfterCheckpoint = undefined
         markEarlySteersCheckpointed(session.openCodeSessionId, session.sessionId)
+        forgetCheckpointedHostNotes(session)
         const rawTokenDetails = decodeConversationTokenDetails(bytes)
         // A zero reading leaves the reset on the guard until the next positive one.
         if (observation.bypass && rawTokenDetails) session.occupancyMediaAfterFrame = undefined
@@ -7337,8 +7406,8 @@ export async function pump(
     if (iu?.partial_tool_call || iu?.tool_call_started) openModelStep()
     if (iu?.partial_tool_call || iu?.tool_call_started || iu?.text_delta || esm) endThinkingRun()
     // Model output opens the next model step; a count carried from the last one no longer applies.
-    if ((iu?.text_delta || iu?.thinking_delta) && toolStep.hostCalls === 0 && !hasDeferredToolExecs(order)) {
-      toolStep = { listed: undefined, resolved: new Set(), hostCalls: 0 }
+    if ((iu?.text_delta || iu?.thinking_delta) && toolStep.hostCalls === 0 && !hasHeldExecs(order)) {
+      toolStep = { listed: undefined, resolved: new Set(), hostCalls: 0, booked: false }
     }
     if (iu?.text_delta && !session.planReviewDeclined) {
       const delta = iu.text_delta as Record<string, unknown>
@@ -7410,7 +7479,7 @@ export async function pump(
       // TurnEnded counts what this Run streamed; a reopened Run estimates only its own output.
       stepOutputChars = 0
       stepReasoningChars = 0
-      session.toolCallOrder = undefined
+      session.stepOrder = undefined
       settleOpenEarlyRows()
       // A checkpoint from before the step's results (or from an earlier Run) would drop the step
       // from any turn that resumed it, so it is neither kept nor saved.
@@ -7563,11 +7632,11 @@ export async function pump(
           editToolCalls.set(callId, { path: editPath })
         }
         if (display) noteCursorWaitStarted(session, callId, display.variant, display.args)
-        noteToolCallStarted(
-          order,
-          callId,
-          display ? displayToolCallMutates(display.variant, display.args, display.preferredToolName) : true,
-        )
+        // Resolve an MCP call's host tool as `parseExecServerMessage` resolves its exec.
+        const mcpHostTool = display?.variant === "mcp_tool_call"
+          ? mapCursorArgsToOpencode(display.preferredToolName, display.args, "mcp_args", session.hostToolDialect).toolName
+          : undefined
+        announceCall(order, callId, isFileChangeDisplay(toolCall, mcpHostTool))
         const callIdLog = callId.replace(/\r?\n/g, "\\n")
         let wireFields = ""
         if (variant === "?") {
@@ -7582,6 +7651,7 @@ export async function pump(
       cursorListsToolRequests = true
       const listed = iu.tool_requests_listed as Record<string, unknown>
       toolStep.listed = Number(listed.call_count ?? 0)
+      noteOrderedCallCount(order, toolStep.listed)
       trace(
         `tool_requests_listed: count=${toolStep.listed} resolved=${toolStep.resolved.size} ` +
           `hostCalls=${toolStep.hostCalls}`,
@@ -7614,7 +7684,7 @@ export async function pump(
       if (callId) announcedCalls.delete(callId)
       if (callId) session.announcedCallIds?.delete(callId)
       if (callId) noteCursorWaitEnded(session, callId)
-      noteToolCallFinished(order, callId)
+      if (callId) finishOrderedCall(order, callId)
       // If exec already claimed this call_id, display map entry is gone — skip.
       if (!callId || !session.displayToolCalls.has(callId)) {
         if (callId) {
@@ -7709,7 +7779,7 @@ export async function pump(
               input,
             } as V3Part)
             if (endsToolStep()) {
-              emitFinish(undefined, { unified: "tool-calls", raw: undefined })
+              finishToolStep()
               return
             }
             continue
@@ -7717,6 +7787,7 @@ export async function pump(
         }
       }
     } else if (iu?.step_started) {
+      startOrderedStep(session.stepOrder)
       cacheDiagnostics.stepStarts++
     } else if (iu?.step_completed) {
       cacheDiagnostics.stepCompletes++
@@ -7724,7 +7795,7 @@ export async function pump(
     } else if (iu?.context_injection_state) {
       if (applyContextInjectionState(session, iu.context_injection_state)) textBreakPending = true
     } else if (esm) {
-      cacheDiagnostics.execRequests++
+      if (!released) cacheDiagnostics.execRequests++
       const esmId = (esm.id as number) ?? 0
       {
         const callId = extractExecDisplayCallId(esm)
@@ -7829,11 +7900,13 @@ export async function pump(
         replaySafety.markBarrier("non-control-exec")
         openModelStep()
         const displayCallId = extractExecDisplayCallId(esm)
-        // A refused exec is final for its announced row, on every refusal path.
+        const orderedCallId = displayCallId ?? `cursor_${session.sessionId}_${esmId}`
+        // A refused exec is final for its announced row and its ordered call, on every refusal path.
         const rejectExec = async (parsed: ParsedExecRequest, reason: string, label: string) => {
           const row = earlyRows.claim(displayCallId)
           // The row is already failed, so Cursor's later completion adds no second one.
           if (row) closeEarlyRow(row, { kind: "outcome", ...cursorEditFailure(row.path, reason) })
+          finishOrderedCall(order, orderedCallId)
           return replyExecRefusal(parsed, reason, label)
         }
         const parsed = parseExecServerMessage(esm, session.hostToolDialect)
@@ -7866,7 +7939,7 @@ export async function pump(
             toolStep.resolved.add(displayCallId)
             announcedCalls.delete(displayCallId)
             session.announcedCallIds?.delete(displayCallId)
-            noteToolCallFinished(order, displayCallId)
+            finishOrderedCall(order, displayCallId)
           }
           if (!await writeExecFrames(runtimeMessages, `runtime metadata reply id=${esmId}`)) return
           if (displayCallId) session.displayToolCalls.delete(displayCallId)
@@ -7887,23 +7960,23 @@ export async function pump(
           announcedCalls.delete(ownRequestCallId)
           session.announcedCallIds?.delete(ownRequestCallId)
         }
-        if (parsed) {
-          // A generated image's write names no call but runs inside one of the open GenerateImage calls, which Cursor
-          // completes only after reading the write's result: it takes the first one's place, not a place behind them.
-          const orderCallId = displayCallId ?? (binaryWritePayload(parsed)
-            ? [...session.displayToolCalls].find(([, toolCall]) => toolCall.generate_image_tool_call)?.[0]
-            : undefined)
-          execMutates = noteToolCallExec(
-            order,
-            orderCallId,
-            toolExecMutates(parsed.toolName, parsed.args, parsed.resultField),
-            isShellResultField(parsed.resultField),
-          )
-          if (!released?.forced && toolExecMustWait(order, orderCallId, execMutates)) {
-            deferToolExec(order, { execId: parsed.id, callId: orderCallId, mutating: execMutates, read: next })
+        const execSideEffect = !!parsed && toolExecMutates(parsed.toolName, parsed.args, parsed.resultField)
+        // Keep the model's order in a step that changes a file (`src/step-order.ts`). Image bytes stay
+        // unordered: Cursor does not wait for an input image's copy.
+        if (session.allowTools && parsed && !binaryWritePayload(parsed)) {
+          const decision = released
+            ? "run"
+            : orderExec(order, orderedCallId, isFileChangeExec(parsed.resultField, parsed.toolName))
+          if (decision === "cancel") {
+            if (!await rejectExec(parsed, HELD_CALL_CANCELLED_REASON, "after a refused file change")) return
+            if (displayCallId) session.displayToolCalls.delete(displayCallId)
+            continue
+          }
+          if (decision === "hold") {
+            holdExec(order, { callId: orderedCallId, execId: parsed.id, frame, request: parsed, pending: undefined })
             trace(
-              `exec order: held execId=${parsed.id} callId=${orderCallId ?? "-"} toolName=${parsed.toolName} ` +
-                `mutating=${execMutates} behind=[${order.calls.map((entry) => entry.callId).join(",")}]`,
+              `step-order: HELD execId=${parsed.id} toolName=${parsed.toolName} ` +
+                `callId=${orderedCallId.replace(/\r?\n/g, "\\n")} held=${order.held.length}`,
             )
             if (toolStep.hostCalls > 0) {
               closeHeldToolStep("a call waits for this step's results")
@@ -7911,6 +7984,10 @@ export async function pump(
             }
             continue
           }
+          const fileChangeRead = isFileChangeCall(order, orderedCallId) && parsed.resultField === "read_result"
+          runExec(order, orderedCallId, parsed.id, fileChangeRead)
+          // An edit's private read answered here does not finish the edit: its write follows.
+          if (!fileChangeRead) answeredHere = orderedCallId
         }
         if (parsed) {
           const executableToolName = resolveCustomWebToolAlias(parsed.toolName, session.toolAliases)
@@ -8121,7 +8198,7 @@ export async function pump(
               input: JSON.stringify({ image_id: imageId }),
             } as V3Part)
             if (endsToolStep()) {
-              emitFinish(undefined, { unified: "tool-calls", raw: undefined })
+              finishToolStep()
               return
             }
             continue
@@ -8206,7 +8283,7 @@ export async function pump(
             session.displayToolCalls.delete(displayCallId)
             trace(`exec: claimed display callId=${displayCallId}`)
           }
-          if (execMutates) session.sideEffectAfterCheckpoint = true
+          if (execSideEffect) session.sideEffectAfterCheckpoint = true
           const boundEarly = earlyRows.claim(displayCallId)
           let earlyToolCallId: string | undefined
           if (boundEarly) {
@@ -8236,6 +8313,7 @@ export async function pump(
           }
           // Keep the stream open; the result arrives on the next doStream call.
           replaySafety.recordHostExec(parsed.id)
+          answeredHere = undefined
           sessionManager.registerPending(
             parsed.id,
             session,
@@ -8275,7 +8353,7 @@ export async function pump(
             input: tc.input,
           } as V3Part)
           if (endsToolStep()) {
-            emitFinish(undefined, { unified: "tool-calls", raw: undefined })
+            finishToolStep()
             return
           }
           continue
@@ -8742,8 +8820,8 @@ export async function pump(
       // The ordering does not hold a step for a later call the way a parallel step does, so an
       // earlier call's exec would close the row of a call announced behind it.
       && [...announcedCalls].every((callId) => callId === announced.callId)
-      && order.calls.every((call) => call.callId === announced.callId)
-      && !hasDeferredToolExecs(order)
+      && unfinishedOrderedCalls(order).every((callId) => callId === announced.callId)
+      && !hasHeldExecs(order)
       && shouldOpenEarlyRow({
         allowTools: session.allowTools && !isPlanTurnEnding(),
         hostInterrupted: !!session.hostInterrupted,
@@ -8780,6 +8858,22 @@ export async function pump(
     // still decides the call. Checkpoints and interaction queries are
     // handled above.
   }
+}
+type StepOrder = StepOrderState<Frame, ParsedExecRequest>
+
+function heldExecIds(order: StepOrder | undefined): number[] {
+  return order?.held.map((held) => held.execId) ?? []
+}
+
+function hasHeldExecs(order: StepOrder | undefined): boolean {
+  return (order?.held.length ?? 0) > 0
+}
+
+/** Calls of the step that neither finished nor were refused. */
+function unfinishedOrderedCalls(order: StepOrder | undefined): string[] {
+  return [...order?.calls ?? []]
+    .filter(([, call]) => call.state !== "done" && call.state !== "refused")
+    .map(([callId]) => callId)
 }
 
 /** Normalize protobufjs bytes / Buffer / number[] into a Uint8Array. */

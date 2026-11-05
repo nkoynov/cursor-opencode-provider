@@ -169,7 +169,7 @@ describe("parallel tool-call pump", () => {
     expect(session.pending.size).toBe(1)
   })
 
-  it.each([false, true])("holds a streamed edit behind the call before it, then counts it at its write (patch catalog: %s)", async patch => {
+  it.each([false, true])("runs a streamed edit after the call before it (patch catalog: %s)", async patch => {
     const root = fs.mkdtempSync("/tmp/cursor-parallel-edit-")
     const target = path.join(root, "target.ts")
     fs.writeFileSync(target, "export const value = 1\n")
@@ -196,9 +196,10 @@ describe("parallel tool-call pump", () => {
       await pump(session, controller, ids)
       // The edit changes state, so (OW-20) its exec waits until the shell call before it finishes.
       expect(reads()).toBe(4)
+      // The edit's private read waits for the shell the model called before it.
       expect(toolCalls(parts).map(p => p.toolName)).toEqual(["bash"])
       expect(finishes(parts)).toHaveLength(1)
-      expect(session.toolCallOrder?.deferred.map(exec => exec.execId)).toEqual([2])
+      expect(session.stepOrder?.held.map(held => held.execId)).toEqual([2])
       const [bash] = toolCalls(parts)
       expect(await deliverContinuationResults(session, [{
         toolCallId: bash!.toolCallId, sessionId: session.sessionId, execId: 1, toolName: "bash", output: "test",

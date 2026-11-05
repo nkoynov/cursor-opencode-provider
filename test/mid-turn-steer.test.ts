@@ -22,6 +22,8 @@ import { analyzeReplayFrame } from "../src/replay-safety.js"
 import { resetCursorShellCalls } from "../src/shell-timeout.js"
 import { CURSOR_COMPACTION_OPTION } from "../src/shared.js"
 import { useTempHostCache } from "./host-cache.js"
+import type { ParsedExecRequest } from "../src/protocol/tools.js"
+import { announceCall, createStepOrder, holdExec, runExec } from "../src/step-order.js"
 
 useTempHostCache()
 
@@ -33,6 +35,14 @@ const MODEL = "cursor-test"
 const NOTE = "<system-update>\nInstructions from: /w/pkg/AGENTS.md\nIndent with tabs.\n</system-update>"
 /** The note as Cursor gets it: a host note is injected as plain text. */
 const NOTE_TEXT = "Instructions from: /w/pkg/AGENTS.md\nIndent with tabs."
+
+/** A step order whose calls are announced and unfinished, with the given execs held. */
+function stepOrderOf(callIds: string[], held: Array<{ callId: string; execId: number; frame: Frame }> = []) {
+  const order = createStepOrder<Frame, ParsedExecRequest>()
+  for (const callId of callIds) announceCall(order, callId, false)
+  for (const entry of held) holdExec(order, { ...entry, request: {} as ParsedExecRequest, pending: undefined })
+  return order
+}
 const ABORTED = JSON.stringify({ error: { type: "aborted", message: "Tool execution interrupted" }, content: [] })
 
 function heldSession(id: string, modelId?: string): HeldSession {
@@ -227,11 +237,7 @@ describe("mid-turn user message after a complete step", () => {
 
   it("keeps the message for a follow-up while a later call of the step is still deferred", () => {
     const held = heldReads("deferred")
-    held.toolCallOrder = {
-      calls: [{ callId: "call_3", mutating: true }],
-      deferred: [{ execId: 3, callId: "call_3", mutating: true, read: { done: true, value: undefined } }],
-      progressAt: Date.now(),
-    }
+    held.stepOrder = stepOrderOf(["call_3"], [{ callId: "call_3", execId: 3, frame: serverFrame({ text_delta: { text: "" } }) }])
     const found = steered(steer("deferred", user("b")))!
     expect(found.results.map((r) => r.execId)).toEqual([1, 2])
     expect(found.messages).toEqual([])
@@ -240,16 +246,12 @@ describe("mid-turn user message after a complete step", () => {
 
   it("keeps the message for a follow-up while a later or unfinished call has no exec yet", () => {
     const held = heldReads("announced")
-    held.toolCallOrder = {
-      calls: [{ callId: "call_1", mutating: false }, { callId: "call_2", mutating: false }, { callId: "call_3", mutating: true }],
-      deferred: [],
-      progressAt: Date.now(),
-    }
+    held.stepOrder = stepOrderOf(["call_1", "call_2", "call_3"])
     expect(steered(steer("announced", user("b")))?.messages).toEqual([])
     sessionManager.dispose()
     const edit = heldReads("edit-read")
     edit.editToolCalls = new Map([["call_2", {}]]) as CursorSession["editToolCalls"]
-    edit.toolCallOrder = { calls: [{ callId: "call_1", mutating: false }, { callId: "call_2", mutating: true }], deferred: [], progressAt: Date.now() }
+    edit.stepOrder = stepOrderOf(["call_1", "call_2"])
     expect(steered(steer("edit-read", user("b")))?.messages).toEqual([])
     sessionManager.dispose()
     const partial = heldReads("partial-only")
@@ -265,7 +267,7 @@ describe("mid-turn user message after a complete step", () => {
     expect(steered(steer("uncounted", user("b")))?.messages).toEqual(["b"])
     sessionManager.dispose()
     const answered = heldReads("answered")
-    answered.toolCallOrder = { calls: [{ callId: "call_1", mutating: false }, { callId: "call_2", mutating: false }], deferred: [], progressAt: Date.now() }
+    answered.stepOrder = stepOrderOf(["call_1", "call_2"])
     expect(steered(steer("answered", user("b")))?.messages).toEqual(["b"])
   })
 
@@ -492,14 +494,18 @@ describe("doStream with a mid-turn user message", () => {
   it("runs a deferred later call of the step before the message, which goes as a follow-up Run", async () => {
     const held = heldReads("deferred-stream")
     held.resumeCheckpoint = new Uint8Array([1])
-    held.toolCallOrder = {
-      calls: [{ callId: "call_1", mutating: false }, { callId: "call_2", mutating: false }, { callId: "call_3", mutating: true }],
-      deferred: [{
-        execId: 3, callId: "call_3", mutating: true,
-        read: { done: false, value: serverFrame({ text_delta: { text: "Deferred call ran." } }) },
-      }],
-      progressAt: Date.now(),
-    }
+    // call_3 changes a file, so it waits for the two calls before it.
+    const order = createStepOrder<Frame, ParsedExecRequest>()
+    announceCall(order, "call_1", false)
+    runExec(order, "call_1", 1, false)
+    announceCall(order, "call_2", false)
+    runExec(order, "call_2", 2, false)
+    announceCall(order, "call_3", true)
+    holdExec(order, {
+      callId: "call_3", execId: 3, frame: serverFrame({ text_delta: { text: "Deferred call ran." } }),
+      request: {} as ParsedExecRequest, pending: undefined,
+    })
+    held.stepOrder = order
     const followUps: string[] = []
     held.reopenWithUserMessage = async (text) => {
       followUps.push(text)

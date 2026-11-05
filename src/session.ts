@@ -8,14 +8,15 @@ import type {
   HostSubagentCatalog,
   HostToolDialect,
   OpencodeToolDef,
+  ParsedExecRequest,
   ToolAliasRegistry,
 } from "./protocol/tools.js"
 import type { CursorConversationTokenDetails } from "./protocol/token-details.js"
 import type { HostToolRun, ModelSwitch } from "./model-fallback.js"
 import type { ContextEpoch } from "./context/epoch.js"
-import type { ToolCallOrder } from "./tool-call-order.js"
 import type { HostNoteBatch } from "./protocol/host-notes.js"
 import type { RunHistoryImages } from "./protocol/sent-history-images.js"
+import type { StepOrderState } from "./step-order.js"
 import type { OpenCodeModelCost } from "./pricing.js"
 import type { RunCostEstimate } from "./billing.js"
 import type { ReplaySafetyState } from "./replay-safety.js"
@@ -397,8 +398,8 @@ export type CursorSession = {
    * must see, in arrival order. Every reader takes them before `queuedFrame`.
    */
   heldFrames?: Frame[]
-  /** The current step's unfinished tool calls in model order, and the execs held back behind them. */
-  toolCallOrder?: ToolCallOrder
+  /** Model-order holds for a step that changes a file (`src/step-order.ts`). */
+  stepOrder?: StepOrderState<Frame, ParsedExecRequest>
   /** Cursor's call count for a step that the ordering split over several pump passes. */
   carriedToolStep?: { listed?: number; resolved: Set<string> }
   pending: Map<number, PendingExec>
@@ -1071,6 +1072,7 @@ export class SessionManager {
     session.queuedFrame = undefined
     session.heldFrames = undefined
     session.carriedToolStep = undefined
+    session.stepOrder = undefined
     this.subscribeTerminal(session)
     try { old.destroy() } catch { /* already closed */ }
   }
@@ -1142,6 +1144,7 @@ export class SessionManager {
     session.queuedFrame = undefined
     session.heldFrames = undefined
     session.carriedToolStep = undefined
+    session.stepOrder = undefined
     session.pumpOwner = null
     session.pumpActive = false
     session.displayToolCalls?.clear()

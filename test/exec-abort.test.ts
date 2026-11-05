@@ -7,7 +7,8 @@ import {
   resetTurnStateForTests,
 } from "../src/language-model.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
-import { toolsToDescriptors } from "../src/protocol/tools.js"
+import { toolsToDescriptors, type ParsedExecRequest } from "../src/protocol/tools.js"
+import { announceCall, createStepOrder, holdExec } from "../src/step-order.js"
 import { SessionManager, sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { resetCursorShellCalls } from "../src/shell-timeout.js"
 
@@ -146,13 +147,15 @@ describe("Cursor's exec abort (ExecServerControlMessage.abort)", () => {
     const session = heldSession(script.frames)
     const { controller } = collector()
     await pumpWithRecovery({ initialSession: session, controller, recover: async () => { throw new Error("no") } })
-    const order = { calls: [], deferred: [{ execId: 2, callId: "b", mutating: false, read: { done: false as const, value: text("x") } }], progressAt: Date.now() }
-    session.toolCallOrder = order
+    const order = createStepOrder<Frame, ParsedExecRequest>()
+    announceCall(order, "a", true)
+    holdExec(order, { callId: "b", execId: 2, frame: text("x"), request: {} as ParsedExecRequest, pending: undefined })
+    session.stepOrder = order
 
     script.push(execAbort(2))
-    await until(() => order.deferred.length === 0)
+    await until(() => order.held.length === 0)
 
-    expect(order.deferred).toEqual([])
+    expect(order.held).toEqual([])
     expect(session.heldFrames ?? []).toEqual([])
   })
 

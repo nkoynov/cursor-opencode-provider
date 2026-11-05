@@ -301,7 +301,12 @@ These are failure lessons shared by both hosts, not a replacement for
   (`test/host-notes-run.test.ts`, `test/image-input.test.ts`).
 - **Injection needs acknowledgement and ordered fallback.** A written note is
   not necessarily consumed. Retry/defer it with its owning turn; an action may
-  remove only the batches it captured (`test/host-notes.test.ts`).
+  remove only the batches it captured (`test/host-notes.test.ts`). `delivered`
+  is not persisted either: Cursor stores the checkpoint holding the note after
+  the ack, and while the Run waits on a host tool that checkpoint sits unread
+  in `heldFrames`, so dropping the note on the ack lost it across a restart
+  (#153). Keep it deferred until the Run stores a later checkpoint
+  (`forgetCheckpointedHostNotes`, `test/host-notes-run.test.ts`).
 - **Every provider-minted tool-call id must stay recognizable.** Early-row ids
   routed only through a live-Run table were dropped once the Run closed, so the
   completed edit never reached Cursor. Keep routes like tombstones and parse the
@@ -349,6 +354,34 @@ These are failure lessons shared by both hosts, not a replacement for
   `test/activity.test.ts`, `test/session.test.ts`).
 
 ## Planning and file mutations
+
+- **Concurrent host execution reorders a step.** An edit and a `git commit`
+  in one step committed before the edit landed: both hosts run a step's calls
+  at once, and Cursor sends an edit's write only after its read, so the command
+  even reached the host first ([discussion #145](https://github.com/oakimov/cursor-opencode-provider/discussions/145),
+  [#151](https://github.com/oakimov/cursor-opencode-provider/issues/151)).
+  Hold the calls after a file change behind its result, by model order, never
+  on a timer: a permission prompt would reopen the race. A held exec frame is
+  dispatched again, so it must skip the replay accounting it already passed
+  and keep its pending entry owed while it waits. Provider mapping refusals
+  finish their own calls; host refusals cancel the calls that follow them
+  (`test/step-order-pump.test.ts`, `test/step-order.test.ts`). Locally answered
+  execs without a display id must settle the same fallback id used for
+  ordering. Apply queued aborts before redispatch, and retain the generation's
+  listed count across an idle host-step split: the first denied edit can
+  finish before a later listed call even arrives. Otherwise the call stays
+  blocked forever, runs after its withdrawal, or escapes the denial. An unknown
+  count is not zero: before count-capability discovery, the first host call
+  can finish before its same-generation follower or count arrives (#154).
+  Retain its refusal until the count proves completion or `step_started`
+  explicitly begins a new generation (`retains refusal when the count arrives
+  late`, `cancels an uncounted follower` in those tests).
+  A new exec or emitted host phase counts in its current step even when the
+  call id already ran the edit's prerequisite read. Treating that write as a
+  late display completion left the listed count unmet and added the idle
+  guard's delay before releasing followers. Held and locally refused phases
+  need the same accounting; genuinely late display completions still do not
+  count (`test/step-order-pump.test.ts`, earlier permission-read cases).
 
 - **Gate the unavoidable transition and stop on refusal.** The model wrote a
   plan and stopped without volunteering SwitchMode. Attach approval to

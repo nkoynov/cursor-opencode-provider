@@ -1,156 +1,8 @@
 /**
- * Order of a model step's tool calls, as Claude Code runs them: consecutive
- * read-only calls run together, a call that can change state (edit, write,
- * shell, an MCP tool not known to be read-only) starts only after every call
- * before it has finished, and the calls after it wait for it.
- *
- * Cursor sends each call's exec as soon as the model has generated it, and an
- * edit's write only after Cursor has its read, so exec arrival order is not
- * the model's order. `tool_call_started` is: calls are tracked from there, and
- * an exec whose call must wait is held back until the calls before it finish.
+ * Whether a tool call can change state, as Claude Code judges it: reads,
+ * searches, subagents, read-only shell lines and MCP tools with read-only names
+ * cannot. A Run resumed from a checkpoint taken before such a call would repeat it.
  */
-import type { Frame } from "./session.js"
-
-/** `provisional`: the display call did not say enough; its exec decides. */
-export type OrderedToolCall = { callId: string; mutating: boolean; provisional?: boolean }
-
-export type DeferredToolExec = {
-  execId: number
-  callId?: string
-  mutating: boolean
-  read: IteratorResult<Frame>
-  /** Released without its predecessors finishing (see `forceReleaseToolExec`). */
-  forced?: boolean
-}
-
-export type ToolCallOrder = {
-  /** Unfinished calls of the Run's current step, in model order. */
-  calls: OrderedToolCall[]
-  /** Exec frames held back, in arrival order. */
-  deferred: DeferredToolExec[]
-  /** Last time anything other than a heartbeat moved the Run. */
-  progressAt: number
-}
-
-/** Release a held exec after this long without progress, so a call Cursor never closes can't stall the Run. */
-export const toolCallOrderTiming = { releaseQuietMs: 15_000 }
-
-export function toolCallOrder(session: { toolCallOrder?: ToolCallOrder }): ToolCallOrder {
-  return session.toolCallOrder ??= { calls: [], deferred: [], progressAt: Date.now() }
-}
-
-export function noteToolCallStarted(order: ToolCallOrder, callId: string, mutating: boolean | undefined): void {
-  if (order.calls.some((call) => call.callId === callId)) return
-  order.calls.push(mutating === undefined ? { callId, mutating: true, provisional: true } : { callId, mutating })
-  order.progressAt = Date.now()
-}
-
-/**
- * An exec of the call arrived; returns whether the call can change state. A
- * shell exec can still turn a call into a state-changing one (a background
- * spawn); for other tools the display call decides.
- */
-export function noteToolCallExec(
-  order: ToolCallOrder,
-  callId: string | undefined,
-  execMutating: boolean,
-  shellExec: boolean,
-): boolean {
-  const call = callId ? order.calls.find((entry) => entry.callId === callId) : undefined
-  if (!call) {
-    if (callId) order.calls.push({ callId, mutating: execMutating })
-    return execMutating
-  }
-  if (call.provisional) call.mutating = execMutating
-  else if (shellExec) call.mutating ||= execMutating
-  call.provisional = false
-  return call.mutating
-}
-
-export function noteToolCallFinished(order: ToolCallOrder | undefined, callId: string | undefined): void {
-  if (!order || !callId) return
-  const index = order.calls.findIndex((call) => call.callId === callId)
-  if (index < 0) return
-  order.calls.splice(index, 1)
-  order.progressAt = Date.now()
-}
-
-/** True when an exec of `callId` must wait for an unfinished call before it. */
-export function toolExecMustWait(order: ToolCallOrder, callId: string | undefined, mutating: boolean): boolean {
-  const index = callId ? order.calls.findIndex((call) => call.callId === callId) : -1
-  const earlier = index >= 0 ? order.calls.slice(0, index) : order.calls.filter((call) => call.callId !== callId)
-  const self = index >= 0 ? order.calls[index]!.mutating || mutating : mutating
-  return earlier.some((call) => self || call.mutating)
-}
-
-export function deferToolExec(order: ToolCallOrder, exec: DeferredToolExec): void {
-  order.deferred.push(exec)
-  order.progressAt = Date.now()
-}
-
-/** The first held exec whose call may now start. */
-export function takeReadyToolExec(order: ToolCallOrder | undefined): DeferredToolExec | undefined {
-  if (!order) return undefined
-  const index = order.deferred.findIndex((exec) => !toolExecMustWait(order, exec.callId, exec.mutating))
-  if (index < 0) return undefined
-  return order.deferred.splice(index, 1)[0]
-}
-
-export function forceReleaseToolExec(order: ToolCallOrder): DeferredToolExec | undefined {
-  const exec = order.deferred.shift()
-  if (exec) exec.forced = true
-  order.progressAt = Date.now()
-  return exec
-}
-
-/** Cursor withdrew a held exec: forget it and its call. */
-export function dropDeferredToolExec(order: ToolCallOrder | undefined, execId: number): DeferredToolExec | undefined {
-  if (!order) return undefined
-  const index = order.deferred.findIndex((exec) => exec.execId === execId)
-  if (index < 0) return undefined
-  const [exec] = order.deferred.splice(index, 1)
-  noteToolCallFinished(order, exec!.callId)
-  return exec
-}
-
-export function deferredToolExecIds(order: ToolCallOrder | undefined): number[] {
-  return order?.deferred.map((exec) => exec.execId) ?? []
-}
-
-export function hasDeferredToolExecs(order: ToolCallOrder | undefined): boolean {
-  return (order?.deferred.length ?? 0) > 0
-}
-
-const READ_ONLY_DISPLAY_VARIANTS = new Set([
-  "read_tool_call",
-  "grep_tool_call",
-  "glob_tool_call",
-  "ls_tool_call",
-  "web_search_tool_call",
-  "web_fetch_tool_call",
-  "fetch_tool_call",
-  "task_tool_call",
-  "await_tool_call",
-  "read_todos_tool_call",
-  "update_todos_tool_call",
-  "get_mcp_tools_tool_call",
-  "ask_question_tool_call",
-  "switch_mode_tool_call",
-  "create_plan_tool_call",
-  "pi_read_tool_call",
-  "pi_ls_tool_call",
-  "pi_grep_tool_call",
-  "pi_find_tool_call",
-])
-
-/** Whether a Cursor display call (`tool_call_started`) can change state; undefined when it doesn't say. */
-export function displayToolCallMutates(variant: string, args: Record<string, unknown>, toolName?: string): boolean | undefined {
-  if (variant === "shell_tool_call" || variant === "pi_bash_tool_call") {
-    return typeof args.command === "string" && args.command.trim() ? !readOnlyShellCommand(args.command) : undefined
-  }
-  if (variant === "mcp_tool_call") return !readOnlyToolName(toolName ?? "")
-  return !READ_ONLY_DISPLAY_VARIANTS.has(variant)
-}
 
 const READ_ONLY_HOST_TOOLS = new Set([
   "read",
@@ -171,7 +23,7 @@ const READ_ONLY_HOST_TOOLS = new Set([
   "question",
 ])
 
-/** Whether an exec with no display call can change state. */
+/** Whether an exec can change state. */
 export function toolExecMutates(toolName: string, args: Record<string, unknown>, resultField: string): boolean {
   if (resultField === "background_shell_spawn_result") return true
   if (toolName === "bash" || toolName === "shell") return !readOnlyShellCommand(args.command) || args.background === true

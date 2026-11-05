@@ -8,7 +8,10 @@ import {
   SessionManager,
   sessionManager,
   type CursorSession,
+  type Frame,
 } from "../src/session.js"
+import type { ParsedExecRequest } from "../src/protocol/tools.js"
+import { createStepOrder, holdExec } from "../src/step-order.js"
 
 let seq = 0
 function heldSession(openCodeSessionId: string, writes: Uint8Array[] = []): CursorSession {
@@ -210,11 +213,11 @@ describe("exec heartbeats", () => {
     sessionManager.registerPending(1, session, "shell_stream", "shell")
     sessionManager.registerPending(900_001, session, "todowrite", "todowrite", true)
     sessionManager.registerPending(3, session, ASK_QUESTION_RESULT_FIELD, "question")
-    session.toolCallOrder = {
-      calls: [],
-      deferred: [{ execId: 2, mutating: false, read: { done: false, value: { flags: 0, payload: encodeMessage("AgentServerMessage", {}) } } }],
-      progressAt: Date.now(),
-    }
+    session.stepOrder = createStepOrder<Frame, ParsedExecRequest>()
+    holdExec(session.stepOrder, {
+      callId: "held", execId: 2, frame: { flags: 0, payload: encodeMessage("AgentServerMessage", {}) },
+      request: {} as ParsedExecRequest, pending: undefined,
+    })
     session.policy = { ...DEFAULT_CONTINUATION_POLICY, heartbeatMs: 60_000 }
     live.push(session)
     attachSessionHeartbeat(session)
