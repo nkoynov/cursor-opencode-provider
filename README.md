@@ -526,6 +526,7 @@ Cursor sends a step's tool calls at once, and both OpenCode majors run them conc
 - A waiting call reaches OpenCode in a later host step, after the result it waits for. Cursor still sees one step: it gets its usual exec heartbeats while the call waits, and nothing is sent to Cursor twice.
 - When the user denies the file change or stops it, the calls after it are not run; Cursor is told why. A file change this provider refuses, or one that fails, does not cancel them. OpenCode 1.x reports a denial as an ordinary failure, and stops the turn on it unless `experimental.continue_loop_on_deny` is set; the held calls run only in that case.
 - A step without a file change runs every call at once, as before. Provider-owned runtime files and image saves are not ordered.
+- This fork orders a shell command the same way when it may change state: anything but a recognised read-only line (`git status`, `rg`, `ls`, `cat`, `gh pr view`, …), and every command started in the background (Cursor's background shell, or the host shell's `background`). A read-only command that only moves to the background when its `block_until_ms` runs out is not ordered. Reads, searches, subagents, MCP tools and read-only commands still run together.
 
 The host step of released calls reports no tokens and no cost: its Cursor step was already booked with the step that held them. Debug logs show `step-order: HELD` and `step-order: released`.
 

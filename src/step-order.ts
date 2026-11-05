@@ -14,6 +14,10 @@
  * completion or withdrawal of it, or this provider refusing it, as a failed
  * tool would under Cursor CLI. When the host refuses the file change (the user
  * denied it) or the user stops it, the calls that follow it are cancelled.
+ *
+ * Fork: a shell call the read-only classifier does not clear
+ * (`src/tool-call-order.ts`) counts as a file change here, so `fileChange`
+ * marks either kind of ordering point.
  */
 
 /** Display calls that change a file. Cursor's `write` arrives as an `edit_tool_call`. */
@@ -34,7 +38,7 @@ const FILE_CHANGE_RESULT_FIELDS: ReadonlySet<string> = new Set([
 const FILE_CHANGE_HOST_TOOLS: ReadonlySet<string> = new Set(["edit", "write", "apply_patch", "patch"])
 
 export const HELD_CALL_CANCELLED_REASON =
-  "Not run: it follows a file change in this step that was refused or interrupted. "
+  "Not run: it follows a file change or state-changing command in this step that was refused or interrupted. "
   + "Run it again only if it still applies."
 
 /** `held`: its exec waits here; `refused`: a file change the host refused, which cancels later calls. */

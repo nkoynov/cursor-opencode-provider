@@ -918,6 +918,7 @@ export function createMessageTypes(): protobuf.Root {
     { id: 2, name: "working_directory", type: "string" },
     { id: 3, name: "timeout", type: "uint32" },
     { id: 4, name: "tool_call_id", type: "string" },
+    { id: 11, name: "is_background", type: "bool" },
     // Canonical agent.v1 fields used by the native CLI to distinguish a
     // foreground cancellation deadline from a soft background handoff.
     { id: 13, name: "timeout_behavior", type: "uint32" },

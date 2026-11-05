@@ -205,11 +205,11 @@ describe("model order in a step that changes a file", () => {
     const root = workspace()
     const target = path.join(root, "target.txt")
     fs.writeFileSync(target, "before\n")
-    const f = fixture([shellStarted("status"), editStarted("edit", target), readExec(1, target, "edit")], root)
+    const f = fixture([shellStarted("status", "git status"), editStarted("edit", target), readExec(1, target, "edit")], root)
     await f.run()
     await answer(f.session, toolCalls(f.parts)[0]!, 1)
 
-    f.push(listed(2), shellExec(4, "status"), writeExec(3, target, "after\n", "edit"), ended())
+    f.push(listed(2), shellExec(4, "status", "git status"), writeExec(3, target, "after\n", "edit"), ended())
     await f.run()
     expect(f.reads()).toBe(6)
     expect(toolCalls(f.parts).map(call => call.toolName)).toEqual(["read", "bash"])
@@ -239,7 +239,8 @@ describe("model order in a step that changes a file", () => {
     const f = fixture([editStarted("edit", target), readExec(1, target, "edit")], root)
     await f.run()
     await answer(f.session, toolCalls(f.parts)[0]!, 1)
-    f.push(listed(2), completed("edit"), shellStarted("first"), shellExec(4, "first"), shellStarted("second"), shellExec(5, "second"), ended())
+    f.push(listed(2), completed("edit"), shellStarted("first", "git status"), shellExec(4, "first", "git status"),
+      shellStarted("second", "git log -1"), shellExec(5, "second", "git log -1"), ended())
     await f.run()
     expect(f.reads()).toBe(8)
     expect(toolCalls(f.parts).map(call => call.toolName)).toEqual(["read", "bash", "bash"])
@@ -514,6 +515,99 @@ describe("model order in a step that changes a file", () => {
     expect(toolCalls(f.parts).map((call) => call.toolName)).toEqual(["bash", "grep", "bash"])
     expect(finishes(f.parts)).toHaveLength(1)
     expect(f.session.stepOrder?.held ?? []).toEqual([])
+  })
+
+  /** A state-changing command, then a read of the file it writes, in one step. */
+  function commandThenRead(root: string) {
+    const target = path.join(root, "made.txt")
+    fs.writeFileSync(target, "old\n")
+    return fixture([
+      listed(2),
+      shellStarted("make", "echo new > made.txt"),
+      shellExec(1, "make", "echo new > made.txt"),
+      started("look", { read_tool_call: { args: { path: target } } }),
+      readExec(2, target, "look"),
+    ], root)
+  }
+
+  it("holds the calls after a state-changing command until its result", async () => {
+    const f = commandThenRead(workspace())
+    await f.run()
+    expect(toolCalls(f.parts).map((call) => call.toolName)).toEqual(["bash"])
+    expect(f.session.stepOrder?.held.map((held) => held.execId)).toEqual([2])
+
+    await answer(f.session, toolCalls(f.parts)[0]!, 1)
+    await f.run()
+    expect(toolCalls(f.parts).map((call) => call.toolName)).toEqual(["bash", "read"])
+    expect(f.session.stepOrder?.held).toEqual([])
+  })
+
+  it("runs the calls after a command that failed", async () => {
+    const f = commandThenRead(workspace())
+    await f.run()
+    await answer(f.session, toolCalls(f.parts)[0]!, 1, { error: "Exited with code 1" })
+    await f.run()
+    expect(toolCalls(f.parts).map((call) => call.toolName)).toEqual(["bash", "read"])
+  })
+
+  it.each([
+    ["refuses", { error: "The user rejected permission to use this specific tool call.", refusal: "rejected" }],
+    ["stops", { error: "Tool execution aborted", interrupted: true }],
+  ] as const)("cancels the calls after a state-changing command the host %s", async (_label, outcome) => {
+    const f = commandThenRead(workspace())
+    await f.run()
+    await answer(f.session, toolCalls(f.parts)[0]!, 1, { ...outcome })
+    f.push(ended())
+    await f.run()
+    expect(toolCalls(f.parts).map((call) => call.toolName)).toEqual(["bash"])
+    expect(replyText(f.writes, 2)).toContain(HELD_CALL_CANCELLED_REASON)
+  })
+
+  it("orders a state-changing command announced over MCP before its exec", async () => {
+    const root = workspace()
+    const target = path.join(root, "made.txt")
+    fs.writeFileSync(target, "old\n")
+    const mcpArgs = (args: Record<string, unknown>) => ({
+      name: "opencode-bash",
+      args: readAllFields(readAllFields(encodeJsonAsValue(args)).find((field) => field.fn === 5)!.bytes!)
+        .map((field) => field.bytes!),
+      tool_call_id: "make",
+    })
+    const make = mcpArgs({ command: "echo new > made.txt" })
+    const f = fixture([
+      listed(2),
+      started("make", { mcp_tool_call: { args: make } }),
+      started("look", { read_tool_call: { args: { path: target } } }),
+      readExec(2, target, "look"),
+      frame({ exec_server_message: { id: 1, mcp_args: make } }),
+    ], root)
+    await f.run()
+    // The read came first on the wire but follows the command in the model's order.
+    expect(toolCalls(f.parts).map((call) => call.toolName)).toEqual(["bash"])
+    expect(f.session.stepOrder?.held.map((held) => held.execId)).toEqual([2])
+  })
+
+  it("reads a background launch from Cursor's ShellArgs.is_background (#11) on the display call", () => {
+    const command = Buffer.from("tail -f app.log")
+    const args = decodeMessage<Record<string, unknown>>("ShellArgs", Uint8Array.from([0x0a, command.length, ...command, 0x58, 0x01]))
+    expect(args).toMatchObject({ command: "tail -f app.log", is_background: true })
+  })
+
+  it("holds a follower whose exec arrives before a read-only background launch's", async () => {
+    const root = workspace()
+    const target = path.join(root, "app.log")
+    fs.writeFileSync(target, "line\n")
+    const command = "tail -f app.log"
+    const f = fixture([
+      listed(2),
+      started("bg", { shell_tool_call: { args: { command, is_background: true } } }),
+      started("look", { read_tool_call: { args: { path: target } } }),
+      readExec(2, target, "look"),
+      frame({ exec_server_message: { id: 1, background_shell_spawn_args: { command, working_directory: root, tool_call_id: "bg" } } }),
+    ], root)
+    await f.run()
+    expect(toolCalls(f.parts).map((call) => call.toolName)).toEqual(["bash"])
+    expect(f.session.stepOrder?.held.map((held) => held.execId)).toEqual([2])
   })
 
   it("does not count an unordered image-copy refusal as a listed model call", async () => {

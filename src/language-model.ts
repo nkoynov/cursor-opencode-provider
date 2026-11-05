@@ -407,7 +407,7 @@ import {
   type ReplayToolLifecycle,
 } from "./replay-safety.js"
 import { noteCursorWaitEnded, noteCursorWaitStarted } from "./cursor-waits.js"
-import { toolExecMutates } from "./tool-call-order.js"
+import { shellCallOrdersStep, shellExecOrdersStep, toolExecMutates } from "./tool-call-order.js"
 import {
   HELD_CALL_CANCELLED_REASON,
   announceCall,
@@ -7633,10 +7633,11 @@ export async function pump(
         }
         if (display) noteCursorWaitStarted(session, callId, display.variant, display.args)
         // Resolve an MCP call's host tool as `parseExecServerMessage` resolves its exec.
-        const mcpHostTool = display?.variant === "mcp_tool_call"
-          ? mapCursorArgsToOpencode(display.preferredToolName, display.args, "mcp_args", session.hostToolDialect).toolName
+        const mcpHost = display?.variant === "mcp_tool_call"
+          ? mapCursorArgsToOpencode(display.preferredToolName, display.args, "mcp_args", session.hostToolDialect)
           : undefined
-        announceCall(order, callId, isFileChangeDisplay(toolCall, mcpHostTool))
+        announceCall(order, callId, isFileChangeDisplay(toolCall, mcpHost?.toolName)
+          || shellCallOrdersStep(display?.variant, display?.args, mcpHost))
         const callIdLog = callId.replace(/\r?\n/g, "\\n")
         let wireFields = ""
         if (variant === "?") {
@@ -7961,12 +7962,13 @@ export async function pump(
           session.announcedCallIds?.delete(ownRequestCallId)
         }
         const execSideEffect = !!parsed && toolExecMutates(parsed.toolName, parsed.args, parsed.resultField)
-        // Keep the model's order in a step that changes a file (`src/step-order.ts`). Image bytes stay
+        // Keep the model's order in a step that changes a file or runs a state-changing command (`src/step-order.ts`). Image bytes stay
         // unordered: Cursor does not wait for an input image's copy.
         if (session.allowTools && parsed && !binaryWritePayload(parsed)) {
           const decision = released
             ? "run"
-            : orderExec(order, orderedCallId, isFileChangeExec(parsed.resultField, parsed.toolName))
+            : orderExec(order, orderedCallId, isFileChangeExec(parsed.resultField, parsed.toolName)
+              || shellExecOrdersStep(parsed.toolName, parsed.args, parsed.resultField))
           if (decision === "cancel") {
             if (!await rejectExec(parsed, HELD_CALL_CANCELLED_REASON, "after a refused file change")) return
             if (displayCallId) session.displayToolCalls.delete(displayCallId)

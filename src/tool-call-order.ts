@@ -30,6 +30,30 @@ export function toolExecMutates(toolName: string, args: Record<string, unknown>,
   return !readOnlyToolName(toolName)
 }
 
+const isShellTool = (toolName: string | undefined) => toolName === "bash" || toolName === "shell"
+
+/** Fork: a shell exec this classifier does not clear orders its step as a file change does (`src/step-order.ts`). */
+export function shellExecOrdersStep(toolName: string, args: Record<string, unknown>, resultField: string): boolean {
+  if (resultField === "background_shell_spawn_result") return true
+  return isShellTool(toolName) && toolExecMutates(toolName, args, resultField)
+}
+
+/**
+ * The same for a `tool_call_started` announcement. `mcpHost`: the host tool and
+ * arguments an `mcp_tool_call` resolves to. A shell announced without its
+ * command waits for its exec to tell.
+ */
+export function shellCallOrdersStep(
+  variant: string | undefined,
+  args: Record<string, unknown> | undefined,
+  mcpHost?: { toolName: string; args: Record<string, unknown> },
+): boolean {
+  if (mcpHost) return isShellTool(mcpHost.toolName) && toolExecMutates(mcpHost.toolName, mcpHost.args, "mcp_result")
+  if (variant !== "shell_tool_call" && variant !== "pi_bash_tool_call") return false
+  if (args?.is_background === true) return true
+  return typeof args?.command === "string" && args.command.trim() !== "" && !readOnlyShellCommand(args.command)
+}
+
 const READ_ONLY_TOOL_WORDS = new Set([
   "get", "list", "search", "read", "fetch", "find", "query", "describe", "view", "status", "capabilities",
 ])

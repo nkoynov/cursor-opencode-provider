@@ -1058,15 +1058,25 @@ describe("host notes through a full provider Run", () => {
           endTurn(run, "Completion notices received.")
         }
       }
-      const initial: Prompt = [{ role: "user", content: [{ type: "text", text: "Launch four uniquely labelled background jobs once." }] }]
-      const first = await collect(model, initial, sessionKey, tools)
-      const calls = first.filter((part) => part.type === "tool-call")
-      expect(calls).toHaveLength(4)
+      // Background launches change state, so the fork runs them one per step, in Cursor's order.
+      let prompt: Prompt = [{ role: "user", content: [{ type: "text", text: "Launch four uniquely labelled background jobs once." }] }]
+      let step = await collect(model, prompt, sessionKey, tools)
+      for (let index = 1; index <= 4; index++) {
+        const calls = step.filter((part) => part.type === "tool-call")
+        expect(calls).toHaveLength(1)
+        const call = calls[0]!
+        if (call.type !== "tool-call") throw new Error("Expected a shell call")
+        expect(JSON.parse(call.input).command).toBe(`echo MARKER-P${index}; exit ${index}`)
+        prompt = [
+          ...prompt,
+          { role: "assistant", content: [{ type: "tool-call", toolCallId: call.toolCallId, toolName: "shell", input: JSON.parse(call.input) }] },
+          { role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: "shell", output: { type: "text", value: `Command moved to the background (shell ID: sh_test_${index}).` } }] },
+        ] as Prompt
+        if (index < 4) step = await collect(model, prompt, sessionKey, tools)
+      }
       const notices = [1, 2, 3].map((id) => `<shell id="sh_test_${id}" state="completed" command="echo MARKER-P${id}; exit ${id}">\nMARKER-P${id}\n\nExited with code ${id}\n</shell>`)
       const second = await collect(model, [
-        ...initial,
-        { role: "assistant", content: calls.map((call) => ({ type: "tool-call", toolCallId: call.toolCallId, toolName: "shell", input: JSON.parse(call.input) })) },
-        { role: "tool", content: calls.map((call, index) => ({ type: "tool-result", toolCallId: call.toolCallId, toolName: "shell", output: { type: "text", value: `Command moved to the background (shell ID: sh_test_${index + 1}).` } })) },
+        ...prompt,
         ...notices.map((text) => ({ role: "user", content: [{ type: "text", text }] })),
       ] as Prompt, sessionKey, tools)
       expect(second.filter((part) => part.type === "tool-call")).toHaveLength(0)

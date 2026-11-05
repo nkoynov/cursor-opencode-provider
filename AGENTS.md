@@ -336,8 +336,11 @@ The **1.18 v2** API and **OpenCode 2.x** are source-incompatible:
   Fork: a held exec stays out of `session.pending` (`stepOrder.held` is its
   owner for heartbeats, aborts and the drain), a hold closes the host step once
   it has host calls, and a released file change ends its host step.
-  `src/tool-call-order.ts` only classifies an exec's side effect for resume
-  safety (`sideEffectAfterCheckpoint`); it no longer orders calls.
+  `src/tool-call-order.ts` classifies an exec's side effect for resume safety
+  (`sideEffectAfterCheckpoint`), and a shell call it does not clear (or any
+  command started in the background; a soft-background read-only command is
+  not) is an ordering point as a file change is
+  (`shellExecOrdersStep`, `shellCallOrdersStep`).
 - Fork early rows: a row opens only while no other call of the step is announced
   or started and unfinished and no exec is held back; otherwise the earlier
   call's exec would close it as failed.

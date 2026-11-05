@@ -176,7 +176,7 @@ describe("ordered tool calls", () => {
     expect(calls(third)).toEqual(["bash#2"])
   })
 
-  it("runs a step without a file change together", async () => {
+  it("runs reads and read-only commands together and orders a state-changing command", async () => {
     const script = scriptedFrames([])
     const session = fakeSession(script.frames)
     const root = rootOf(session)
@@ -190,7 +190,30 @@ describe("ordered tool calls", () => {
     ]) script.push(next)
 
     const first = await pumpOnce(session)
-    expect(calls(first)).toEqual(["read#1", "bash#2", "bash#3", "read#4"])
+    expect(calls(first)).toEqual(["read#1", "bash#2"])
+    expect(session.stepOrder?.held.map((held) => held.execId)).toEqual([3])
+    await deliverAll(session)
+    expect(calls(await pumpOnce(session))).toEqual(["bash#3"])
+    await deliverAll(session)
+    const third = await pumpOnce(session)
+    expect(calls(third)).toEqual(["read#4"])
+    expect(finishes(third)).toEqual(["tool-calls"])
+  })
+
+  it("runs a step of reads and read-only commands together", async () => {
+    const script = scriptedFrames([])
+    const session = fakeSession(script.frames)
+    const root = rootOf(session)
+    for (const name of ["a", "c"]) fs.writeFileSync(path.join(root, name), name)
+    for (const next of [
+      listed(3),
+      ...read(1, "ra", path.join(root, "a")),
+      ...shell(2, "status", "git status --short"),
+      ...read(3, "rc", path.join(root, "c")),
+    ]) script.push(next)
+
+    const first = await pumpOnce(session)
+    expect(calls(first)).toEqual(["read#1", "bash#2", "read#3"])
     expect(finishes(first)).toEqual(["tool-calls"])
     expect(session.stepOrder?.held).toEqual([])
   })
