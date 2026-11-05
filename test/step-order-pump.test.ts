@@ -770,6 +770,25 @@ describe("model order in a step that changes a file", () => {
     expect(billingLedger.totals(f.session.billing.key).billedUsd).toBe(booked)
   }))
 
+  it("books a Cursor step whose first host call was held and released before any host step closed", async () => withTempHostCache(async cacheDir => {
+    const root = workspace()
+    const { frames } = editThenShell(root)
+    // Cursor completes the edit itself (no write), which releases the held command.
+    const f = fixture([listed(2), frames[1]!, frames[3]!, frames[4]!, completed("edit")], root)
+    f.session.cacheDir = cacheDir
+    f.session.openCodeSessionId = "ses_step_order_first_released"
+    f.session.tokenDetails = { usedTokens: 40_000, maxTokens: 256_000 }
+    f.session.tokenDetailsFresh = true
+    f.session.billing = { key: "ses_step_order_first_released", cost: { input: 2, output: 6, cache_read: 0.5 }, prefixTokens: 30_000 }
+
+    await f.run()
+    expect(toolCalls(f.parts).map((call) => call.toolName)).toEqual(["bash"])
+    const [finish] = finishes(f.parts)
+    expect(finish!.providerMetadata).not.toMatchObject({ cursor: { releasedStep: true } })
+    expect(finish!.usage.inputTokens.total! + finish!.usage.outputTokens.total!).toBe(40_000)
+    expect(billingLedger.totals(f.session.billing.key).billedUsd).toBeGreaterThan(0)
+  }))
+
   it("keeps a held call owed to Cursor with the usual exec heartbeats", async () => {
     const root = workspace()
     const { frames } = editThenShell(root)

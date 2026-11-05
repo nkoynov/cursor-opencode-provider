@@ -6145,8 +6145,6 @@ export async function pump(
   const order: StepOrder = session.stepOrder ??= createStepOrder()
   /** The held exec whose frame this iteration handles. */
   let released: HeldExec<Frame, ParsedExecRequest> | undefined
-  /** Host calls of this pass that came from a hold: their Cursor step was booked with the step that held them. */
-  let releasedHostCalls = 0
   /** The ordered call whose exec this iteration dispatched, until the exec goes to the host: otherwise it was answered here. */
   let answeredHere: string | undefined
   /** When the held step's quiet window started, and whether the last frame restarts it. */
@@ -6155,7 +6153,6 @@ export async function pump(
   /** Count a host tool call; true when it must end the AI SDK step now. */
   const endsToolStep = (): boolean => {
     toolStep.hostCalls++
-    if (released) releasedHostCalls++
     // A released file change ends its host step: the rest of its Cursor step (its own write included) follows its result.
     if (released && isFileChangeCall(order, released.callId)) {
       carryToolStep()
@@ -6170,9 +6167,12 @@ export async function pump(
       session.carriedToolStep = { listed: toolStep.listed, resolved: toolStep.resolved }
     }
   }
-  /** End the host step on tool calls; one that continues a booked Cursor step or ran only released calls books nothing. */
+  /**
+   * End the host step on tool calls; one that continues a booked Cursor step books nothing. A call released
+   * from a hold no host step closed for (held while the step had no host calls) still books its Cursor step.
+   */
   const finishToolStep = (): void => {
-    const unbilled = toolStep.hostCalls > 0 && (toolStep.booked || releasedHostCalls === toolStep.hostCalls)
+    const unbilled = toolStep.hostCalls > 0 && toolStep.booked
     emitFinish(undefined, { unified: "tool-calls", raw: undefined }, undefined, undefined, { unbilled })
   }
   /** End a held step; `requeue` is a frame read that belongs to the next pump pass. */
@@ -6674,8 +6674,8 @@ export async function pump(
     closeOpenSpans()
     if (reason.unified === "tool-calls" && hasHeldExecs(order)) carryToolStep()
     if (options?.unbilled && !te) {
-      // Calls released from a hold belong to a Cursor step already booked with
-      // the host step that held them. OpenCode 2 prices any reported token, so
+      // An earlier host step booked this Cursor step (the one a hold or a
+      // released file change closed). OpenCode 2 prices any reported token, so
       // this step reports none and costs nothing; its output stays for TurnEnded.
       trace(`billing: step=released pricing=${session.billing.cost ? "priced" : "unpriced"} stepUsd=0.000000 ` +
         `key=${session.billing.key}`)
