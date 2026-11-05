@@ -4,6 +4,7 @@
 
 ### Added
 
+- The debug log names what a Cursor `user_message_appended` frame echoes: `steer echo id=…` or `host-note echo id=…` for an injection this Run tracks, matched by the message id Cursor echoes, else `unmatched user_message_appended`. It logs ids only. It used to log every such frame as `steer: Cursor appended a user message to the Run`, host notes included. A host note and a mid-step steer now send their injection id as the message id, as a promoted steer already did
 - Recovery-only diagnostics (`CURSOR_PROVIDER_RECOVERY_DEBUG=1`) record interruption, recovery decisions, and host-call/result IDs without logging prompt or tool payloads.
 
 ### Changed

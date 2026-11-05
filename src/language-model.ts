@@ -31,6 +31,7 @@ import {
   forgetUndeliveredEarlySteer,
   handOverEarlySteers,
   isEarlySteerTracked,
+  isRunEarlySteer,
   needsHostHistory,
   listenForHostSteers,
   markEarlySteerDelivered,
@@ -5379,7 +5380,7 @@ async function injectHostNotes(
         inject_context_action: {
           injection_id: injectionId,
           ...(session.runId ? { expected_run_id: session.runId } : {}),
-          user_context: { user_message: { text, message_id: crypto.randomUUID() } },
+          user_context: { user_message: { text, message_id: injectionId } },
         },
       },
     }), "host note injection")
@@ -5446,6 +5447,16 @@ function applyContextInjectionState(session: CursorSession, value: unknown): boo
   appendUndeliveredHostNotes(sessionKey, [{ notes: entry.notes, order: entry.order }])
   trace(`continuation: host note injection ${kind}; kept for the next user turn sessionKey=${sessionKey}`)
   return false
+}
+
+/** Which of this Run's tracked injections a `user_message_appended` echoes, by the message id it echoes (ids only). */
+export function describeAppendedUserMessage(session: CursorSession, appended: unknown): string {
+  const echoed = (appended as { user_message?: { message_id?: unknown } } | undefined)?.user_message?.message_id
+  const id = typeof echoed === "string" ? echoed : ""
+  const sessionKey = session.openCodeSessionId
+  if (id && sessionKey && isRunEarlySteer(sessionKey, session.sessionId, id)) return `steer echo id=${id}`
+  if (id && sessionKey && hostNoteInjectionsBySession.get(sessionKey)?.get(id)?.session === session) return `host-note echo id=${id}`
+  return `unmatched user_message_appended id=${JSON.stringify(id)}`
 }
 
 /** A checkpoint `session` stored after a delivery ack holds that note. */
@@ -5669,7 +5680,7 @@ function injectHostSteer(session: CursorSession, steer: HostSteer): boolean {
       inject_context_action: {
         injection_id: injectionId,
         expected_run_id: runId,
-        user_context: { user_message: { text: steer.text, message_id: crypto.randomUUID() } },
+        user_context: { user_message: { text: steer.text, message_id: injectionId } },
       },
     },
   }), "steer injection", () => isEarlySteerTracked(steer.sessionID, injectionId) && takesSteers()).then((written) => {
@@ -7619,7 +7630,7 @@ export async function pump(
       sessionManager.close(session)
       return
     } else if (iu?.user_message_appended) {
-      trace("steer: Cursor appended a user message to the Run")
+      trace(describeAppendedUserMessage(session, iu.user_message_appended))
       endThinkingRun()
       if (textStarted) textSeparator = "\n\n"
     } else if (iu?.tool_call_started) {

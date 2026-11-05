@@ -19,7 +19,13 @@ import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests } from "../
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { sessionManager } from "../src/session.js"
 import { notifyHostInterrupt } from "../src/host-interrupt.js"
-import { HELD_RUN_SAVE_DELAY_MS, resetTurnStateForTests, restorePersistedHostNotes, settleRunSavesForTests } from "../src/language-model.js"
+import {
+  describeAppendedUserMessage,
+  HELD_RUN_SAVE_DELAY_MS,
+  resetTurnStateForTests,
+  restorePersistedHostNotes,
+  settleRunSavesForTests,
+} from "../src/language-model.js"
 import { decodePersistedHostNotes, encodePersistedHostNotes } from "../src/protocol/host-notes.js"
 import { getActiveCursorMode, resetActiveCursorModesForTests, setActiveCursorMode, takeActiveCursorModeReminder } from "../src/protocol/switch-mode.js"
 import { peekConversationId, resetConversationBindingsForTests, sessionIdToUuid } from "../src/protocol/conversation-bind.js"
@@ -1487,6 +1493,45 @@ describe("host notes through a full provider Run", () => {
       // The checkpoint from before the delivery ack lacks the note: start after the note, or carry it once.
       const afterNote = Buffer.from(request.conversation_state ?? []).equals(noteCheckpoint)
       expect({ afterNote, notes }).toEqual(afterNote ? { afterNote, notes: 0 } : { afterNote, notes: 1 })
+    } finally {
+      sessionManager.dispose()
+      await settleRunSavesForTests()
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it("names the host note a user_message_appended echoes by its id, never its text", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-host-notes-echo-"))
+    cacheHttp2SessionForTests(ORIGIN, client)
+    try {
+      const file = path.join(root, "data.txt")
+      fs.writeFileSync(file, "payload line\n")
+      const instructions = `Instructions from: ${path.join(root, "sub", "AGENTS.md")}\nThe build tool here is BAZEL-77.`
+      const sessionKey = "ses_note_echo"
+      const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      onRun = (run, message) => {
+        if (message.run_request) {
+          run.send({ exec_server_message: { id: 0, exec_id: "exec-0", read_args: { path: file, tool_call_id: "tc-0" } } })
+        } else if (message.conversation_action?.inject_context_action) {
+          const injectionId = message.conversation_action.inject_context_action.injection_id
+          run.send({ interaction_update: { context_injection_state: { injection_id: injectionId, state: { delivered: { step: 1 } } } } })
+          run.send({ exec_server_message: { id: 1, exec_id: "exec-1", read_args: { path: file, tool_call_id: "tc-1" } } })
+        }
+      }
+      const system = { role: "system", content: "Host system prompt." } as Prompt[number]
+      const ask = { role: "user", content: [{ type: "text", text: "Read data.txt, then read it again." }] } as Prompt[number]
+      const first = (await collect(model, [system, ask], sessionKey)).find((part) => part.type === "tool-call") as { toolCallId: string; input: string }
+      await collect(model, [
+        system, ask,
+        { role: "assistant", content: [{ type: "tool-call", toolCallId: first.toolCallId, toolName: "read", input: JSON.parse(first.input) }] },
+        { role: "tool", content: [{ type: "tool-result", toolCallId: first.toolCallId, toolName: "read", output: { type: "text", value: "payload line" } }] },
+        { role: "user", content: [{ type: "text", text: instructions }] },
+      ] as Prompt, sessionKey)
+      const [injection] = runs[0]!.received.flatMap((message) => message.conversation_action?.inject_context_action ?? [])
+      const held = sessionManager.findOpenByOpenCodeSessionId(sessionKey)!
+      const echoed = { user_message: { text: instructions, message_id: injection.user_context.user_message.message_id } }
+      expect(describeAppendedUserMessage(held, echoed)).toBe(`host-note echo id=${injection.injection_id}`)
+      expect(describeAppendedUserMessage({ ...held }, echoed)).toBe(`unmatched user_message_appended id=${JSON.stringify(injection.injection_id)}`)
     } finally {
       sessionManager.dispose()
       await settleRunSavesForTests()

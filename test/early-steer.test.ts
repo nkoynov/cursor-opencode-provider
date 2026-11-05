@@ -18,7 +18,12 @@ import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { sessionManager, type CursorSession } from "../src/session.js"
 import { resetTurnProvenanceForTests } from "../src/protocol/turn-provenance.js"
 import { resetConversationBlobsForTests } from "../src/protocol/blob-store.js"
-import { resetTurnStateForTests, settleRunSavesForTests, settleTerminalCheckpointSavesForTests } from "../src/language-model.js"
+import {
+  describeAppendedUserMessage,
+  resetTurnStateForTests,
+  settleRunSavesForTests,
+  settleTerminalCheckpointSavesForTests,
+} from "../src/language-model.js"
 import { resetConversationBindingsForTests } from "../src/protocol/conversation-bind.js"
 import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { getPersistedConversation, resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
@@ -517,6 +522,31 @@ describe("a steer sent while Cursor waits inside a step", () => {
       onRun = (run, next) => { if (next.run_request) endTurn(run, "Again.") }
       expect(textOf(await collect(model, [...answered, assistant("ok"), user(message.text)], sessionKey))).toBe("Again.")
       expect(runs).toHaveLength(3)
+    })
+  }, 30_000)
+
+  it("names the steer a user_message_appended echoes by its id, never its text", async () => {
+    await withModel("echo", async (model) => {
+      const sessionKey = "ses_early_echo"
+      const text = "Stop waiting and say STEERED."
+      let session!: CursorSession
+      let echo = ""
+      const waiting = await waitingRun(model, sessionKey, {
+        inject: (run, id) => {
+          const messageId = injectionsOf(run).at(-1).user_context.user_message.message_id
+          echo = describeAppendedUserMessage(session, { user_message: { text, message_id: messageId } })
+          injectionState(run, id, "queued")
+          answerSteer(run, id)
+        },
+      })
+      session = waiting.session
+      waiting.announce(text)
+      await waiting.first
+      const [injection] = injectionsOf(runs[0]!)
+      expect(echo).toBe(`steer echo id=${injection.injection_id}`)
+      expect(describeAppendedUserMessage(session, { user_message: { text, message_id: "msg-foreign" } }))
+        .toBe('unmatched user_message_appended id="msg-foreign"')
+      expect(describeAppendedUserMessage(session, {})).toBe('unmatched user_message_appended id=""')
     })
   }, 30_000)
 
