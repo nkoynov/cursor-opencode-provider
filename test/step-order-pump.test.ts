@@ -580,6 +580,26 @@ describe("model order in a step that changes a file", () => {
     expect(f.session.stepOrder?.held.map((held) => held.execId)).toEqual([3])
   })
 
+  it("holds a write behind an earlier call whose exec arrives after it", async () => {
+    const root = workspace()
+    const target = path.join(root, "new.txt")
+    const f = fixture([
+      listed(2),
+      shellStarted("status", "git status"),
+      editStarted("edit", target),
+      writeExec(1, target, "created\n", "edit"),
+      shellExec(2, "status", "git status"),
+    ], root)
+    await f.run()
+    // The status came second on the wire but precedes the write in the model's order.
+    expect(toolCalls(f.parts).map((call) => call.toolName)).toEqual(["bash"])
+    expect(f.session.stepOrder?.held.map((held) => held.execId)).toEqual([1])
+    await answer(f.session, toolCalls(f.parts)[0]!, 2)
+    await f.run()
+    expect(toolCalls(f.parts).map((call) => call.toolName)).toEqual(["bash", "write"])
+    expect(f.session.stepOrder?.held).toEqual([])
+  })
+
   it("books one Cursor step once when its calls run in two host steps", async () => withTempHostCache(async cacheDir => {
     const root = workspace()
     const target = path.join(root, "new.txt")
