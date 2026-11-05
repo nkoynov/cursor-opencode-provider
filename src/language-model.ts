@@ -112,7 +112,7 @@ import { hostPatchTool, isHostPatchTool } from "./protocol/apply-patch.js"
 import { buildGitDiffUnavailableMessages } from "./protocol/git-diff.js"
 import { runtimeExecMessages, runtimeRootFromContext } from "./runtime-files.js"
 import { createManagedTerminal } from "./terminal-runner.js"
-import { cursorExecVariantByRequestField, describeCursorExecVariant } from "./protocol/exec-variants.js"
+import { cursorExecVariantByRequestField, describeCursorExecVariant, isExecRequestWithoutNewCall } from "./protocol/exec-variants.js"
 import { appendCheckpointUserGrounding, appendWorkspaceRootGrounding } from "./protocol/workspace-grounding.js"
 import {
   progressOnlyContinuationPrompt,
@@ -6149,6 +6149,9 @@ export async function pump(
   let releasedHostCalls = 0
   /** The ordered call whose exec this iteration dispatched, until the exec goes to the host: otherwise it was answered here. */
   let answeredHere: string | undefined
+  /** When the held step's quiet window started, and whether the last frame restarts it. */
+  let quietFrom = Date.now()
+  let lastFrameMoved = true
   /** Count a host tool call; true when it must end the AI SDK step now. */
   const endsToolStep = (): boolean => {
     toolStep.hostCalls++
@@ -7111,7 +7114,10 @@ export async function pump(
         trace(`step-order: released execId=${released.execId} callId=${released.callId.replace(/\r?\n/g, "\\n")}`)
         next = { done: false, value: released.frame }
       } else if (toolStep.hostCalls > 0) {
-        const held = await nextFrameWithin(session, HELD_TOOL_STEP_QUIET_MS)
+        if (lastFrameMoved) quietFrom = Date.now()
+        const quietLeft = HELD_TOOL_STEP_QUIET_MS - (Date.now() - quietFrom)
+        // A frame already buffered would win a zero-length race and keep the step open.
+        const held = quietLeft > 0 ? await nextFrameWithin(session, quietLeft) : undefined
         if (!held) {
           closeHeldToolStep(`quiet ${HELD_TOOL_STEP_QUIET_MS}ms`)
           return
@@ -7201,6 +7207,9 @@ export async function pump(
       trace(`gunzip FAILED (skipping frame): flags=0x${frame.flags.toString(16)} len=${frame.payload.length} err=${(e as Error).message}`)
       continue
     }
+    // Setup probes and requests about a call already sent (Cursor retries
+    // force-background while a held shell runs) do not restart the quiet window.
+    lastFrameMoved = !isExecRequestWithoutNewCall(detectExecVariantField(payload))
     let asm: Record<string, unknown>
     try {
       asm = decodeMessage<Record<string, unknown>>("AgentServerMessage", payload)

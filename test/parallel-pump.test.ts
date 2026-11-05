@@ -42,6 +42,17 @@ const question = (tool_call_id: string) => frame({ interaction_query: {
   }),
 } })
 const completed = (call_id: string) => frame({ interaction_update: { tool_call_completed: { call_id } } })
+/**
+ * ExecServerMessage #30/#31 (`ForceBackground{Shell,Subagent}Args|1 tool_call_id`)
+ * are not in the decoder's schema; the pump finds them by raw field.
+ */
+const forceBackground = (field: number, id: number, toolCallId: string): Frame => {
+  const callId = new TextEncoder().encode(toolCallId)
+  const args = [0x0a, callId.length, ...callId]
+  const tag = (field << 3) | 2
+  const exec = [0x08, id, (tag & 0x7f) | 0x80, tag >> 7, args.length, ...args]
+  return { flags: 0, payload: Uint8Array.of(0x12, exec.length, ...exec) }
+}
 
 function fixture(frames: Frame[], sessionId = "parallel-pump", arriveOnRead = false) {
   const writes: Uint8Array[] = []
@@ -502,6 +513,69 @@ describe("parallel tool-call pump", () => {
     expect(toolCalls(parts)).toHaveLength(2)
     expect(decodeMessage<any>("AgentClientMessage", writes[0]!).kv_client_message.id).toBe(50)
   })
+
+  // https://github.com/oakimov/cursor-opencode-provider/issues/155, test by @nkoynov.
+  // Cursor retries about every 0.6 s while the shell runs, inside the held step's 1.5 s quiet window: either each
+  // retry arrives 0.6 s after the last, or they wait buffered while each refusal takes 0.6 s to reach Cursor.
+  it.each(["arrive", "drain"] as const)("closes a shell's step while Cursor keeps asking to background it for a queued note (retries %s 0.6 s apart)", async slow => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-note-stall-"))
+    const target = path.join(root, "data.txt")
+    fs.writeFileSync(target, "payload line\n")
+    const requests = [2, 3, 4, 5, 6].map(id => forceBackground(30, id, "shell-call"))
+    const after = text("after")
+    const frames = [
+      frame({ interaction_update: { tool_call_started: {
+        call_id: "read-call", tool_call: { read_tool_call: { args: { path: target } } },
+      } } }),
+      frame({ exec_server_message: { id: 0, read_args: { path: target, tool_call_id: "read-call" } } }),
+      frame({ interaction_update: { tool_call_started: {
+        call_id: "shell-call", tool_call: { shell_tool_call: { args: { command: "sleep 3; echo SLEPT" } } },
+      } } }),
+      listed(2), shell(1, "shell-call"),
+      ...requests, after,
+    ]
+    const { session, writes } = fixture(frames)
+    const tools = [...session.toolCatalog!, { name: "read", description: "Read" }]
+    session.toolCatalog = tools
+    session.toolDescriptors = toolsToDescriptors(tools, "opencode")
+    session.requestContext.env = { workspace_paths: [root] }
+    const next = session.frames.next.bind(session.frames)
+    const delivered: Frame[] = []
+    session.frames.next = async () => {
+      const result = await next()
+      if (slow === "arrive" && !result.done && (requests.includes(result.value) || result.value === after)) await Bun.sleep(600)
+      if (!result.done) delivered.push(result.value)
+      return result
+    }
+    if (slow === "drain") {
+      session.stream.write = (data: Uint8Array) => {
+        writes.push(data)
+        const id = decodeMessage<any>("AgentClientMessage", data).exec_client_message?.id ?? 0
+        return id >= 2 ? Bun.sleep(600).then(() => true) : true
+      }
+    }
+    try {
+      const first = collect()
+      await pump(session, first.controller, ids)
+      expect(toolCalls(first.parts).map(p => p.toolName)).toEqual(["read"])
+      const read = toolCalls(first.parts)[0]!
+      expect(await deliverContinuationResults(session, [{
+        sessionId: session.sessionId, execId: 0, toolCallId: read.toolCallId, toolName: "read", output: "payload line",
+      }])).toBe(session)
+
+      const second = collect()
+      await pump(session, second.controller, ids)
+      expect(toolCalls(second.parts).map(p => p.toolName)).toEqual(["bash"])
+      expect(finishes(second.parts).map(p => p.finishReason.unified)).toEqual(["tool-calls"])
+      expect(session.pending.has(1)).toBe(true)
+      // The quiet window closed the step while Cursor was still retrying.
+      expect(delivered).not.toContain(after)
+      const answered = writes.map(bytes => decodeMessage<any>("AgentClientMessage", bytes).exec_client_message?.id)
+      expect(answered).toContain(2)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  }, 15_000)
 
   it("clears an aborted step's emission state while retaining its pending exec", async () => {
     const abort = new AbortController()
