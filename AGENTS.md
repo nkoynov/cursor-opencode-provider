@@ -259,8 +259,9 @@ The **1.18 v2** API and **OpenCode 2.x** are source-incompatible:
   host cache: checkpoint, reachable blobs, baseline, catalogs, provenance, notes,
   lost requests and steer receipts. Keep all blobs if reachability is uncertain.
   A >100 MiB or incomplete transfer graph warns and warm-reuses; it never remints.
-- Fork: a Run still in progress (held on a host tool for a second, shutdown, a
-  cancel without `turn_ended`) saves its latest checkpoint and the blobs it
+- Fork: a Run still in progress (held on a host tool for a second, at most once
+  per `HELD_RUN_SAVE_INTERVAL_MS`; shutdown; a cancel without `turn_ended`)
+  saves its latest checkpoint and the blobs it
   reaches without pruning the live store: the Run may still need blobs only its
   next checkpoint references. Snapshot field 15 is the lost request; the fork's
   model-fallback stop is field 101, and an older fork field 15 that is not a

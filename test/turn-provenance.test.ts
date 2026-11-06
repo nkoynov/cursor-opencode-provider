@@ -21,8 +21,10 @@ import {
   assertForeignHistoryRebaseFits,
   extractPromptHistory,
   HELD_RUN_SAVE_DELAY_MS,
+  HELD_RUN_SAVE_INTERVAL_MS,
   pump,
   resetTurnStateForTests,
+  settleRunSavesForTests,
   settleTerminalCheckpointSavesForTests,
 } from "../src/language-model.js"
 import { createCursor } from "../src/index.js"
@@ -752,6 +754,57 @@ describe("provenance through a Cursor Run", () => {
     const saved = await persistedOnDisk(root, (value) => value?.checkpoint?.join() === LATER_CHECKPOINT.join())
     expect(saved!.blobs.map((blob) => blob.id)).not.toContain("ab")
     expect(conversationBlobCount(CONVERSATION)).toBe(1)
+    sessionManager.close(session, "ordinary-cleanup")
+  })
+
+  async function checkpointOnDisk(root: string): Promise<string | undefined> {
+    await settleRunSavesForTests()
+    resetConversationPersistenceForTests()
+    return (await getPersistedConversation(root, SESSION))?.checkpoint?.join()
+  }
+
+  it("saves a Run's next held step only once the save interval since its last held save has passed", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "cursor-provenance-"))
+    roots.push(root)
+    let session: CursorSession
+    jest.useFakeTimers()
+    try {
+      ;({ session } = await turnThenQuestion(root))
+      jest.advanceTimersByTime(HELD_RUN_SAVE_DELAY_MS)
+      expect(await checkpointOnDisk(root)).toBe(MID_RUN_CHECKPOINT.join())
+
+      // The question was answered and the Run went on to its next question.
+      session.pending.clear()
+      await pumpUntilQuestion(session)
+      jest.advanceTimersByTime(HELD_RUN_SAVE_DELAY_MS)
+      expect(await checkpointOnDisk(root)).toBe(MID_RUN_CHECKPOINT.join())
+      jest.advanceTimersByTime(HELD_RUN_SAVE_INTERVAL_MS - HELD_RUN_SAVE_DELAY_MS - 1)
+      expect(await checkpointOnDisk(root)).toBe(MID_RUN_CHECKPOINT.join())
+      jest.advanceTimersByTime(1)
+      expect(await checkpointOnDisk(root)).toBe(LATER_CHECKPOINT.join())
+    } finally {
+      jest.useRealTimers()
+    }
+    sessionManager.close(session, "ordinary-cleanup")
+  })
+
+  it("saves a held step the save interval holds back when the host shuts down", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "cursor-provenance-"))
+    roots.push(root)
+    let session: CursorSession
+    jest.useFakeTimers()
+    try {
+      ;({ session } = await turnThenQuestion(root))
+      jest.advanceTimersByTime(HELD_RUN_SAVE_DELAY_MS)
+      expect(await checkpointOnDisk(root)).toBe(MID_RUN_CHECKPOINT.join())
+      session.pending.clear()
+      await pumpUntilQuestion(session)
+      jest.advanceTimersByTime(HELD_RUN_SAVE_DELAY_MS)
+    } finally {
+      jest.useRealTimers()
+    }
+    await notifyHostInterrupt(undefined, "shutdown")
+    expect(await checkpointOnDisk(root)).toBe(LATER_CHECKPOINT.join())
     sessionManager.close(session, "ordinary-cleanup")
   })
 })

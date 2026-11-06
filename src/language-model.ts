@@ -4134,20 +4134,31 @@ async function persistPlanOperations(session: CursorSession): Promise<void> {
 
 /** How long a Run must wait on host tools before its state is saved for a restart. */
 export const HELD_RUN_SAVE_DELAY_MS = 1_000
+/** Fork: the least time between a Run's held saves; each rewrites the whole snapshot, often megabytes. */
+export const HELD_RUN_SAVE_INTERVAL_MS = 60_000
 const heldRunSaveTimers = new WeakMap<CursorSession, ReturnType<typeof setTimeout>>()
+const heldRunSavedAt = new WeakMap<CursorSession, number>()
 
 // A step that ended in a tool call is recorded only in memory until TurnEnded.
 // Save it once the host's tool runs a while, so a Stop or a restart during a
-// shell, question or permission prompt still finds this step on disk.
+// shell, question or permission prompt still finds this step on disk. Fork: a
+// Run saved less than HELD_RUN_SAVE_INTERVAL_MS ago waits out the rest of it;
+// a Stop or a shutdown in between still saves at once, a crash leaves the
+// Run's previous save.
 function scheduleHeldRunSave(session: CursorSession): void {
   if (!session.openCodeSessionId) return
   clearTimeout(heldRunSaveTimers.get(session))
+  const savedAt = heldRunSavedAt.get(session)
+  const delay = savedAt === undefined
+    ? HELD_RUN_SAVE_DELAY_MS
+    : Math.max(HELD_RUN_SAVE_DELAY_MS, savedAt + HELD_RUN_SAVE_INTERVAL_MS - Date.now())
   const timer = setTimeout(() => {
     heldRunSaveTimers.delete(session)
     if (session.closed || session.hostInterrupted || session.pending.size === 0) return
     if (sessionManager.isActivelyPumping(session)) return
+    heldRunSavedAt.set(session, Date.now())
     void persistRunInProgress(session, "held Run")
-  }, HELD_RUN_SAVE_DELAY_MS)
+  }, delay)
   timer.unref?.()
   heldRunSaveTimers.set(session, timer)
 }
