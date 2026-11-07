@@ -4316,6 +4316,7 @@ async function deliverContinuationResultsNow(
             ? "create_plan answer"
             : "exec result"
     trace(`recovery: host-result-delivered hostSessionId=${session.openCodeSessionId} sessionId=${session.sessionId} execId=${r.execId}`)
+    testCutAfterResult(session, pending.toolName ?? r.toolName, r.execId)
     trace(
       `continuation: wrote ${resultKind} execId=${r.execId} field=${pending.resultField} ` +
         `frames=${outcome.framesWritten} outLen=${r.output.length}`,
@@ -4433,6 +4434,38 @@ function trackHostNoteInjection(
   }
 }
 
+const testCutSessions = new Set<string>()
+const testCutDelivered = new WeakSet<CursorSession>()
+
+function testCutDelayMs(name: string): number | undefined {
+  const raw = process.env[name]?.trim()
+  const delayMs = raw ? Number(raw) : NaN
+  return Number.isFinite(delayMs) && delayMs >= 0 ? delayMs : undefined
+}
+
+function testCut(session: CursorSession, delayMs: number, after: string): void {
+  const key = session.openCodeSessionId ?? session.sessionId
+  if (testCutSessions.has(key)) return
+  testCutSessions.add(key)
+  trace(`TEST: cutting sessionId=${session.sessionId} ${delayMs}ms after ${after}`)
+  const stream = session.stream
+  setTimeout(() => stream.injectRemoteAbortForTest?.(), delayMs).unref?.()
+}
+
+/** Test only: see CURSOR_PROVIDER_TEST_CUT_AFTER_RESULT_MS in the commit message. */
+function testCutAfterResult(session: CursorSession, toolName: string | undefined, execId: number): void {
+  const delayMs = testCutDelayMs("CURSOR_PROVIDER_TEST_CUT_AFTER_RESULT_MS")
+  if (delayMs === undefined || (toolName !== "shell" && toolName !== "bash") || !testCutDelivered.has(session)) return
+  testCut(session, delayMs, `the result of execId=${execId} tool=${toolName}`)
+}
+
+/** Test only: see CURSOR_PROVIDER_TEST_CUT_AFTER_DELIVERED_MS in the commit message. */
+function testCutAfterDelivered(session: CursorSession, injectionId: string | undefined): void {
+  const delayMs = testCutDelayMs("CURSOR_PROVIDER_TEST_CUT_AFTER_DELIVERED_MS")
+  if (delayMs === undefined) return
+  testCut(session, delayMs, `injection ${injectionId ?? ""} was delivered`)
+}
+
 /**
  * `InteractionUpdate.context_injection_state` (#23) for an injection this
  * provider sent. Same outcomes as Cursor SDK `Run.steer`: `delivered` hands
@@ -4453,6 +4486,10 @@ function applyContextInjectionState(session: CursorSession, value: unknown): boo
       (reason ? ` reason=${JSON.stringify(reason)}` : ""),
   )
   const sessionKey = session.openCodeSessionId
+  if (kind === "delivered") {
+    testCutDelivered.add(session)
+    testCutAfterDelivered(session, update.injection_id)
+  }
   if (kind === "delivered") markRunInjectionDelivered(session.injections, update.injection_id)
   if (kind === "delivered" && markEarlySteerDelivered(sessionKey, update.injection_id)) return true
   const entries = sessionKey ? hostNoteInjectionsBySession.get(sessionKey) : undefined

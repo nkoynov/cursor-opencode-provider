@@ -323,6 +323,7 @@ export type BidiStream = {
   /** Nothing more can be written: Cursor ended or reset the stream, or it was closed locally. */
   isClosed(): boolean
   onTerminal(listener: (event: BidiTerminalEvent) => void): () => void
+  injectRemoteAbortForTest?(): void
 }
 
 export type BidiTerminalEvent =
@@ -1145,6 +1146,16 @@ export async function bidiRunStream(
   let queuedWrites: Promise<boolean> | undefined
 
   return {
+    injectRemoteAbortForTest() {
+      if (locallyClosed || terminalEvent) return
+      rawStreamError = new CursorTransportError("Cursor Run stream aborted by remote", {
+        transient: true,
+        replaySafe: true,
+        code: "ERR_HTTP2_STREAM_CANCEL",
+      })
+      trace("TEST: injected remote abort (RST_STREAM CANCEL)")
+      try { stream.close(http2.constants.NGHTTP2_CANCEL) } catch { /* already closing */ }
+    },
     write(msg: Uint8Array) {
       assertWritable()
       const gzip = compress && msg.length >= RUN_COMPRESS_MIN_BYTES
