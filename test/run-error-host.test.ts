@@ -962,10 +962,8 @@ describe("checkpoint eligibility across host results", () => {
     }, 30_000)
   }
 
-  // Fork: the result replay (resume the step's checkpoint, answer Cursor's repeat from the written result)
-  // is the fallback when the history rebuild refuses.
   for (const echo of ["matched", "unmatched"] as const) {
-    it(`recovers a cut right after a result past an earlier note echo (${echo}) by ${echo === "matched" ? "rebuilding from history" : "replaying the result"}`, async () => {
+    it(`${echo === "matched" ? "rebuilds from history" : "refuses"} a cut right after a result past an earlier note echo (${echo})`, async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-echo-fallback-"))
       const requests: Array<{ conversation_id: string; action: { resume_action?: unknown; user_message_action?: { user_message: { text: string } } } }> = []
       const replies: Array<{ id: number; text: string }> = []
@@ -1035,19 +1033,21 @@ describe("checkpoint eligibility across host results", () => {
           prompt.push({ role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName, output: { type: "text", value: output } }] })
           if (output === "first completed") prompt.push({ role: "user", content: [{ type: "text", text: notice }] })
         }
-        const parts = await read()
-        expect(parts.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
-        expect(parts.some(part => part.type === "tool-call")).toBe(false)
-        expect(requests).toHaveLength(2)
+        const outcome = await read().then(parts => parts, (error: Error) => error)
         expect(injections).toBe(1)
         if (echo === "matched") {
+          if (outcome instanceof Error) throw outcome
+          expect(outcome.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
+          expect(outcome.some(part => part.type === "tool-call")).toBe(false)
+          expect(requests).toHaveLength(2)
           expect(requests[1]!.action.resume_action).toBeUndefined()
           expect(requests[1]!.conversation_id).not.toBe(requests[0]!.conversation_id)
           expect(requests[1]!.action.user_message_action!.user_message.text.match(/background job finished/g)).toHaveLength(1)
         } else {
-          expect(requests[1]!.action.resume_action).toBeDefined()
-          expect(requests[1]!.conversation_id).toBe(requests[0]!.conversation_id)
-          expect(replies.filter(reply => reply.id === 7).map(reply => reply.text).join("")).toContain("second completed")
+          expect(outcome).toBeInstanceOf(Error)
+          expect((outcome as Error).message).toContain("automatic retry unsafe")
+          expect(requests).toHaveLength(1)
+          expect(replies.some(reply => reply.id === 7)).toBe(false)
         }
       } finally {
         sessionManager.dispose()
