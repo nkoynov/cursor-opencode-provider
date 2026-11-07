@@ -508,6 +508,7 @@ export function buildAsyncAskQuestionCompletion(
 /** A message the user sent while the Run's tools ran, injected the way Cursor CLI steers. */
 export function buildInjectUserMessage(input: {
   injectionId: string
+  messageId: string
   expectedRunId: string
   text: string
 }): Uint8Array {
@@ -517,7 +518,7 @@ export function buildInjectUserMessage(input: {
         injection_id: input.injectionId,
         expected_run_id: input.expectedRunId,
         user_context: {
-          user_message: { text: input.text, message_id: input.injectionId },
+          user_message: { text: input.text, message_id: input.messageId },
         },
       },
     },

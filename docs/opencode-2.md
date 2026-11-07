@@ -320,6 +320,9 @@ interrupted step's output, announced calls and provider-answered execs do not
 prevent it, and its shown text is passed on to be continued. Missing results,
 a host tool started in that step or unrepresented activity remain final. A Run
 whose request upload is cut off is sent again.
+An early steer or host note Cursor took into that Run does not block the
+rebuild when host history holds it: a steer once OpenCode has added its copy,
+a note while its text is still in history.
 A rebuild too large for the model's context is reported as a context overflow
 (413), so OpenCode compacts instead of retrying. Recovery retains the latest eligible checkpoint across token renewal, including
 a rejected credential on an untouched resumed attempt. Checkpoints received

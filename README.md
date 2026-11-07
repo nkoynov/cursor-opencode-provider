@@ -216,15 +216,11 @@ Catalog entries derive a models.dev-style `family` from the Cursor model id (`cl
 OpenCode uses family metadata to select a small model for session titles (2.x: `gpt-luna`, `gemini-flash-lite`, `gemini-flash`, `claude-haiku`; 1.x: `gemini-flash`, `gpt-nano`, `claude-haiku`). If no eligible family is available, titles fall back to the session model. To override this selection, set the `title` agent's `model` on either major, or `small_model` on 1.x. Compaction summaries use the host's compaction model selection; this metadata does not move them to the small model. OpenCode 2.x's model-listing tool shows one entry per family unless asked for all.
 #### Image input
 
-The provider advertises `text` + `image` input only when the selected Cursor model supports images; model output remains text. This works in the classic plugin, the 1.18 v2 plugin, and OpenCode 2.x.
+The provider advertises `text` + `image` input only for Cursor models that our own live test saw read an image; every other model is text-only, including one Cursor added after the last test. Model output remains text. This works in the classic plugin, the 1.18 v2 plugin, and OpenCode 2.x.
 
-Image support is resolved in this order:
+Cursor's `AvailableModels.supportsImages` is not used: it marks some models text-only whose Run reads images (Grok 4.7, Composer 2.5, Kimi K2.7 Code) and Kimi K3 as reading images though its Run does not, and for a model that cannot read images Cursor's Run drops the image without an error. `bun run generate:images` tests each model once, when it first appears: one short Run with a probe image, recording in `src/image-input-data.ts` whether the reply transcribes the text drawn in it. A recorded result is retested only on request (`-- --model <id>` or `-- --all`), and removed only with `-- --prune`, since each account's model list differs. Like Cursor CLI, the provider sends Cursor every image the host passes.
 
-1. Live `AvailableModels.supportsImages` metadata, including authoritative `false` values
-2. The `Capabilities` column in Cursor's [`docs.md`](https://cursor.com/docs.md), generated alongside context and pricing metadata
-3. Text-only when neither source describes the model
-
-OpenCode image file parts are decoded from bytes, base64/data URLs, local file URLs, or HTTP(S) URLs and sent through Cursor's `UserMessage.selected_context.selected_images` field. Fresh and rebased Runs normalize the same image formats as held-Run continuations, including AI SDK `image-data` / `image-url` and OpenCode attachment URLs. A Run that resumes a checkpoint skips the history images that exact checkpoint is known to hold (by content hash, recorded when a turn ends on a checkpoint of its own and kept in the restart snapshot); a Run without a checkpoint sends them all.
+OpenCode image file parts are decoded from bytes, base64/data URLs, local file URLs, or HTTP(S) URLs and sent through Cursor's `UserMessage.selected_context.selected_images` field. Fresh and rebased Runs normalize the same image formats as held-Run continuations, including AI SDK `image-data` / `image-url` and OpenCode attachment URLs. A Run that resumes a checkpoint skips the history images that exact checkpoint is known to hold (by content hash, recorded when a turn ends on a checkpoint of its own and kept in the restart snapshot); a Run without a checkpoint sends them all. Earlier images that no longer fit the 20 MiB image budget are left out with a note, so a text follow-up still works; this turn's own attachments past the budget fail the request.
 
 On a held-open Run, an image read returns bytes in `ReadSuccess.data` (including GenerateImage reference reads), and MCP tool images return as `McpImageContent` items after the success text (`McpToolResultContentItem` field 2). Detached media is attributed only where OpenCode's result order and markers establish its owner; ambiguous images stay available through history instead of being attached to an unrelated tool. A host instruction update beside a native read uses Cursor's context-injection channel because read text and bytes are mutually exclusive.
 
@@ -446,20 +442,46 @@ Set `CURSOR_AGENT_TRANSCRIPTS_FOLDER` before starting OpenCode (or its daemon). 
 
 ## Development
 
-Changes listed under [Unreleased](CHANGELOG.md#unreleased) describe the development checkout; use a rebuilt local install to test them before a release. Maintainer guides and incident lessons are linked from the [documentation index](docs/README.md).
+For complete local checks across Linux, macOS and native Windows, use
+`python3 -B scripts/test-harness.py` (`python -B` on Windows). It detects native
+test capabilities and uses a local Linux-container engine on Windows or when
+native prerequisites are missing. Cursor agent is optional. Run with
+`--diagnose` to check prerequisites; see the [test harness guide](docs/pr-review.md#local-checks-on-different-operating-systems)
+for the image build and isolation requirements.
+
+Changes listed under [Unreleased](CHANGELOG.md#unreleased) describe the development checkout; use a rebuilt local install to test them before a release. Maintainer guides and incident lessons are linked from the [documentation index](docs/README.md). The manual Cursor review, isolated pull-request checks, and OpenCode live test are in [docs/pr-review.md](docs/pr-review.md).
+
+Manual Cloud Agent reviews publish through the configured GitHub App after exact-preview approval. See the [App publisher setup](docs/pr-review.md#github-app-publisher) for `REVIEW_APP_ID`, the private key and optional installation ID. Tokens are restricted to this repository and retain the installation's configured permissions; the returned grant must include review-write access. `review-publish.py auth-info` reports configuration without printing secrets. Reviews use the App's bot identity, with no automatic review trigger.
+
+Linux isolated checks include the nested sandbox tests. Live credentials require
+the full check to pass and a separate trust decision for that exact revision.
+
+Re-reviews verify earlier threads and replies, and resolve fixed or refuted
+findings through the App after approval of the listed actions. The publisher
+checks the discussion and revision again and confirms resolved readback; a
+summary or an author reply alone does not close a thread. See the
+[re-review procedure](docs/pr-review.md#re-review-and-thread-resolution).
+
+Review results and previews live in persistent, gitignored `.review-artifacts/`,
+created by `review-publish.py start`. They survive approval waits and ordinary
+temporary-file cleanup. The publisher retains recovery copies and permits
+guarded cleanup only after publication or an explicit discard instruction;
+see [artifact retention](docs/pr-review.md#artifact-retention).
 
 ```bash
 bun install          # install dependencies
 bun run build        # compile TypeScript → dist/
 bun run typecheck    # type-check without emit
 bun test             # run unit tests
+bun run live-test    # OpenCode live run; skips unless CURSOR_API_KEY is set
 bun run test:node-http2 # Node HTTP/2 cleanup, drain, cancellation and memory regressions
 bun run test:watch   # watch mode
 bun run generate:pricing  # refresh src/pricing-data.ts from Cursor docs
 bun run check:pricing     # fixture coverage for known model ids
+bun run generate:images   # live-test image input of untested Cursor models (needs a Cursor credential)
 ```
 
-**HARD STOP before any version bump or `v*` tag:** run `generate:pricing` and `check:pricing` in the same session, fix any unmapped Cursor display names, commit mapping/`pricing-data.ts` updates, and finalize [`CHANGELOG.md`](CHANGELOG.md) (`[Unreleased]` → dated version) **before** touching `"version"` or creating the tag. Publish CI regenerates rates from the live docs and will fail the release on an unmapped name — that is a last line of defense, not the primary check. See `AGENTS.md` and [Changelog](#changelog).
+**HARD STOP before any version bump or `v*` tag:** run `generate:pricing` and `check:pricing` in the same session, fix any unmapped Cursor display names, commit mapping/`pricing-data.ts` updates, run `generate:images` and commit `image-input-data.ts`, and finalize [`CHANGELOG.md`](CHANGELOG.md) (`[Unreleased]` → dated version) **before** touching `"version"` or creating the tag. Publish CI regenerates rates from the live docs and will fail the release on an unmapped name — that is a last line of defense, not the primary check. See `AGENTS.md` and [Changelog](#changelog).
 
 ## Architecture
 
@@ -591,7 +613,7 @@ The package root intentionally stays plugin-safe for OpenCode's classic loader. 
 
 ## Troubleshooting
 
-For intermittent disconnects or laptop sleep/wake, enable `CURSOR_PROVIDER_RECOVERY_DEBUG=1` before starting the host. Set `CURSOR_PROVIDER_DEBUG_FILE` to a persistent file if the default temporary log is unsuitable. The file is mode 0600 and capped at 10 MiB. Search `recovery:` lines by `hostSessionId`: `interrupted` records the error code and checkpoint/barrier state; `history-check` explains acceptance or refusal; `reopened` links old and replacement Run IDs; `pump-complete` records progress (`closed=true pending=0` is terminal). `host-call-emitted` and `host-result-delivered` correlate dispatched calls and saved results. These IDs help investigate duplicates but do not by themselves prove two different model-generated calls have identical effects. Elapsed wall time includes suspension; it is not proof the OS slept. Correlate with the OS sleep log.
+For intermittent disconnects or laptop sleep/wake, enable `CURSOR_PROVIDER_RECOVERY_DEBUG=1` before starting the host. Set `CURSOR_PROVIDER_DEBUG_FILE` to a persistent file if the default temporary log is unsuitable. The file is mode 0600 and capped at 10 MiB. Search `recovery:` lines by `hostSessionId`: `interrupted` records the error code and checkpoint/barrier state; `history-check` explains acceptance or refusal, `history-unsafe` names every cause that made a Run's history unrepresentable, and `appended-echo`, `appended-unmatched` and `appended-not-in-history` follow Cursor's echoes of injected steers and host notes; `reopened` links old and replacement Run IDs; `pump-complete` records progress (`closed=true pending=0` is terminal). `host-call-emitted` and `host-result-delivered` correlate dispatched calls and saved results. These IDs help investigate duplicates but do not by themselves prove two different model-generated calls have identical effects. Elapsed wall time includes suspension; it is not proof the OS slept. Correlate with the OS sleep log.
 
 Completed inline `get_mcp_tools` lookups are read-only and do not block rebuilding from completed host results. A lookup that is unfinished, spills to a file, has unknown fields, or has no matching start remains a barrier, as does other unrepresented server-side work.
 

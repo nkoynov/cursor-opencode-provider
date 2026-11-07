@@ -12,15 +12,16 @@ import path from "node:path"
 import { APICallError, type LanguageModelV3CallOptions, type LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
 import { decodeFramePayload } from "../src/protocol/framing.js"
-import { CURSOR_COMPACTION_OPTION, CURSOR_HOST_AGENT_OPTION, CURSOR_SESSION_EDITS_DENIED_OPTION } from "../src/shared.js"
+import { CURSOR_COMPACTION_OPTION, CURSOR_HOST_AGENT_OPTION, CURSOR_SESSION_EDITS_DENIED_OPTION, MODEL_CACHE_SCHEMA_VERSION } from "../src/shared.js"
+import { CURSOR_VARIANT_PARAMETERS_KEY, CURSOR_WIRE_MODEL_ID_KEY, writeCache } from "../src/models.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { encodeJsonAsValue, readAllFields } from "../src/protocol/struct.js"
 import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { sessionManager } from "../src/session.js"
+import { takeAppendedInjection } from "../src/replay-safety.js"
 import { notifyHostInterrupt } from "../src/host-interrupt.js"
 import {
-  describeAppendedUserMessage,
   HELD_RUN_SAVE_DELAY_MS,
   resetTurnStateForTests,
   restorePersistedHostNotes,
@@ -459,6 +460,65 @@ describe("history images through a full provider Run", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-history-images-"))
     try { await run(root) } finally { await settleRunSavesForTests(); fs.rmSync(root, { recursive: true, force: true }) }
   }
+
+  it.each([false, true])("sends images through a catalog alias and keeps the next turn warm (fast=%s)", async (fast) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-alias-images-"))
+    try {
+      const parameters = [
+        { id: "context", value: "500k" },
+        { id: "reasoning_effort", value: "low" },
+        { id: "fast", value: String(fast) },
+      ]
+      await writeCache(root, { schemaVersion: MODEL_CACHE_SCHEMA_VERSION, fetchedAt: Date.now(), models: [{
+        id: "aliased-model",
+        variants: [{ key: "aliased-model", displayName: "500k low", parameterValues: parameters,
+          isDefaultNonMax: false, isDefaultMax: true, isMaxMode: true }],
+      }] })
+      // Classic passes a synthetic catalog id plus its wire-id option; 2.x
+      // passes Model.Info.modelID directly. Exercise both call shapes.
+      const aliased = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root })
+        .languageModel(fast ? "aliased-model-500k-fast" : "aliased-model")
+      const options = { cursor: { [CURSOR_VARIANT_PARAMETERS_KEY]: parameters,
+        ...(fast ? { [CURSOR_WIRE_MODEL_ID_KEY]: "aliased-model" } : {}) } }
+      const sessionKey = `ses_alias_images_${fast}`
+      onRun = (run, message) => { if (message.run_request) endTurnOn(run, checkpoint(runs.indexOf(run) + 1)) }
+      const initial: Prompt = [user("Describe the attached image.", IMAGE_A)]
+      expect(textOf(await collect(aliased, initial, sessionKey, undefined, options))).toBe("Done.")
+      await collect(aliased, [...initial, assistant("Done."), user("What shape was it?")], sessionKey, undefined, options)
+      expect(sentImages(0)).toEqual([IMAGE_A])
+      expect(request(0).requested_model.model_id).toBe("aliased-model")
+      expect(request(0).requested_model.max_mode).toBe(true)
+      expect(request(1).conversation_id).toBe(request(0).conversation_id)
+      expect(sentCheckpoint(1)).toEqual(checkpoint(1))
+      expect(sentImages(1)).toEqual([])
+      expect(request(1).action.user_message_action.request_context)
+        .toEqual(request(0).action.user_message_action.request_context)
+    } finally {
+      sessionManager.dispose()
+      await settleRunSavesForTests()
+      setHostCacheDirOverride(undefined)
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it("opens a text turn with a note when an earlier image cannot be attached", () => withRoot(async (root) => {
+    onRun = (run, message) => { if (message.run_request) endTurnOn(run, checkpoint(runs.indexOf(run) + 1)) }
+    const prompt = [
+      user("Read the screenshot."),
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: "call_shot", toolName: "read", input: { filePath: "shot.png" } }] },
+      { role: "tool", content: [{ type: "tool-result", toolCallId: "call_shot", toolName: "read", output: { type: "content", value: [
+        { type: "text", text: "Image read successfully" },
+        { type: "file-data", mediaType: "image/png", data: "!!!" },
+      ] } }] },
+      assistant("Done."),
+      user("What next?"),
+    ] as Prompt
+    expect(textOf(await collect(model(root), prompt, "ses_images_omitted"))).toBe("Done.")
+    expect(sentImages(0)).toEqual([])
+    expect(request(0).action.user_message_action.user_message.text as string).toContain(
+      "[1 earlier image(s) could not be attached: unreadable, or past the 20 MiB image budget. Their pixels are unavailable.]",
+    )
+  }), 30_000)
 
   it("attaches an explicit image once, and not again after a restart", () => withRoot(async (root) => {
     const sessionKey = "ses_images_restart"
@@ -1500,7 +1560,7 @@ describe("host notes through a full provider Run", () => {
     }
   }, 30_000)
 
-  it("names the host note a user_message_appended echoes by its id, never its text", async () => {
+  it("tracks the message id a host note injection sends, so Cursor's echo of it matches", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-host-notes-echo-"))
     cacheHttp2SessionForTests(ORIGIN, client)
     try {
@@ -1529,9 +1589,15 @@ describe("host notes through a full provider Run", () => {
       ] as Prompt, sessionKey)
       const [injection] = runs[0]!.received.flatMap((message) => message.conversation_action?.inject_context_action ?? [])
       const held = sessionManager.findOpenByOpenCodeSessionId(sessionKey)!
-      const echoed = { user_message: { text: instructions, message_id: injection.user_context.user_message.message_id } }
-      expect(describeAppendedUserMessage(held, echoed)).toBe(`host-note echo id=${injection.injection_id}`)
-      expect(describeAppendedUserMessage({ ...held }, echoed)).toBe(`unmatched user_message_appended id=${JSON.stringify(injection.injection_id)}`)
+      const messageId = injection.user_context.user_message.message_id
+      expect(messageId).toBeTruthy()
+      expect(messageId).not.toBe(injection.injection_id)
+      const text = injection.user_context.user_message.text
+      expect(takeAppendedInjection(held.injections, { messageId: "msg-foreign", text })).toBeUndefined()
+      expect(takeAppendedInjection(held.injections, { messageId, text }))
+        .toEqual({ kind: "note", injectionId: injection.injection_id, notes: [instructions] })
+      // A second echo of the same message is not the Run's own any more.
+      expect(takeAppendedInjection(held.injections, { messageId, text })).toBeUndefined()
     } finally {
       sessionManager.dispose()
       await settleRunSavesForTests()

@@ -79,7 +79,8 @@ These are failure lessons shared by both hosts, not a replacement for
   errors. Consult the shipped descriptors and canonical fixtures
   (`src/protocol/exec-variants.ts`, `test/exec-variants.test.ts`). Recognizing a
   member does not make it control traffic: `user_message_appended` after context
-  injection changes conversation state and must retain its replay barrier
+  injection changes conversation state and must retain its replay barrier, even
+  where history can represent it (#159)
   (`test/replay-safety.test.ts`, `test/run-interruption.test.ts`).
 - **Apply protobuf defaults deliberately.** Omitted scalars may mean zero, while
   protobufjs encodes explicitly owned zero values; omission assertions need raw
@@ -183,6 +184,21 @@ These are failure lessons shared by both hosts, not a replacement for
   decoded duplicate or unknown fields otherwise authorize a malformed completion
   ([#114](https://github.com/oakimov/cursor-opencode-provider/pull/114),
   `test/replay-safety.test.ts`, `test/run-error-host.test.ts`).
+  The same barrier refused rebuilds in Runs that had delivered a steer or a
+  background-shell notice minutes earlier: Cursor echoes every delivered
+  injection as `user_message_appended`, and that marked the whole Run opaque
+  ([#159](https://github.com/oakimov/cursor-opencode-provider/issues/159)).
+  The live cause was host notes, not the steers a fork's log label suggested;
+  read the frame's `message_id` before attributing it. Match the echo to the
+  Run's own injection and check at rebuild time that the seeded prompt holds
+  it; also exempt a failed attempt whose only barriers were such echoes
+  (`replayBarrierEchoesOnly`, `test/early-steer.test.ts`,
+  `test/run-error-host.test.ts`).
+  A failed replacement open moves a Run's injected notes into the deferred
+  store before retrying. The rebuild guard must recognize that retained copy
+  too: recomputing recovery from the emptied injection registry otherwise
+  downgrades the next seed and drops earlier completed tool results
+  (`carried-missing-retry` in `test/run-error-host.test.ts`).
   Seed all completed tool steps; retaining only the last result loses earlier work,
   and that full seed needs the same context-fit check as a foreign-history rebase.
   An `APICallError` 413 is already host-shaped: wrapping it as a setup failure made
@@ -694,7 +710,13 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Model metadata has separate owners.** Keep wire parameters isolated; make
   metadata-changing variants separate catalog entries. Invalidate cache schema
   before config consumes it; live negative capabilities outrank docs
-  (`test/model-metadata.test.ts`). PRs #84/#86/#95 showed that tier selection
+  (`test/model-metadata.test.ts`). Capability claims need our own evidence:
+  `supports_images` marked Grok 4.7, Composer 2.5 and Kimi K2.7 Code text-only
+  though their Runs read images, Cursor CLI ignores it, and Cursor drops images
+  for a text-only model without an error. Advertise images only from the live
+  probe record (`generate:images`), never the flag or a hardcoded id
+  (`test/image-input-probe.test.ts`, `test/model-selection-review.test.ts`).
+  PRs #84/#86/#95 showed that tier selection
   must precede speed preference, defaults must survive catalog partitioning,
   and unmatched hints must not rewrite an advertised tuple. Exercise marked
   non-1M tiers and duplicate ids (`test/model-selection-review.test.ts`,
@@ -731,6 +753,18 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Isolate fixture state.** Capture teardown paths before awaiting; restore
   host-agent callbacks and cache overrides. One leaked cache root broke later
   plugin tests (`test/host-interrupt.test.ts`).
+- **A private home is not a credential boundary.** `env -i` and a private `HOME` clear variables and leave the reviewer's files, agent sockets, and the parent git directory readable. Untrusted install and test commands run through `scripts/isolate-run.sh`, which fails closed unless Linux user, mount, and pid namespaces or macOS `sandbox-exec` are usable. Namespace setup capabilities can remount a read-only bind of a user-owned file until they are dropped in the process that execs the command. The macOS profile allows the dynamic linker, a read of the root directory inode (`literal "/"`), and the selected tool file plus libraries that binary names. The Linux boundary PATH is `/opt/tools:/usr/bin:/bin:/usr/sbin`, so a tool linked from `/usr/local` is not already visible. Mount that tool's real file at `/opt/tools/<name>` and leave its directory, including a home install beside the file, unmounted (`test/review-scripts.test.ts`). A parent directory of a tool is not safe to allow: it includes sibling credentials. The profile translates `/src`, `/tmp`, `/home/reviewer`, and `--ro-bind` destinations; a blanket `file-read*` is not a profile. Seatbelt matches resolved paths: with macOS's default `TMPDIR` (`/var/folders`, a link into `/private`), a profile naming logical paths denied every write to the source, home and temp directory, and the working directory, while the run still exited 0. Tests that resolved `os.tmpdir()` first went green and hid it; feed the symlinked path and expect the resolved one (`lets the command write its source, home, temp directory and /dev/null`). `/dev/null` needs its own write rule. Empty `"${array[@]}"` under `set -u` aborts bash 3.2 before that probe, so the scripts iterate by length. The sentinel coverage is `test/review-scripts.test.ts`. Passing those checks is not a decision to pass `CURSOR_API_KEY`. Trust is `CURSOR_REVIEW_TRUST_SHA` for one fetched commit. The archive uses that commit id, not the moving `FETCH_HEAD` name, and the script checks the commit again before the key is forwarded.
+  Mapping the sandbox command to root and then dropping every capability
+  stopped a same-head archive suite at its nested `uid_map` writes: Linux
+  requires `CAP_SETFCAP` when a child maps parent UID 0. Map the caller
+  to a non-root namespace UID, retain capabilities only for setup, then
+  drop all sets before exec. Include system administration tools in the
+  restricted PATH; the next nested attempt otherwise could not locate
+  `pivot_root`. The nested-entry regression also creates a raw child
+  namespace to prove it cannot remount or modify an ancestor read-only
+  bind (`runs nested isolation with no capabilities and keeps ancestor binds read-only`).
+- **OpenCode keeps the last matching permission rule.** A generated `*` allow after the env denies lets `.env` through, and `/tmp/*` allows every other temp directory. `scripts/configure-opencode.sh` puts the broad allow first and the `.env.example` exception last, and allows only the owned canonical roots. `scripts/opencode-permission.mjs` runs the upstream matcher from commit `958f965`.
+- **A deadline helper and its temp files need one owner.** `scripts/live-test.sh` resolves GNU `timeout` or `gtimeout`, or `LIVE_TEST_TIMEOUT`, and the same EXIT trap that owns the transcript files also owns the plugin-list files. Native Bun also extracts libraries and creates scratch directories; place the whole invocation in an owned TMPDIR subdirectory so cleanup removes runtime-created entries without touching an older run. The deadline command is a session leader. Cancellation signals that group and walks `ps -ax -o pid=,ppid=`, then `KILL`s what ignored `TERM`. A failed listing is a cleanup failure. A helper that turns `errexit` back on before returning skips the caller's diagnostics. Ordinary cancellation is covered by `test/review-scripts.test.ts`. SIGKILL of the script itself is not.
 - **A removed temp dir can come back.** Tests left about 200 TMPDIR entries per
   run ([#102](https://github.com/oakimov/cursor-opencode-provider/issues/102)):
   cutting the whole project-folder path put it outside a long cache root;
@@ -746,11 +780,124 @@ These are failure lessons shared by both hosts, not a replacement for
   process listing or a writer surviving termination must fail cleanup, not
   silently permit removal (`test/process-cleanup.test.ts`). Test log content
   separately from its path-bearing diagnostic header (`test/debug.test.ts`).
-- **Match CI environments.** Narrow PATH fixtures omitted mkdir; Linux shell
-  tests need an init reaper. Strip temporary module copies from coverage and
-  include Bun editor types (`scripts/strip-copied-coverage.ts`).
+- **Match CI environments.** Narrow PATH fixtures omitted mkdir. Queued
+  publication tests once read Linux's `/proc/locks`, which macOS lacks;
+  observe the test contender at the real `flock` call after its approval peek,
+  while a separate holder owns the lock (`test/review-publish.test.ts`). Files of
+  multi-command publication and isolation scenarios set one default deadline:
+  Bun's five seconds expired under ordinary load, on a different set of cases
+  each run, so per-case overrides chased symptoms. Do not canonicalize the
+  temp root in isolation fixtures: that hid the macOS profile denying every
+  write (see the credential-boundary lesson). Local source snapshots must hydrate
+  sparse exclusions without restoring them in the operator's checkout, and
+  parser fixtures need their own Git origin. Archived evaluation tools report
+  unavailable Git provenance explicitly rather than using an enclosing repo.
+  Select native tools or a local Linux-container engine from OS capabilities;
+  Cursor agent availability does not select the test backend. Windows enters
+  through native Python and runs the POSIX suite in Linux containers
+  (`test/test_harness_test.py`). Docker's init and resolver files create locked
+  submounts under system directories. Retain them with recursive binds and
+  remount every descendant read-only with its existing VFS flags before
+  dropping capabilities (`retains locked nested bind mounts` in
+  `test/review-scripts.test.ts`). Linux shell
+  tests need an init reaper. The review namespace's PID 1 has to be that
+  reaper. When `bun test` was PID 1, a killed grandchild stayed a zombie,
+  `kill -0` still succeeded, and the shell-supervision tests failed inside
+  `scripts/isolate-run.sh` while the same files passed outside
+  (`test/review-scripts.test.ts`). Ubuntu 24.04 CI denies unprivileged user
+  namespaces until `kernel.apparmor_restrict_unprivileged_userns` is 0, and
+  the isolation tests require that namespace rather than skipping. The
+  coverage job checks out the pull request head, so that probe lives in the
+  workflow rather than in a script the head might not contain. Strip
+  temporary module copies from coverage and include Bun editor types
+  (`scripts/strip-copied-coverage.ts`).
+- **A green suite is not a branch audit.** A review missed a generator whose
+  failed refresh retained the state that made the next invocation skip its
+  promised retry, and it also promoted observations and policy preferences
+  into actionable defects. The review procedure has to establish a contract,
+  a reachable trigger, a causal path, and a violation before publishing, then
+  make a separate pass over behaviors and later uses that were not examined.
+  An `adversarial` label and a well-formed private ledger only attest to that
+  work. Measure detection with the manual pairs in `eval/review/`, including
+  held-out cases and false-positive controls, and say so when no fresh
+  reviewer ran. Repair the review harness when that is the requested target,
+  using the reviewed defect as evaluation evidence rather than turning the
+  repair into a patch to the subject (`docs/pr-review.md`).
+- **A returned call is not settled ownership.** A clean review of #161 passed
+  a process runner that waited for the check's leader only, sent KILL only
+  when that leader overran, and had no SIGTERM handler, while its contract
+  said processes are awaited before snapshot cleanup. Synthetic POSIX runs
+  showed a TERM-ignoring descendant alive after SIGINT and after a successful
+  leader, with the snapshot already deleted, and SIGTERM left everything
+  behind. Its mocked `run` tests could not show any of that. The review
+  procedure now states ownership postconditions for anything a change starts
+  or cleans up and challenges completion, nonzero exit, catchable termination,
+  and an early-exiting leader with acknowledged ordering, reading liveness,
+  existence, and a write attempt after the owner returns. The ledger's
+  `ownership` record keeps those paths, and `check-runner` with its settling
+  and explicit-transfer controls measures it (`test/review-eval.test.ts`).
+  The local runner itself must settle the group after every check, not just
+  on an exception. Record signals for safe checkpoints so a second cancellation
+  cannot bypass escalation; confirm no live group member remains before
+  releasing the snapshot (`Lifecycles` in `test/test_harness_test.py`).
+- **Exercise review tooling from the reviewer's actual inputs.** A calibration
+  test passed with unrelated PR objects in the developer's Git database but
+  failed in shallow CI. Test archive preparation with local commits and missing
+  history; keep fetching real calibration revisions an explicit integration
+  step. An offline reviewer mount needs its validator, policy context, and an
+  explicit adapter for production-only gates. Bind the ledger revision to the
+  result head so analysis from an older revision cannot validate a newer result
+  (`test/review-eval.test.ts`).
+- **Review text is not a publication receipt.** Publish through the approved
+  review publisher, including clean verdicts. A discussion comment can carry
+  the exact review marker without being a submitted review or creating inline
+  threads. Require a review-specific URL for the returned id and read back its
+  comments; do not fall back to a comment tool when publication is unavailable
+  (`test/review-publish.test.ts`). A proposed resolution in a summary does not
+  close its thread. Re-review the complete discussion against the current
+  head, bind each approved resolution to that discussion, and require actual
+  resolved readback. Preserve the review receipt across partial thread-action
+  failures; neither an outdated anchor nor an author's reply proves a repair.
+  Completing those actions through the recovery helper must also finalize the
+  artifact receipt; otherwise guarded cleanup still treats the finished review
+  as pending (`completes rejected resolutions idempotently` regression).
+  A bundled `gh` without `--slurp` stopped the review lookup before the send.
+  Parse the `--paginate` JSON stream locally, including later-page receipts,
+  and reject partial or malformed output before inferring no prior review
+  (`publishes and recovers later-page receipts with gh that has no slurp flag`).
+- **A code verdict is not a command exit status.** A review labelled an isolated
+  check passed while reporting its nonzero exit and failing self-tests. The
+  result model also rejected clean code verdicts with established baseline or
+  environment failures. Record command exits,
+  preserve the failed status, and establish attribution separately before
+  allowing a clean code verdict. Keep required analysis and the live credential
+  gate intact (`rejects command statuses that contradict their exit codes`,
+  `keeps attributed baseline and environment failures visible in a clean code review`).
+  A later report attributed archived subject self-test failures to the current
+  launcher even though the harness already fixed the Git fixtures and replaced
+  an installation-dependent tool test. Trace each subprocess to its owning
+  revision before assigning the failure. A read-only API lookup is still a
+  GitHub call: `bind` must report that it read the revision without making
+  GitHub changes (`records the pull request revision` regression).
+- **An approval wait outlives temporary cleanup.** A successful `show` froze a
+  preview that the agent then removed with its temporary review directory.
+  Review results, ledgers, previews, and publication state belong in a persistent
+  private store. Keep recoverable exact bytes before reporting a preview, and
+  distinguish refusing publication from instructing discard. Exercise loss of
+  the old temporary working tree and reject cleanup of a pending or changed
+  review (`test/review-publish.test.ts`, review artifact retention).
+- **App permissions are not a VM token's effective permissions.** A repository
+  read succeeded while the COMMENT review endpoint rejected the sandbox
+  credential with HTTP 403. A declared App grant does not prove that token's
+  review-write access. The publisher supports a separately controlled App,
+  checks its installation grant, mints a repository-scoped token after local
+  approval, and reports credential sources without printing values
+  (`test/review-publish.test.ts`, `auth-info`). Treat installation tokens as
+  opaque: an alphanumeric-only check rejected the stateless token format.
+  Exercise the actual HTTP authorization scheme as well as JWT signatures;
+  GitHub App JWT requests require Bearer authentication.
 - **Keep one current policy across docs and prompts.** A rebase can add review
-  rules; reviewer patches still need whole-path validation. Changelog fixes
+  rules; reviewer patches still need whole-path validation. A manual Cursor review posts only after the maintainer approves the preview digest `show` printed for that payload and head (`scripts/review-publish.py`). The review request uses a GitHub App installation token minted from `REVIEW_APP_ID` and the app private key after the final pull read; the approval is read again after the mint. The Cloud Agent login, a user token, and the app client secret are not that credential (`test/review-publish.test.ts`). `post` reads that approval after the publication lock, after each read-only lookup, and again immediately before the send. The pull request, head, identity, preview digest, and approval generation are the ones current when the lock was acquired, so a denial, a replaced payload, or another valid approval is not sent on that operation. A send that does not confirm delivery stays unsettled and is not repeated. A confirmed review id and its comment ids remain delivery evidence when the summary marker is edited or the review is no longer listed, and are not posted again. The review records the repository, pull request, base, head, and linux runtime; `render` turns that structured result into the COMMENT payload, refuses an incomplete or malformed result, and anchors a comment only at a listed diff location. Earlier findings stay classified. `approve` and `post` name the rendered payload, the same file `show` froze. After the reviews lookup, and immediately before the send, `post` fetches the pull request again and then re-reads the pinned local operation. A moved base or head stops the send for a refreshed review and a new approval (`test/review-publish.test.ts`). A push after that fetch is outside the check. A returned review URL has to name the approved pull request. A response that shows GitHub rejected the request can be retried. The public-text scan flags secret values and local paths, including `~/...`, Markdown labels, `file://` autolinks, and a path written directly after a colon, and still allows public URLs and public identifiers such as `CURSOR_API_KEY`. The procedure stays in `docs/pr-review.md`. Changelog fixes
   compare with the release, not an intermediate PR state. A versioned heading
   or package version bump does not establish publication. Verify release status
   and keep entries in the maintainer-designated upcoming release. Concurrent changelog

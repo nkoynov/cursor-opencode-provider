@@ -19,7 +19,7 @@ import type { RunHistoryImages } from "./protocol/sent-history-images.js"
 import type { StepOrderState } from "./step-order.js"
 import type { OpenCodeModelCost } from "./pricing.js"
 import type { RunCostEstimate } from "./billing.js"
-import type { ReplaySafetyState } from "./replay-safety.js"
+import type { ReplaySafetyState, RunInjection } from "./replay-safety.js"
 
 export type Frame = { flags: number; payload: Uint8Array }
 
@@ -294,6 +294,8 @@ export type CursorSession = {
   resultReplay?: { results: Map<string, WrittenHostResult>; required: Set<string>; replayed?: Set<string> }
   /** Stateful replay barriers survive host tool-step boundaries on this Run. */
   replaySafety?: ReplaySafetyState
+  /** Steers and host notes this Run injected whose echo has not arrived yet. */
+  injections?: RunInjection[]
   /** A delivered plan result refused execution; terminate this Run without continuing. */
   planReviewDeclined?: boolean
   /**
@@ -383,8 +385,6 @@ export type CursorSession = {
   toolCatalog?: OpencodeToolDef[]
   /** Configured MCP server ids used to split flattened host tool names. */
   knownMcpServers?: string[]
-  /** The Run's model accepts images, so held-Run exec results may carry them. */
-  supportsImages?: boolean
   stream: BidiStream
   frames: AsyncIterator<Frame>
   /**

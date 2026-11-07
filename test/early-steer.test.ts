@@ -16,10 +16,10 @@ import { buildHeartbeat } from "../src/protocol/request.js"
 import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests, lastFrameArrival } from "../src/transport/connect.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { sessionManager, type CursorSession } from "../src/session.js"
+import { markRunInjectionDelivered, takeAppendedInjection } from "../src/replay-safety.js"
 import { resetTurnProvenanceForTests } from "../src/protocol/turn-provenance.js"
 import { resetConversationBlobsForTests } from "../src/protocol/blob-store.js"
 import {
-  describeAppendedUserMessage,
   resetTurnStateForTests,
   settleRunSavesForTests,
   settleTerminalCheckpointSavesForTests,
@@ -55,6 +55,8 @@ const CHECKPOINT = Uint8Array.from([0x0a, 0x00])
 type FakeRun = {
   received: ClientMessage[]
   send(message: Record<string, unknown>): void
+  /** An `AgentServerMessage` built from independent bytes. */
+  sendRaw(payload: Uint8Array): void
   end(error?: string): void
 }
 
@@ -84,6 +86,9 @@ beforeAll(async () => {
       received: [],
       send: (message) => {
         if (!stream.destroyed && !stream.closed) stream.write(frame(encodeMessage("AgentServerMessage", message)))
+      },
+      sendRaw: (payload) => {
+        if (!stream.destroyed && !stream.closed) stream.write(frame(payload))
       },
       end: (error) => {
         if (error) stream.write(frame(Buffer.from(JSON.stringify({ error: { code: error } })), 2))
@@ -203,6 +208,27 @@ function injectionState(run: FakeRun, injectionId: string, state: "queued" | "de
   run.send({ interaction_update: { context_injection_state: {
     injection_id: injectionId, state: state === "queued" ? { queued: {} } : { delivered: { step: 2 } },
   } } })
+}
+
+function lengthDelimited(field: number, bytes: Uint8Array): number[] {
+  const varint = (value: number) => {
+    const out: number[] = []
+    for (; value >= 0x80; value >>>= 7) out.push((value & 0x7f) | 0x80)
+    return [...out, value]
+  }
+  return [...varint((field << 3) | 2), ...varint(bytes.length), ...bytes]
+}
+
+/**
+ * Cursor's `user_message_appended` echo of a delivered injection (#159), from independent bytes:
+ * InteractionUpdate #6 → user_message #1 → text #1, message_id #2, a flag and two timestamps (#24–#26).
+ */
+function appendedEcho(text: string, messageId: string): Uint8Array {
+  const message = Uint8Array.from([
+    ...lengthDelimited(1, Buffer.from(text)), ...lengthDelimited(2, Buffer.from(messageId)),
+    0xc0, 0x01, 0x01, 0xc8, 0x01, 0x05, 0xd0, 0x01, 0x06,
+  ])
+  return Uint8Array.from(lengthDelimited(1, Uint8Array.from(lengthDelimited(6, Uint8Array.from(lengthDelimited(1, message))))))
 }
 
 function endTurn(run: FakeRun, text: string): void {
@@ -525,28 +551,29 @@ describe("a steer sent while Cursor waits inside a step", () => {
     })
   }, 30_000)
 
-  it("names the steer a user_message_appended echoes by its id, never its text", async () => {
+  it("tracks the message id a steer injection sends, so Cursor's echo of it matches", async () => {
     await withModel("echo", async (model) => {
       const sessionKey = "ses_early_echo"
       const text = "Stop waiting and say STEERED."
-      let session!: CursorSession
-      let echo = ""
       const waiting = await waitingRun(model, sessionKey, {
         inject: (run, id) => {
-          const messageId = injectionsOf(run).at(-1).user_context.user_message.message_id
-          echo = describeAppendedUserMessage(session, { user_message: { text, message_id: messageId } })
           injectionState(run, id, "queued")
           answerSteer(run, id)
         },
       })
-      session = waiting.session
+      const session = waiting.session
       waiting.announce(text)
       await waiting.first
       const [injection] = injectionsOf(runs[0]!)
-      expect(echo).toBe(`steer echo id=${injection.injection_id}`)
-      expect(describeAppendedUserMessage(session, { user_message: { text, message_id: "msg-foreign" } }))
-        .toBe('unmatched user_message_appended id="msg-foreign"')
-      expect(describeAppendedUserMessage(session, {})).toBe('unmatched user_message_appended id=""')
+      const messageId = injection.user_context.user_message.message_id
+      expect(messageId).toBeTruthy()
+      expect(messageId).not.toBe(injection.injection_id)
+      expect(session.injections?.find((entry) => entry.injectionId === injection.injection_id))
+        .toMatchObject({ kind: "steer", messageId, text })
+      markRunInjectionDelivered(session.injections, injection.injection_id)
+      expect(takeAppendedInjection(session.injections, { messageId: "msg-foreign", text })).toBeUndefined()
+      expect(takeAppendedInjection(session.injections, { messageId, text }))
+        .toEqual({ kind: "steer", injectionId: injection.injection_id })
     })
   }, 30_000)
 
@@ -776,6 +803,61 @@ describe("a steer sent while Cursor waits inside a step", () => {
       return "example-token"
     })
   }, 30_000)
+
+  for (const promoted of [true, false]) {
+    it(`rebuilds a drop after the step's result past the steer's echo only once OpenCode promoted it (promoted: ${promoted})`, async () => {
+      await withModel(`echo-rebuild-${promoted}`, async (model, cacheDir) => {
+        const file = probeFile(cacheDir)
+        const sessionKey = `ses_early_echo_rebuild_${promoted}`
+        let ready = false
+        onRun = (run, message) => {
+          const injection = message.conversation_action?.inject_context_action
+          if (message.run_request && runs.indexOf(run) === 0) {
+            // Cursor works on its step without announcing a call of its own.
+            run.send({ conversation_checkpoint_update: CHECKPOINT })
+            ready = true
+          } else if (injection) {
+            readOnSteer(file)(run, injection.injection_id)
+          } else if (message.exec_client_message?.read_result) {
+            const injected = run.received.find((received) => received.conversation_action?.inject_context_action)!
+            const { injection_id, user_context } = injected.conversation_action.inject_context_action
+            injectionState(run, injection_id, "delivered")
+            run.sendRaw(appendedEcho(user_context.user_message.text, user_context.user_message.message_id))
+            // Cut right after the result write, before Cursor's next checkpoint.
+            run.end()
+          } else if (message.run_request) {
+            endTurn(run, "Answered once.")
+          }
+        }
+        const first = collect(model, [ask], sessionKey)
+        await waitFor(() => ready && !!pumping(sessionKey), "the working Run")
+        const message = steer(sessionKey, "Then read probe.txt and say STEERED.")
+        expect(announceHostSteer(message)).toBe(true)
+        const step = readStep(readCall(await first), file, message.text)
+        // Without OpenCode's copy after the result, history lacks the steer Cursor appended.
+        const sent = collect(model, promoted ? step : step.slice(0, -1), sessionKey)
+        if (!promoted) {
+          expect(await failure(sent)).toMatchObject({ isRetryable: false })
+          expect(runs).toHaveLength(1)
+          return
+        }
+        expect(textOf(await sent)).toBe("Answered once.")
+        expect(runs).toHaveLength(2)
+        const original = runs[0]!.received[0]!.run_request
+        const rebuilt = runs[1]!.received[0]!.run_request
+        expect(rebuilt.action.resume_action).toBeUndefined()
+        expect(rebuilt.conversation_id).not.toBe(original.conversation_id)
+        expect(Uint8Array.from(rebuilt.conversation_state ?? [])).toEqual(new Uint8Array())
+        const text = userText(runs[1]!)
+        expect(text.split(message.text)).toHaveLength(2)
+        expect(text).toContain(`Read file ${file}, lines 1-1\n1: alpha`)
+        expect(text).toContain("Do not repeat completed work")
+        expect(injectionsOf(runs[1]!)).toEqual([])
+        // The rebuild took the steer from history; no receipt is left to send or match it again.
+        expect(matchEarlySteers(sessionKey, [message.text], () => true)).toEqual([])
+      })
+    }, 30_000)
+  }
 
   it("resumes the checkpoint when a new message finishes a Run that answered a promoted steer", async () => {
     await withModel("promoted-drained", async (model, cacheDir) => {

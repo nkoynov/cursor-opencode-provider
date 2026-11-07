@@ -4,7 +4,6 @@ import { processShared } from "./process-shared.js"
 export type HostSteer = { sessionID: string; inboxID: string; text: string }
 
 export type EarlySteer = HostSteer & {
-  /** Also the injected `UserMessage.message_id`, which Cursor echoes in `user_message_appended`. */
   injectionId: string
   /** The Cursor Run (`CursorSession.sessionId`) it was injected into, or the Run resumed from its checkpoint. */
   run: string
@@ -88,12 +87,12 @@ function keep(sessionID: string, records: EarlySteer[]): void {
   else state.injected.set(sessionID, records)
 }
 
-export function isEarlySteerTracked(sessionID: string, injectionId: string): boolean {
-  return !!state.injected.get(sessionID)?.some((record) => record.injectionId === injectionId)
+export function findEarlySteer(sessionID: string | undefined, injectionId: string): EarlySteer | undefined {
+  return sessionID ? state.injected.get(sessionID)?.find((record) => record.injectionId === injectionId) : undefined
 }
 
-export function isRunEarlySteer(sessionID: string, run: string, injectionId: string): boolean {
-  return !!state.injected.get(sessionID)?.some((record) => record.run === run && record.injectionId === injectionId)
+export function isEarlySteerTracked(sessionID: string, injectionId: string): boolean {
+  return !!state.injected.get(sessionID)?.some((record) => record.injectionId === injectionId)
 }
 
 /** An injection Cursor never accepted. A promoted one stays, to be sent at `turn_ended`. */

@@ -14,8 +14,9 @@ agent protocol. TypeScript ESM; Bun installs/tests; `tsc` builds `dist/`.
   current requirements here and dated validation in private run reports.
 - Keep operator behavior in [README.md](README.md) and the matching
   [host guide](docs/README.md). Follow [CONTRIBUTING.md](CONTRIBUTING.md) and the
-  [review rules](docs/review-rules.md), including every Greptile finding and
-  applicable Codecov issue. User-facing changes need an Unreleased changelog line.
+  [review rules](docs/review-rules.md), including every Greptile finding, every
+  Cursor review finding, and each applicable Codecov issue. User-facing changes
+  need an Unreleased changelog line.
 - Never leave TMPDIR remnants, from tests, scripts or your own scratch work
   (files, directories, worktrees, detached processes and their logs). Remove
   what you create before finishing; first await the writes and stop the
@@ -28,6 +29,13 @@ agent protocol. TypeScript ESM; Bun installs/tests; `tsc` builds `dist/`.
   resolves the client version its own cache root (`withTempHostCache` or
   `useTempHostCache`, `test/host-cache.ts`). Node test scripts
   import `test/node-tmpdir.mjs` first for the TMPDIR guard.
+- Pending review artifacts are durable work, not disposable scratch. Use
+  `review-publish.py start` and the gitignored `.review-artifacts/` store,
+  outside TMPDIR. Keep the result, ledger, payload, frozen preview, approval,
+  and publication journal until confirmed posting or an explicit maintainer
+  discard instruction. No cleanup, denial, interrupted turn, failed send, or
+  changed PR head authorizes deletion. Preserve legacy pending files even if
+  they were mistakenly put under TMPDIR; the cleanup rule above is no exception.
 
 ## Non-negotiable provider / compatibility-layer boundary
 
@@ -68,7 +76,8 @@ bun test
 bun run test:coverage      # CI's lcov run, with copied-module records stripped
 bun run test:node-http2     # build + Node transport regressions
 bun run check:pricing      # fixture coverage, not live regeneration
-bun run generate:pricing   # live Cursor pricing/context/capability metadata
+bun run generate:pricing   # live Cursor pricing/context metadata
+bun run generate:images    # live-test image input of untested Cursor models
 ```
 
 The executable publish surface is `dist/`; rebuild before testing a local
@@ -358,7 +367,15 @@ The **1.18 v2** API and **OpenCode 2.x** are source-incompatible:
   after delivered host results may rebase from history only when every observed
   exec has a completed result and no opaque activity occurred. Include all
   completed tool steps; never resume their earlier checkpoint. Other barriers
-  stay final.
+  stay final. Cursor's `user_message_appended` echo of the Run's own delivered
+  steer or host note (its `message_id` and text, nothing else) stays a stateful
+  barrier but is not opaque: decide at rebuild time that the seeded prompt
+  holds each one (a promoted steer's copy at its boundary; a note's text, or a
+  note the Run still tracks and carries over). Fork: every injection site
+  (`injectHostNotes`, `injectHostSteer`, `injectPromotedSteers`) tracks its
+  fresh `message_id` in `session.injections`; a matched echo does not make the
+  interrupted pass unrepresentable, but a Run lost while the host runs tools
+  (no rebuild-time check there) stays closed after one.
 - Fork (CB-10): only execs handed to a host tool (`recordHostExec`) and the
   host calls the provider makes up (`recordHostCall`: mirrored display calls,
   AskQuestion, SwitchMode, CreatePlan) need a result in history, each by its
@@ -472,6 +489,10 @@ The **1.18 v2** API and **OpenCode 2.x** are source-incompatible:
 - SwitchMode never spawns a subagent. Apply native primary-agent switches only
   after the owning Run is terminal; lifecycle turns soft-ack without mutating
   mode. Same-mode switches auto-approve. Entering plan needs no execution gate.
+- Advertise image input only where `src/image-input-data.ts` records that the
+  model's Run read the probe image; anything else is text-only. Never use
+  Cursor's `supports_images` or a hardcoded model id. Send Cursor every image
+  the host passes, like Cursor CLI.
 - Generated images arrive through binary write execs; display image data is
   preview only. Gate GenerateImage approval on advertised `cursor_image_save`.
   Stage bytes behind a single-use opaque `cursor_image_save` id,
@@ -501,7 +522,7 @@ for cache, token and billing claims.
 ## HARD STOP — release / version bump / tag gate (non-optional)
 
 **Do not edit the package version, create/push a `v*` tag, or publish until all
-steps 1–4 below succeed in this turn.** CI or a previous run cannot replace them.
+steps 1–5 below succeed in this turn.** CI or a previous run cannot replace them.
 
 1. Run `bun run generate:pricing` against live Cursor docs.
 2. Resolve every unmapped display name in `DISPLAY_NAME_TO_MODEL_ID` or
@@ -509,12 +530,19 @@ steps 1–4 below succeed in this turn.** CI or a previous run cannot replace th
    `test/fixtures/cursor-pricing-models.txt` and regenerate until exit 0.
 3. Run `bun run check:pricing` successfully. Commit mapping/fixture/generated
    `src/pricing-data.ts` changes **before** the version bump commit.
-4. Finalize `CHANGELOG.md`: cover every user-facing change since the release,
+4. Run `bun run generate:images` with a Cursor credential. It live-tests each
+   model Cursor lists once, when it has no recorded result; it does not retest
+   recorded models (`--model <id>` or `--all` do, on request) or remove ids the
+   account does not list (`--prune` does). A failed or unclear probe changes
+   nothing: an untested model is tried again by the next run, and a retested
+   one keeps its previous result. Rerun until exit 0; commit
+   `src/image-input-data.ts` before the version bump.
+5. Finalize `CHANGELOG.md`: cover every user-facing change since the release,
    rename Unreleased to `[X.Y.Z] - YYYY-MM-DD` using the UTC release date, and
    insert a fresh empty Unreleased section.
-5. Only then bump the version, commit with the finalized changelog, tag and push.
+6. Only then bump the version, commit with the finalized changelog, tag and push.
 
-A request only to bump/tag/publish still requires steps 1–4 first; report their
+A request only to bump/tag/publish still requires steps 1–5 first; report their
 results before touching the version. The failed-release rationale belongs in
 [general lessons](tasks/lessons/opencode.md#auth-models-and-delivery-process).
 

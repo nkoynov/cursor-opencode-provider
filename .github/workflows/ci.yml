@@ -12,6 +12,20 @@ permissions:
   contents: read
 
 jobs:
+  harness-platform:
+    name: Harness platform (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test native harness selection and lifecycle
+        # Windows names the interpreter python; Linux and macOS images ship python3.
+        run: ${{ runner.os == 'Windows' && 'python' || 'python3' }} -B test/test_harness_test.py
+
   # Required check. On a pull request it tests the merge with main (the
   # checkout default), so a PR that no longer works on current main fails here.
   test:
@@ -32,6 +46,37 @@ jobs:
       # injector integration test needs /bin/zsh (absent on stock ubuntu-latest).
       - name: Install zsh
         run: sudo apt-get update && sudo apt-get install -y zsh
+
+      # ubuntu-latest denies unprivileged user namespaces. The isolation
+      # tests require them and fail closed when unshare cannot create one.
+      # Inlined so a pull request head that predates scripts/ci-enable-userns.sh
+      # can still run. Keep this probe in sync with that script for local use.
+      - &userns-step
+        name: Allow user namespaces
+        run: |
+          set -euo pipefail
+          probe() {
+            unshare --user --map-root-user --mount --pid --fork --mount-proc true
+          }
+          if probe >/dev/null 2>&1; then
+            echo "user namespaces already available"
+            exit 0
+          fi
+          sysctl_path=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [[ -r "$sysctl_path" && "$(cat "$sysctl_path")" != "0" ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          clone_path=/proc/sys/kernel/unprivileged_userns_clone
+          if [[ -r "$clone_path" && "$(cat "$clone_path")" != "1" ]]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if probe >/dev/null 2>&1; then
+            echo "user namespaces enabled"
+            exit 0
+          fi
+          echo "unshare still cannot create a user, mount, and pid namespace." >&2
+          probe || true
+          exit 1
 
       - name: Typecheck
         run: bun run typecheck
@@ -93,6 +138,8 @@ jobs:
 
       - name: Install zsh
         run: sudo apt-get update && sudo apt-get install -y zsh
+
+      - *userns-step
 
       # Keep in step with the test job's commands.
       - name: Test

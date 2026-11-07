@@ -26,12 +26,13 @@ import {
   writeStreamMessage as writeWithBackpressure,
 } from "./stream-write.js"
 import {
+  carriesSteer,
   clearUnansweredEarlySteers,
+  findEarlySteer,
   forgetEarlySteerRecords,
   forgetUndeliveredEarlySteer,
   handOverEarlySteers,
   isEarlySteerTracked,
-  isRunEarlySteer,
   needsHostHistory,
   listenForHostSteers,
   markEarlySteerDelivered,
@@ -371,7 +372,6 @@ import { isCompactionSession } from "./compaction-marker.js"
 import { resolveSessionWorkspaceRoot } from "./session-directory.js"
 import type { SeedHistoryMessage } from "./protocol/request.js"
 import {
-  assertCursorUserImageSupport,
   extractCursorPromptImages,
   extractCursorToolResultImages,
   CURSOR_SUPPORTED_URLS,
@@ -379,7 +379,7 @@ import {
   MAX_CURSOR_IMAGE_INPUT_BYTES,
   type CursorImageInput,
 } from "./image-input.js"
-import { getDocumentedCursorModelContext, resolveCursorModelSupportsImages } from "./model-metadata.js"
+import { getDocumentedCursorModelContext } from "./model-metadata.js"
 import {
   CURSOR_TIMEOUT_BACKGROUND,
   consumeCursorShellResult,
@@ -405,6 +405,9 @@ import {
   describeFrameLayout,
   heldRunLossRebuildable,
   hostExecs,
+  markRunInjectionDelivered,
+  takeAppendedInjection,
+  trackRunInjection,
   type ReplayToolLifecycle,
 } from "./replay-safety.js"
 import { noteCursorWaitEnded, noteCursorWaitStarted } from "./cursor-waits.js"
@@ -1714,15 +1717,9 @@ async function doStreamImpl(
     // session and returns undefined so we fall through to history rebase
     // instead of pumping a connection that can no longer accept writes.
     const tailMedia = trailingToolResults.reduce((n, r) => n + (r.media?.length ?? 0), 0)
-    trace(
-      `continuation: prompt-tail mediaParts=${tailMedia} supportsImages=${session.supportsImages} ` +
-        `roles=${describePromptTail(prompt)}`,
-    )
-    const results = session.supportsImages
-      ? await decodeTrailingToolImages(session, trailingToolResults, callOptions.abortSignal)
-      : trailingToolResults
+    trace(`continuation: prompt-tail mediaParts=${tailMedia} roles=${describePromptTail(prompt)}`)
     const resultsAfterCheckpoint = steeredPrompt || session.resultsAfterCheckpoint
-      ? resultsWithoutCheckpoint(session, results)
+      ? resultsWithoutCheckpoint(session, trailingToolResults)
       : undefined
     const held = session
     const cancelled = () => new CursorLocalCancellationError("Cursor continuation upload cancelled")
@@ -1737,6 +1734,10 @@ async function doStreamImpl(
         cancelUpload()
         throw cancelled()
       }
+      // Like Cursor CLI, tool images reach the Run whatever AvailableModels
+      // says. Decoding is part of the upload: a Stop during it closes the Run.
+      const results = await decodeTrailingToolImages(held, trailingToolResults, signal)
+        .catch((error: unknown) => { throw signal?.aborted ? cancelled() : error })
       session = await deliverContinuationResults(held, results, {
         steer: steerInjections,
         messageReachesRun: steerReachesRun,
@@ -1932,6 +1933,7 @@ async function doStreamImpl(
                   : !failed.checkpointRevokedByHostResult ? "checkpoint-not-revoked-by-result"
                   : failed.pending.size > 0 ? "pending-execs"
                   : replay?.historyRebaseUnsafe ? "opaque-activity"
+                  : !appendedInjectionsInRebuild(failed, prompt) ? "opaque-activity"
                   : replay?.attempt?.unrepresentable ? "unrepresentable-attempt"
                   : !announcedCallsClaimed(replay, replay?.attempt?.announcedCalls) ? "unaccounted-display-calls"
                   : !execs.length && !replay?.bridgedCalls?.length ? "no-host-execs"
@@ -2157,6 +2159,7 @@ export async function pumpWithRecovery(input: {
         bridgedCalls: pumpedSession.replaySafety?.bridgedCalls?.slice(),
         completedCalls: pumpedSession.replaySafety?.completedCalls?.slice(),
         catalogCalls: pumpedSession.replaySafety?.catalogCalls && { ...pumpedSession.replaySafety.catalogCalls },
+        appendedInjections: pumpedSession.replaySafety?.appendedInjections?.slice(),
       }
       // Any later resume of this turn may have Cursor ask again for a call the host already ran.
       const results = replayableResults(pumpedSession)
@@ -3239,40 +3242,27 @@ async function startSession(
   const hintMaxMode = !!(providerOptions?.maxMode ?? false)
 
   const modelInfo = _availableModels?.find((m) => m.id === cursorModelId)
-  const supportsImages = resolveCursorModelSupportsImages(cursorModelId, modelInfo?.supportsImages)
-  if (!resuming) {
-    const liveMessages = liveTurn ? prompt.slice(liveTurn.start).filter((message) => message.role === "user") : [lastUser]
-    for (const message of liveMessages) {
-      assertCursorUserImageSupport(message as unknown as Record<string, unknown> | undefined, supportsImages, cursorModelId)
-    }
-  }
   // A Run without a checkpoint (new, reset, rebased or compacted conversation) sends every image.
   const heldImages = sessionKey && !ephemeralRun && conversationState
     ? heldHistoryImageHashes(sessionKey, conversationId, conversationState)
     : undefined
   const imageExtraction = resuming
-    ? { images: [], hashes: [], candidateCount: 0, duplicateCount: 0, userImageCount: 0, omittedCount: 0 }
+    ? { images: [], hashes: [], duplicateCount: 0, omittedCount: 0 }
     : await extractCursorPromptImages(
         (fallbackReply
           ? prompt.filter((_, index) => index < fallbackReply.turnStart || index > fallbackReply.stopIndex)
           : prompt) as readonly unknown[],
         lastUser as unknown as Record<string, unknown> | undefined,
         {
-          supportsImages,
           seenHistoryHashes: heldImages,
           signal: callOptions.abortSignal,
         },
       )
   if (imageExtraction.omittedCount) {
     userText = appendMidConversationMessage(userText,
-      `[${imageExtraction.omittedCount} historical tool image(s) could not be decoded; their pixels are unavailable.]`)
-    trace(`image input: omitted ${imageExtraction.omittedCount} unreadable tool image(s)`)
-  }
-  if (!supportsImages && imageExtraction.candidateCount > 0) {
-    trace(
-      `image input: dropped ${imageExtraction.candidateCount} tool/assistant history image(s); ` +
-      `model=${cursorModelId} does not support images`,
-    )
+      `[${imageExtraction.omittedCount} earlier image(s) could not be attached: unreadable, or past the ` +
+      `${MAX_CURSOR_IMAGE_INPUT_BYTES / 1024 / 1024} MiB image budget. Their pixels are unavailable.]`)
+    trace(`image input: omitted ${imageExtraction.omittedCount} unreadable or over-budget earlier image(s)`)
   }
   if (imageExtraction.duplicateCount > 0) {
     trace(`image input: skipped ${imageExtraction.duplicateCount} previously sent history image(s)`)
@@ -3503,7 +3493,6 @@ async function startSession(
     postCompactionRebase: isCompaction,
     toolCatalog: sessionKey ? snapshotToolCatalog(sessionKey) : structuredClone(tools),
     knownMcpServers,
-    supportsImages,
     stream,
     runId,
     frames: stream.frames()[Symbol.asyncIterator](),
@@ -5383,15 +5372,17 @@ async function injectHostNotes(
   const text = hostNoteText(notes)
   if (!text) return true
   const injectionId = crypto.randomUUID()
+  const messageId = crypto.randomUUID()
   const sessionKey = session.openCodeSessionId
   if (sessionKey) trackHostNoteInjection(sessionKey, injectionId, [...notes], session, order)
+  trackRunInjection(session.injections ??= [], { kind: "note", injectionId, messageId, text, notes: [...notes] })
   try {
     await writeWithBackpressure(session.stream, encodeMessage("AgentClientMessage", {
       conversation_action: {
         inject_context_action: {
           injection_id: injectionId,
           ...(session.runId ? { expected_run_id: session.runId } : {}),
-          user_context: { user_message: { text, message_id: injectionId } },
+          user_context: { user_message: { text, message_id: messageId } },
         },
       },
     }), "host note injection")
@@ -5445,6 +5436,7 @@ function applyContextInjectionState(session: CursorSession, value: unknown): boo
       (reason ? ` reason=${JSON.stringify(reason)}` : ""),
   )
   const sessionKey = session.openCodeSessionId
+  if (kind === "delivered") markRunInjectionDelivered(session.injections, update.injection_id)
   if (kind === "delivered" && markEarlySteerDelivered(sessionKey, update.injection_id)) return true
   const entries = sessionKey ? hostNoteInjectionsBySession.get(sessionKey) : undefined
   const entry = update.injection_id ? entries?.get(update.injection_id) : undefined
@@ -5458,16 +5450,6 @@ function applyContextInjectionState(session: CursorSession, value: unknown): boo
   appendUndeliveredHostNotes(sessionKey, [{ notes: entry.notes, order: entry.order }])
   trace(`continuation: host note injection ${kind}; kept for the next user turn sessionKey=${sessionKey}`)
   return false
-}
-
-/** Which of this Run's tracked injections a `user_message_appended` echoes, by the message id it echoes (ids only). */
-export function describeAppendedUserMessage(session: CursorSession, appended: unknown): string {
-  const echoed = (appended as { user_message?: { message_id?: unknown } } | undefined)?.user_message?.message_id
-  const id = typeof echoed === "string" ? echoed : ""
-  const sessionKey = session.openCodeSessionId
-  if (id && sessionKey && isRunEarlySteer(sessionKey, session.sessionId, id)) return `steer echo id=${id}`
-  if (id && sessionKey && hostNoteInjectionsBySession.get(sessionKey)?.get(id)?.session === session) return `host-note echo id=${id}`
-  return `unmatched user_message_appended id=${JSON.stringify(id)}`
 }
 
 /** A checkpoint `session` stored after a delivery ack holds that note. */
@@ -5685,13 +5667,15 @@ function injectHostSteer(session: CursorSession, steer: HostSteer): boolean {
     trace(`steer: too many early steers tracked for sessionID=${steer.sessionID}; left for the next step`)
     return false
   }
+  const messageId = crypto.randomUUID()
+  trackRunInjection(session.injections ??= [], { kind: "steer", injectionId, messageId, text: steer.text })
   // While it waits behind another write, the host may withdraw it, or its Run may end or be replaced.
   writeWithBackpressure(stream, encodeMessage("AgentClientMessage", {
     conversation_action: {
       inject_context_action: {
         injection_id: injectionId,
         expected_run_id: runId,
-        user_context: { user_message: { text: steer.text, message_id: injectionId } },
+        user_context: { user_message: { text: steer.text, message_id: messageId } },
       },
     },
   }), "steer injection", () => isEarlySteerTracked(steer.sessionID, injectionId) && takesSteers()).then((written) => {
@@ -5907,6 +5891,64 @@ export function continuationAfterEarlySteers(
       `and ${added.length} new message(s)${injectNew ? " to inject" : " for a follow-up"}`,
   )
   return { results, session: held, inject: injectNew ? added : [], messageReachesRun: steers.length > 0 || (injectNew && added.length > 0) }
+}
+
+/**
+ * A history rebuild after completed tool results seeds `prompt` (every tool result and the trailing
+ * user messages) as a new conversation. Each of the failed Run's own injections Cursor appended must
+ * reach that conversation once:
+ * - an early steer through OpenCode's promoted copy at the boundary it was promoted at
+ *   (`handOverEarlySteers` then forgets the record, so nothing injects it again);
+ * - a host note through the seeded text, or as an injection the Run still tracks, which the rebuild
+ *   carries over unless the seed already holds it (`prepareUserTurnHostNotes`).
+ * A steer appended in the cut step before OpenCode promoted it, or a note history no longer holds,
+ * keeps the rebuild refused.
+ */
+function appendedInjectionsInRebuild(failed: CursorSession, prompt: LanguageModelV3CallOptions["prompt"]): boolean {
+  const appended = failed.replaySafety?.appendedInjections
+  if (!appended?.length) return true
+  const sessionKey = failed.openCodeSessionId
+  const copies = prompt.flatMap((message, index) => message.role === "user" && !message.content.some((part) => part.type !== "text")
+    ? [{ index, text: extractUserText(message as unknown as Record<string, unknown>) }]
+    : [])
+  const blockStart = (index: number) => {
+    while (index > 0 && (prompt[index - 1]!.role === "user" || prompt[index - 1]!.role === "system")) index--
+    return index
+  }
+  const tracked = sessionKey ? hostNoteInjectionsBySession.get(sessionKey) : undefined
+  // A failed replacement open leaves the notes `reopen` took from the Run in
+  // this store. They still reach the next seed even when host history lost them.
+  const deferred = sessionKey ? undeliveredHostNotes(sessionKey) : []
+  let seeded: string | undefined
+  for (const injection of appended) {
+    if (injection.kind === "steer") {
+      const record = findEarlySteer(sessionKey, injection.injectionId)
+      const copy = record?.delivered && record.promoted && record.hostTurn
+        ? copies.findIndex(({ index, text }) => carriesSteer(text, record.text)
+          && steerHostTurn(prompt, blockStart(index)) === record.hostTurn)
+        : -1
+      if (copy === -1) {
+        trace(`recovery: appended-not-in-history kind=steer injectionId=${injection.injectionId} ` +
+          `promoted=${!!record?.promoted} sessionId=${failed.sessionId}`)
+        return false
+      }
+      copies.splice(copy, 1)
+      continue
+    }
+    if (tracked?.get(injection.injectionId)?.session === failed) continue
+    if (injection.notes.every((note) => deferred.includes(note))) continue
+    // The seed `startSession` builds for a completed-tool-results rebase.
+    seeded ??= extractPromptHistory(prompt, { preserveTrailingUser: true, toolResults: "all" })
+      .filter((message) => message.role === "user")
+      .map((message) => message.content)
+      .join("\n\n")
+    if (!injection.notes.every((note) => seeded!.includes(note.trim()))) {
+      trace(`recovery: appended-not-in-history kind=note injectionId=${injection.injectionId} ` +
+        `sessionId=${failed.sessionId}`)
+      return false
+    }
+  }
+  return true
 }
 
 async function loadAvailableModels(): Promise<void> {
@@ -7348,6 +7390,14 @@ export async function pump(
     if (replayFrame.barrier === "display-tool-lifecycle") {
       replaySafety.recordToolLifecycle(replayFrame.toolLifecycle)
       acknowledgeHostResults(session, replayFrame.toolLifecycle, frame)
+    } else if (iu?.user_message_appended && replayFrame.barrier === "stateful-interaction") {
+      const injection = takeAppendedInjection(session.injections, replayFrame.appendedUserMessage)
+      // Field numbers and wire types only, so an unexpected echo shape can be compared.
+      if (!injection) {
+        trace(`recovery: appended-unmatched layout=${describeFrameLayout(payload, 4)} ` +
+          `parsed=${!!replayFrame.appendedUserMessage} sessionId=${session.sessionId}`)
+      }
+      replaySafety.recordAppendedMessage(injection)
     } else if (replayFrame.barrier) replaySafety.markBarrier(replayFrame.barrier)
     // The provider answers some queries itself (a plan file, an image approval); resuming a checkpoint
     // from before one would repeat it, so only a later checkpoint is resumed.
@@ -7641,7 +7691,6 @@ export async function pump(
       sessionManager.close(session)
       return
     } else if (iu?.user_message_appended) {
-      trace(describeAppendedUserMessage(session, iu.user_message_appended))
       endThinkingRun()
       if (textStarted) textSeparator = "\n\n"
     } else if (iu?.tool_call_started) {
@@ -9174,7 +9223,7 @@ export async function decodeTrailingToolImages(
   for (const result of results) {
     signal?.throwIfAborted()
     const pending = result.sessionId === session.sessionId ? session.pending.get(result.execId) : undefined
-    if (!session.supportsImages || result.error || !result.media?.length || !pending || pending.bridged
+    if (result.error || !result.media?.length || !pending || pending.bridged
       || (pending.resultField !== "read_result" && pending.resultField !== "mcp_result")) {
       decoded.push(result)
       continue
@@ -9276,8 +9325,11 @@ function resultsWithoutCheckpoint(
 async function injectPromotedSteers(session: CursorSession, steers: readonly EarlySteer[]): Promise<boolean> {
   try {
     for (const steer of steers) {
+      const messageId = crypto.randomUUID()
+      trackRunInjection(session.injections ??= [], { kind: "steer", injectionId: steer.injectionId, messageId, text: steer.text })
       await writeWithBackpressure(session.stream, buildInjectUserMessage({
         injectionId: steer.injectionId,
+        messageId,
         expectedRunId: session.runId!,
         text: steer.text,
       }), "steer injection")
