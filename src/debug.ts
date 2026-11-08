@@ -74,9 +74,15 @@ const moduleCopies = processShared("debug.module-copies.v1", () => ({ count: 0 }
 const MODULE_COPY = ++moduleCopies.count
 const maintenance = processShared("debug.maintenance.v1", () => new Map<string, number>())
 // Keys `traceOncePerLog` already wrote to the current file, shared by every copy
-// since they append to the same file.
-const writtenOnce = processShared("debug.written-once.v1", () => ({ keys: new Set<string>() }))
+// since they append to the same file, and the file as it was after the last such line.
+const writtenOnce = processShared("debug.written-once.v2", () => ({
+  keys: new Set<string>(),
+  file: undefined as { dev: number; ino: number; size: number; at: number } | undefined,
+}))
 const WRITTEN_ONCE_MAX_KEYS = 4096
+// Another process sharing the file may trim it in place, and the file can grow back past the
+// size remembered here, so the memory also expires.
+const WRITTEN_ONCE_MAX_AGE_MS = 10 * 60 * 1000
 
 let _traceInitialized = false
 let _debugFile: string | undefined
@@ -397,7 +403,10 @@ function appendTrace(message: () => string): boolean {
       )
     }
     // A trimmed or rotated file may no longer hold the full lines `traceOncePerLog` wrote.
-    if (maintainDebugLog(_debugFile)) writtenOnce.keys.clear()
+    if (maintainDebugLog(_debugFile)) {
+      writtenOnce.keys.clear()
+      writtenOnce.file = undefined
+    }
     fs.appendFileSync(_debugFile, `[${new Date().toISOString()}] ${copyTag()}${message()}\n`, { mode: 0o600 })
     return true
   } catch {
@@ -418,12 +427,39 @@ export function traceVerbose(msg: string): void {
 export function traceOncePerLog(key: string, full: string, brief: string): void {
   if (!DEBUG_ENABLED) return
   const keys = writtenOnce.keys
-  const written = appendTrace(() => (DEBUG_LEVEL < 2 && keys.has(key) ? brief : full))
+  const written = appendTrace(() => {
+    if (onceLogReplaced()) keys.clear()
+    return DEBUG_LEVEL < 2 && keys.has(key) ? brief : full
+  })
   if (!written) return
   // Re-inserted on every use, so eviction drops the least recently used key.
   keys.delete(key)
   keys.add(key)
   if (keys.size > WRITTEN_ONCE_MAX_KEYS) keys.delete(keys.values().next().value!)
+  try {
+    const stat = fs.statSync(_debugFile!)
+    writtenOnce.file ??= { dev: stat.dev, ino: stat.ino, size: stat.size, at: Date.now() }
+    Object.assign(writtenOnce.file, { dev: stat.dev, ino: stat.ino, size: stat.size })
+  } catch {
+    writtenOnce.file = undefined
+  }
+}
+
+/** Whether the file may have lost the full lines written since the memory started: another process rotated or trimmed it. */
+function onceLogReplaced(): boolean {
+  const seen = writtenOnce.file
+  if (!seen) return false
+  let replaced = Date.now() - seen.at >= WRITTEN_ONCE_MAX_AGE_MS
+  if (!replaced) {
+    try {
+      const stat = fs.statSync(_debugFile!)
+      replaced = stat.dev !== seen.dev || stat.ino !== seen.ino || stat.size < seen.size
+    } catch {
+      replaced = true
+    }
+  }
+  if (replaced) writtenOnce.file = undefined
+  return replaced
 }
 
 /**

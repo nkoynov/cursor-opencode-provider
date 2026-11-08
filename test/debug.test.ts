@@ -1110,4 +1110,30 @@ describe("debug log levels", () => {
       assert.match(log[3], /^\\[[^\\]]+\\] tools=a$/);
     `)
   })
+
+  it("writes a list in full again after another process rotates or trims the file, and every 10 minutes", async () => {
+    await traceInChild(`
+      let clock = Date.now();
+      Date.now = () => clock;
+      const { traceOncePerLog } = await import(${debugModule});
+      const once = () => traceOncePerLog("tools:a", "tools=a [full]", "tools=a");
+      const tools = () => fs.readFileSync(file, "utf8").split("\\n")
+        .filter((line) => line.includes("tools=a")).map((line) => line.replace(/^\\[[^\\]]+\\] /, ""));
+      once();
+      once();
+      assert.deepEqual(tools(), ["tools=a [full]", "tools=a"]);
+      fs.renameSync(file, file + ".1");
+      once();
+      once();
+      assert.deepEqual(tools(), ["tools=a [full]", "tools=a"]);
+      fs.truncateSync(file, 0);
+      once();
+      once();
+      assert.deepEqual(tools(), ["tools=a [full]", "tools=a"]);
+      clock += 10 * 60 * 1000;
+      once();
+      once();
+      assert.deepEqual(tools(), ["tools=a [full]", "tools=a", "tools=a [full]", "tools=a"]);
+    `)
+  })
 })
