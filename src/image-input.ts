@@ -1,13 +1,18 @@
 import { createHash } from "node:crypto"
-import { readFile, stat } from "node:fs/promises"
+import { constants } from "node:fs"
+import { open, realpath } from "node:fs/promises"
 import path from "node:path"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { UnsupportedFunctionalityError } from "@ai-sdk/provider"
+import { hostGlobalDataDir } from "./context/paths.js"
 
 export const MAX_CURSOR_IMAGE_INPUT_BYTES = 20 * 1024 * 1024
 
-/** Local image files are read here, so hosts may pass `file:` URLs (OpenCode's stored tool media) instead of bytes. */
+/** OpenCode's stored tool media is read here, so it may pass their `file:` URLs instead of bytes. */
 export const CURSOR_SUPPORTED_URLS: Record<string, RegExp[]> = { "image/*": [/^file:\/\//i] }
+
+// Non-blocking, so a FIFO in the store cannot stall the open before the stat rejects it.
+const STORED_TOOL_MEDIA_OPEN = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)
 
 const STORED_TOOL_MEDIA = /^([0-9a-f]{64})\.(?:png|jpg|gif|webp)$/
 
@@ -166,6 +171,40 @@ async function readResponseBytes(response: Response, remaining: number): Promise
   return data
 }
 
+/**
+ * The only local files read: the exact `file:` URL of a regular file directly in OpenCode's
+ * `<data>/tool-media`, not a symlink out of it, whose content matches the hash in its name.
+ */
+async function readStoredToolMedia(url: URL, remaining: number): Promise<{ data: Uint8Array; filename: string }> {
+  const refuse = (): never =>
+    unsupported("image URL input", "Cursor provider reads local images only from OpenCode's stored tool media")
+  const hash = storedToolMediaHash(url)
+  const store = path.join(hostGlobalDataDir(), "tool-media")
+  let filePath: string
+  try {
+    filePath = fileURLToPath(url)
+  } catch {
+    return refuse()
+  }
+  if (!hash || path.dirname(filePath) !== store || pathToFileURL(filePath).href !== url.href) return refuse()
+  const real = await realpath(filePath)
+  if (real !== path.join(await realpath(store), path.basename(filePath))) return refuse()
+  const handle = await open(real, STORED_TOOL_MEDIA_OPEN)
+  try {
+    const info = await handle.stat()
+    if (!info.isFile()) return refuse()
+    assertImageSize(info.size, remaining)
+    const data = new Uint8Array(await handle.readFile())
+    assertImageSize(data.length, remaining)
+    if (imageContentHash(data) !== hash) {
+      return unsupported("image input", "Cursor provider found a stored tool image whose content no longer matches its name")
+    }
+    return { data, filename: path.basename(filePath) }
+  } finally {
+    await handle.close()
+  }
+}
+
 async function resolveImageData(
   value: Uint8Array | string | URL,
   remaining: number,
@@ -179,12 +218,7 @@ async function resolveImageData(
     return value.startsWith("data:") ? decodeDataUrl(value, remaining) : { data: decodeBase64(value, remaining) }
   }
   if (value.protocol === "data:") return decodeDataUrl(value.href, remaining)
-  if (value.protocol === "file:") {
-    const filePath = fileURLToPath(value)
-    const info = await stat(filePath)
-    assertImageSize(info.size, remaining)
-    return { data: Uint8Array.from(await readFile(filePath)), filename: path.basename(filePath) }
-  }
+  if (value.protocol === "file:") return readStoredToolMedia(value, remaining)
   if (value.protocol !== "http:" && value.protocol !== "https:") {
     return unsupported(
       "image URL input",
@@ -229,10 +263,6 @@ async function decodeCursorImagePart(
     signal,
   )
   assertImageSize(resolved.data.length, remaining)
-  const stored = storedToolMediaHash(file.data)
-  if (stored && imageContentHash(resolved.data) !== stored) {
-    return unsupported("image input", "Cursor provider found a stored tool image whose content no longer matches its name")
-  }
   const declaredMimeType = file.mediaType
   const mimeType = declaredMimeType === "image/*"
     ? (resolved.mimeType?.startsWith("image/") ? resolved.mimeType : inferImageMimeType(resolved.data))

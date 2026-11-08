@@ -1,6 +1,7 @@
-import { afterAll, describe, expect, it } from "bun:test"
+import { afterAll, beforeAll, describe, expect, it } from "bun:test"
+import { spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
@@ -383,9 +384,17 @@ describe("Cursor image input", () => {
 
 describe("OpenCode stored tool media", () => {
   const root = mkdtempSync(path.join(tmpdir(), "cursor-tool-media-"))
-  const store = path.join(root, "tool-media")
-  mkdirSync(store)
-  afterAll(() => rmSync(root, { recursive: true, force: true }))
+  const store = path.join(root, "opencode", "tool-media")
+  mkdirSync(store, { recursive: true })
+  const dataHome = process.env.XDG_DATA_HOME
+  beforeAll(() => {
+    process.env.XDG_DATA_HOME = root
+  })
+  afterAll(() => {
+    if (dataHome === undefined) delete process.env.XDG_DATA_HOME
+    else process.env.XDG_DATA_HOME = dataHome
+    rmSync(root, { recursive: true, force: true })
+  })
   const png = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3])
   const hash = createHash("sha256").update(png).digest("hex")
   const stored = (name: string) => [{ role: "user", content: [
@@ -439,5 +448,32 @@ describe("OpenCode stored tool media", () => {
     const result = await extractCursorHistoryImages(stored(`${gone}.png`))
     expect(result.images).toHaveLength(0)
     expect(result.omittedCount).toBe(1)
+  })
+
+  it("reads no local file outside the store, through a symlink out of it, or that is not a regular file", async () => {
+    const outside = path.join(root, "elsewhere", "tool-media")
+    mkdirSync(outside, { recursive: true })
+    writeFileSync(path.join(outside, `${hash}.png`), png)
+    const secret = Uint8Array.from([...png, 9])
+    const secretFile = path.join(root, "secret.png")
+    writeFileSync(secretFile, secret)
+    const link = path.join(store, `${createHash("sha256").update(secret).digest("hex")}.png`)
+    symlinkSync(secretFile, link)
+    const fifo = path.join(store, `${"f".repeat(64)}.png`)
+    expect(spawnSync("mkfifo", [fifo]).status).toBe(0)
+    const urls = [
+      pathToFileURL(path.join(outside, `${hash}.png`)),
+      new URL(`${pathToFileURL(store).href}/../../elsewhere/tool-media/${hash}.png`),
+      pathToFileURL(secretFile),
+      pathToFileURL(link),
+      pathToFileURL(fifo),
+      new URL(`${pathToFileURL(path.join(store, `${hash}.png`)).href}?x`),
+    ]
+    for (const data of urls) {
+      const part = { type: "file", mediaType: "image/png", data }
+      const held = await extractCursorToolResultImages([part])
+      expect([data.href, held.images.length, held.omittedCount]).toEqual([data.href, 0, 1])
+      await expect(extractCursorUserImages({ role: "user", content: [part] })).rejects.toBeInstanceOf(UnsupportedFunctionalityError)
+    }
   })
 })
