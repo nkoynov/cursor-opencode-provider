@@ -1108,9 +1108,13 @@ function queuedFinalVerdict(run: LostRun): CursorProviderError | undefined {
  * Fork: whether a lost held Run can go on from host history: its interrupted pass, continued by the frames the held
  * reader queued unread, recorded on a copy of its replay state as the pump would have recorded them, so the same rules
  * judge both (catalog lookups and announced calls included). The held reader answers aborts of the host's own execs
- * itself, so a queued abort of any other exec withdraws one nothing ran and is left out.
+ * itself, so a queued abort of any other exec withdraws one nothing ran and is left out. An exec the provider answered
+ * earlier in the Run, other than a terminal poll or refusal, needs its result in host history as for any rebuild.
  */
-function lostRunUnrebuildable(run: LostRun): string | undefined {
+function lostRunUnrebuildable(run: LostRun, completed: ReadonlySet<string>): string | undefined {
+  const answered = execsOwedResults(run.replaySafety)
+    .find((exec) => !exec.host && !completed.has(`${exec.sessionId}:${exec.id}`))
+  if (answered) return `provider-answered-exec id=${answered.id}`
   const state = structuredClone(run.replaySafety ?? {})
   const interrupted = state.attempt ?? {}
   const hostIds = new Set(hostExecs(state).filter((exec) => exec.sessionId === run.sessionId).map((exec) => exec.id))
@@ -1595,6 +1599,7 @@ async function doStreamImpl(
         .find((failure) => !!failure && isFinalVerdict(failure))
       if (finalVerdict) throw hostFacingError(finalVerdict, { modelId })
       const ambiguous = lostRuns.some((run) => run.ambiguousDelivery)
+      const completedToolResults = new Set(extractToolResults(prompt).map((result) => `${result.sessionId}:${result.execId}`))
       const keepLostRunNotes = () => {
         for (const run of lostRuns) {
           if (sessionKey && run.userTurnHostNotes?.length) appendUndeliveredHostNotes(sessionKey, run.userTurnHostNotes)
@@ -1609,7 +1614,8 @@ async function doStreamImpl(
       }
       const why = ambiguous
         ? "a tool result it may already hold"
-        : lostRuns.map(lostRunUnrebuildable).find((reason) => reason !== undefined)
+        : lostRuns.map((run) => lostRunUnrebuildable(run, completedToolResults))
+          .find((reason) => reason !== undefined)
       if (why) {
         trace(`continuation: the lost Run cannot be rebuilt from host history (${why})`)
         throw hostFacingError(retrySuppressedError(

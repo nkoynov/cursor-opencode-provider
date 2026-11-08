@@ -276,6 +276,7 @@ export class AttemptReplaySafety {
     const exec = this.state.execs?.find(exec => exec.sessionId === this.sessionId && exec.id === id)
     if (exec) exec[mark] = true
     this.state.attempt!.unrepresentable = true
+    this.state.attempt!.unrebuildable ??= mark === "terminalRead" ? "terminal-read" : "provider-refusal"
   }
 
   /**

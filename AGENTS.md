@@ -387,7 +387,9 @@ The **1.18 v2** API and **OpenCode 2.x** are source-incompatible:
   cancelled after a refused change). The interrupted pump pass
   (`ReplaySafetyState.attempt`) does not bar the rebuild with its output or its
   announced calls nothing claimed or completed; it does with any exec (a poll or
-  refusal included), a bridge or a stateful or unknown frame. Its shown text goes to the rebuilt Run as `<interrupted_reply>`
+  refusal included), a bridge or a stateful or unknown frame. A lost held Run
+  (`lostRunUnrebuildable`) never runs the history check, so it checks the
+  provider's owed answers itself. Its shown text goes to the rebuilt Run as `<interrupted_reply>`
   to be continued. A `get_mcp_tools` lookup Cursor ran itself answers from the
   catalog the provider sent and counts as claimed once its completion validates
   strictly on the wire (`inlineCatalog`, `catalogCalls`: #44 the only variant

@@ -1240,7 +1240,8 @@ describe("host calls still running when the Run dies", () => {
   const setup = (step: "held" | "open",
     cut: "reset" | "clean-close" | "clean-end" | "trailers-end" | "null-error" | "reply-write" | "final" | "invalid-argument"
       | "kv-final" | "none", key: string,
-    before?: "unknown-frame" | "cursor-run-call" | "catalog-lookup" | "catalog-started",
+    before?: "unknown-frame" | "cursor-run-call" | "catalog-lookup" | "catalog-started" | "provider-exec" | "terminal-poll"
+      | "refusal",
     queued?: "next-step" | "cursor-run-call" | "appended-user" | "unknown-frame" | "exec-abort" | "checkpoint"
       | "catalog-lookup" | "catalog-started" | "catalog-invalid" | "own-completion") => {
     const requests: RunRequest[] = []
@@ -1270,6 +1271,16 @@ describe("host calls still running when the Run dies", () => {
           ? { get_mcp_tools_tool_call: { args, result: { success: { content: "slack_read(channel: string)" } } } }
           : own
         send({ interaction_update: { tool_call_completed: { call_id: "own", tool_call: done } } })
+      }
+      // Execs the provider answers itself in the pass the cut interrupts; history holds none of them.
+      if (before === "provider-exec") send({ exec_server_message: { id: 90, list_mcp_resources_exec_args: {} } })
+      if (before === "refusal") send({ exec_server_message: { id: 90, grep_args: { pattern: "first" } } })
+      if (before === "terminal-poll") {
+        const env = sessionManager.findOpenByOpenCodeSessionId(key)!.requestContext.env as { project_folder: string }
+        const record = path.join(env.project_folder, "terminals", "7.txt")
+        fs.mkdirSync(path.dirname(record), { recursive: true })
+        fs.writeFileSync(record, "running\n")
+        send({ exec_server_message: { id: 90, read_args: { path: record, tool_call_id: "poll" } } })
       }
       if (step === "open") {
         send({ interaction_update: { tool_call_started: { call_id: "first", tool_call: { read_tool_call: { args: { path: "notes.txt" } } } } } })
@@ -1474,6 +1485,8 @@ describe("host calls still running when the Run dies", () => {
     ["held", "clean-close", undefined, "catalog-invalid"], ["held", "final", undefined, "appended-user"],
     ["held", "kv-final", undefined, undefined], ["held", "none", undefined, undefined],
     ["held", "null-error", undefined, undefined], ["open", "null-error", undefined, undefined],
+    ["held", "reset", "provider-exec", undefined], ["held", "reset", "terminal-poll", undefined],
+    ["held", "reset", "refusal", undefined],
   ] as const) {
     it(`ends the turn once the running call's result is in when the Run cannot be rebuilt (${step} step, ${cut}${before ? `, ${before}` : ""}${queued ? `, queued ${queued}` : ""})`, async () => {
       const { requests, prompt, read, cleanup, waitForCut } = setup(step, cut, `ses_held_tool_refuse_${step}_${cut}_${before}_${queued}`, before, queued)
@@ -1496,6 +1509,8 @@ describe("host calls still running when the Run dies", () => {
         // Cursor's own final error wins over the provider's refusal.
         if (cut === "final" || cut === "kv-final") expect((error as APICallError).message).not.toContain("continue")
         else if (cut !== "invalid-argument" && cut !== "null-error") expect((error as APICallError).message).toContain("continue")
+        const why = { "provider-exec": "provider-answered-exec id=90", "terminal-poll": "terminal-read", refusal: "provider-refusal" }
+        if (before && before in why) expect((error as APICallError).message).toContain(why[before as keyof typeof why])
         expect(requests).toHaveLength(1)
       } finally {
         await cleanup()
