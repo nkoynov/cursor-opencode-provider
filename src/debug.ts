@@ -50,7 +50,7 @@ const MODULE_COPY = ++moduleCopies.count
 // Keys `traceOncePerLog` already wrote to the current file, shared by every copy
 // since they append to the same file.
 const writtenOnce = processShared("debug.written-once.v1", () => ({ keys: new Set<string>() }))
-const WRITTEN_ONCE_MAX_KEYS = 1024
+const WRITTEN_ONCE_MAX_KEYS = 4096
 
 let _traceInitialized = false
 let _debugFile: string | undefined
@@ -175,7 +175,7 @@ export function trace(msg: string): void {
 }
 
 /** `message` runs after any rotation, so it sees whether this line starts a new file. */
-function appendTrace(message: () => string): void {
+function appendTrace(message: () => string): boolean {
   try {
     if (!_debugFile) {
       _debugFileUsesManagedDirectory = !process.env.CURSOR_PROVIDER_DEBUG_FILE
@@ -207,8 +207,9 @@ function appendTrace(message: () => string): void {
     }
     if (rotateDebugLogIfOversized(_debugFile, _debugLogMaxBytes)) writtenOnce.keys.clear()
     fs.appendFileSync(_debugFile, `[${new Date().toISOString()}] ${copyTag()}${message()}\n`)
+    return true
   } catch {
-    /* ignore */
+    return false
   }
 }
 
@@ -224,13 +225,13 @@ export function traceVerbose(msg: string): void {
  */
 export function traceOncePerLog(key: string, full: string, brief: string): void {
   if (!DEBUG_ENABLED) return
-  appendTrace(() => {
-    const keys = writtenOnce.keys
-    if (DEBUG_LEVEL < 2 && keys.has(key)) return brief
-    if (keys.size >= WRITTEN_ONCE_MAX_KEYS) keys.clear()
-    keys.add(key)
-    return full
-  })
+  const keys = writtenOnce.keys
+  const written = appendTrace(() => (DEBUG_LEVEL < 2 && keys.has(key) ? brief : full))
+  if (!written) return
+  // Re-inserted on every use, so eviction drops the least recently used key.
+  keys.delete(key)
+  keys.add(key)
+  if (keys.size > WRITTEN_ONCE_MAX_KEYS) keys.delete(keys.values().next().value!)
 }
 
 /**

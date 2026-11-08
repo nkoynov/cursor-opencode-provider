@@ -3817,7 +3817,7 @@ async function readHeldFrames(session: CursorSession, frames: CursorSession["fra
       if (kvReply.kind === "set") noteAssistantBlob(session, kv!)
       try {
         await writeWithBackpressure(session.stream, kvReply.reply, `held KV ${kvReply.kind}_blob reply id=${kvReply.id}`)
-        trace(`held Run: answered KV ${kvReply.kind} id=${kvReply.id} sessionId=${session.sessionId}`)
+        traceVerbose(`held Run: answered KV ${kvReply.kind} id=${kvReply.id} sessionId=${session.sessionId}`)
       } catch (error) {
         trace(`held Run: KV reply failed sessionId=${session.sessionId}: ${(error as Error).message}`)
         sessionManager.close(session, "reply-write-failed", toCursorProviderError(error, {
@@ -3838,7 +3838,7 @@ async function readHeldFrames(session: CursorSession, frames: CursorSession["fra
     // Everything else, a KV request this client cannot answer included (the
     // pump fails the Run on it), waits for the next pump in order.
     ;(session.heldFrames ??= []).push(frame)
-    trace(`held Run: queued a frame for the next pump queued=${session.heldFrames.length} sessionId=${session.sessionId}`)
+    traceVerbose(`held Run: queued a frame for the next pump queued=${session.heldFrames.length} sessionId=${session.sessionId}`)
     if (frame.flags & 0x02) return
   }
 }
@@ -10027,7 +10027,8 @@ export async function refreshHeldSessionToolCatalog(
   }
 }
 
-function extractTools(callOptions: LanguageModelV3CallOptions): OpencodeToolDef[] {
+/** Exported for tests. */
+export function extractTools(callOptions: LanguageModelV3CallOptions): OpencodeToolDef[] {
   const tools = callOptions.tools
   if (!tools || tools.length === 0) {
     trace("extractTools: callOptions.tools empty/missing")
