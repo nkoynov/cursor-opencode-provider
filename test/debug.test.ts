@@ -265,7 +265,7 @@ describe("debug log levels", () => {
         CURSOR_PROVIDER_DEBUG: level,
         CURSOR_PROVIDER_RECOVERY_DEBUG: "0",
         CURSOR_PROVIDER_DEBUG_FILE: file,
-        ...(maxBytes ? { CURSOR_PROVIDER_DEBUG_MAX_BYTES: maxBytes } : {}),
+        CURSOR_PROVIDER_DEBUG_MAX_BYTES: maxBytes ?? String(DEBUG_LOG_MAX_BYTES),
       },
     })
   const messages = (file: string) => fs.readFileSync(file, "utf8").split("\n")

@@ -3817,7 +3817,11 @@ async function readHeldFrames(session: CursorSession, frames: CursorSession["fra
       if (kvReply.kind === "set") noteAssistantBlob(session, kv!)
       try {
         await writeWithBackpressure(session.stream, kvReply.reply, `held KV ${kvReply.kind}_blob reply id=${kvReply.id}`)
-        traceVerbose(`held Run: answered KV ${kvReply.kind} id=${kvReply.id} sessionId=${session.sessionId}`)
+        const missed = kvReply.kind === "get" && !kvReply.found && !kvReply.echoed
+        ;(missed ? trace : traceVerbose)(
+          `held Run: answered KV ${kvReply.kind} id=${kvReply.id} found=${kvReply.found} ` +
+            `echoed=${!!kvReply.echoed} sessionId=${session.sessionId}`,
+        )
       } catch (error) {
         trace(`held Run: KV reply failed sessionId=${session.sessionId}: ${(error as Error).message}`)
         sessionManager.close(session, "reply-write-failed", toCursorProviderError(error, {
