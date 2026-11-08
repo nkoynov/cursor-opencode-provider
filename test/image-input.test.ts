@@ -42,6 +42,21 @@ describe("tool-result images", () => {
     expect(result.omittedCount).toBe(1)
   })
 
+  it("harvests images of provider-executed tool results inside assistant messages", async () => {
+    const history = [
+      { role: "assistant", content: [
+        { type: "tool-call", toolCallId: "c1", toolName: "web_search", input: {}, providerExecuted: true },
+        { type: "tool-result", toolCallId: "c1", toolName: "web_search", output: { type: "content", value: [
+          { type: "text", text: "found" },
+          { type: "image-data", mediaType: "image/png", data: "AQID" },
+        ] } },
+      ] },
+      { role: "user", content: [{ type: "text", text: "continue" }] },
+    ]
+    const result = await extractCursorHistoryImages(history)
+    expect(result.images.map((image) => [...image.data])).toEqual([[1, 2, 3]])
+  })
+
   it("honors cancellation even for inline tool media", async () => {
     const controller = new AbortController()
     controller.abort()

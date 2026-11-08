@@ -355,26 +355,31 @@ function cursorHistoryImageParts(prompt: readonly unknown[]): HistoryImageCandid
 
     if (record.role === "assistant") {
       pushImageFileParts(parts, record.content)
+      // Provider-executed tool results sit in the assistant message itself.
+      pushToolResultImageParts(parts, record.content)
       continue
     }
 
-    if (record.role !== "tool") continue
-    for (const part of record.content) {
-      if (!part || typeof part !== "object") continue
-      const toolResult = part as Record<string, unknown>
-      if (toolResult.type !== "tool-result" || !toolResult.output || typeof toolResult.output !== "object") {
-        continue
-      }
-      const output = toolResult.output as Record<string, unknown>
-      if (output.type !== "content" || !Array.isArray(output.value)) continue
-      for (const value of output.value) {
-        if (!value || typeof value !== "object") continue
-        const file = toolImagePart(value)
-        if (file) parts.push({ file, toolResult: true })
-      }
-    }
+    if (record.role === "tool") pushToolResultImageParts(parts, record.content)
   }
   return parts
+}
+
+function pushToolResultImageParts(parts: HistoryImageCandidate[], content: readonly unknown[]): void {
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue
+    const toolResult = part as Record<string, unknown>
+    if (toolResult.type !== "tool-result" || !toolResult.output || typeof toolResult.output !== "object") {
+      continue
+    }
+    const output = toolResult.output as Record<string, unknown>
+    if (output.type !== "content" || !Array.isArray(output.value)) continue
+    for (const value of output.value) {
+      if (!value || typeof value !== "object") continue
+      const file = toolImagePart(value)
+      if (file) parts.push({ file, toolResult: true })
+    }
+  }
 }
 
 export async function extractCursorHistoryImages(
