@@ -12,6 +12,7 @@ import { createCursor } from "../src/index.js"
 import { CursorAuthError, CursorRetryExhaustedError, CursorServerError, CursorTransportError } from "../src/errors.js"
 import { decodeFramePayload } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
+import { encodeJsonAsValue, readAllFields } from "../src/protocol/struct.js"
 import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests, CursorRunInterruptedError, frameArrival, lastFrameArrival } from "../src/transport/connect.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { sessionManager } from "../src/session.js"
@@ -482,6 +483,7 @@ describe("checkpoint eligibility across host results", () => {
     "inline-catalog", "spilled-catalog", "unfinished-catalog", "unacknowledged-checkpoint",
     "catalog-lookup", "catalog-lookup-open", "cursor-run-completed", "catalog-lookup-mismatch",
     "catalog-lookup-unknown-variant", "catalog-lookup-reused-id",
+    "terminal-poll", "terminal-poll-after-result", "mcp-terminal-poll", "refusal-before-result", "refusal-after-result",
   ] as const) {
     it(`recovers a post-result drop only from represented completed work (${scenario})`, async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-result-history-"))
@@ -586,11 +588,40 @@ describe("checkpoint eligibility across host results", () => {
           delivered.push(id)
           if (id === 1) {
             completed("first", "echo first")
+            // AwaitShell: Cursor polls the terminal record of a background shell; the provider answers each read.
+            if (scenario === "terminal-poll") {
+              const env = sessionManager.findOpenByOpenCodeSessionId(`ses_result_history_${scenario}`)!.requestContext.env as { project_folder: string }
+              const record = path.join(env.project_folder, "terminals", "7.txt")
+              fs.mkdirSync(path.dirname(record), { recursive: true })
+              fs.writeFileSync(record, "running\n")
+              for (const poll of [50, 51, 52]) {
+                send({ exec_server_message: { id: poll, read_args: { path: record, tool_call_id: `poll-${poll}` } } })
+              }
+            }
+            // Fork: the same poll through the advertised canonical read over MCP.
+            if (scenario === "mcp-terminal-poll") {
+              const env = sessionManager.findOpenByOpenCodeSessionId(`ses_result_history_${scenario}`)!.requestContext.env as { project_folder: string }
+              const record = path.join(env.project_folder, "terminals", "7.txt")
+              fs.mkdirSync(path.dirname(record), { recursive: true })
+              fs.writeFileSync(record, "running\n")
+              const struct = readAllFields(encodeJsonAsValue({ filePath: record })).find((field) => field.fn === 5)!.bytes!
+              const args = readAllFields(struct).map((field) => field.bytes!)
+              send({ exec_server_message: { id: 50, mcp_args: { name: "opencode-read", args, tool_call_id: "poll-mcp" } } })
+            }
+            // Fork: a refusal earlier in the Run (here of a tool the host does not offer) ran nothing on the host.
+            if (scenario === "refusal-before-result") send({ exec_server_message: { id: 50, grep_args: { pattern: "first" } } })
             started("second", "echo second")
             send({ exec_server_message: { id: 2, [shellVariant]: { command: "echo second", tool_call_id: "second" } } })
           } else {
             // The Run can drop before Cursor closes the last call.
             if (scenario !== "announced-open") completed("second", "echo second")
+            // A poll after the last result belongs to the cut step itself, so the rebuild would lose it.
+            if (scenario === "terminal-poll-after-result") {
+              const env = sessionManager.findOpenByOpenCodeSessionId(`ses_result_history_${scenario}`)!.requestContext.env as { project_folder: string }
+              send({ exec_server_message: { id: 50, read_args: { path: path.join(env.project_folder, "terminals", "7.txt") } } })
+            }
+            // Fork: a refusal in the cut step is as final as a poll there.
+            if (scenario === "refusal-after-result") send({ exec_server_message: { id: 51, grep_args: { pattern: "second" } } })
             if (scenario === "malformed-completion" || scenario === "repeated-completion-id") {
               // Independent lifecycle wire: completion #3, call_id #1.
               // The decoder discards the unknown field or duplicate call id.
@@ -622,7 +653,12 @@ describe("checkpoint eligibility across host results", () => {
           workspaceRoot: root, cacheDir: root, retry: { baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
         const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Run both commands" }] }]
         const options = { prompt, headers: { "x-opencode-session-id": `ses_result_history_${scenario}` },
-          tools: [{ type: "function" as const, name: "bash", inputSchema: { type: "object", properties: { command: { type: "string" } } } }] }
+          tools: [
+            { type: "function" as const, name: "bash", inputSchema: { type: "object", properties: { command: { type: "string" } } } },
+            ...scenario === "mcp-terminal-poll"
+              ? [{ type: "function" as const, name: "read", inputSchema: { type: "object", properties: { filePath: { type: "string" } } } }]
+              : [],
+          ] }
         const read = async () => {
           const parts: LanguageModelV3StreamPart[] = []
           const { stream } = await model.doStream(options)
@@ -644,10 +680,12 @@ describe("checkpoint eligibility across host results", () => {
           prompt.push({ role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName, output: { type: "text", value: output } }] })
         }
         if (scenario === "missing-history") prompt.splice(1, 2)
+        // Provider-answered execs other than terminal reads and refusals need host results as upstream (#164);
+        // in the interrupted step even those refuse.
         if (scenario === "complete" || scenario === "announced" || scenario === "announced-shell" || scenario === "announced-open"
-          || scenario === "provider-answered-exec" || scenario === "new-output" || scenario === "next-call-announced"
-          || scenario === "provider-exec-after-result" || scenario === "edit-in-progress" || scenario === "interaction-after-result"
-          || scenario === "inline-catalog" || scenario === "unacknowledged-checkpoint" || scenario === "catalog-lookup") {
+          || scenario === "new-output" || scenario === "next-call-announced" || scenario === "interaction-after-result"
+          || scenario === "inline-catalog" || scenario === "unacknowledged-checkpoint" || scenario === "catalog-lookup"
+          || scenario === "terminal-poll" || scenario === "mcp-terminal-poll" || scenario === "refusal-before-result") {
           const parts = await read()
           expect(parts.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
           expect(parts.some(part => part.type === "tool-call")).toBe(false)
@@ -660,7 +698,6 @@ describe("checkpoint eligibility across host results", () => {
           expect(text).toContain("Do not repeat completed work")
           // Shown output stays on screen; the rebuilt step continues it.
           if (scenario === "new-output") expect(text).toContain("<interrupted_reply>\nnew output\n</interrupted_reply>")
-          else if (scenario === "edit-in-progress") expect(text).toContain("<interrupted_reply>\nFixing the test next.\n</interrupted_reply>")
           else expect(text).not.toContain("<interrupted_reply>")
         } else if (scenario === "oversized") {
           // The host compacts on this context overflow instead of retrying.

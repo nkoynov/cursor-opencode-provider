@@ -72,11 +72,12 @@ export type ReplaySafetyState = {
   statefulBarrier?: ReplayBarrierReason
   /**
    * Every exec needs its owner's host result; ids can restart on a resumed Run.
-   * `callId` is the display call the exec claims. Fork: `host` marks an exec
-   * handed to a host tool; the provider answers the others itself (refusals,
-   * its own runtime files, placeholders), and they change nothing outside it.
+   * `callId` is the display call the exec claims. `terminalRead` marks the provider's own answer
+   * from a host shell's terminal record (Cursor's AwaitShell polls): it ran nothing, so history needs no result.
+   * Fork: `refused` marks the provider's refusal (a held call after a refused file change or state-changing
+   * command), which needs no result either; `host` marks an exec handed to a host tool.
    */
-  execs?: Array<{ sessionId: string; id: number; callId?: string; host?: true }>
+  execs?: Array<{ sessionId: string; id: number; callId?: string; host?: true; terminalRead?: true; refused?: true }>
   /** Display calls Cursor announced; history holds one only through the host exec that claims it. */
   announcedCalls?: string[]
   /** Only strict inline catalog lookups qualify; spilled catalogs remain barriers. */
@@ -131,9 +132,14 @@ export function announcedCallsClaimed(state: ReplaySafetyState | undefined, unfi
     && (state?.completedCalls ?? []).every((callId) => bridged.has(callId))
 }
 
-/** Fork: execs a host tool ran, each of which needs its result in host history. */
+/** Fork: execs a host tool ran. */
 export function hostExecs(state: ReplaySafetyState | undefined): NonNullable<ReplaySafetyState["execs"]> {
   return state?.execs?.filter((exec) => exec.host) ?? []
+}
+
+/** Execs whose result host history must hold before a rebuild: all but the provider's terminal reads and refusals. */
+export function execsOwedResults(state: ReplaySafetyState | undefined): NonNullable<ReplaySafetyState["execs"]> {
+  return state?.execs?.filter((exec) => !exec.terminalRead && !exec.refused) ?? []
 }
 
 export class AttemptReplaySafety {
@@ -253,6 +259,23 @@ export class AttemptReplaySafety {
   /** Fork: text the host shows, which a rebuilt step must continue rather than repeat. */
   recordShownText(text: string): void {
     this.state.attempt!.shownText = (this.state.attempt!.shownText ?? "") + text
+  }
+
+  /** The provider answered this exec itself by reading a host shell's terminal record. */
+  recordTerminalRead(id: number): void {
+    this.recordProviderAnswer(id, "terminalRead")
+  }
+
+  /** Fork: the provider refused this exec itself. */
+  recordRefusal(id: number): void {
+    this.recordProviderAnswer(id, "refused")
+  }
+
+  /** History needs no result for it, unless it came in the interrupted pass, which a rebuild cannot account for. */
+  private recordProviderAnswer(id: number, mark: "terminalRead" | "refused"): void {
+    const exec = this.state.execs?.find(exec => exec.sessionId === this.sessionId && exec.id === id)
+    if (exec) exec[mark] = true
+    this.state.attempt!.unrepresentable = true
   }
 
   /**

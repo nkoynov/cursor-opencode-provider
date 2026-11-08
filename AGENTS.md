@@ -365,7 +365,9 @@ The **1.18 v2** API and **OpenCode 2.x** are source-incompatible:
   no checkpoint in the turn, a transient failure after only text or reasoning
   is `hostRetryable` (the CLI resends the action). A silent drop immediately
   after delivered host results may rebase from history only when every observed
-  exec has a completed result and no opaque activity occurred. Include all
+  exec has a completed result and no opaque activity occurred. A read the
+  provider answered from a host shell's terminal record (AwaitShell polls,
+  `recordTerminalRead`) needs none; one in the cut attempt stays a barrier. Include all
   completed tool steps; never resume their earlier checkpoint. Other barriers
   stay final. Cursor's `user_message_appended` echo of the Run's own delivered
   steer or host note (its `message_id` and text, nothing else) stays a stateful
@@ -376,14 +378,16 @@ The **1.18 v2** API and **OpenCode 2.x** are source-incompatible:
   fresh `message_id` in `session.injections`; a matched echo does not make the
   interrupted pass unrepresentable, but a Run lost while the host runs tools
   (no rebuild-time check there) stays closed after one.
-- Fork (CB-10): only execs handed to a host tool (`recordHostExec`) and the
-  host calls the provider makes up (`recordHostCall`: mirrored display calls,
-  AskQuestion, SwitchMode, CreatePlan) need a result in history, each by its
-  exec id; the provider's own answers change nothing outside it. The
-  interrupted pump pass (`ReplaySafetyState.attempt`) does not bar the rebuild
-  with its output, its announced calls nothing claimed or completed, or its
-  provider-answered execs; it does with a host exec, a bridge or a stateful or
-  unknown frame. Its shown text goes to the rebuilt Run as `<interrupted_reply>`
+- Every recorded exec, and the host calls the provider makes up
+  (`recordHostCall`: mirrored display calls, AskQuestion, SwitchMode,
+  CreatePlan), needs a result in history by its exec id (`execsOwedResults`),
+  except terminal-record polls the provider answered (#164,
+  `recordTerminalRead`, also through the canonical MCP `read`) and, fork
+  (CB-10), execs it refused (`recordRefusal`: a refusal burst, held calls
+  cancelled after a refused change). The interrupted pump pass
+  (`ReplaySafetyState.attempt`) does not bar the rebuild with its output or its
+  announced calls nothing claimed or completed; it does with any exec (a poll or
+  refusal included), a bridge or a stateful or unknown frame. Its shown text goes to the rebuilt Run as `<interrupted_reply>`
   to be continued. A `get_mcp_tools` lookup Cursor ran itself answers from the
   catalog the provider sent and counts as claimed once its completion validates
   strictly on the wire (`inlineCatalog`, `catalogCalls`: #44 the only variant

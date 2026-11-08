@@ -112,7 +112,7 @@ import {
 } from "./protocol/tools.js"
 import { hostPatchTool, isHostPatchTool } from "./protocol/apply-patch.js"
 import { buildGitDiffUnavailableMessages } from "./protocol/git-diff.js"
-import { runtimeExecMessages, runtimeRootFromContext } from "./runtime-files.js"
+import { isTerminalRecordRead, runtimeExecMessages, runtimeRootFromContext } from "./runtime-files.js"
 import { createManagedTerminal } from "./terminal-runner.js"
 import { cursorExecVariantByRequestField, describeCursorExecVariant, isExecRequestWithoutNewCall } from "./protocol/exec-variants.js"
 import { appendCheckpointUserGrounding, appendWorkspaceRootGrounding } from "./protocol/workspace-grounding.js"
@@ -402,6 +402,7 @@ import {
   announcedCallsClaimed,
   AttemptReplaySafety,
   describeFrameLayout,
+  execsOwedResults,
   heldRunLossRebuildable,
   hostExecs,
   markRunInjectionDelivered,
@@ -1733,7 +1734,10 @@ async function doStreamImpl(
                 const replay = failed.replaySafety
                 const completed = new Set(extractToolResults(prompt)
                   .map(result => `${result.sessionId}:${result.execId}`))
-                const execs = hostExecs(replay)
+                // The provider's own answers from terminal records, and its refusals, ran nothing on the host.
+                const terminalReads = replay?.execs?.filter(exec => exec.terminalRead).length ?? 0
+                const refused = replay?.execs?.filter(exec => exec.refused).length ?? 0
+                const execs = execsOwedResults(replay)
                 const reason = failed !== session ? "different-run"
                   : trailingToolResults.length === 0 ? "no-tool-result-tail"
                   : !failed.checkpointRevokedByHostResult ? "checkpoint-not-revoked-by-result"
@@ -1746,7 +1750,8 @@ async function doStreamImpl(
                   : !execs.every(exec => completed.has(`${exec.sessionId}:${exec.id}`)) ? "missing-host-results"
                   : "completed-tool-results"
                 trace(`recovery: history-check hostSessionId=${failed.openCodeSessionId} sessionId=${failed.sessionId} ` +
-                  `reason=${reason} execs=${execs.length} results=${completed.size} pending=${failed.pending.size}`)
+                  `reason=${reason} execs=${execs.length} terminalReads=${terminalReads} refused=${refused} ` +
+                  `results=${completed.size} pending=${failed.pending.size}`)
                 return reason === "completed-tool-results"
               },
               recover: (recovery) => openSession({ recovery }),
@@ -6152,7 +6157,10 @@ export async function pump(
       }),
       `reject ${label} id=${parsed.id}`,
     )
-    if (ok) trace(`exec: REFUSED ${label} toolName=${parsed.toolName} id=${parsed.id} reason=${JSON.stringify(reason)}`)
+    if (ok) {
+      replaySafety.recordRefusal(parsed.id)
+      trace(`exec: REFUSED ${label} toolName=${parsed.toolName} id=${parsed.id} reason=${JSON.stringify(reason)}`)
+    }
     return ok
   }
 
@@ -7700,6 +7708,9 @@ export async function pump(
             finishOrderedCall(order, displayCallId)
           }
           if (!await writeExecFrames(runtimeMessages, `runtime metadata reply id=${esmId}`)) return
+          if (isTerminalRecordRead(mcpRead ? { read_args: { path: opencodePathArg(parsed!.args) } } : esm, session.requestContext)) {
+            replaySafety.recordTerminalRead(esmId)
+          }
           if (displayCallId) session.displayToolCalls.delete(displayCallId)
           continue
         }

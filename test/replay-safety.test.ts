@@ -5,6 +5,7 @@ import {
   announcedCallsClaimed,
   AttemptReplaySafety,
   describeFrameLayout,
+  execsOwedResults,
   hostExecs,
   markRunInjectionDelivered,
   takeAppendedInjection,
@@ -477,6 +478,27 @@ describe("display tool lifecycle", () => {
     expect(state.attempt).toEqual({})
     expect(hostExecs(state)).toHaveLength(1)
     expect(state.statefulBarrier).toBe("non-control-exec")
+  })
+
+  it("owes no host result for terminal reads and refusals, but refuses them in the interrupted pass", () => {
+    const state: ReplaySafetyState = {}
+    const step = new AttemptReplaySafety("run-1", state)
+    step.recordExec(1, "shell-1")
+    step.recordHostExec(1)
+    step.recordExec(2)
+    step.recordTerminalRead(2)
+    step.recordExec(3, "grep-1")
+    step.recordRefusal(3)
+    step.recordExec(4)
+    expect(execsOwedResults(state).map(exec => exec.id)).toEqual([1, 4])
+    expect(state.attempt?.unrepresentable).toBe(true)
+
+    const next = new AttemptReplaySafety("run-1", state)
+    next.recordExec(5)
+    expect(state.attempt?.unrepresentable).toBeUndefined()
+    next.recordTerminalRead(5)
+    expect(state.attempt?.unrepresentable).toBe(true)
+    expect(execsOwedResults(state).map(exec => exec.id)).toEqual([1, 4])
   })
 
   it("marks only the attempt for provider state a rebuild cannot carry", () => {

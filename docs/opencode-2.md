@@ -316,10 +316,12 @@ pending host work fails after 30 s without an inbound frame; heartbeats and
 partial inputs renew that deadline, while client heartbeats do not. The 120 s
 transport read-idle watchdog remains a backstop. A drop after completed tool
 results, before a new checkpoint, can rebuild from complete host history; the
-interrupted step's output, announced calls and provider-answered execs do not
-prevent it, and its shown text is passed on to be continued. Missing results,
-a host tool started in that step or unrepresented activity remain final. A Run
-whose request upload is cut off is sent again.
+interrupted step's output and announced calls do not prevent it, and its shown
+text is passed on to be continued. Earlier polls of a background shell's
+terminal record and the provider's own refusals (fork) need no result in
+history. Missing results, any other exec the provider answered, a poll,
+refusal or host tool in the interrupted step, or unrepresented activity remain
+final. A Run whose request upload is cut off is sent again.
 An early steer or host note Cursor took into that Run does not block the
 rebuild when host history holds it: a steer once OpenCode has added its copy,
 a note while its text is still in history.
@@ -342,7 +344,12 @@ History recovery keeps completed results from earlier resumed Runs too.
 Completed inline catalog lookups do not block it; unfinished, spilled, malformed,
 and unknown server-side work still do. For sleep/wake diagnostics, set
 `CURSOR_PROVIDER_RECOVERY_DEBUG=1` before starting the daemon. This records recovery
-metadata without prompts or tool payloads, using the existing 10 MiB log cap.
+metadata without prompts or tool payloads. By default, full and recovery-only logs share the
+[recycling policy](cache-log-runbook.md#log-recycling-design): on the first write
+and hourly thereafter, a file above 50 MiB is compacted in place to roughly its
+newest 25 MiB of complete lines.
+Set `CURSOR_PROVIDER_DEBUG_LOG_MODE=rotate` before starting the daemon for
+configurable [numbered archives](cache-log-runbook.md#numbered-rotation).
 
 The provider shares Cursor CLI's limits of 10 transport retries and 3 server
 retries across this turn, including OpenCode's retries. OpenCode can stop earlier.
