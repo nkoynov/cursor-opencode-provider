@@ -22,7 +22,6 @@ import {
   resetTurnStateForTests,
   settleRunSavesForTests,
 } from "../src/language-model.js"
-import { resetToolRequestsListedSeenForTests } from "../src/parallel-step.js"
 import { CURSOR_IMAGE_SAVE_TOOL } from "../src/protocol/generate-image.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import {
@@ -55,7 +54,6 @@ afterEach(async () => {
   await settleRunSavesForTests()
   sessionManager.dispose()
   clearPendingCursorImages()
-  resetToolRequestsListedSeenForTests()
   resetTurnStateForTests()
   resetHeldHistoryImagesForTests()
   if (cacheOverridden) setHostCacheDirOverride(previousCache)
@@ -332,6 +330,26 @@ describe("Cursor's input-image writes, which Cursor never waits for", () => {
     },
   )
 
+  it("are all saved when 35 are staged before the host saves the first", async () => {
+    const images = Array.from({ length: 35 }, (_, i) => Uint8Array.of(...PNG_A.subarray(0, 8), i))
+    const run = imageRun([
+      ...images.map((data, i) => imageWrite(i + 1, data, `/elsewhere/assets/shot-${i}.png`)),
+      ended(),
+    ], images)
+    const saves: LanguageModelV3StreamPart[] = []
+    for (let pass = 0; pass < 35 && saves.length < 35; pass++) {
+      const step = collect()
+      await pump(run.session, step.controller, ids)
+      saves.push(...step.parts.filter((part) => part.type === "tool-call"))
+    }
+    expect(saves).toHaveLength(35)
+    const ctx = { worktree: run.workspace, directory: run.workspace, ask: async () => {} }
+    for (const save of saves) {
+      if (save.type === "tool-call") await executeCursorImageSave(JSON.parse(save.input), ctx)
+    }
+    expect(fs.readdirSync(run.assets).sort()).toEqual(images.map((_, i) => `shot-${i}.png`).sort())
+  })
+
   it("tell the model a declined copy is not on disk, in the running turn", async () => {
     const run = imageRun([imageWrite(1, PNG_A), ended()], [PNG_A])
     await pump(run.session, collect().controller, ids)
@@ -429,7 +447,7 @@ describe("Cursor's input-image writes, which Cursor never waits for", () => {
 
   it("keep the Run when Cursor ends it while the step that answered is still ending", () => {
     const run = imageRun([], [PNG_A])
-    sessionManager.registerPending(1, run.session, "write_result", CURSOR_IMAGE_SAVE_TOOL, false, { inputImage: true }, true)
+    sessionManager.registerPending(1, run.session, "write_result", CURSOR_IMAGE_SAVE_TOOL, false, { inputImage: true }, undefined, true)
     const owner = Symbol("pump")
     sessionManager.beginPump(run.session, owner)
     run.closeCleanly()
@@ -440,7 +458,7 @@ describe("Cursor's input-image writes, which Cursor never waits for", () => {
 
   it("still close a Run Cursor ended while the host owes it a result", () => {
     const run = imageRun([], [PNG_A])
-    sessionManager.registerPending(1, run.session, "write_result", CURSOR_IMAGE_SAVE_TOOL, false, { inputImage: true }, true)
+    sessionManager.registerPending(1, run.session, "write_result", CURSOR_IMAGE_SAVE_TOOL, false, { inputImage: true }, undefined, true)
     sessionManager.registerPending(2, run.session, "shell_stream", "bash")
     run.closeCleanly()
     expect(run.session.closed).toBe(true)
