@@ -11,7 +11,7 @@
 
 ### Changed
 
-- The debug log at `CURSOR_PROVIDER_DEBUG=1` is about a tenth of its former size. The per-frame lines (`pump frame`, `frame yield`, `kv frame raw`, a held Run's `held Run: answered KV` and `queued a frame`, and `kv replied` unless the blob was missing) were 60–65 % of its bytes and now need `CURSOR_PROVIDER_DEBUG=2` (or `verbose`). `extractTools:` lines, about a quarter of the bytes, carry a `tools=<hash>` of the advertised names and list the names only the first time a list appears in a log file (level 2: every time); after a trim or rotation the file lists them again. A host advertising ~190 tools no longer writes ~6 KB on each of the several calls per request ([@nkoynov](https://github.com/nkoynov)).
+- The debug log at `CURSOR_PROVIDER_DEBUG=1` is about a tenth of its former size. The per-frame lines (`pump frame`, `frame yield`, `kv frame raw`, a held Run's `held Run: answered KV` and `queued a frame`, and `kv replied` unless the blob was missing) were 60–65 % of its bytes and now need `CURSOR_PROVIDER_DEBUG=2` (or `verbose`). `extractTools:` lines, about a quarter of the bytes, carry a `tools=<hash>` of the advertised names and list the names only the first time a list appears in a log file (level 2: every time); after a trim or rotation, also by another process sharing the file, and at least every 10 minutes, the file lists them again. A host advertising ~190 tools no longer writes ~6 KB on each of the several calls per request ([@nkoynov](https://github.com/nkoynov)).
 - Local test checks detect Linux, macOS and Windows capabilities; Windows can run the full suite through a local Linux-container engine without Cursor agent installed.
 
 ### Fixed
