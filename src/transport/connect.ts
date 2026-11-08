@@ -3,7 +3,7 @@ import { decodeFramePayload, encodeFrame, encodeGzipFrame, FLAG_END_STREAM, stre
 import { createCursorChecksumHeader } from "../protocol/checksum.js"
 import { getDeviceIds } from "../protocol/device-id.js"
 import { INSTALLER_WAIT_MS, resolveClientVersion } from "../protocol/client-version.js"
-import { errorMessage, trace } from "../debug.js"
+import { errorMessage, trace, traceVerbose } from "../debug.js"
 import {
   CONNECT_TIMEOUT_CODE,
   CursorLocalCancellationError,
@@ -1871,7 +1871,7 @@ export async function bidiRunStream(
         while (true) {
           const frame = await nextInboundFrame()
           if (!frame) break
-          trace(`frame yield: flags=0x${frame.flags.toString(16)} payload=${frame.payload.length}B`)
+          traceVerbose(`frame yield: flags=0x${frame.flags.toString(16)} payload=${frame.payload.length}B`)
           yield frame
         }
 

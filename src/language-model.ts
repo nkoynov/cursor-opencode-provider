@@ -45,7 +45,7 @@ import {
   type EarlySteer,
   type HostSteer,
 } from "./host-steer.js"
-import { isDebugEnabled, trace, traceRequestContextPaths } from "./debug.js"
+import { isDebugEnabled, trace, traceOncePerLog, traceRequestContextPaths, traceVerbose } from "./debug.js"
 import { TOOL_RESULT_STATUS_KEY, toolResultFailure, type ToolRefusal } from "./opencode2/tool-results.js"
 import { isExchangeableApiKey } from "./auth.js"
 import { resolveBearerToken } from "./auth-renewal.js"
@@ -7103,7 +7103,7 @@ export async function pump(
     if (ttft) trace(`ttft: sessionId=${session.sessionId} ${ttft}`)
     {
       const iuKind = iu ? Object.keys(iu).find((k) => iu[k]) : undefined
-      trace(
+      traceVerbose(
         `pump frame: topField=${topField} interaction_update=${iuKind ?? "-"} ` +
           `exec=${esm ? "yes" : "no"} kv=${kv ? "yes" : "no"} ` +
           `interaction_query=${interactionQuery ? "yes" : "no"} ` +
@@ -8505,7 +8505,7 @@ export async function pump(
     } else if (kv) {
       // KV blob channel: ack set_blob / answer get_blob, then keep pumping.
       // Not replying hangs the turn — see protocol/kv.ts.
-      trace(
+      traceVerbose(
         `kv frame raw: gunzippedLen=${payload.length} id=${kv.id ?? "?"} ` +
           `get=${!!kv.get_blob_args} set=${!!kv.set_blob_args} ` +
           `getBlobIdLen=${(kv.get_blob_args as any)?.blob_id?.length ?? "-"} ` +
@@ -8516,7 +8516,8 @@ export async function pump(
       if (handled?.kind === "set") noteAssistantBlob(session, kv)
       // Content-as-id reads are answered by echoing the id back (`echoed`); only a
       // hash we cannot serve means the checkpoint references state we lost.
-      if (handled?.kind === "get" && !handled.found && !handled.echoed) blobMiss = true
+      const missed = handled?.kind === "get" && !handled.found && !handled.echoed
+      if (missed) blobMiss = true
       if (handled) {
         try {
           await writeWithBackpressure(
@@ -8524,7 +8525,7 @@ export async function pump(
             handled.reply,
             `KV ${handled.kind}_blob reply id=${handled.id}`,
           )
-          trace(
+          ;(missed ? trace : traceVerbose)(
             `kv replied: kind=${handled.kind} id=${handled.id} blobId=${handled.blobIdHex.slice(0, 16)}… ` +
               `found=${handled.found} echoed=${!!handled.echoed} ` +
               `replyBytes=${handled.reply.length} replyBlobBytes=${handled.replyBlobBytes} ` +
@@ -10050,7 +10051,12 @@ function extractTools(callOptions: LanguageModelV3CallOptions): OpencodeToolDef[
       out.push({ name: any.name, description: any.description, inputSchema: schema })
     }
   }
-  trace(`extractTools: ${tools.length} incoming → ${out.length} advertised [${out.map((t) => t.name).join(",")}]`)
+  if (isDebugEnabled()) {
+    const names = out.map((t) => t.name).join(",")
+    const hash = createHash("sha256").update(names).digest("hex").slice(0, 12)
+    const counts = `extractTools: ${tools.length} incoming → ${out.length} advertised tools=${hash}`
+    traceOncePerLog(`extractTools:${hash}`, `${counts} [${names}]`, counts)
+  }
   return out
 }
 

@@ -3,7 +3,9 @@ import os from "node:os"
 import path from "node:path"
 import { processShared } from "./process-shared.js"
 
-// Wire-level diagnostics. Opt in with CURSOR_PROVIDER_DEBUG=1 (or "true").
+// Wire-level diagnostics. Opt in with CURSOR_PROVIDER_DEBUG=1 (or "true"); =2 (or
+// "verbose") adds the per-frame lines (`pump frame`, `frame yield`, KV frames) and
+// the advertised tool list on every request, which level 1 writes once per list.
 // CURSOR_PROVIDER_RECOVERY_DEBUG=1 keeps only recovery metadata, without payload traces.
 // Default path mirrors Cursor CLI: $TMPDIR/cursor-provider-logs-<uid>/debug-<pid>.log
 // with directory mode 0o700 and file mode 0o600. Override with CURSOR_PROVIDER_DEBUG_FILE.
@@ -15,9 +17,16 @@ import { processShared } from "./process-shared.js"
 // renamed to `<file>.1`, replacing an older one, and a fresh file starts with a
 // new header, so the log stays bounded at about twice the cap. Tokens /
 // checksums: redact in callers.
-const DEBUG_ENABLED =
-  process.env.CURSOR_PROVIDER_DEBUG === "1" ||
-  process.env.CURSOR_PROVIDER_DEBUG === "true"
+/** `CURSOR_PROVIDER_DEBUG` as a level: 0 off, 1 (`1`/`true`), 2 (`2`/`verbose`). */
+export function resolveDebugLevel(
+  value: string | undefined = process.env.CURSOR_PROVIDER_DEBUG,
+): 0 | 1 | 2 {
+  if (value === "2" || value === "verbose") return 2
+  return value === "1" || value === "true" ? 1 : 0
+}
+
+const DEBUG_LEVEL = resolveDebugLevel()
+const DEBUG_ENABLED = DEBUG_LEVEL > 0
 const RECOVERY_DEBUG_ENABLED = ["1", "true"].includes(process.env.CURSOR_PROVIDER_RECOVERY_DEBUG ?? "")
 
 /** Default soft cap for the debug log file; reaching it rotates the file to `<file>.1`. */
@@ -38,6 +47,10 @@ export function resolveDebugLogMaxBytes(
 // each banner names its copy and, once there are several, every line says which.
 const moduleCopies = processShared("debug.module-copies.v1", () => ({ count: 0 }))
 const MODULE_COPY = ++moduleCopies.count
+// Keys `traceOncePerLog` already wrote to the current file, shared by every copy
+// since they append to the same file.
+const writtenOnce = processShared("debug.written-once.v1", () => ({ keys: new Set<string>() }))
+const WRITTEN_ONCE_MAX_KEYS = 1024
 
 let _traceInitialized = false
 let _debugFile: string | undefined
@@ -158,6 +171,11 @@ export function rotateDebugLogIfOversized(
 
 export function trace(msg: string): void {
   if (!DEBUG_ENABLED && !(RECOVERY_DEBUG_ENABLED && msg.startsWith("recovery:"))) return
+  appendTrace(() => msg)
+}
+
+/** `message` runs after any rotation, so it sees whether this line starts a new file. */
+function appendTrace(message: () => string): void {
   try {
     if (!_debugFile) {
       _debugFileUsesManagedDirectory = !process.env.CURSOR_PROVIDER_DEBUG_FILE
@@ -167,7 +185,7 @@ export function trace(msg: string): void {
     if (!_traceInitialized) {
       ensureSecureDebugLog(_debugFile, { secureParent: _debugFileUsesManagedDirectory })
       // Rotate oversized leftovers from a prior run before appending a reinit banner.
-      rotateDebugLogIfOversized(_debugFile, _debugLogMaxBytes)
+      if (rotateDebugLogIfOversized(_debugFile, _debugLogMaxBytes)) writtenOnce.keys.clear()
       const banner = debugBannerLine()
       const preexisting =
         fs.existsSync(_debugFile) && fs.statSync(_debugFile).size > 0
@@ -187,11 +205,32 @@ export function trace(msg: string): void {
           `\n`,
       )
     }
-    rotateDebugLogIfOversized(_debugFile, _debugLogMaxBytes)
-    fs.appendFileSync(_debugFile, `[${new Date().toISOString()}] ${copyTag()}${msg}\n`)
+    if (rotateDebugLogIfOversized(_debugFile, _debugLogMaxBytes)) writtenOnce.keys.clear()
+    fs.appendFileSync(_debugFile, `[${new Date().toISOString()}] ${copyTag()}${message()}\n`)
   } catch {
     /* ignore */
   }
+}
+
+/** `trace` only at `CURSOR_PROVIDER_DEBUG=2`: per-frame wire detail. */
+export function traceVerbose(msg: string): void {
+  if (DEBUG_LEVEL >= 2) trace(msg)
+}
+
+/**
+ * Write `full` the first time `key` appears in the current log file, `brief` after that
+ * (level 2: always `full`). A rotated file starts over, so every file holds the full line
+ * for each key it mentions.
+ */
+export function traceOncePerLog(key: string, full: string, brief: string): void {
+  if (!DEBUG_ENABLED) return
+  appendTrace(() => {
+    const keys = writtenOnce.keys
+    if (DEBUG_LEVEL < 2 && keys.has(key)) return brief
+    if (keys.size >= WRITTEN_ONCE_MAX_KEYS) keys.clear()
+    keys.add(key)
+    return full
+  })
 }
 
 /**

@@ -5,6 +5,7 @@ import path from "node:path"
 import {
   DEBUG_LOG_MAX_BYTES,
   ensureSecureDebugLog,
+  resolveDebugLevel,
   resolveDebugLogMaxBytes,
   resolveDebugLogPath,
   rotateDebugLogIfOversized,
@@ -241,6 +242,91 @@ describe("debug log paths / modes (F9)", () => {
       expect(run("not-a-number").exitCode).toBe(0)
       expect(fs.existsSync(`${file}.1`)).toBe(false)
       expect(fs.readFileSync(file, "utf8")).toContain("line 0 ")
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("debug log levels", () => {
+  const debugModule = JSON.stringify(path.resolve(import.meta.dir, "../src/debug.ts"))
+  const traceAll = `
+    import { trace, traceOncePerLog, traceVerbose } from ${debugModule}
+    trace("plain line")
+    traceVerbose("pump frame: verbose only")
+    for (const list of ["a", "a", "b", "a"]) {
+      traceOncePerLog("tools:" + list, "tools=" + list + " [full " + list + "]", "tools=" + list)
+    }
+  `
+  const runLevel = (level: string, file: string, script = traceAll, maxBytes?: string) =>
+    Bun.spawnSync([process.execPath, "-e", script], {
+      env: {
+        ...process.env,
+        CURSOR_PROVIDER_DEBUG: level,
+        CURSOR_PROVIDER_RECOVERY_DEBUG: "0",
+        CURSOR_PROVIDER_DEBUG_FILE: file,
+        ...(maxBytes ? { CURSOR_PROVIDER_DEBUG_MAX_BYTES: maxBytes } : {}),
+      },
+    })
+  const messages = (file: string) => fs.readFileSync(file, "utf8").split("\n")
+    .map((line) => line.match(/^\[[^\]]+\] (?!debug: )(.*)$/)?.[1])
+    .filter((line): line is string => line !== undefined)
+
+  it("reads CURSOR_PROVIDER_DEBUG as level 0, 1 or 2", () => {
+    expect(resolveDebugLevel("1")).toBe(1)
+    expect(resolveDebugLevel("true")).toBe(1)
+    expect(resolveDebugLevel("2")).toBe(2)
+    expect(resolveDebugLevel("verbose")).toBe(2)
+    for (const off of [undefined, "", "0", "false", "3", "TRUE"]) expect(resolveDebugLevel(off)).toBe(0)
+  })
+
+  it("keeps per-frame lines for level 2 and writes a repeated list in full once at level 1", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-provider-debug-levels-"))
+    try {
+      const one = path.join(root, "one.log")
+      expect(runLevel("1", one).exitCode).toBe(0)
+      expect(messages(one)).toEqual([
+        "plain line",
+        "tools=a [full a]",
+        "tools=a",
+        "tools=b [full b]",
+        "tools=a",
+      ])
+
+      const two = path.join(root, "two.log")
+      expect(runLevel("verbose", two).exitCode).toBe(0)
+      expect(messages(two)).toEqual([
+        "plain line",
+        "pump frame: verbose only",
+        "tools=a [full a]",
+        "tools=a [full a]",
+        "tools=b [full b]",
+        "tools=a [full a]",
+      ])
+
+      const off = path.join(root, "off.log")
+      expect(runLevel("0", off).exitCode).toBe(0)
+      expect(fs.existsSync(off)).toBe(false)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it("writes a list in full again in the file a rotation starts", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-provider-debug-once-rotate-"))
+    const file = path.join(root, "debug.log")
+    const script = `
+      import { traceOncePerLog } from ${debugModule}
+      for (let i = 0; i < 60; i++) traceOncePerLog("tools:a", "tools=a [full] " + i + " " + "z".repeat(60), "tools=a " + i + " " + "z".repeat(60))
+    `
+    try {
+      expect(runLevel("1", file, script, "2000").exitCode).toBe(0)
+      for (const part of [`${file}.1`, file]) {
+        const lines = messages(part)
+        expect(lines.length).toBeGreaterThan(1)
+        expect(lines[0]).toStartWith("tools=a [full] ")
+        expect(lines.slice(1).every((line) => !line.includes("[full]"))).toBe(true)
+      }
     } finally {
       fs.rmSync(root, { recursive: true, force: true })
     }

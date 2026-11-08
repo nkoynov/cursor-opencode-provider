@@ -425,7 +425,7 @@ OpenCode's own retry limits.
 | `HTTPS_PROXY` / `https_proxy` | HTTP CONNECT proxy for HTTPS. Bun `fetch` uses this for unary RPCs; the Run HTTP/2 session also tunnels through it (see `NO_PROXY`). The Run tunnel supports only `http://` proxy URLs (Basic auth via userinfo); `https://` and SOCKS proxy URLs leave the Run on a direct connection. `HTTP_PROXY` is not used for HTTPS |
 | `NO_PROXY` / `no_proxy` | Comma/space hosts that bypass the proxy (`*`, exact host, or `.suffix` / `suffix` domain forms; a `host:port` entry bypasses only that port) |
 | `CURSOR_ENDLESS_RETRIES` | Set to `1` or `true` to bypass retry count limits; off by default. Safety cutoffs and host retry limits still apply. See [retry limits](#retry-limits). |
-| `CURSOR_PROVIDER_DEBUG` | Set to `1` or `true` to enable wire-level debug logging |
+| `CURSOR_PROVIDER_DEBUG` | Set to `1` or `true` to enable wire-level debug logging; `2` or `verbose` adds a line per wire frame and KV message and the full advertised tool list on every request (level 1 lists each distinct tool list once per log file and refers to it by `tools=<hash>`) |
 | `CURSOR_PROVIDER_RECOVERY_DEBUG` | Set to `1` or `true` for recovery metadata only (session/call IDs, elapsed time, checkpoints, guard decisions). Uses the same log path and 10 MiB cap; leave full debug off to exclude payload traces. |
 | `CURSOR_PROVIDER_DEBUG_FILE` | Debug log path (default: `debug-<pid>.log` under `$TMPDIR/cursor-provider-logs-<uid>/`) |
 | `CURSOR_PROVIDER_DEBUG_MAX_BYTES` | Debug log size cap in bytes (default 10 MiB). At the cap the file moves to `<file>.1`, replacing an older one, and a fresh file starts; a value that isn't a positive whole number keeps the default |
