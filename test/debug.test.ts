@@ -1130,6 +1130,11 @@ describe("debug log levels", () => {
       once();
       once();
       assert.deepEqual(tools(), ["tools=a [full]", "tools=a"]);
+      // A trim in place that the file has grown back past since.
+      fs.writeFileSync(file, "[2026-01-01T00:00:00.000Z] kept tail\\n" + "x".repeat(fs.statSync(file).size) + "\\n");
+      once();
+      once();
+      assert.deepEqual(tools(), ["tools=a [full]", "tools=a"]);
       clock += 10 * 60 * 1000;
       once();
       once();

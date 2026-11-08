@@ -73,16 +73,17 @@ const logOptions = resolveDebugLogOptions()
 const moduleCopies = processShared("debug.module-copies.v1", () => ({ count: 0 }))
 const MODULE_COPY = ++moduleCopies.count
 const maintenance = processShared("debug.maintenance.v1", () => new Map<string, number>())
+type DebugLogIdentity = { dev: number; ino: number; size: number; head: string }
 // Keys `traceOncePerLog` already wrote to the current file, shared by every copy
-// since they append to the same file, and the file as it was after the last such line.
+// since they append to the same file, and the file as checked before the last such line.
 const writtenOnce = processShared("debug.written-once.v2", () => ({
   keys: new Set<string>(),
-  file: undefined as { dev: number; ino: number; size: number; at: number } | undefined,
+  file: undefined as (DebugLogIdentity & { at: number }) | undefined,
 }))
 const WRITTEN_ONCE_MAX_KEYS = 4096
-// Another process sharing the file may trim it in place, and the file can grow back past the
-// size remembered here, so the memory also expires.
 const WRITTEN_ONCE_MAX_AGE_MS = 10 * 60 * 1000
+// A trim moves the file's tail to its start, so another process's trim shows in its first bytes.
+const DEBUG_LOG_HEAD_BYTES = 64
 
 let _traceInitialized = false
 let _debugFile: string | undefined
@@ -427,8 +428,10 @@ export function traceVerbose(msg: string): void {
 export function traceOncePerLog(key: string, full: string, brief: string): void {
   if (!DEBUG_ENABLED) return
   const keys = writtenOnce.keys
+  let current: DebugLogIdentity | undefined
   const written = appendTrace(() => {
-    if (onceLogReplaced()) keys.clear()
+    current = debugLogIdentity()
+    if (onceLogReplaced(current)) keys.clear()
     return DEBUG_LEVEL < 2 && keys.has(key) ? brief : full
   })
   if (!written) return
@@ -436,30 +439,38 @@ export function traceOncePerLog(key: string, full: string, brief: string): void 
   keys.delete(key)
   keys.add(key)
   if (keys.size > WRITTEN_ONCE_MAX_KEYS) keys.delete(keys.values().next().value!)
-  try {
-    const stat = fs.statSync(_debugFile!)
-    writtenOnce.file ??= { dev: stat.dev, ino: stat.ino, size: stat.size, at: Date.now() }
-    Object.assign(writtenOnce.file, { dev: stat.dev, ino: stat.ino, size: stat.size })
-  } catch {
-    writtenOnce.file = undefined
-  }
+  // The file as checked, not as after the append: a rotation in between then shows on the next check.
+  writtenOnce.file = current && { ...current, at: writtenOnce.file?.at ?? Date.now() }
 }
 
-/** Whether the file may have lost the full lines written since the memory started: another process rotated or trimmed it. */
-function onceLogReplaced(): boolean {
+/**
+ * Whether the file may have lost the full lines written since the memory started: another process
+ * rotated, trimmed or replaced it, or the memory is 10 minutes old.
+ */
+function onceLogReplaced(current: DebugLogIdentity | undefined): boolean {
   const seen = writtenOnce.file
   if (!seen) return false
-  let replaced = Date.now() - seen.at >= WRITTEN_ONCE_MAX_AGE_MS
-  if (!replaced) {
-    try {
-      const stat = fs.statSync(_debugFile!)
-      replaced = stat.dev !== seen.dev || stat.ino !== seen.ino || stat.size < seen.size
-    } catch {
-      replaced = true
-    }
-  }
+  const replaced = !current || Date.now() - seen.at >= WRITTEN_ONCE_MAX_AGE_MS
+    || current.dev !== seen.dev || current.ino !== seen.ino || current.size < seen.size
+    || !current.head.startsWith(seen.head)
   if (replaced) writtenOnce.file = undefined
   return replaced
+}
+
+function debugLogIdentity(): DebugLogIdentity | undefined {
+  try {
+    const fd = fs.openSync(_debugFile!, "r")
+    try {
+      const stat = fs.fstatSync(fd)
+      const head = Buffer.alloc(DEBUG_LOG_HEAD_BYTES)
+      const read = fs.readSync(fd, head, 0, head.length, 0)
+      return { dev: stat.dev, ino: stat.ino, size: stat.size, head: head.subarray(0, read).toString("latin1") }
+    } finally {
+      fs.closeSync(fd)
+    }
+  } catch {
+    return undefined
+  }
 }
 
 /**
