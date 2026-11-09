@@ -5167,6 +5167,8 @@ function continuationResultInput(
  */
 async function injectHostNotes(
   session: CursorSession, notes: readonly string[], order = nextHostNoteOrder++,
+  /** "rethrow": a transport failure is thrown with the Run left open, as a pump's failed reply is. */
+  failure: "close" | "rethrow" = "close",
 ): Promise<boolean> {
   const text = hostNoteText(notes)
   if (!text) return true
@@ -5190,6 +5192,7 @@ async function injectHostNotes(
   } catch (error) {
     // The notes stay tracked against this closed Run and reach the next one.
     trace(`continuation: host note injection write failed id=${injectionId}: ${(error as Error).message}`)
+    if (failure === "rethrow" && error instanceof CursorProviderError && error.origin !== "protocol") throw error
     sessionManager.close(session, "result-write-failed", toCursorProviderError(error, {
       replaySafe: false, fallback: "Cursor host note injection write failed",
     }))
@@ -7931,7 +7934,6 @@ export async function pump(
             } catch (error) {
               const reason = (error as Error).message
               const runEnded = inputImage && (session.stream.isClosed() || runEndQueued(session))
-              const beforeReply = lastFrameArrival()
               if (inputImage) {
                 // Cursor ignores a copy's WriteResult. Keep its failure notice
                 // before replying, so a failed reply cannot lose the note too.
@@ -7941,19 +7943,12 @@ export async function pump(
                     if (session.openCodeSessionId) {
                       appendUndeliveredHostNotes(session.openCodeSessionId, [{ notes: [note], order: nextHostNoteOrder++ }])
                     }
-                  } else if (!await injectHostNotes(session, [note])) {
-                    // The note stays tracked for the next Run; the lost one goes to recovery, as a failed reply does.
-                    throw session.closeError ?? new CursorTransportError("Cursor host note injection write failed", {
-                      transient: false, replaySafe: false,
-                    })
-                  }
+                  } else if (!await injectHostNotes(session, [note], undefined, "rethrow")) return
                 }
               }
               // Queued input copies need no reply once Cursor ended the Run.
               if (runEnded) continue
               if (!await rejectExec(parsed, reason, "binary write not staged")) return
-              // Resuming the checkpoint before the note would replay the copy and inject the note again.
-              if (inputImage) invalidateResumeCheckpoint(session, beforeReply, true)
               continue
             }
             // Cursor CLI's agent fires the write of an input image's copy and ignores
