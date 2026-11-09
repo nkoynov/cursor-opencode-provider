@@ -536,17 +536,15 @@ describe("display tool lifecycle", () => {
     expect(uncoveredExecs(other, new Set(["run-1:2"])).map(exec => exec.id)).toEqual([1])
   })
 
-  it("leaves a handshake or attachment read of a Run lost while the host runs its owner to that owner's result", () => {
+  it("leaves the answers of a Run lost while the host runs the pass's calls to the coverage rule", () => {
     const state: ReplaySafetyState = {}
     const step = new AttemptReplaySafety("run-1", state)
-    step.recordExec(1, "edit-1")
-    step.recordProviderAnswer(1, "edit-handshake")
-    step.recordExec(2, "task-1")
-    step.recordProviderAnswer(2, "task-attachment")
+    for (const [id, answer] of [[1, "edit-handshake"], [2, "task-attachment"], [3, "missing-read"], [4, "terminal-read"], [5, "refusal"]] as const) {
+      step.recordExec(id, `call-${id}`)
+      step.recordProviderAnswer(id, answer)
+    }
     expect(state.attempt).toEqual({ unrepresentable: true })
-    step.recordExec(3)
-    step.recordProviderAnswer(3, "missing-read")
-    expect(state.attempt?.unrebuildable).toBe("missing-read")
+    expect(uncoveredExecs(state, new Set()).map(exec => exec.id)).toEqual([1, 2])
   })
 
   it("marks only the attempt for provider state a rebuild cannot carry", () => {

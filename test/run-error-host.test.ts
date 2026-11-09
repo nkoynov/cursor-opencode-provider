@@ -1499,6 +1499,9 @@ describe("host calls still running when the Run dies", () => {
     ["held", "reset", undefined, undefined], ["held", "clean-close", undefined, undefined], ["open", "reset", undefined, undefined],
     ["open", "clean-close", undefined, undefined], ["open", "reply-write", undefined, undefined],
     ["held", "reset", "catalog-lookup", undefined], ["held", "clean-close", undefined, "next-step"],
+    // The provider's own answers in the held pass precede its calls' results, as earlier answers do.
+    ["held", "reset", "terminal-poll", undefined], ["held", "reset", "refusal", undefined],
+    ["held", "reset", "missing-read", undefined],
     ["held", "clean-close", undefined, "exec-abort"], ["held", "clean-close", undefined, "catalog-lookup"],
     ["held", "reset", undefined, "checkpoint"], ["open", "reset", undefined, "checkpoint"],
     ["held", "clean-close", "catalog-started", "own-completion"],
@@ -1543,8 +1546,7 @@ describe("host calls still running when the Run dies", () => {
     ["held", "clean-close", undefined, "catalog-invalid"], ["held", "final", undefined, "appended-user"],
     ["held", "kv-final", undefined, undefined], ["held", "none", undefined, undefined],
     ["held", "null-error", undefined, undefined], ["open", "null-error", undefined, undefined],
-    ["held", "reset", "provider-exec", undefined], ["held", "reset", "terminal-poll", undefined],
-    ["held", "reset", "refusal", undefined], ["held", "reset", "missing-read", undefined],
+    ["held", "reset", "provider-exec", undefined],
   ] as const) {
     it(`ends the turn once the running call's result is in when the Run cannot be rebuilt (${step} step, ${cut}${before ? `, ${before}` : ""}${queued ? `, queued ${queued}` : ""})`, async () => {
       const { requests, prompt, read, cleanup, waitForCut } = setup(step, cut, `ses_held_tool_refuse_${step}_${cut}_${before}_${queued}`, before, queued)
@@ -1567,8 +1569,7 @@ describe("host calls still running when the Run dies", () => {
         // Cursor's own final error wins over the provider's refusal.
         if (cut === "final" || cut === "kv-final") expect((error as APICallError).message).not.toContain("continue")
         else if (cut !== "invalid-argument" && cut !== "null-error") expect((error as APICallError).message).toContain("continue")
-        const why = { "provider-exec": "provider-answered-exec id=90", "terminal-poll": "terminal-read", refusal: "provider-refusal",
-          "missing-read": "missing-read" }
+        const why = { "provider-exec": "provider-answered-exec id=90" }
         if (before && before in why) expect((error as APICallError).message).toContain(why[before as keyof typeof why])
         expect(requests).toHaveLength(1)
       } finally {

@@ -323,14 +323,13 @@ export class AttemptReplaySafety {
 
   /**
    * The provider answered this exec itself; nothing ran on the host.
-   * Fork: a post-result rebuild cannot account for one in the interrupted pass; a Run lost while the host runs an
-   * edit handshake's or Task attachment's own call is judged by that call's result instead.
+   * Fork: a post-result rebuild cannot account for one in the interrupted pass. In a Run lost while the host runs
+   * the pass's calls, the answer came before those calls' results, so `uncoveredExecs` judges it as an earlier one.
    */
   recordProviderAnswer(id: number, answer: ProviderAnswer): void {
     const exec = this.state.execs?.find(exec => exec.sessionId === this.sessionId && exec.id === id)
     if (exec) exec.answer = answer
     this.state.attempt!.unrepresentable = true
-    if (!OWNED_ANSWERS.has(answer)) this.state.attempt!.unrebuildable ??= answer === "refusal" ? "provider-refusal" : answer
   }
 
   /**

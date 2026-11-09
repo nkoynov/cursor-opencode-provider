@@ -402,9 +402,10 @@ The **1.18 v2** API and **OpenCode 2.x** are source-incompatible:
   rebuild with its output or its announced calls nothing claimed or completed;
   it does with any exec (any provider answer included), a bridge or a stateful
   or unknown frame. A lost held Run (`lostRunUnrebuildable`) never runs the
-  history check, so it applies the same rule itself (`uncoveredExecs`); in its
-  interrupted pass an edit handshake or Task attachment read is left to its
-  owner, the held host call, whose result it then needs. Its shown text goes to the rebuilt Run as `<interrupted_reply>`
+  history check, so it applies the same rule itself (`uncoveredExecs`), also
+  to the answers of its interrupted pass: they came before that pass's host
+  results, as earlier answers did (a missing read right before a long shell
+  shares the shell's pass). Its shown text goes to the rebuilt Run as `<interrupted_reply>`
   to be continued. A `get_mcp_tools` lookup Cursor ran itself answers from the
   catalog the provider sent and counts as claimed once its completion validates
   strictly on the wire (`inlineCatalog`, `catalogCalls`: #44 the only variant
