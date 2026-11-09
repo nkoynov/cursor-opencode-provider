@@ -402,13 +402,13 @@ import {
   announcedCallsClaimed,
   AttemptReplaySafety,
   describeFrameLayout,
-  execsOwedResults,
   heldRunLossRebuildable,
+  historyCoverage,
   hostExecs,
   markRunInjectionDelivered,
-  providerAnswerCounts,
   takeAppendedInjection,
   trackRunInjection,
+  uncoveredExecs,
   type ReplayToolLifecycle,
 } from "./replay-safety.js"
 import { noteCursorWaitEnded, noteCursorWaitStarted } from "./cursor-waits.js"
@@ -1124,11 +1124,10 @@ function queuedFinalVerdict(run: LostRun): CursorProviderError | undefined {
  * reader queued unread, recorded on a copy of its replay state as the pump would have recorded them, so the same rules
  * judge both (catalog lookups and announced calls included). The held reader answers aborts of the host's own execs
  * itself, so a queued abort of any other exec withdraws one nothing ran and is left out. An exec the provider answered
- * needs its result in host history unless `execsOwedResults` exempts it, as for any rebuild.
+ * needs what `historyCoverage` asks of it, as for any rebuild.
  */
 function lostRunUnrebuildable(run: LostRun, completed: ReadonlySet<string>): string | undefined {
-  const answered = execsOwedResults(run.replaySafety, completed)
-    .find((exec) => !exec.host && !completed.has(`${exec.sessionId}:${exec.id}`))
+  const answered = uncoveredExecs(run.replaySafety, completed).find((exec) => !exec.host)
   if (answered) return `provider-answered-exec id=${answered.id}`
   const state = structuredClone(run.replaySafety ?? {})
   const interrupted = state.attempt ?? {}
@@ -1765,8 +1764,8 @@ async function doStreamImpl(
                 const replay = failed.replaySafety
                 const completed = new Set(extractToolResults(prompt)
                   .map(result => `${result.sessionId}:${result.execId}`))
-                const terminalReads = replay?.execs?.filter(exec => exec.answer === "terminal-read").length ?? 0
-                const execs = execsOwedResults(replay, completed)
+                // The provider's own answers ran nothing on the host and have no result of their own.
+                const coverage = historyCoverage(replay, completed)
                 const reason = failed !== session ? "different-run"
                   : trailingToolResults.length === 0 ? "no-tool-result-tail"
                   : !failed.checkpointRevokedByHostResult ? "checkpoint-not-revoked-by-result"
@@ -1775,11 +1774,14 @@ async function doStreamImpl(
                   : !appendedInjectionsInRebuild(failed, prompt) ? "opaque-activity"
                   : replay?.attempt?.unrepresentable ? "unrepresentable-attempt"
                   : !announcedCallsClaimed(replay, replay?.attempt?.announcedCalls) ? "unaccounted-display-calls"
-                  : !execs.length && !replay?.bridgedCalls?.length ? "no-host-execs"
-                  : !execs.every(exec => completed.has(`${exec.sessionId}:${exec.id}`)) ? "missing-host-results"
+                  : !coverage.hostExecs && !replay?.bridgedCalls?.length ? "no-host-execs"
+                  : !coverage.complete ? "missing-host-results"
                   : "completed-tool-results"
+                const { answers } = coverage
                 trace(`recovery: history-check hostSessionId=${failed.openCodeSessionId} sessionId=${failed.sessionId} ` +
-                  `reason=${reason} execs=${execs.length} terminalReads=${terminalReads} answers=${providerAnswerCounts(replay)} ` +
+                  `reason=${reason} execs=${coverage.hostExecs} terminalReads=${answers["terminal-read"] ?? 0} ` +
+                  `missingReads=${answers["missing-read"] ?? 0} editHandshakes=${answers["edit-handshake"] ?? 0} ` +
+                  `attachmentReads=${answers["task-attachment"] ?? 0} refused=${answers.refusal ?? 0} ` +
                   `results=${completed.size} pending=${failed.pending.size}`)
                 return reason === "completed-tool-results"
               },
@@ -6357,8 +6359,8 @@ export async function pump(
       for (const frame of buildReadRejectionMessages(parsed.id, readResult)) {
         await writeWithBackpressure(session.stream, frame, "missing read target reply")
       }
-      const kind = Object.keys(readResult)[0]
       replaySafety.recordProviderAnswer(parsed.id, "missing-read")
+      const kind = Object.keys(readResult)[0]
       trace(
         `exec: rejected missing read target id=${parsed.id} kind=${kind} ` +
           `path=${JSON.stringify(absolutePath)}`,
@@ -7745,8 +7747,8 @@ export async function pump(
           }
           if (!await writeExecFrames(runtimeMessages, `runtime metadata reply id=${esmId}`)) return
           if (isTerminalRecordRead(mcpRead ? { read_args: { path: opencodePathArg(parsed!.args) } } : esm, session.requestContext)) {
-            replaySafety.recordTerminalRead(esmId)
-          } else if (mcpRead || esm.read_args) replaySafety.recordProviderAnswer(esmId, "runtime-read")
+            replaySafety.recordProviderAnswer(esmId, "terminal-read")
+          }
           if (displayCallId) session.displayToolCalls.delete(displayCallId)
           continue
         }

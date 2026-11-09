@@ -201,7 +201,14 @@ These are failure lessons shared by both hosts, not a replacement for
   failed (`missing-host-results`): the history check required a host result for
   every exec, including the terminal-record polls the provider answers itself.
   Reproduce a live refusal's full Run shape, not only the barrier it names; the
-  check's `execs` count exposed the polls (`recordTerminalRead`).
+  check's `execs` count exposed the polls (`recordTerminalRead`, now
+  `recordProviderAnswer`). Exempting only the polls left 30% of a reporter's
+  post-result cuts refused, mostly by the empty read before a new file's edit
+  ([#172](https://github.com/oakimov/cursor-opencode-provider/issues/172)).
+  Exempt answers by kind, and tie a read to its call's host result where one
+  holds the outcome (`historyCoverage`). A fixture must advertise the tool
+  whose answer it tests: without `read`, the provider refused the read as
+  unavailable, and that refusal posed as a missing-target answer.
   A failed replacement open moves a Run's injected notes into the deferred
   store before retrying. The rebuild guard must recognize that retained copy
   too: recomputing recovery from the emptied injection registry otherwise
@@ -247,11 +254,8 @@ These are failure lessons shared by both hosts, not a replacement for
   interrupted step's own output. Owe no result for refusals and terminal polls
   (#164), and judge the interrupted pass apart from the Run
   (`ReplaySafetyState.attempt`). Counting only host execs (c11480f) gave way
-  in the e580aab sync to upstream's rule, which then refused 30 % of a week's
-  rebuilt cuts, nearly all for a new file's empty edit read (2026-11-09). Record
-  each provider answer's kind when it is given and exempt by kind (#172:
-  missing and runtime reads; an edit handshake or Task attachment read once its
-  owner's result is in history); an answer without a recorded kind still owes one.
+  in the e580aab sync to upstream's rule, and then to #174's answers by kind
+  (above).
   A `get_mcp_tools` lookup Cursor ran at the start of a Run blocked that
   rebuild for the rest of the Run: a GOAWAY right after two read results ended
   a 14-minute turn (2026-10-26). The lookup answers from the catalog the

@@ -67,14 +67,18 @@ export function takeAppendedInjection(
     : { kind: "note", injectionId: injection.injectionId, notes: [...injection.notes ?? []] }
 }
 
-/** How the provider answered an exec itself, without a host tool (#172). */
-export type ProviderAnswer =
-  | "terminal-read"
-  | "edit-handshake"
-  | "task-attachment"
-  | "missing-read"
-  | "runtime-read"
-  | "refusal"
+/**
+ * An exec the provider answered itself, so it has no host result. Each ran nothing on the host:
+ * - `terminal-read`: a read of a host shell's terminal record (Cursor's AwaitShell polls);
+ * - `missing-read`: the typed `file_not_found` / `invalid_file` of a read whose target is missing;
+ * - `edit-handshake`: the empty read before an edit creates a new file;
+ * - `task-attachment`: the placeholder read of a Task's attachment.
+ * The last two are only complete with their call's host result: the edit's write, the Task.
+ * Fork: `refusal`, the provider's refusal of a call (a refusal burst, a held call cancelled after a refused change).
+ */
+export type ProviderAnswer = "terminal-read" | "missing-read" | "edit-handshake" | "task-attachment" | "refusal"
+
+const OWNED_ANSWERS: ReadonlySet<ProviderAnswer> = new Set(["edit-handshake", "task-attachment"])
 
 type ReplayExec = {
   sessionId: string
@@ -90,8 +94,8 @@ export type ReplaySafetyState = {
   statefulBarrier?: ReplayBarrierReason
   /**
    * Every exec needs its owner's host result; ids can restart on a resumed Run.
-   * `callId` is the display call the exec claims. `answer` marks an exec the provider answered itself, which
-   * history may need no result for (`execsOwedResults`).
+   * `callId` is the display call the exec claims. `answer` marks an exec the provider answered
+   * itself (`ProviderAnswer`); history holds no result for it.
    */
   execs?: ReplayExec[]
   /** Display calls Cursor announced; history holds one only through the host exec that claims it. */
@@ -153,35 +157,49 @@ export function hostExecs(state: ReplaySafetyState | undefined): NonNullable<Rep
   return state?.execs?.filter((exec) => exec.host) ?? []
 }
 
-/**
- * Execs whose result host history must hold before a rebuild, given the `completed` `sessionId:execId` results it
- * holds. Reads that change nothing need none; an edit's handshake read or a Task's attachment read needs none once
- * the exec owning its display call has its result. Fork: neither does a refusal.
- */
-export function execsOwedResults(state: ReplaySafetyState | undefined, completed: ReadonlySet<string>): ReplayExec[] {
-  const execs = state?.execs ?? []
-  const hasResult = (exec: ReplayExec) => completed.has(`${exec.sessionId}:${exec.id}`)
-  return execs.filter((exec) => {
-    switch (exec.answer) {
-      case "terminal-read":
-      case "missing-read":
-      case "runtime-read":
-      case "refusal":
-        return false
-      case "edit-handshake":
-      case "task-attachment":
-        return !exec.callId || !execs.some((owner) => owner !== exec && !owner.answer && owner.callId === exec.callId && hasResult(owner))
-      default:
-        return true
-    }
-  })
+export type HistoryCoverage = {
+  /** Execs that went to the host. */
+  hostExecs: number
+  /** Provider answers by kind. */
+  answers: Partial<Record<ProviderAnswer, number>>
+  /** Every host exec has its result in history, and every owned answer its call's host result. */
+  complete: boolean
 }
 
-/** `kind:count` for each provider answer the Run recorded, for the history-check trace. */
-export function providerAnswerCounts(state: ReplaySafetyState | undefined): string {
-  const counts = new Map<ProviderAnswer, number>()
-  for (const exec of state?.execs ?? []) if (exec.answer) counts.set(exec.answer, (counts.get(exec.answer) ?? 0) + 1)
-  return [...counts].map(([kind, count]) => `${kind}:${count}`).join(",") || "-"
+/**
+ * Whether host history holds everything the Run's execs did. `completed` holds
+ * `sessionId:execId` of each host result in the prompt being rebuilt. A provider
+ * answer needs no result of its own; an edit handshake or Task attachment read
+ * needs a host exec of the same call whose result history holds.
+ */
+export function historyCoverage(state: ReplaySafetyState | undefined, completed: ReadonlySet<string>): HistoryCoverage {
+  const execs = state?.execs ?? []
+  const hostExecs = execs.filter((exec) => !exec.answer)
+  const resultHeld = (exec: { sessionId: string; id: number }) => completed.has(`${exec.sessionId}:${exec.id}`)
+  const answers: Partial<Record<ProviderAnswer, number>> = {}
+  let complete = hostExecs.every(resultHeld)
+  for (const exec of execs) {
+    if (!exec.answer) continue
+    answers[exec.answer] = (answers[exec.answer] ?? 0) + 1
+    if (OWNED_ANSWERS.has(exec.answer)
+      && !(exec.callId && hostExecs.some((owner) => owner.callId === exec.callId && resultHeld(owner)))) {
+      complete = false
+    }
+  }
+  return { hostExecs: hostExecs.length, answers, complete }
+}
+
+/**
+ * Fork: the execs `historyCoverage` finds history short of, for a lost held Run's check: an exec without an answer
+ * and without its result, or an edit handshake or Task attachment read without its call's host result.
+ */
+export function uncoveredExecs(state: ReplaySafetyState | undefined, completed: ReadonlySet<string>): ReplayExec[] {
+  const execs = state?.execs ?? []
+  const hostExecs = execs.filter((exec) => !exec.answer)
+  const resultHeld = (exec: ReplayExec) => completed.has(`${exec.sessionId}:${exec.id}`)
+  return execs.filter((exec) => !exec.answer
+    ? !resultHeld(exec)
+    : OWNED_ANSWERS.has(exec.answer) && !(exec.callId && hostExecs.some((owner) => owner.callId === exec.callId && resultHeld(owner))))
 }
 
 export class AttemptReplaySafety {
@@ -303,22 +321,16 @@ export class AttemptReplaySafety {
     this.state.attempt!.shownText = (this.state.attempt!.shownText ?? "") + text
   }
 
-  /** The provider answered this exec itself by reading a host shell's terminal record. */
-  recordTerminalRead(id: number): void {
-    this.recordProviderAnswer(id, "terminal-read")
-  }
-
   /**
-   * The provider answered this exec itself. A post-result rebuild cannot account for one in the interrupted pass.
-   * Fork: a Run lost while the host runs the owner's call is judged by that owner's result instead.
+   * The provider answered this exec itself; nothing ran on the host.
+   * Fork: a post-result rebuild cannot account for one in the interrupted pass; a Run lost while the host runs an
+   * edit handshake's or Task attachment's own call is judged by that call's result instead.
    */
   recordProviderAnswer(id: number, answer: ProviderAnswer): void {
     const exec = this.state.execs?.find(exec => exec.sessionId === this.sessionId && exec.id === id)
     if (exec) exec.answer = answer
     this.state.attempt!.unrepresentable = true
-    if (answer !== "edit-handshake" && answer !== "task-attachment") {
-      this.state.attempt!.unrebuildable ??= answer === "refusal" ? "provider-refusal" : answer
-    }
+    if (!OWNED_ANSWERS.has(answer)) this.state.attempt!.unrebuildable ??= answer === "refusal" ? "provider-refusal" : answer
   }
 
   /**

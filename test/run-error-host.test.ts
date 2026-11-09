@@ -484,8 +484,8 @@ describe("checkpoint eligibility across host results", () => {
     "catalog-lookup", "catalog-lookup-open", "cursor-run-completed", "catalog-lookup-mismatch",
     "catalog-lookup-unknown-variant", "catalog-lookup-reused-id",
     "terminal-poll", "terminal-poll-after-result", "mcp-terminal-poll", "refusal-before-result", "refusal-after-result",
-    "missing-read", "missing-read-after-result", "new-file-edit", "handshake-without-write", "task-attachment",
-    "plan-refusal",
+    "missing-read", "missing-read-after-result", "refused-read", "new-file-edit",
+    "handshake-without-write", "task-attachment", "plan-refusal",
   ] as const) {
     it(`recovers a post-result drop only from represented completed work (${scenario})`, async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-result-history-"))
@@ -497,6 +497,8 @@ describe("checkpoint eligibility across host results", () => {
         || scenario === "unannounced-completion" || scenario === "oversized"
         || scenario === "malformed-completion" || scenario === "repeated-completion-id" || scenario === "announced-open"
       const shellVariant = scenario === "announced-shell" ? "shell_args" : "shell_stream_args"
+      const newFileEdit = scenario === "new-file-edit"
+      const fileReads = newFileEdit || scenario === "missing-read" || scenario === "missing-read-after-result"
       scripted = (stream, message) => {
         const send = (value: Record<string, unknown>) => stream.write(frame(encodeMessage("AgentServerMessage", value)))
         const shell = (callId: string, command: string) => ({ shell_tool_call: { args: { command, tool_call_id: callId } } })
@@ -585,12 +587,11 @@ describe("checkpoint eligibility across host results", () => {
         } else if (message.exec_client_message) {
           const id = (message.exec_client_message as { id: number }).id
           // A result is complete with its exit; a large stdout arrives first.
-          const shellReply = message.exec_client_message as {
+          const hostReply = message.exec_client_message as {
             shell_stream?: { exit?: unknown }; shell_result?: unknown; write_result?: unknown; subagent_result?: unknown
           }
-          const complete = shellReply.shell_stream?.exit || shellReply.shell_result
-            || (id === 2 && (shellReply.write_result || shellReply.subagent_result))
-          if (!complete || delivered.includes(id)) return
+          if ((!hostReply.shell_stream?.exit && !hostReply.shell_result && !hostReply.write_result && !hostReply.subagent_result)
+            || delivered.includes(id)) return
           delivered.push(id)
           if (id === 1) {
             completed("first", "echo first")
@@ -616,15 +617,17 @@ describe("checkpoint eligibility across host results", () => {
             }
             // Fork: a refusal earlier in the Run (here of a tool the host does not offer) ran nothing on the host.
             if (scenario === "refusal-before-result") send({ exec_server_message: { id: 50, grep_args: { pattern: "first" } } })
-            // #172: a typed file_not_found for a read of a missing path changes nothing.
-            if (scenario === "missing-read") send({ exec_server_message: { id: 50, read_args: { path: "missing.txt" } } })
-            if (scenario === "new-file-edit") {
-              // Cursor reads a new file's absent target before its write; the provider answers it as empty.
-              send({ interaction_update: { tool_call_started: { call_id: "second", tool_call: {
-                edit_tool_call: { args: { path: "created.txt" } },
-              } } } })
-              send({ exec_server_message: { id: 60, read_args: { path: "created.txt", tool_call_id: "second" } } })
-              send({ exec_server_message: { id: 2, write_args: { path: "created.txt", file_text: "created\n", tool_call_id: "second" } } })
+            // The provider answers a read of a missing path itself, with a typed file_not_found.
+            // Without an advertised `read` (`refused-read`) it refuses the call instead; fork: a refusal needs no result.
+            if (scenario === "missing-read" || scenario === "refused-read") {
+              send({ exec_server_message: { id: 60, read_args: { path: path.join(root, "absent.txt"), tool_call_id: "absent" } } })
+            }
+            // A new file's edit: the provider answers its read with an empty file, then the write goes to the host.
+            if (newFileEdit) {
+              const target = path.join(root, "created.txt")
+              send({ interaction_update: { tool_call_started: { call_id: "edit", tool_call: { edit_tool_call: { args: { path: target } } } } } })
+              send({ exec_server_message: { id: 61, read_args: { path: target, tool_call_id: "edit" } } })
+              send({ exec_server_message: { id: 2, write_args: { path: target, file_text: "created\n", tool_call_id: "edit" } } })
             } else if (scenario === "handshake-without-write") {
               // Cursor ends the edit after its handshake read without a write: no host result stands for the read.
               const edit = { edit_tool_call: { args: { path: "created.txt" } } }
@@ -655,7 +658,10 @@ describe("checkpoint eligibility across host results", () => {
             }
             // Fork: a refusal in the cut step is as final as a poll there.
             if (scenario === "refusal-after-result") send({ exec_server_message: { id: 51, grep_args: { pattern: "second" } } })
-            if (scenario === "missing-read-after-result") send({ exec_server_message: { id: 51, read_args: { path: "missing.txt" } } })
+            // A provider answer after the last result belongs to the cut attempt.
+            if (scenario === "missing-read-after-result") {
+              send({ exec_server_message: { id: 60, read_args: { path: path.join(root, "absent.txt"), tool_call_id: "absent" } } })
+            }
             if (scenario === "malformed-completion" || scenario === "repeated-completion-id") {
               // Independent lifecycle wire: completion #3, call_id #1.
               // The decoder discards the unknown field or duplicate call id.
@@ -686,14 +692,14 @@ describe("checkpoint eligibility across host results", () => {
         const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN,
           workspaceRoot: root, cacheDir: root, retry: { baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
         const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Run both commands" }] }]
+        // Fork: the tools of the fork's own scenarios.
         const tool = (name: string) => ({ type: "function" as const, name, inputSchema: { type: "object", properties: {
           ...name === "read" || name === "write" || name === "edit" ? { filePath: { type: "string" } } : {},
           ...name === "write" ? { content: { type: "string" } } : {},
           ...name === "task" ? { description: { type: "string" }, prompt: { type: "string" } } : {},
         } } })
-        const extraTools = scenario === "mcp-terminal-poll" || scenario === "missing-read" || scenario === "missing-read-after-result"
-          ? ["read"]
-          : scenario === "new-file-edit" || scenario === "handshake-without-write" ? ["read", "write", "edit"]
+        const extraTools = scenario === "mcp-terminal-poll" ? ["read"]
+          : scenario === "handshake-without-write" ? ["read", "write", "edit"]
           : scenario === "task-attachment" ? ["task"]
           : scenario === "plan-refusal" ? ["plan_exit"]
           : []
@@ -702,6 +708,11 @@ describe("checkpoint eligibility across host results", () => {
           ...scenario === "plan-refusal" ? { providerOptions: { cursor: { opencodeSessionEditsDenied: true } } } : {},
           tools: [
             { type: "function" as const, name: "bash", inputSchema: { type: "object", properties: { command: { type: "string" } } } },
+            // Without an advertised `read` the provider refuses the read instead of answering it.
+            ...(fileReads ? [{ type: "function" as const, name: "read", inputSchema: { type: "object",
+              properties: { filePath: { type: "string" } }, required: ["filePath"] } }] : []),
+            ...(newFileEdit ? [{ type: "function" as const, name: "write", inputSchema: { type: "object",
+              properties: { filePath: { type: "string" }, content: { type: "string" } }, required: ["filePath", "content"] } }] : []),
             ...extraTools.map(tool),
           ] }
         const read = async () => {
@@ -725,13 +736,13 @@ describe("checkpoint eligibility across host results", () => {
           prompt.push({ role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName, output: { type: "text", value: output } }] })
         }
         if (scenario === "missing-history") prompt.splice(1, 2)
-        // Provider answers need no host result when they change nothing or their owner's result is in history (#172);
-        // other provider-answered execs need one as upstream (#164), and in the interrupted step every answer refuses.
+        // Terminal and missing-target reads need no host result, nor do an edit handshake or Task attachment read whose
+        // call's result is in history (#174); fork: nor do refusals. Every answer in the interrupted step refuses.
         if (scenario === "complete" || scenario === "announced" || scenario === "announced-shell" || scenario === "announced-open"
           || scenario === "new-output" || scenario === "next-call-announced" || scenario === "interaction-after-result"
           || scenario === "inline-catalog" || scenario === "unacknowledged-checkpoint" || scenario === "catalog-lookup"
           || scenario === "terminal-poll" || scenario === "mcp-terminal-poll" || scenario === "refusal-before-result"
-          || scenario === "missing-read" || scenario === "new-file-edit" || scenario === "task-attachment") {
+          || scenario === "missing-read" || scenario === "refused-read" || scenario === "new-file-edit" || scenario === "task-attachment") {
           const parts = await read()
           expect(parts.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
           expect(parts.some(part => part.type === "tool-call")).toBe(false)
@@ -1562,6 +1573,118 @@ describe("host calls still running when the Run dies", () => {
         expect(requests).toHaveLength(1)
       } finally {
         await cleanup()
+      }
+    }, 30_000)
+  }
+
+  // Fork: the lost held Run's check applies #174's rule to the provider's own answers.
+  for (const shape of ["held-new-file-write", "prior-missing-read", "prior-new-file-edit"] as const) {
+    it(`rebuilds a lost held Run past the provider's own answers (${shape})`, async () => {
+      const key = `ses_held_tool_answers_${shape}`
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-held-tool-answers-"))
+      const target = path.join(root, "created.txt")
+      const requests: RunRequest[] = []
+      let cutSent!: () => void
+      const cutDone = new Promise<void>((resolve) => { cutSent = resolve })
+      scripted = (stream, message) => {
+        const send = (value: Record<string, unknown>) => stream.write(frame(encodeMessage("AgentServerMessage", value)))
+        const newFileEdit = (id: number) => {
+          send({ interaction_update: { tool_call_started: { call_id: "edit", tool_call: { edit_tool_call: { args: { path: target } } } } } })
+          send({ interaction_update: { tool_requests_listed: { call_count: 1 } } })
+          send({ exec_server_message: { id: 60, read_args: { path: target, tool_call_id: "edit" } } })
+          send({ exec_server_message: { id, write_args: { path: target, file_text: "created\n", tool_call_id: "edit" } } })
+        }
+        const heldStep = () => {
+          if (shape === "held-new-file-write") newFileEdit(2)
+          else {
+            send({ interaction_update: { tool_call_started: { call_id: "first", tool_call: { shell_tool_call: { args: { command, tool_call_id: "first" } } } } } })
+            send({ interaction_update: { tool_requests_listed: { call_count: 1 } } })
+            send({ exec_server_message: { id: 2, shell_stream_args: { command, tool_call_id: "first" } } })
+          }
+          setTimeout(() => {
+            stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR)
+            cutSent()
+          }, 50)
+        }
+        if (message.run_request) {
+          requests.push(message.run_request as RunRequest)
+          if (requests.length > 1) {
+            send({ interaction_update: { text_delta: { text: "Done." } } })
+            send({ interaction_update: { turn_ended: {} } })
+            stream.end()
+            return
+          }
+          send({ conversation_checkpoint_update: Uint8Array.of(10, 1, 7) })
+          send({ interaction_update: { text_delta: { text: "Running it now." } } })
+          if (shape === "held-new-file-write") return heldStep()
+          // An earlier step whose host result reaches the Run before the held step.
+          if (shape === "prior-missing-read") {
+            send({ exec_server_message: { id: 50, read_args: { path: path.join(root, "absent.txt"), tool_call_id: "absent" } } })
+            send({ interaction_update: { tool_call_started: { call_id: "zero", tool_call: { shell_tool_call: { args: { command: "echo zero", tool_call_id: "zero" } } } } } })
+            send({ interaction_update: { tool_requests_listed: { call_count: 1 } } })
+            send({ exec_server_message: { id: 1, shell_stream_args: { command: "echo zero", tool_call_id: "zero" } } })
+          } else newFileEdit(1)
+        } else if (message.exec_client_message) {
+          const reply = message.exec_client_message as { id: number; shell_stream?: { exit?: unknown }; write_result?: unknown }
+          if (reply.id === 1 && (reply.shell_stream?.exit || reply.write_result)) heldStep()
+        }
+      }
+      const connections: http2.ClientHttp2Session[] = []
+      const connect = async () => {
+        const current = connections.at(-1)
+        if (current && !current.closed && !current.destroyed) return
+        const next = http2.connect(`http://127.0.0.1:${(server.address() as net.AddressInfo).port}`)
+        await new Promise<void>((resolve, reject) => {
+          next.once("connect", () => resolve())
+          next.once("error", reject)
+        })
+        connections.push(next)
+        cacheHttp2SessionForTests(ORIGIN, next)
+      }
+      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN,
+        workspaceRoot: root, cacheDir: root, retry: { baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
+      const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Run it" }] }]
+      const options = { prompt, headers: { "x-opencode-session-id": key }, tools: [
+        ...tools,
+        { type: "function" as const, name: "write", inputSchema: { type: "object",
+          properties: { filePath: { type: "string" }, content: { type: "string" } }, required: ["filePath", "content"] } },
+      ] }
+      const read = async () => {
+        const parts: LanguageModelV3StreamPart[] = []
+        await connect()
+        const { stream } = await model.doStream(options)
+        const reader = stream.getReader()
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) return parts
+          parts.push(value)
+        }
+      }
+      try {
+        const outputs = shape === "held-new-file-write" ? ["write landed"] : ["first step done", "ledger line written"]
+        for (const [index, output] of outputs.entries()) {
+          const calls = hostCalls(await read())
+          expect(calls).toHaveLength(1)
+          if (index === outputs.length - 1) {
+            await cutDone
+            for (let i = 0; i < 500 && sessionManager.findOpenByOpenCodeSessionId(key); i++) await Bun.sleep(10)
+            expect(requests).toHaveLength(1)
+          }
+          pushResult(prompt, calls[0]!, { type: "text", value: output })
+        }
+        const rebuilt = await read()
+        expect(hostCalls(rebuilt)).toHaveLength(0)
+        expect(rebuilt.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
+        expect(requests).toHaveLength(2)
+        expect(requests[1]!.action.resume_action).toBeUndefined()
+        const text = requests[1]!.action.user_message_action!.user_message.text
+        for (const output of outputs) expect(text.match(new RegExp(output, "g"))).toHaveLength(1)
+      } finally {
+        sessionManager.dispose()
+        await settleRunSavesForTests()
+        for (const connection of connections) connection.destroy()
+        setHostCacheDirOverride(undefined)
+        fs.rmSync(root, { recursive: true, force: true })
       }
     }, 30_000)
   }

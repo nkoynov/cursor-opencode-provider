@@ -232,9 +232,9 @@ results, before a new checkpoint, can rebuild from complete host history; the
 interrupted step's output and announced calls do not prevent it, and its shown
 text is passed on to be continued. Earlier reads the provider answered itself
 need no result in history: polls of a background shell's terminal record,
-reads of a missing path, other runtime-file reads, and, once the edit's or
-Task's own result is in history, a new file's empty edit read and a Task's
-attachment read (#172); nor do the provider's refusals of a call (fork). Missing
+reads of a missing path, and, once the edit's or Task's own result is in
+history, a new file's empty edit read and a Task's attachment read (#174);
+nor do the provider's refusals of a call (fork). Missing
 results, any other exec the provider answered, any provider answer or host
 tool in the interrupted step, or unrepresented activity remain final. A Run
 whose request upload is cut off is sent again.

@@ -395,11 +395,11 @@ can override `continuation.semanticIdleMs` (or its `softHealthMs` alias).
 If a Run drops after completed tool results, before Cursor saves a checkpoint,
 the provider can rebuild from host history containing every observed exec's
 result. Some execs the provider answered itself need none: Cursor's polls of a
-background shell's terminal record, reads of a missing path, other
-runtime-file reads and the provider's refusals of a call; a new file's empty
-edit read or a Task's attachment read needs none once the edit's or Task's own
-result is in history. Its other answers (an MCP resource listing, a git diff,
-a Cursor tool it declines as unsupported, a spill write) still need one. It sends the
+background shell's terminal record, reads of a missing path and the provider's
+refusals of a call; a new file's empty edit read or a Task's attachment read
+needs none once the edit's or Task's own result is in history. Its other
+answers (an MCP resource listing, a git diff, a runtime-file read or spill
+write, a Cursor tool it declines as unsupported) still need one. It sends the
 completed results once and asks Cursor to continue. A checkpoint predating
 those results is never resumed. The step that was interrupted does not stop the
 rebuild while nothing of it reached an exec: its text (which the rebuilt step is
