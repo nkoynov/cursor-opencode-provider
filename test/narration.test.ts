@@ -3,7 +3,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { pump, resetTurnStateForTests, settleRunSavesForTests } from "../src/language-model.js"
-import { assistantBlobShape, isNarrationSignature } from "../src/narration.js"
+import { assistantBlobShape, canBeProgressUpdate, isNarrationSignature } from "../src/narration.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { toolsToDescriptors } from "../src/protocol/tools.js"
@@ -21,7 +21,8 @@ const REASONING_SIGNATURE = "CAQSoAkKEggSEAIYAjgBQgh0aGlua2luZxIMJRBnnUuo7eQv5WR
 const NARRATION_SIGNATURE = "CAQS5wYKEwgSEAIYAjgBQgluYXJyYXRpb24SDMFdI5ZS24+5d6CpIRoMkeUb2lmr"
 
 const frame = (message: Record<string, unknown>): Frame => ({ flags: 0, payload: encodeMessage("AgentServerMessage", message) })
-const thinking = (text: string) => frame({ interaction_update: { thinking_delta: { text, thinking_style: 1 } } })
+const thinking = (text: string, thinking_style = 1) => frame({ interaction_update: { thinking_delta: { text, thinking_style } } })
+const CODEX_STYLE = 2
 const thinkingCompleted = frame({ interaction_update: { thinking_completed: { thinking_duration_ms: 1200 } } })
 const textFrame = (text: string) => frame({ interaction_update: { text_delta: { text } } })
 const checkpointFrame = frame({
@@ -39,6 +40,14 @@ describe("signature kinds", () => {
     expect(isNarrationSignature(NARRATION_SIGNATURE)).toBe(true)
     expect(isNarrationSignature(REASONING_SIGNATURE)).toBe(false)
     expect(isNarrationSignature("")).toBe(false)
+  })
+
+  it("allows progress updates only in the default thinking style", () => {
+    expect(canBeProgressUpdate(1)).toBe(true)
+    expect(canBeProgressUpdate(0)).toBe(false)
+    expect(canBeProgressUpdate(2)).toBe(false)
+    expect(canBeProgressUpdate(3)).toBe(false)
+    expect(canBeProgressUpdate(undefined)).toBe(false)
   })
 
   it("reads the block kinds of a stored assistant message", () => {
@@ -159,6 +168,36 @@ describe("progress updates streamed as thinking", () => {
     ])
     expect(joined(parts, "reasoning-delta")).toBe("Just run it. Nothing to say first.\n\n")
     expect(joined(parts, "text-delta")).toBe("")
+  })
+
+  it("keeps every block of a GPT step as reasoning", async () => {
+    const parts = await pass([
+      thinking("**Evaluating invoice calculations**\n\n", CODEX_STYLE),
+      thinkingCompleted,
+      thinking("**Checking rounding rules**\n\nI'm looking into the tax code.\n\n", CODEX_STYLE),
+      thinkingCompleted,
+      thinking("**Planning the test run**\n\n", CODEX_STYLE),
+      thinkingCompleted,
+      ...shellCall(1, "call-1", "echo hi"),
+    ])
+    expect(joined(parts, "reasoning-delta")).toBe(
+      "**Evaluating invoice calculations**\n\n**Checking rounding rules**\n\nI'm looking into the tax code.\n\n**Planning the test run**\n\n",
+    )
+    expect(joined(parts, "text-delta")).toBe("")
+  })
+
+  it("keeps GPT summaries out of the final answer", async () => {
+    const parts = await pass([
+      thinking("**Reviewing the diff**\n\n", CODEX_STYLE),
+      thinkingCompleted,
+      thinking("**Summarizing findings**\n\n", CODEX_STYLE),
+      thinkingCompleted,
+      textFrame("Found two bugs."),
+      checkpointFrame,
+      frame({ interaction_update: { turn_ended: { input_tokens: 10, output_tokens: 2 } } }),
+    ])
+    expect(joined(parts, "reasoning-delta")).toBe("**Reviewing the diff**\n\n**Summarizing findings**\n\n")
+    expect(joined(parts, "text-delta")).toBe("Found two bugs.")
   })
 
   it("leaves real text alone", async () => {

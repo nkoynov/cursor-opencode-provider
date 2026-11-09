@@ -303,7 +303,7 @@ import {
   unrecordedToolsNote,
   type ModelFallbackReply,
 } from "./model-fallback.js"
-import { assistantBlobShape, noteThinkingKind, takeThinkingKinds } from "./narration.js"
+import { assistantBlobShape, canBeProgressUpdate, noteThinkingKind, takeThinkingKinds } from "./narration.js"
 import { initializeConversationPersistence } from "./protocol/conversation-persistence.js"
 import {
   putBackFrame,
@@ -7220,7 +7220,7 @@ export async function pump(
         thinkingBlock.chars = 0
         thinkingBlock.indexInStep += 1
         // Opus 5.5 sends at most one progress update per tool call, after its reasoning block.
-        thinkingBlock.narration = thinkingBlock.indexInStep > 1
+        thinkingBlock.narration = thinkingBlock.indexInStep > 1 && canBeProgressUpdate(delta.thinking_style)
         noteThinkingKind(session, thinkingBlock.narration ? "N" : "R")
         trace(
           `thinking block start: index=${thinkingBlock.indexInStep} style=${delta.thinking_style ?? "-"} ` +

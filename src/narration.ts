@@ -6,6 +6,15 @@ import { isAssistantMessageBlob } from "./model-fallback.js"
 // block's signature, which reaches the client in the step's stored assistant
 // message after the step's tool results, says which kind a block was.
 
+// GPT models stream in the codex thinking style and split their reasoning
+// summaries into several blocks per step, none of them a progress update.
+const DEFAULT_THINKING_STYLE = 1
+
+/** Whether a thinking block in this agent.v1 ThinkingStyle can be a progress update. */
+export function canBeProgressUpdate(thinkingStyle: unknown): boolean {
+  return thinkingStyle === DEFAULT_THINKING_STYLE
+}
+
 const streamedThinkingKinds = new WeakMap<object, string[]>()
 
 /** Records how a streamed thinking block was shown (`R` reasoning, `N` text), for the debug log. */
