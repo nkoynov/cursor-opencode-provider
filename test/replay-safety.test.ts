@@ -8,6 +8,7 @@ import {
   execsOwedResults,
   hostExecs,
   markRunInjectionDelivered,
+  providerAnswerCounts,
   takeAppendedInjection,
   trackRunInjection,
   type ReplaySafetyState,
@@ -488,9 +489,9 @@ describe("display tool lifecycle", () => {
     step.recordExec(2)
     step.recordTerminalRead(2)
     step.recordExec(3, "grep-1")
-    step.recordRefusal(3)
+    step.recordProviderAnswer(3, "refusal")
     step.recordExec(4)
-    expect(execsOwedResults(state).map(exec => exec.id)).toEqual([1, 4])
+    expect(execsOwedResults(state, new Set()).map(exec => exec.id)).toEqual([1, 4])
     expect(state.attempt?.unrepresentable).toBe(true)
 
     const next = new AttemptReplaySafety("run-1", state)
@@ -498,7 +499,52 @@ describe("display tool lifecycle", () => {
     expect(state.attempt?.unrepresentable).toBeUndefined()
     next.recordTerminalRead(5)
     expect(state.attempt?.unrepresentable).toBe(true)
-    expect(execsOwedResults(state).map(exec => exec.id)).toEqual([1, 4])
+    expect(execsOwedResults(state, new Set()).map(exec => exec.id)).toEqual([1, 4])
+  })
+
+  it("owes no result for side-effect-free reads, nor for handshake and attachment reads once their owner's result is in", () => {
+    const state: ReplaySafetyState = {}
+    const step = new AttemptReplaySafety("run-1", state)
+    step.recordExec(1, "edit-1")
+    step.recordProviderAnswer(1, "edit-handshake")
+    step.recordExec(2, "edit-1")
+    step.recordHostExec(2)
+    step.recordExec(3, "task-1")
+    step.recordProviderAnswer(3, "task-attachment")
+    step.recordExec(4, "task-1")
+    step.recordHostExec(4)
+    step.recordExec(5)
+    step.recordProviderAnswer(5, "missing-read")
+    step.recordExec(6)
+    step.recordProviderAnswer(6, "runtime-read")
+    step.recordExec(7)
+    step.recordProviderAnswer(7, "edit-handshake")
+    // The handshake and attachment reads wait on their owners' results; one without a display call has no owner.
+    expect(execsOwedResults(state, new Set()).map(exec => exec.id)).toEqual([1, 2, 3, 4, 7])
+    expect(execsOwedResults(state, new Set(["run-1:2"])).map(exec => exec.id)).toEqual([2, 3, 4, 7])
+    expect(execsOwedResults(state, new Set(["run-1:2", "run-1:4"])).map(exec => exec.id)).toEqual([2, 4, 7])
+    expect(providerAnswerCounts(state)).toBe("edit-handshake:2,task-attachment:1,missing-read:1,runtime-read:1")
+    // Only the owner's own result counts: another answer under the same call stands for nothing.
+    const other: ReplaySafetyState = {}
+    const pass = new AttemptReplaySafety("run-1", other)
+    pass.recordExec(1, "edit-1")
+    pass.recordProviderAnswer(1, "edit-handshake")
+    pass.recordExec(2, "edit-1")
+    pass.recordProviderAnswer(2, "refusal")
+    expect(execsOwedResults(other, new Set(["run-1:2"])).map(exec => exec.id)).toEqual([1])
+  })
+
+  it("leaves a handshake or attachment read of a Run lost while the host runs its owner to that owner's result", () => {
+    const state: ReplaySafetyState = {}
+    const step = new AttemptReplaySafety("run-1", state)
+    step.recordExec(1, "edit-1")
+    step.recordProviderAnswer(1, "edit-handshake")
+    step.recordExec(2, "task-1")
+    step.recordProviderAnswer(2, "task-attachment")
+    expect(state.attempt).toEqual({ unrepresentable: true })
+    step.recordExec(3)
+    step.recordProviderAnswer(3, "missing-read")
+    expect(state.attempt?.unrebuildable).toBe("missing-read")
   })
 
   it("marks only the attempt for provider state a rebuild cannot carry", () => {

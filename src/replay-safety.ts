@@ -67,17 +67,33 @@ export function takeAppendedInjection(
     : { kind: "note", injectionId: injection.injectionId, notes: [...injection.notes ?? []] }
 }
 
+/** How the provider answered an exec itself, without a host tool (#172). */
+export type ProviderAnswer =
+  | "terminal-read"
+  | "edit-handshake"
+  | "task-attachment"
+  | "missing-read"
+  | "runtime-read"
+  | "refusal"
+
+type ReplayExec = {
+  sessionId: string
+  id: number
+  callId?: string
+  answer?: ProviderAnswer
+  /** Fork: an exec handed to a host tool. */
+  host?: true
+}
+
 /** Plain Run-owned state retained across host tool-step pump calls. */
 export type ReplaySafetyState = {
   statefulBarrier?: ReplayBarrierReason
   /**
    * Every exec needs its owner's host result; ids can restart on a resumed Run.
-   * `callId` is the display call the exec claims. `terminalRead` marks the provider's own answer
-   * from a host shell's terminal record (Cursor's AwaitShell polls): it ran nothing, so history needs no result.
-   * Fork: `refused` marks the provider's refusal (a held call after a refused file change or state-changing
-   * command), which needs no result either; `host` marks an exec handed to a host tool.
+   * `callId` is the display call the exec claims. `answer` marks an exec the provider answered itself, which
+   * history may need no result for (`execsOwedResults`).
    */
-  execs?: Array<{ sessionId: string; id: number; callId?: string; host?: true; terminalRead?: true; refused?: true }>
+  execs?: ReplayExec[]
   /** Display calls Cursor announced; history holds one only through the host exec that claims it. */
   announcedCalls?: string[]
   /** Only strict inline catalog lookups qualify; spilled catalogs remain barriers. */
@@ -137,9 +153,35 @@ export function hostExecs(state: ReplaySafetyState | undefined): NonNullable<Rep
   return state?.execs?.filter((exec) => exec.host) ?? []
 }
 
-/** Execs whose result host history must hold before a rebuild: all but the provider's terminal reads and refusals. */
-export function execsOwedResults(state: ReplaySafetyState | undefined): NonNullable<ReplaySafetyState["execs"]> {
-  return state?.execs?.filter((exec) => !exec.terminalRead && !exec.refused) ?? []
+/**
+ * Execs whose result host history must hold before a rebuild, given the `completed` `sessionId:execId` results it
+ * holds. Reads that change nothing need none; an edit's handshake read or a Task's attachment read needs none once
+ * the exec owning its display call has its result. Fork: neither does a refusal.
+ */
+export function execsOwedResults(state: ReplaySafetyState | undefined, completed: ReadonlySet<string>): ReplayExec[] {
+  const execs = state?.execs ?? []
+  const hasResult = (exec: ReplayExec) => completed.has(`${exec.sessionId}:${exec.id}`)
+  return execs.filter((exec) => {
+    switch (exec.answer) {
+      case "terminal-read":
+      case "missing-read":
+      case "runtime-read":
+      case "refusal":
+        return false
+      case "edit-handshake":
+      case "task-attachment":
+        return !exec.callId || !execs.some((owner) => owner !== exec && !owner.answer && owner.callId === exec.callId && hasResult(owner))
+      default:
+        return true
+    }
+  })
+}
+
+/** `kind:count` for each provider answer the Run recorded, for the history-check trace. */
+export function providerAnswerCounts(state: ReplaySafetyState | undefined): string {
+  const counts = new Map<ProviderAnswer, number>()
+  for (const exec of state?.execs ?? []) if (exec.answer) counts.set(exec.answer, (counts.get(exec.answer) ?? 0) + 1)
+  return [...counts].map(([kind, count]) => `${kind}:${count}`).join(",") || "-"
 }
 
 export class AttemptReplaySafety {
@@ -263,20 +305,20 @@ export class AttemptReplaySafety {
 
   /** The provider answered this exec itself by reading a host shell's terminal record. */
   recordTerminalRead(id: number): void {
-    this.recordProviderAnswer(id, "terminalRead")
+    this.recordProviderAnswer(id, "terminal-read")
   }
 
-  /** Fork: the provider refused this exec itself. */
-  recordRefusal(id: number): void {
-    this.recordProviderAnswer(id, "refused")
-  }
-
-  /** History needs no result for it, unless it came in the interrupted pass, which a rebuild cannot account for. */
-  private recordProviderAnswer(id: number, mark: "terminalRead" | "refused"): void {
+  /**
+   * The provider answered this exec itself. A post-result rebuild cannot account for one in the interrupted pass.
+   * Fork: a Run lost while the host runs the owner's call is judged by that owner's result instead.
+   */
+  recordProviderAnswer(id: number, answer: ProviderAnswer): void {
     const exec = this.state.execs?.find(exec => exec.sessionId === this.sessionId && exec.id === id)
-    if (exec) exec[mark] = true
+    if (exec) exec.answer = answer
     this.state.attempt!.unrepresentable = true
-    this.state.attempt!.unrebuildable ??= mark === "terminalRead" ? "terminal-read" : "provider-refusal"
+    if (answer !== "edit-handshake" && answer !== "task-attachment") {
+      this.state.attempt!.unrebuildable ??= answer === "refusal" ? "provider-refusal" : answer
+    }
   }
 
   /**

@@ -369,9 +369,8 @@ The **1.18 v2** API and **OpenCode 2.x** are source-incompatible:
   no checkpoint in the turn, a transient failure after only text or reasoning
   is `hostRetryable` (the CLI resends the action). A silent drop immediately
   after delivered host results may rebase from history only when every observed
-  exec has a completed result and no opaque activity occurred. A read the
-  provider answered from a host shell's terminal record (AwaitShell polls,
-  `recordTerminalRead`) needs none; one in the cut attempt stays a barrier. Include all
+  exec owes no result or has a completed one (`execsOwedResults`, below) and no
+  opaque activity occurred; a provider answer in the cut attempt stays a barrier. Include all
   completed tool steps; never resume their earlier checkpoint. Other barriers
   stay final. Cursor's `user_message_appended` echo of the Run's own delivered
   steer or host note (its `message_id` and text, nothing else) stays a stateful
@@ -385,15 +384,23 @@ The **1.18 v2** API and **OpenCode 2.x** are source-incompatible:
 - Every recorded exec, and the host calls the provider makes up
   (`recordHostCall`: mirrored display calls, AskQuestion, SwitchMode,
   CreatePlan), needs a result in history by its exec id (`execsOwedResults`),
-  except terminal-record polls the provider answered (#164,
-  `recordTerminalRead`, also through the canonical MCP `read`) and, fork
-  (CB-10), execs it refused (`recordRefusal`: a refusal burst, held calls
-  cancelled after a refused change). The interrupted pump pass
-  (`ReplaySafetyState.attempt`) does not bar the rebuild with its output or its
-  announced calls nothing claimed or completed; it does with any exec (a poll or
-  refusal included), a bridge or a stateful or unknown frame. A lost held Run
-  (`lostRunUnrebuildable`) never runs the history check, so it checks the
-  provider's owed answers itself. Its shown text goes to the rebuilt Run as `<interrupted_reply>`
+  except execs the provider answered itself, by the kind recorded when it
+  answered (#172, `recordProviderAnswer`): terminal-record polls (#164,
+  `terminal-read`, also through the canonical MCP `read`), missing read targets
+  (`missing-read`) and other runtime-file reads (`runtime-read`) need none; a
+  new file's empty edit handshake (`edit-handshake`) and a Task's attachment
+  read (`task-attachment`) need none once the exec owning the same display call
+  has its result; fork (CB-10), refusals (`refusal`: a refusal burst, held
+  calls cancelled after a refused change) need none. Spill writes, MCP resource
+  listings, git diffs, soft-denied native execs and any exec without a recorded
+  answer kind stay owed.
+  The interrupted pump pass (`ReplaySafetyState.attempt`) does not bar the
+  rebuild with its output or its announced calls nothing claimed or completed;
+  it does with any exec (any provider answer included), a bridge or a stateful
+  or unknown frame. A lost held Run (`lostRunUnrebuildable`) never runs the
+  history check, so it applies `execsOwedResults` itself; in its interrupted
+  pass an edit handshake or Task attachment read is left to its owner, the held
+  host call, whose result it then needs. Its shown text goes to the rebuilt Run as `<interrupted_reply>`
   to be continued. A `get_mcp_tools` lookup Cursor ran itself answers from the
   catalog the provider sent and counts as claimed once its completion validates
   strictly on the wire (`inlineCatalog`, `catalogCalls`: #44 the only variant

@@ -246,8 +246,12 @@ These are failure lessons shared by both hosts, not a replacement for
   anywhere in the Run (they were counted as execs owed a result) and the
   interrupted step's own output. Owe no result for refusals and terminal polls
   (#164), and judge the interrupted pass apart from the Run
-  (`ReplaySafetyState.attempt`). Other provider answers still owe one, as
-  upstream: counting only host execs (c11480f) gave way in the e580aab sync.
+  (`ReplaySafetyState.attempt`). Counting only host execs (c11480f) gave way
+  in the e580aab sync to upstream's rule, which then refused 30 % of a week's
+  rebuilt cuts, nearly all for a new file's empty edit read (2026-11-09). Record
+  each provider answer's kind when it is given and exempt by kind (#172:
+  missing and runtime reads; an edit handshake or Task attachment read once its
+  owner's result is in history); an answer without a recorded kind still owes one.
   A `get_mcp_tools` lookup Cursor ran at the start of a Run blocked that
   rebuild for the rest of the Run: a GOAWAY right after two read results ended
   a 14-minute turn (2026-10-26). The lookup answers from the catalog the

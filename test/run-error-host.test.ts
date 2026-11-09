@@ -484,6 +484,8 @@ describe("checkpoint eligibility across host results", () => {
     "catalog-lookup", "catalog-lookup-open", "cursor-run-completed", "catalog-lookup-mismatch",
     "catalog-lookup-unknown-variant", "catalog-lookup-reused-id",
     "terminal-poll", "terminal-poll-after-result", "mcp-terminal-poll", "refusal-before-result", "refusal-after-result",
+    "missing-read", "missing-read-after-result", "new-file-edit", "handshake-without-write", "task-attachment",
+    "plan-refusal",
   ] as const) {
     it(`recovers a post-result drop only from represented completed work (${scenario})`, async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-result-history-"))
@@ -583,8 +585,12 @@ describe("checkpoint eligibility across host results", () => {
         } else if (message.exec_client_message) {
           const id = (message.exec_client_message as { id: number }).id
           // A result is complete with its exit; a large stdout arrives first.
-          const shellReply = message.exec_client_message as { shell_stream?: { exit?: unknown }; shell_result?: unknown }
-          if ((!shellReply.shell_stream?.exit && !shellReply.shell_result) || delivered.includes(id)) return
+          const shellReply = message.exec_client_message as {
+            shell_stream?: { exit?: unknown }; shell_result?: unknown; write_result?: unknown; subagent_result?: unknown
+          }
+          const complete = shellReply.shell_stream?.exit || shellReply.shell_result
+            || (id === 2 && (shellReply.write_result || shellReply.subagent_result))
+          if (!complete || delivered.includes(id)) return
           delivered.push(id)
           if (id === 1) {
             completed("first", "echo first")
@@ -610,8 +616,35 @@ describe("checkpoint eligibility across host results", () => {
             }
             // Fork: a refusal earlier in the Run (here of a tool the host does not offer) ran nothing on the host.
             if (scenario === "refusal-before-result") send({ exec_server_message: { id: 50, grep_args: { pattern: "first" } } })
-            started("second", "echo second")
-            send({ exec_server_message: { id: 2, [shellVariant]: { command: "echo second", tool_call_id: "second" } } })
+            // #172: a typed file_not_found for a read of a missing path changes nothing.
+            if (scenario === "missing-read") send({ exec_server_message: { id: 50, read_args: { path: "missing.txt" } } })
+            if (scenario === "new-file-edit") {
+              // Cursor reads a new file's absent target before its write; the provider answers it as empty.
+              send({ interaction_update: { tool_call_started: { call_id: "second", tool_call: {
+                edit_tool_call: { args: { path: "created.txt" } },
+              } } } })
+              send({ exec_server_message: { id: 60, read_args: { path: "created.txt", tool_call_id: "second" } } })
+              send({ exec_server_message: { id: 2, write_args: { path: "created.txt", file_text: "created\n", tool_call_id: "second" } } })
+            } else if (scenario === "handshake-without-write") {
+              // Cursor ends the edit after its handshake read without a write: no host result stands for the read.
+              const edit = { edit_tool_call: { args: { path: "created.txt" } } }
+              send({ interaction_update: { tool_call_started: { call_id: "edit", tool_call: edit } } })
+              send({ exec_server_message: { id: 60, read_args: { path: "created.txt", tool_call_id: "edit" } } })
+              send({ interaction_update: { tool_call_completed: { call_id: "edit", tool_call: edit } } })
+              started("second", "echo second")
+              send({ exec_server_message: { id: 2, [shellVariant]: { command: "echo second", tool_call_id: "second" } } })
+            } else if (scenario === "task-attachment") {
+              // The provider answers a Task's attachment read; the Task's own result stands for it.
+              const args = { description: "Describe the shot", prompt: "Describe the attached image.", attachments: ["shot.png"] }
+              send({ interaction_update: { tool_call_started: { call_id: "second", tool_call: { task_tool_call: { args } } } } })
+              send({ exec_server_message: { id: 60, read_args: { path: "shot.png", tool_call_id: "second" } } })
+              send({ exec_server_message: { id: 2, subagent_args: { tool_call_id: "second", prompt: args.prompt, subagent_type: "generalPurpose" } } })
+            } else {
+              started("second", "echo second")
+              send({ exec_server_message: { id: 2, [shellVariant]: { command: "echo second", tool_call_id: "second" } } })
+            }
+            // A refused plan exit ends the turn, so a cut after the step's result stays refused.
+            if (scenario === "plan-refusal") send({ exec_server_message: { id: 50, mcp_args: { name: "opencode-plan_exit", args: [], tool_call_id: "plan" } } })
           } else {
             // The Run can drop before Cursor closes the last call.
             if (scenario !== "announced-open") completed("second", "echo second")
@@ -622,6 +655,7 @@ describe("checkpoint eligibility across host results", () => {
             }
             // Fork: a refusal in the cut step is as final as a poll there.
             if (scenario === "refusal-after-result") send({ exec_server_message: { id: 51, grep_args: { pattern: "second" } } })
+            if (scenario === "missing-read-after-result") send({ exec_server_message: { id: 51, read_args: { path: "missing.txt" } } })
             if (scenario === "malformed-completion" || scenario === "repeated-completion-id") {
               // Independent lifecycle wire: completion #3, call_id #1.
               // The decoder discards the unknown field or duplicate call id.
@@ -652,12 +686,23 @@ describe("checkpoint eligibility across host results", () => {
         const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN,
           workspaceRoot: root, cacheDir: root, retry: { baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
         const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Run both commands" }] }]
+        const tool = (name: string) => ({ type: "function" as const, name, inputSchema: { type: "object", properties: {
+          ...name === "read" || name === "write" || name === "edit" ? { filePath: { type: "string" } } : {},
+          ...name === "write" ? { content: { type: "string" } } : {},
+          ...name === "task" ? { description: { type: "string" }, prompt: { type: "string" } } : {},
+        } } })
+        const extraTools = scenario === "mcp-terminal-poll" || scenario === "missing-read" || scenario === "missing-read-after-result"
+          ? ["read"]
+          : scenario === "new-file-edit" || scenario === "handshake-without-write" ? ["read", "write", "edit"]
+          : scenario === "task-attachment" ? ["task"]
+          : scenario === "plan-refusal" ? ["plan_exit"]
+          : []
+        if (scenario === "task-attachment") fs.writeFileSync(path.join(root, "shot.png"), "shot bytes")
         const options = { prompt, headers: { "x-opencode-session-id": `ses_result_history_${scenario}` },
+          ...scenario === "plan-refusal" ? { providerOptions: { cursor: { opencodeSessionEditsDenied: true } } } : {},
           tools: [
             { type: "function" as const, name: "bash", inputSchema: { type: "object", properties: { command: { type: "string" } } } },
-            ...scenario === "mcp-terminal-poll"
-              ? [{ type: "function" as const, name: "read", inputSchema: { type: "object", properties: { filePath: { type: "string" } } } }]
-              : [],
+            ...extraTools.map(tool),
           ] }
         const read = async () => {
           const parts: LanguageModelV3StreamPart[] = []
@@ -680,12 +725,13 @@ describe("checkpoint eligibility across host results", () => {
           prompt.push({ role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName, output: { type: "text", value: output } }] })
         }
         if (scenario === "missing-history") prompt.splice(1, 2)
-        // Provider-answered execs other than terminal reads and refusals need host results as upstream (#164);
-        // in the interrupted step even those refuse.
+        // Provider answers need no host result when they change nothing or their owner's result is in history (#172);
+        // other provider-answered execs need one as upstream (#164), and in the interrupted step every answer refuses.
         if (scenario === "complete" || scenario === "announced" || scenario === "announced-shell" || scenario === "announced-open"
           || scenario === "new-output" || scenario === "next-call-announced" || scenario === "interaction-after-result"
           || scenario === "inline-catalog" || scenario === "unacknowledged-checkpoint" || scenario === "catalog-lookup"
-          || scenario === "terminal-poll" || scenario === "mcp-terminal-poll" || scenario === "refusal-before-result") {
+          || scenario === "terminal-poll" || scenario === "mcp-terminal-poll" || scenario === "refusal-before-result"
+          || scenario === "missing-read" || scenario === "new-file-edit" || scenario === "task-attachment") {
           const parts = await read()
           expect(parts.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
           expect(parts.some(part => part.type === "tool-call")).toBe(false)
@@ -1241,7 +1287,7 @@ describe("host calls still running when the Run dies", () => {
     cut: "reset" | "clean-close" | "clean-end" | "trailers-end" | "null-error" | "reply-write" | "final" | "invalid-argument"
       | "kv-final" | "none", key: string,
     before?: "unknown-frame" | "cursor-run-call" | "catalog-lookup" | "catalog-started" | "provider-exec" | "terminal-poll"
-      | "refusal",
+      | "refusal" | "missing-read",
     queued?: "next-step" | "cursor-run-call" | "appended-user" | "unknown-frame" | "exec-abort" | "checkpoint"
       | "catalog-lookup" | "catalog-started" | "catalog-invalid" | "own-completion") => {
     const requests: RunRequest[] = []
@@ -1275,6 +1321,7 @@ describe("host calls still running when the Run dies", () => {
       // Execs the provider answers itself in the pass the cut interrupts; history holds none of them.
       if (before === "provider-exec") send({ exec_server_message: { id: 90, list_mcp_resources_exec_args: {} } })
       if (before === "refusal") send({ exec_server_message: { id: 90, grep_args: { pattern: "first" } } })
+      if (before === "missing-read") send({ exec_server_message: { id: 90, read_args: { path: "missing.txt" } } })
       if (before === "terminal-poll") {
         const env = sessionManager.findOpenByOpenCodeSessionId(key)!.requestContext.env as { project_folder: string }
         const record = path.join(env.project_folder, "terminals", "7.txt")
@@ -1486,7 +1533,7 @@ describe("host calls still running when the Run dies", () => {
     ["held", "kv-final", undefined, undefined], ["held", "none", undefined, undefined],
     ["held", "null-error", undefined, undefined], ["open", "null-error", undefined, undefined],
     ["held", "reset", "provider-exec", undefined], ["held", "reset", "terminal-poll", undefined],
-    ["held", "reset", "refusal", undefined],
+    ["held", "reset", "refusal", undefined], ["held", "reset", "missing-read", undefined],
   ] as const) {
     it(`ends the turn once the running call's result is in when the Run cannot be rebuilt (${step} step, ${cut}${before ? `, ${before}` : ""}${queued ? `, queued ${queued}` : ""})`, async () => {
       const { requests, prompt, read, cleanup, waitForCut } = setup(step, cut, `ses_held_tool_refuse_${step}_${cut}_${before}_${queued}`, before, queued)
@@ -1509,7 +1556,8 @@ describe("host calls still running when the Run dies", () => {
         // Cursor's own final error wins over the provider's refusal.
         if (cut === "final" || cut === "kv-final") expect((error as APICallError).message).not.toContain("continue")
         else if (cut !== "invalid-argument" && cut !== "null-error") expect((error as APICallError).message).toContain("continue")
-        const why = { "provider-exec": "provider-answered-exec id=90", "terminal-poll": "terminal-read", refusal: "provider-refusal" }
+        const why = { "provider-exec": "provider-answered-exec id=90", "terminal-poll": "terminal-read", refusal: "provider-refusal",
+          "missing-read": "missing-read" }
         if (before && before in why) expect((error as APICallError).message).toContain(why[before as keyof typeof why])
         expect(requests).toHaveLength(1)
       } finally {
