@@ -226,6 +226,21 @@ On a held-open Run, an image read returns bytes in `ReadSuccess.data` (including
 
 One 20 MiB decoded-byte budget covers all image-bearing pending results in a continuation, without Cursor CLI's resize/re-encode step. Unreadable or oversized tool images are reported without blocking other results; cancellation still stops decoding. Other result shapes have no image field, so their images reach Cursor as history on the next fresh Run. Direct PDF, audio, and video attachments are unsupported; tool-result delivery only forwards image media.
 
+#### Saving Cursor images
+
+Cursor's copies of attached images and generated images save through
+`cursor_image_save`, with the host's write permissions. Pending images and saves
+in progress share a 400 MiB payload-byte budget across the process, with a
+50 MiB per-image limit. A new image that does not fit is refused before issuing
+a save handle; it never evicts an existing unexpired image. There is no
+eight-image count limit. Unclaimed handles expire after 10 minutes. Once a save
+claims an image, it retains its bytes, budget and path reservation throughout
+permission approval until completion or failure. Saving or discarding an image
+frees capacity for another write.
+If staging refuses a copy of an attached image, the provider also tells the
+model through a host note, since Cursor ignores that copy's write result.
+When Cursor has ended the Run, the note waits for the next user turn.
+
 #### Max mode
 
 Cursor IDE has a separate **Max Mode** toggle that sets `requested_model.max_mode` and selects the default max variant. OpenCode has no equivalent custom toggle, so this provider approximates it:
@@ -453,9 +468,15 @@ native prerequisites are missing. Cursor agent is optional. Run with
 `--diagnose` to check prerequisites; see the [test harness guide](docs/pr-review.md#local-checks-on-different-operating-systems)
 for the image build and isolation requirements.
 
-Changes listed under [Unreleased](CHANGELOG.md#unreleased) describe the development checkout; use a rebuilt local install to test them before a release. Maintainer guides and incident lessons are linked from the [documentation index](docs/README.md). The manual Cursor review, isolated pull-request checks, and OpenCode live test are in [docs/pr-review.md](docs/pr-review.md).
+Changes listed under [Unreleased](CHANGELOG.md#unreleased) describe the development checkout; use a rebuilt local install to test them before a release. Maintainer guides and incident lessons are linked from the [documentation index](docs/README.md). The manual `caeliq-reviewer` review, isolated pull-request checks, and OpenCode live test are in [docs/pr-review.md](docs/pr-review.md).
 
 Manual Cloud Agent reviews publish through the configured GitHub App after exact-preview approval. See the [App publisher setup](docs/pr-review.md#github-app-publisher) for `REVIEW_APP_ID`, the private key and optional installation ID. Tokens are restricted to this repository and retain the installation's configured permissions; the returned grant must include review-write access. `review-publish.py auth-info` reports configuration without printing secrets. Reviews use the App's bot identity, with no automatic review trigger.
+
+New review payloads require a completed, revision-matched evidence ledger and
+an isolated-check exit record. Rendering retains the ledger privately and binds
+its digest; preview and publication recheck those bytes. Keep the digest-named
+ledger file with its payload, including during recovery. Existing retained
+legacy previews remain usable; see the [review procedure](docs/pr-review.md).
 
 Linux isolated checks include the nested sandbox tests. Live credentials require
 the full check to pass and a separate trust decision for that exact revision.

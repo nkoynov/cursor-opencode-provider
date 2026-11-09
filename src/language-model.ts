@@ -1166,7 +1166,11 @@ function imageWriteSuccessFrame(execId: number, path: string, bytes: number): Ui
  * What the model must hear about a copy of an input image: nothing when it was
  * saved where Cursor said, otherwise where it went or that it was not saved.
  */
-function inputImageCopyNote(metadata: Record<string, unknown>, error: string | undefined): string | undefined {
+function inputImageCopyNote(
+  metadata: Record<string, unknown>,
+  error: string | undefined,
+  options: { stagingRefused?: boolean } = {},
+): string | undefined {
   const savedPath = typeof metadata.path === "string" ? metadata.path : undefined
   if (!savedPath) return undefined
   const requested = typeof metadata.requestedPath === "string" ? metadata.requestedPath : undefined
@@ -1177,6 +1181,12 @@ function inputImageCopyNote(metadata: Record<string, unknown>, error: string | u
       : undefined
   }
   const reason = error.replace(`${IMAGE_PERMISSION_DENIED_PREFIX} `, "").trim() || "the save failed"
+  // Staging may fail even when the intended path already holds the same bytes,
+  // or before collision resolution finishes. Do not claim that path is absent.
+  if (options.stagingRefused) {
+    return `The copy of an attached image meant for ${requested ?? savedPath} was not saved (${reason}). `
+      + "The image itself is still in this conversation."
+  }
   return requested
     ? `The copy of an attached image meant for ${requested} was not saved (${reason}); `
       + `${requested} holds a different image. The image itself is still in this conversation.`
@@ -5138,7 +5148,8 @@ function continuationResultInput(
 /**
  * Add host notes to the running turn as Cursor SDK `Run.steer` does:
  * `inject_context_action.user_context` with plain text, bound to this Run.
- * Written after the step's results, so Cursor sees them before its next step.
+ * Continuations write these after their step's results. An input-image copy
+ * refusal sends its notice first because Cursor ignores that copy's result.
  */
 async function injectHostNotes(
   session: CursorSession, notes: readonly string[], order = nextHostNoteOrder++,
@@ -7904,7 +7915,22 @@ export async function pump(
                 sessionId: session.openCodeSessionId,
               })
             } catch (error) {
-              if (!await rejectExec(parsed, (error as Error).message, "binary write not staged")) return
+              const reason = (error as Error).message
+              if (inputImage) {
+                // Cursor ignores a copy's WriteResult. Keep its failure notice
+                // before replying, so a failed reply cannot lose the note too.
+                const note = inputImageCopyNote({ path: remapped }, reason, { stagingRefused: true })
+                if (note) {
+                  if (session.stream.isClosed()) {
+                    if (session.openCodeSessionId) {
+                      appendUndeliveredHostNotes(session.openCodeSessionId, [{ notes: [note], order: nextHostNoteOrder++ }])
+                    }
+                  } else if (!await injectHostNotes(session, [note])) return
+                }
+              }
+              // Queued input copies need no reply once Cursor ended the Run.
+              if (!(inputImage && session.stream.isClosed())
+                && !await rejectExec(parsed, reason, "binary write not staged")) return
               continue
             }
             // Cursor CLI's agent fires the write of an input image's copy and ignores

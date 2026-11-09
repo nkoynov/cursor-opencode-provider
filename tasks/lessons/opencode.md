@@ -532,6 +532,20 @@ These are failure lessons shared by both hosts, not a replacement for
   a directory or target swapped to a symlink during approval otherwise redirects the
   authorized write, even to another path within an allowed root. Default
   project assets intentionally stay outside the git worktree (`test/generate-image.test.ts`, `src/image-save.ts`).
+- **Issued image handles own bytes; they are not cache entries.** In #165, the
+  ninth pending image evicted the first even when their total bytes were small.
+  Replacing count eviction with byte eviction only moves that failure to a
+  larger burst. Cursor CLI retains bytes in each write execution; OpenCode's
+  save-tool handoff needs the same ownership. Bound admission without evicting
+  unexpired handles, and charge claimed saves until they finish, including
+  approval waits and failures. Regress the binary-write-to-save path with 35
+  images, saturation, refusal/retry and separate module graphs
+  (`test/input-image-write.test.ts`, `test/generate-image.test.ts`).
+  The first refusal regression checked only WriteResult. Cursor ignores that
+  result for input-image copies, so a refusal before staging also needs a host
+  note; no save-tool result will arrive to create it. Retain it across a closed
+  Run or a failed write, and avoid claiming an existing target is absent
+  (`inputImageCopyNote`, staging-refusal cases in `test/input-image-write.test.ts`).
 
 ## Context, caching and accounting
 
@@ -770,6 +784,9 @@ These are failure lessons shared by both hosts, not a replacement for
   stop later pushes in the same shell sequence. Require successful exit before
   publishing, and scan commit bodies and coauthor trailers as well as author /
   committer identities. A clean file diff alone does not establish privacy.
+- **Keep task lists actionable.** Completed fix checklists and review summaries
+  accumulated in `tasks/todo.md`, obscuring future work. The storage rule belongs
+  in [working conventions](../../AGENTS.md#working-conventions).
 - **Coverage must be measured on the commit it is reported for.** On a pull
   request, checkout tests the merge with main while codecov-action files the
   report under the PR head. Once main changed `src/language-model.ts`, PR #107's
@@ -854,6 +871,21 @@ These are failure lessons shared by both hosts, not a replacement for
   reviewer ran. Repair the review harness when that is the requested target,
   using the reviewed defect as evaluation evidence rather than turning the
   repair into a patch to the subject (`docs/pr-review.md`).
+  The #166 audit then rendered a synthetic clean verdict with only `diff` and
+  `adversarial` assertions: the required ledger comparison was a manual step
+  no later consumer enforced. Run it inside rendering, retain digest-bound
+  evidence with the payload, and revalidate after publication lookups. Regress
+  missing and changed evidence, working-copy loss and retained legacy recovery
+  (`review evidence gate` in `test/review-publish.test.ts`). Those regressions
+  measure the evidence gate, not a fresh reviewer's defect-detection rate.
+  A later review correctly traced two host representations but called the
+  unchanged, already-working consumer an incomplete fix. Its own evidence
+  refuted the claimed runtime violation. Compare base and head at each
+  consumer before applying a cross-host rule; different representations need
+  not change together. `consumer-parity` in `eval/review/` pairs that precision
+  control with a real regression in the other adapter
+  (`test/review-eval.test.ts`); fixture and scorer checks still do not measure
+  a fresh reviewer's detection.
 - **A returned call is not settled ownership.** A clean review of #161 passed
   a process runner that waited for the check's leader only, sent KILL only
   when that leader overran, and had no SIGTERM handler, while its contract
@@ -910,6 +942,8 @@ These are failure lessons shared by both hosts, not a replacement for
   revision before assigning the failure. A read-only API lookup is still a
   GitHub call: `bind` must report that it read the revision without making
   GitHub changes (`records the pull request revision` regression).
+  Scope direct Bun runs to `./test` when ignored scratch checkouts exist;
+  unqualified or filename-pattern runs can mix revisions in one aggregate.
 - **An approval wait outlives temporary cleanup.** A successful `show` froze a
   preview that the agent then removed with its temporary review directory.
   Review results, ledgers, previews, and publication state belong in a persistent
@@ -928,7 +962,7 @@ These are failure lessons shared by both hosts, not a replacement for
   Exercise the actual HTTP authorization scheme as well as JWT signatures;
   GitHub App JWT requests require Bearer authentication.
 - **Keep one current policy across docs and prompts.** A rebase can add review
-  rules; reviewer patches still need whole-path validation. A manual Cursor review posts only after the maintainer approves the preview digest `show` printed for that payload and head (`scripts/review-publish.py`). The review request uses a GitHub App installation token minted from `REVIEW_APP_ID` and the app private key after the final pull read; the approval is read again after the mint. The Cloud Agent login, a user token, and the app client secret are not that credential (`test/review-publish.test.ts`). `post` reads that approval after the publication lock, after each read-only lookup, and again immediately before the send. The pull request, head, identity, preview digest, and approval generation are the ones current when the lock was acquired, so a denial, a replaced payload, or another valid approval is not sent on that operation. A send that does not confirm delivery stays unsettled and is not repeated. A confirmed review id and its comment ids remain delivery evidence when the summary marker is edited or the review is no longer listed, and are not posted again. The review records the repository, pull request, base, head, and linux runtime; `render` turns that structured result into the COMMENT payload, refuses an incomplete or malformed result, and anchors a comment only at a listed diff location. Earlier findings stay classified. `approve` and `post` name the rendered payload, the same file `show` froze. After the reviews lookup, and immediately before the send, `post` fetches the pull request again and then re-reads the pinned local operation. A moved base or head stops the send for a refreshed review and a new approval (`test/review-publish.test.ts`). A push after that fetch is outside the check. A returned review URL has to name the approved pull request. A response that shows GitHub rejected the request can be retried. The public-text scan flags secret values and local paths, including `~/...`, Markdown labels, `file://` autolinks, and a path written directly after a colon, and still allows public URLs and public identifiers such as `CURSOR_API_KEY`. The procedure stays in `docs/pr-review.md`. Changelog fixes
+  rules; reviewer patches still need whole-path validation. A manual `caeliq-reviewer` review posts only after the maintainer approves the preview digest `show` printed for that payload and head (`scripts/review-publish.py`). The review request uses a GitHub App installation token minted from `REVIEW_APP_ID` and the app private key after the final pull read; the approval is read again after the mint. The Cloud Agent login, a user token, and the app client secret are not that credential (`test/review-publish.test.ts`). `post` reads that approval after the publication lock, after each read-only lookup, and again immediately before the send. The pull request, head, identity, preview digest, and approval generation are the ones current when the lock was acquired, so a denial, a replaced payload, or another valid approval is not sent on that operation. A send that does not confirm delivery stays unsettled and is not repeated. A confirmed review id and its comment ids remain delivery evidence when the summary marker is edited or the review is no longer listed, and are not posted again. The review records the repository, pull request, base, head, and linux runtime; `render` turns that structured result into the COMMENT payload, refuses an incomplete or malformed result, and anchors a comment only at a listed diff location. Earlier findings stay classified. `approve` and `post` name the rendered payload, the same file `show` froze. After the reviews lookup, and immediately before the send, `post` fetches the pull request again and then re-reads the pinned local operation. A moved base or head stops the send for a refreshed review and a new approval (`test/review-publish.test.ts`). A push after that fetch is outside the check. A returned review URL has to name the approved pull request. A response that shows GitHub rejected the request can be retried. The public-text scan flags secret values and local paths, including `~/...`, Markdown labels, `file://` autolinks, and a path written directly after a colon, and still allows public URLs and public identifiers such as `CURSOR_API_KEY`. The procedure stays in `docs/pr-review.md`. Changelog fixes
   compare with the release, not an intermediate PR state. A versioned heading
   or package version bump does not establish publication. Verify release status
   and keep entries in the maintainer-designated upcoming release. Concurrent changelog
