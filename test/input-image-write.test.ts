@@ -404,7 +404,10 @@ describe("Cursor's input-image writes, which Cursor never waits for", () => {
       if (state === "ended") run.closeCleanly()
       else run.endWithoutNotice()
       const reply = collect()
-      await pump(run.session, reply.controller, ids)
+      const pumped = pump(run.session, reply.controller, ids)
+      // A note write that finds the Run gone fails the turn into recovery, as a failed reply does.
+      if (state === "ended") await pumped
+      else await expect(pumped).rejects.toThrow("no longer writable")
       expect(reply.parts.filter(part => part.type === "tool-call")).toEqual([])
       expect(writeResults(run.writes)).toEqual([])
       expect(injectedNotes(run.writes)).toEqual([])
@@ -413,6 +416,33 @@ describe("Cursor's input-image writes, which Cursor never waits for", () => {
       ])
     },
   )
+
+  it("keep a staging-refusal note for the next turn, writing nothing, when Cursor's end is queued behind the copy", async () => {
+    fillImageBudget()
+    const run = imageRun([], [PNG_A])
+    run.session.heldFrames = [imageWrite(1, PNG_A), ended()]
+    await pump(run.session, collect().controller, ids)
+    expect(writeResults(run.writes)).toEqual([])
+    expect(injectedNotes(run.writes)).toEqual([])
+    expect(releaseHostNoteInjectionsForTests(HOST_SESSION).undelivered).toEqual([
+      expect.stringContaining(`The copy of an attached image meant for ${path.join(run.assets, "cvs.png")} was not saved`),
+    ])
+  })
+
+  it("resume no checkpoint from before a staging refusal's note, only a later one", async () => {
+    const early = Uint8Array.of(10, 2, 4, 4)
+    const later = Uint8Array.of(10, 2, 5, 5)
+    fillImageBudget()
+    const refused = imageRun([checkpoint(early), imageWrite(1, PNG_A), ended()], [PNG_A])
+    await pump(refused.session, collect().controller, ids)
+    expect(injectedNotes(refused.writes)).toHaveLength(1)
+    expect(refused.session.resumeCheckpoint).toBeUndefined()
+
+    const resumed = imageRun([checkpoint(early), imageWrite(2, PNG_A), checkpoint(later), ended()], [PNG_A],
+      "image-refusal-later-checkpoint", refused.workspace)
+    await pump(resumed.session, collect().controller, ids)
+    expect(resumed.session.resumeCheckpoint).toEqual(later)
+  })
 
   it("retain a staging-refusal note when its later write-result reply fails", async () => {
     fillImageBudget()
