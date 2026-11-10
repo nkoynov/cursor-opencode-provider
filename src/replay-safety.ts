@@ -202,6 +202,29 @@ export function uncoveredExecs(state: ReplaySafetyState | undefined, completed: 
     : OWNED_ANSWERS.has(exec.answer) && !(exec.callId && hostExecs.some((owner) => owner.callId === exec.callId && resultHeld(owner))))
 }
 
+/**
+ * Fork: the replay state a Run resumed from the cut Run's checkpoint carries. The resume runs the cut pass's model
+ * step again, so a call that pass began and only the provider answered (an edit's handshake, a Task's attachment read)
+ * is gone with its answers, and no host result can ever cover them.
+ */
+export function resumedReplaySafety(state: ReplaySafetyState | undefined): ReplaySafetyState {
+  const execs = state?.execs ?? []
+  const abandoned = new Set((state?.attempt?.announcedCalls ?? []).filter((callId) => {
+    const claimers = execs.filter((exec) => exec.callId === callId)
+    return claimers.length > 0 && claimers.every((exec) => !!exec.answer && OWNED_ANSWERS.has(exec.answer))
+      && !state?.bridgedCalls?.includes(callId) && !state?.completedCalls?.includes(callId)
+  }))
+  return {
+    ...state,
+    execs: state?.execs?.filter((exec) => !exec.callId || !abandoned.has(exec.callId)),
+    announcedCalls: state?.announcedCalls?.filter((callId) => !abandoned.has(callId)),
+    bridgedCalls: state?.bridgedCalls?.slice(),
+    completedCalls: state?.completedCalls?.slice(),
+    catalogCalls: state?.catalogCalls && { ...state.catalogCalls },
+    appendedInjections: state?.appendedInjections?.slice(),
+  }
+}
+
 export class AttemptReplaySafety {
   private barrierReason: ReplayBarrierReason | undefined
   private stateful = false
