@@ -108,6 +108,11 @@ export type ReplaySafetyState = {
   bridgedCalls?: string[]
   /** Fork: calls Cursor completed without an exec; history holds one only once it is bridged. */
   completedCalls?: string[]
+  /**
+   * Fork: what the Run did after the last checkpoint it accepted, which a Run resumed from that checkpoint does again:
+   * the calls it announced, and the `sessionId:execId` of each handshake or attachment read the provider answered.
+   */
+  sinceCheckpoint?: { announcedCalls?: string[]; ownedAnswers?: string[] }
   /** Fork: the latest pump pass, which a history rebuild generates again. */
   attempt?: {
     /** Calls it announced: nothing ran them unless an exec claimed them or Cursor completed them. */
@@ -202,18 +207,26 @@ export function uncoveredExecs(state: ReplaySafetyState | undefined, completed: 
     : OWNED_ANSWERS.has(exec.answer) && !(exec.callId && hostExecs.some((owner) => owner.callId === exec.callId && resultHeld(owner))))
 }
 
+/** Fork: the Run accepted a checkpoint it may resume from. */
+export function markResumeCheckpoint(state: ReplaySafetyState | undefined): void {
+  if (state) state.sinceCheckpoint = undefined
+}
+
 /**
- * Fork: the replay state a Run resumed from the cut Run's checkpoint carries. The resume runs the cut pass's model
- * step again, so a call that pass began and only the provider answered (an edit's handshake, a Task's attachment read)
- * is gone with its answers, and no host result can ever cover them.
+ * Fork: the replay state a Run resumed from the cut Run's checkpoint carries. The resume does again what followed
+ * that checkpoint, so a call that began after it and that only the provider answered (an edit's handshake, a Task's
+ * attachment read) is gone with its answers, and no host result can ever cover them. A call the checkpoint saw
+ * announced, or with an answer before it, stays.
  */
 export function resumedReplaySafety(state: ReplaySafetyState | undefined): ReplaySafetyState {
   const execs = state?.execs ?? []
-  const abandoned = new Set((state?.attempt?.announcedCalls ?? []).filter((callId) => {
-    const claimers = execs.filter((exec) => exec.callId === callId)
-    return claimers.length > 0 && claimers.every((exec) => !!exec.answer && OWNED_ANSWERS.has(exec.answer))
-      && !state?.bridgedCalls?.includes(callId) && !state?.completedCalls?.includes(callId)
-  }))
+  const since = state?.sinceCheckpoint
+  const answeredSince = new Set(since?.ownedAnswers)
+  const afterCheckpoint = (exec: ReplayExec) => answeredSince.has(`${exec.sessionId}:${exec.id}`)
+  const abandoned = new Set(execs.filter(afterCheckpoint).flatMap((exec) => exec.callId ? [exec.callId] : [])
+    .filter((callId) => execs.every((exec) => exec.callId !== callId || afterCheckpoint(exec))
+      && (!state?.announcedCalls?.includes(callId) || !!since?.announcedCalls?.includes(callId))
+      && !state?.bridgedCalls?.includes(callId) && !state?.completedCalls?.includes(callId)))
   return {
     ...state,
     execs: state?.execs?.filter((exec) => !exec.callId || !abandoned.has(exec.callId)),
@@ -222,6 +235,7 @@ export function resumedReplaySafety(state: ReplaySafetyState | undefined): Repla
     completedCalls: state?.completedCalls?.slice(),
     catalogCalls: state?.catalogCalls && { ...state.catalogCalls },
     appendedInjections: state?.appendedInjections?.slice(),
+    sinceCheckpoint: undefined,
   }
 }
 
@@ -275,6 +289,8 @@ export class AttemptReplaySafety {
       }
       const announced = this.state.announcedCalls ??= []
       if (!announced.includes(lifecycle.callId)) announced.push(lifecycle.callId)
+      const sinceCheckpoint = (this.state.sinceCheckpoint ??= {}).announcedCalls ??= []
+      if (!sinceCheckpoint.includes(lifecycle.callId)) sinceCheckpoint.push(lifecycle.callId)
       const attempt = this.state.attempt!.announcedCalls ??= []
       if (!attempt.includes(lifecycle.callId)) attempt.push(lifecycle.callId)
       this.mark("display-tool-lifecycle", true)
@@ -352,6 +368,9 @@ export class AttemptReplaySafety {
   recordProviderAnswer(id: number, answer: ProviderAnswer): void {
     const exec = this.state.execs?.find(exec => exec.sessionId === this.sessionId && exec.id === id)
     if (exec) exec.answer = answer
+    if (exec?.callId && OWNED_ANSWERS.has(answer)) {
+      ((this.state.sinceCheckpoint ??= {}).ownedAnswers ??= []).push(`${this.sessionId}:${id}`)
+    }
     this.state.attempt!.unrepresentable = true
   }
 

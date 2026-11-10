@@ -405,6 +405,7 @@ import {
   heldRunLossRebuildable,
   historyCoverage,
   hostExecs,
+  markResumeCheckpoint,
   markRunInjectionDelivered,
   resumedReplaySafety,
   takeAppendedInjection,
@@ -1272,6 +1273,7 @@ function acceptResumeCheckpoint(session: CursorSession, bytes: Uint8Array, frame
   session.earlierCheckpointStale = false
   session.sideEffectAfterCheckpoint = false
   session.resumeCheckpointAfterFrame = undefined
+  markResumeCheckpoint(session.replaySafety)
   return true
 }
 
