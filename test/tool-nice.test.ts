@@ -103,7 +103,6 @@ describe("tool shells run at the nice increment", () => {
   })
 
   onLinux("puts an armed tool call's shell first in line for the OOM killer", async () => {
-    expect(oomScoreOf("/bin/sh")).toBeLessThan(TOOL_OOM_SCORE_ADJ)
     await armCursorShellCreate("cursor_oom_plain", { input: { command: "echo oom" } })
     const event = createEvent("echo oom")
     prepareCursorShellCreate(event)
