@@ -7,9 +7,13 @@ import { basename, join } from "node:path"
  * Tool processes share the OpenCode server's cgroup, so without a nice
  * increment a busy test suite gets the same CPU share per process as the
  * server's single JavaScript thread and can starve its event stream.
+ * They also inherit the server's OOM score, so when a test suite fills the
+ * machine the kernel kills the server, the largest single process, and with
+ * it every session; lowered shells raise their own score above the server's.
  */
 export const TOOL_NICE_ENV = "CURSOR_PROVIDER_TOOL_NICE"
 export const DEFAULT_TOOL_NICE = 10
+export const TOOL_OOM_SCORE_ADJ = 1000
 const MAX_NICE = 19
 
 export function toolNiceIncrement(env: NodeJS.ProcessEnv = process.env): number {
@@ -22,10 +26,14 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`
 }
 
-/** `exec <target>` lowered by `nice` when it is installed; `target` is already shell-quoted. */
+/**
+ * `exec <target>` lowered by `nice` when it is installed and first in line for
+ * the OOM killer where Linux allows it; `target` is already shell-quoted.
+ */
 export function niceExecLines(target: string, nice: number): string[] {
   if (nice <= 0) return [`exec ${target}`]
   return [
+    `{ echo ${TOOL_OOM_SCORE_ADJ} > /proc/self/oom_score_adj; } 2>/dev/null`,
     `if command -v nice >/dev/null 2>&1; then exec nice -n ${nice} ${target}; fi`,
     `exec ${target}`,
   ]
@@ -45,15 +53,16 @@ export function resetToolNiceAdapters(): void {
 /**
  * An executable with the shell's basename (OpenCode picks `-c` and its
  * permission parser by that name) that runs the shell at `nice`. One per
- * shell and increment, rewritten when temp cleanup removed it.
+ * shell and script, rewritten when temp cleanup removed it.
  */
 export function niceShellAdapter(shell: string, nice: number): string {
-  const key = createHash("sha256").update(`${nice}\0${shell}`).digest("hex").slice(0, 16)
+  const script = ["#!/bin/sh", ...niceExecLines(`${shellQuote(shell)} "$@"`, nice), ""].join("\n")
+  // Keyed by the whole script: a provider that changes it must not reuse an older build's adapter.
+  const key = createHash("sha256").update(`${shell}\0${script}`).digest("hex").slice(0, 16)
   const directory = join(adapterDirectory(), key)
   const executable = join(directory, basename(shell))
   if (existsSync(executable)) return executable
   mkdirSync(directory, { recursive: true, mode: 0o700 })
-  const script = ["#!/bin/sh", ...niceExecLines(`${shellQuote(shell)} "$@"`, nice), ""].join("\n")
   const partial = `${executable}.${process.pid}.tmp`
   writeFileSync(partial, script, { mode: 0o700 })
   renameSync(partial, executable)

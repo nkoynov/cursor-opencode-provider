@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test"
+import { createHash } from "node:crypto"
 import { existsSync, readFileSync, rmSync } from "node:fs"
 import { getPriority } from "node:os"
 import path from "node:path"
@@ -12,7 +13,7 @@ import {
   releaseCursorShellEnv,
   resetCursorShellCalls,
 } from "../src/shell-timeout.js"
-import { DEFAULT_TOOL_NICE, TOOL_NICE_ENV, niceShellAdapter, toolNiceIncrement } from "../src/tool-nice.js"
+import { DEFAULT_TOOL_NICE, TOOL_NICE_ENV, TOOL_OOM_SCORE_ADJ, niceShellAdapter, toolNiceIncrement } from "../src/tool-nice.js"
 
 const lowered = (increment: number) => Math.min(19, getPriority() + increment)
 const createEvent = (command: string, cwd = "/tmp") =>
@@ -22,6 +23,11 @@ const niceOf = (shell: string, env: Record<string, string> = {}) => {
   const result = Bun.spawnSync([shell, "-c", "read -r s < /proc/$$/stat; set -- $s; shift 18; echo $1"], {
     env: { ...process.env, ...env }, stdout: "pipe", stderr: "pipe",
   })
+  expect(result.exitCode).toBe(0)
+  return Number(result.stdout.toString().trim())
+}
+const oomScoreOf = (shell: string) => {
+  const result = Bun.spawnSync([shell, "-c", "read -r a < /proc/$$/oom_score_adj; echo $a"], { stdout: "pipe", stderr: "pipe" })
   expect(result.exitCode).toBe(0)
   return Number(result.stdout.toString().trim())
 }
@@ -94,6 +100,38 @@ describe("tool shells run at the nice increment", () => {
     const result = Bun.spawnSync([event.shell, "-c", command], { stdout: "pipe", stderr: "pipe" })
     expect(Number(captureCursorShellResult(id, result.stdout.toString()).trim())).toBe(lowered(DEFAULT_TOOL_NICE))
     releaseCursorShellEnv(id)
+  })
+
+  onLinux("puts an armed tool call's shell first in line for the OOM killer", async () => {
+    expect(oomScoreOf("/bin/sh")).toBeLessThan(TOOL_OOM_SCORE_ADJ)
+    await armCursorShellCreate("cursor_oom_plain", { input: { command: "echo oom" } })
+    const event = createEvent("echo oom")
+    prepareCursorShellCreate(event)
+    expect(oomScoreOf(event.shell)).toBe(TOOL_OOM_SCORE_ADJ)
+  })
+
+  onLinux("raises a wrapped call's payload's OOM score", async () => {
+    const id = "cursor_oom_wrapped"
+    const command = "read -r a < /proc/$$/oom_score_adj; echo $a"
+    registerCursorShellCall(id, {
+      shell_stream: true, command, working_directory: "/tmp", timeout_ms: 10_000, timeout_behavior: CURSOR_TIMEOUT_BACKGROUND,
+    })
+    const args: Record<string, unknown> = { command }
+    prepareCursorShellArgs(id, args, { deferToShellHook: true })
+    await armCursorShellCreate(id, { input: args })
+    const event = createEvent(command)
+    prepareCursorShellCreate(event)
+    const result = Bun.spawnSync([event.shell, "-c", command], { stdout: "pipe", stderr: "pipe" })
+    expect(Number(captureCursorShellResult(id, result.stdout.toString()).trim())).toBe(TOOL_OOM_SCORE_ADJ)
+    releaseCursorShellEnv(id)
+  })
+
+  it("keys an adapter by its script, so an older build's adapter is not reused", () => {
+    const adapter = niceShellAdapter("/bin/sh", DEFAULT_TOOL_NICE)
+    expect(readFileSync(adapter, "utf8")).toContain(`echo ${TOOL_OOM_SCORE_ADJ} > /proc/self/oom_score_adj`)
+    expect(path.basename(path.dirname(adapter))).not.toBe(
+      createHash("sha256").update(`${DEFAULT_TOOL_NICE}\0/bin/sh`).digest("hex").slice(0, 16),
+    )
   })
 
   onLinux("runs the shell unlowered when nice is not installed", () => {
