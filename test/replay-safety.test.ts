@@ -7,11 +7,13 @@ import {
   describeFrameLayout,
   historyCoverage,
   hostExecs,
+  markResumeCheckpoint,
   markRunInjectionDelivered,
   resumedReplaySafety,
   takeAppendedInjection,
   trackRunInjection,
   uncoveredExecs,
+  type ProviderAnswer,
   type ReplaySafetyState,
   type RunInjection,
 } from "../src/replay-safety.js"
@@ -548,25 +550,34 @@ describe("display tool lifecycle", () => {
     expect(uncoveredExecs(state, new Set()).map(exec => exec.id)).toEqual([1, 2])
   })
 
-  it("carries into a resumed Run only the cut pass's calls something besides the provider ran", () => {
+  it("carries into a resumed Run only the calls past its checkpoint something besides the provider ran", () => {
     const state: ReplaySafetyState = {}
-    const earlier = new AttemptReplaySafety("run-1", state)
-    earlier.recordToolLifecycle({ kind: "started", callId: "edit-earlier" })
-    earlier.recordExec(1, "edit-earlier")
-    earlier.recordProviderAnswer(1, "edit-handshake")
-    const cut = new AttemptReplaySafety("run-1", state)
-    for (const [id, callId] of [[2, "edit-ran"], [4, "edit-begun"], [5, "task-begun"]] as const) {
-      cut.recordToolLifecycle({ kind: "started", callId })
-      cut.recordExec(id, callId)
-      cut.recordProviderAnswer(id, callId === "task-begun" ? "task-attachment" : "edit-handshake")
+    const answer = (pass: AttemptReplaySafety, id: number, callId: string, kind: ProviderAnswer = "edit-handshake") => {
+      pass.recordExec(id, callId)
+      pass.recordProviderAnswer(id, kind)
     }
-    cut.recordExec(3, "edit-ran")
-    cut.recordHostExec(3)
+    const first = new AttemptReplaySafety("run-1", state)
+    first.recordToolLifecycle({ kind: "started", callId: "edit-held" })
+    answer(first, 1, "edit-held")
+    first.recordToolLifecycle({ kind: "started", callId: "edit-announced" })
+    markResumeCheckpoint(state)
+    first.recordToolLifecycle({ kind: "started", callId: "edit-split" })
+    first.recordToolLifecycle({ kind: "started", callId: "edit-ran" })
+    answer(first, 2, "edit-ran")
+    first.recordExec(3, "edit-ran")
+    first.recordHostExec(3)
+    const cut = new AttemptReplaySafety("run-1", state)
+    answer(cut, 4, "edit-split")
+    answer(cut, 5, "edit-announced")
+    cut.recordToolLifecycle({ kind: "started", callId: "task-begun" })
+    answer(cut, 6, "task-begun", "task-attachment")
+    answer(cut, 7, "edit-unannounced")
     const resumed = resumedReplaySafety(state)
-    expect(resumed.execs?.map(exec => exec.id)).toEqual([1, 2, 3])
-    expect(resumed.announcedCalls).toEqual(["edit-earlier", "edit-ran"])
-    expect(uncoveredExecs(resumed, new Set(["run-1:3"])).map(exec => exec.id)).toEqual([1])
-    expect(state.execs?.map(exec => exec.id)).toEqual([1, 2, 4, 5, 3])
+    expect(resumed.execs?.map(exec => exec.id)).toEqual([1, 2, 3, 5])
+    expect(resumed.announcedCalls).toEqual(["edit-held", "edit-announced", "edit-ran"])
+    expect(resumed.sinceCheckpoint).toBeUndefined()
+    expect(uncoveredExecs(resumed, new Set(["run-1:3"])).map(exec => exec.id)).toEqual([1, 5])
+    expect(state.execs?.map(exec => exec.id)).toEqual([1, 2, 3, 4, 5, 6, 7])
   })
 
   it("marks only the attempt for provider state a rebuild cannot carry", () => {

@@ -713,6 +713,61 @@ describe("parallel tool-call pump", () => {
     } finally { fs.rmSync(root, { recursive: true, force: true }) }
   })
 
+  describe("a resumed Run keeps an edit handshake its checkpoint saw", () => {
+    const run = (frames: (target: string) => Frame[], passes: number) => async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-resume-kept-handshake-"))
+      try {
+        const target = path.join(root, "new.py")
+        await noteToolRequestsListedSeen()
+        const { session } = fixture(frames(target))
+        const tools = [{ name: "bash", description: "Run shell command" }, { name: "read" }, { name: "write" }]
+        session.toolCatalog = tools
+        session.toolDescriptors = toolsToDescriptors(tools, "opencode")
+        session.requestContext = { env: { workspace_paths: [root] } }
+        session.editToolCalls = new Map()
+        for (let pass = 0; pass < passes; pass++) {
+          const step = collect()
+          await pump(session, step.controller, ids)
+          const call = toolCalls(step.parts)[0]!
+          expect(await deliverContinuationResults(session, [{
+            toolCallId: call.toolCallId, sessionId: session.sessionId, execId: pass * 2 + 1,
+            toolName: call.toolName, output: "command completed",
+          }])).toBe(session)
+        }
+        const recoveries: Array<{ kind: string }> = []
+        const resumed = await pumpWithRecovery({
+          initialSession: session,
+          controller: collect().controller,
+          recover: async recovery => {
+            recoveries.push(recovery)
+            return fixture([ended()], "parallel-pump-resumed").session
+          },
+        })
+        expect(recoveries.map(recovery => recovery.kind)).toEqual(["resume"])
+        const handshake = { sessionId: session.sessionId, id: passes * 2, callId: "edit-new", answer: "edit-handshake" as const }
+        expect(resumed.replaySafety?.execs).toContainEqual(handshake)
+        expect(resumed.replaySafety?.announcedCalls).toContain("edit-new")
+      } finally { fs.rmSync(root, { recursive: true, force: true }) }
+    }
+    const started = (target: string) => frame({ interaction_update: { tool_call_started: {
+      call_id: "edit-new", tool_call: { edit_tool_call: { args: { path: target } } },
+    } } })
+    const handshake = (id: number, target: string) =>
+      frame({ exec_server_message: { id, read_args: { path: target, tool_call_id: "edit-new" } } })
+
+    it("answered before that checkpoint in the cut pass", run((target) => [
+      listed(1), shell(1), completed("call-1"), started(target), handshake(2, target),
+      frame({ conversation_checkpoint_update: Uint8Array.of(10, 1, 5) }),
+    ], 1))
+
+    // The edit waits for the step's earlier call; that call's result drops the older checkpoint.
+    it("announced before that checkpoint and answered in a later pass", run((target) => [
+      listed(1), shell(1), completed("call-1"), frame({ conversation_checkpoint_update: Uint8Array.of(10, 1, 6) }),
+      shell(3), started(target), text("writing the file"),
+      completed("call-3"), frame({ conversation_checkpoint_update: Uint8Array.of(10, 1, 7) }), handshake(4, target),
+    ], 2))
+  })
+
   const interactionAnswers = [
     { name: "question", request: question("interaction-call"), output: JSON.stringify({ answers: [["Yes"]] }) },
     { name: "plan_enter", request: mode("interaction-call"), output: "Approved" },
