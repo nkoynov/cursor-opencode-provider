@@ -406,6 +406,7 @@ import {
   historyCoverage,
   hostExecs,
   markRunInjectionDelivered,
+  resumedReplaySafety,
   takeAppendedInjection,
   trackRunInjection,
   uncoveredExecs,
@@ -1990,15 +1991,7 @@ export async function pumpWithRecovery(input: {
       recovery.kind === "resume" ? next.sessionId : undefined,
     )
     if (recovery.kind === "resume") {
-      next.replaySafety = {
-        ...pumpedSession.replaySafety,
-        execs: pumpedSession.replaySafety?.execs?.slice(),
-        announcedCalls: pumpedSession.replaySafety?.announcedCalls?.slice(),
-        bridgedCalls: pumpedSession.replaySafety?.bridgedCalls?.slice(),
-        completedCalls: pumpedSession.replaySafety?.completedCalls?.slice(),
-        catalogCalls: pumpedSession.replaySafety?.catalogCalls && { ...pumpedSession.replaySafety.catalogCalls },
-        appendedInjections: pumpedSession.replaySafety?.appendedInjections?.slice(),
-      }
+      next.replaySafety = resumedReplaySafety(pumpedSession.replaySafety)
       next.userTurnHostNotes = pumpedSession.userTurnHostNotes
       next.usageEstimate = { ...pumpedSession.usageEstimate }
       // The resumed Run sends no images; the cut Run's are in the checkpoint it resumes.

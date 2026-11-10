@@ -12,6 +12,7 @@ import { getHostCacheDirOverride, setHostCacheDirOverride } from "../src/context
 import { discardPendingCursorImage } from "../src/image-staging.js"
 import { IMAGE_PERMISSION_DENIED_PREFIX } from "../src/image-save.js"
 import { noteFrameArrivalForTests } from "../src/transport/connect.js"
+import { announcedCallsClaimed, historyCoverage, uncoveredExecs } from "../src/replay-safety.js"
 import { sessionFixture } from "./session-fixture.js"
 
 function frame(message: Record<string, unknown>): Frame {
@@ -668,6 +669,48 @@ describe("parallel tool-call pump", () => {
       },
     })
     expect(recoveries).toEqual([{ kind: "resume", conversationId: session.conversationId, checkpoint }])
+  })
+
+  it("leaves out of the resumed Run's replay state an edit the cut pass began past its checkpoint", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-resume-handshake-"))
+    try {
+      const checkpoint = Uint8Array.of(10, 1, 4)
+      const target = path.join(root, "new.py")
+      const { session } = fixture([
+        shell(1), completed("call-1"), frame({ conversation_checkpoint_update: checkpoint }),
+        frame({ interaction_update: { tool_call_started: {
+          call_id: "edit-new", tool_call: { edit_tool_call: { args: { path: target } } },
+        } } }),
+        frame({ exec_server_message: { id: 2, read_args: { path: target, tool_call_id: "edit-new" } } }),
+      ])
+      const tools = [{ name: "bash", description: "Run shell command" }, { name: "read" }, { name: "write" }]
+      session.toolCatalog = tools
+      session.toolDescriptors = toolsToDescriptors(tools, "opencode")
+      session.requestContext = { env: { workspace_paths: [root] } }
+      session.editToolCalls = new Map()
+      const first = collect()
+      await pump(session, first.controller, ids)
+      const call = toolCalls(first.parts)[0]!
+      await deliverContinuationResults(session, [{
+        toolCallId: call.toolCallId, sessionId: session.sessionId, execId: 1,
+        toolName: call.toolName, output: "command completed",
+      }])
+      const recoveries: unknown[] = []
+      const resumed = await pumpWithRecovery({
+        initialSession: session,
+        controller: collect().controller,
+        recover: async recovery => {
+          recoveries.push(recovery)
+          expect(session.replaySafety?.execs).toContainEqual({ sessionId: session.sessionId, id: 2, callId: "edit-new", answer: "edit-handshake" })
+          return fixture([ended()], "parallel-pump-resumed").session
+        },
+      })
+      expect(recoveries).toEqual([{ kind: "resume", conversationId: session.conversationId, checkpoint }])
+      const completedResults = new Set([`${session.sessionId}:1`])
+      expect(uncoveredExecs(resumed.replaySafety, completedResults)).toEqual([])
+      expect(historyCoverage(resumed.replaySafety, completedResults).complete).toBe(true)
+      expect(announcedCallsClaimed(resumed.replaySafety)).toBe(true)
+    } finally { fs.rmSync(root, { recursive: true, force: true }) }
   })
 
   const interactionAnswers = [
