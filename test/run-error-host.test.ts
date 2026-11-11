@@ -414,6 +414,7 @@ describe("checkpoint eligibility across host results", () => {
     "inline-catalog", "spilled-catalog", "unfinished-catalog", "unacknowledged-checkpoint",
     "terminal-poll", "terminal-poll-after-result",
     "missing-read", "missing-read-after-result", "refused-read", "new-file-edit",
+    "soft-denied-background", "soft-denied-background-after-result",
   ] as const) {
     it(`recovers a post-result drop only from represented completed work (${scenario})`, async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-result-history-"))
@@ -427,6 +428,7 @@ describe("checkpoint eligibility across host results", () => {
       const shellVariant = scenario === "announced-shell" ? "shell_args" : "shell_stream_args"
       const newFileEdit = scenario === "new-file-edit"
       const fileReads = newFileEdit || scenario === "missing-read" || scenario === "missing-read-after-result"
+      const softDenied: number[] = []
       scripted = (stream, message) => {
         const send = (value: Record<string, unknown>) => stream.write(frame(encodeMessage("AgentServerMessage", value)))
         const shell = (callId: string, command: string) => ({ shell_tool_call: { args: { command, tool_call_id: callId } } })
@@ -435,6 +437,13 @@ describe("checkpoint eligibility across host results", () => {
         }
         const completed = (callId: string, command: string) => {
           if (lifecycle) send({ interaction_update: { tool_call_completed: { call_id: callId, tool_call: shell(callId, command) } } })
+        }
+        // ExecServerMessage #30 force_background_shell_args, which the provider soft-denies as unsupported.
+        // Raw bytes as in test/parallel-pump.test.ts: the schema has no type for the request.
+        const forceBackground = (id: number, callId: string) => {
+          const args = [0x0a, callId.length, ...Buffer.from(callId)]
+          const exec = [0x08, id, 0xf2, 0x01, args.length, ...args]
+          stream.write(frame(Uint8Array.from([0x12, exec.length, ...exec])))
         }
         if (message.run_request) {
           requests.push(message.run_request as RunRequest)
@@ -469,6 +478,7 @@ describe("checkpoint eligibility across host results", () => {
           send({ exec_server_message: { id: 1, [shellVariant]: { command: "echo first", tool_call_id: "first" } } })
         } else if (message.exec_client_message) {
           const id = (message.exec_client_message as { id: number }).id
+          if ((message.exec_client_message as { force_background_shell_result?: unknown }).force_background_shell_result) softDenied.push(id)
           // A result is complete with its exit; a large stdout arrives first.
           const hostReply = message.exec_client_message as { shell_stream?: { exit?: unknown }; shell_result?: unknown; write_result?: unknown }
           if ((!hostReply.shell_stream?.exit && !hostReply.shell_result && !hostReply.write_result) || delivered.includes(id)) return
@@ -490,6 +500,9 @@ describe("checkpoint eligibility across host results", () => {
             if (scenario === "missing-read" || scenario === "refused-read") {
               send({ exec_server_message: { id: 60, read_args: { path: path.join(root, "absent.txt"), tool_call_id: "absent" } } })
             }
+            // Cursor asks to move a shell to the background (it does so to deliver a queued host note);
+            // the provider refuses the unsupported request itself and nothing reaches the host.
+            if (scenario === "soft-denied-background") forceBackground(70, "first")
             // A new file's edit: the provider answers its read with an empty file, then the write goes to the host.
             if (newFileEdit) {
               const target = path.join(root, "created.txt")
@@ -511,6 +524,7 @@ describe("checkpoint eligibility across host results", () => {
             if (scenario === "missing-read-after-result") {
               send({ exec_server_message: { id: 60, read_args: { path: path.join(root, "absent.txt"), tool_call_id: "absent" } } })
             }
+            if (scenario === "soft-denied-background-after-result") forceBackground(71, "second")
             if (scenario === "malformed-completion" || scenario === "repeated-completion-id") {
               // Independent lifecycle wire: completion #3, call_id #1.
               // The decoder discards the unknown field or duplicate call id.
@@ -564,7 +578,7 @@ describe("checkpoint eligibility across host results", () => {
         if (scenario === "missing-history") prompt.splice(1, 2)
         if (scenario === "complete" || scenario === "announced" || scenario === "announced-shell" || scenario === "inline-catalog"
           || scenario === "unacknowledged-checkpoint" || scenario === "terminal-poll"
-          || scenario === "missing-read" || scenario === "new-file-edit") {
+          || scenario === "missing-read" || scenario === "new-file-edit" || scenario === "soft-denied-background") {
           const parts = await read()
           expect(parts.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
           expect(parts.some(part => part.type === "tool-call")).toBe(false)
@@ -588,6 +602,8 @@ describe("checkpoint eligibility across host results", () => {
           expect(requests).toHaveLength(scenario === "followup-before-result" ? 2 : 1)
         }
         expect(delivered).toEqual([1, 2])
+        // The provider answered the request itself; nothing reached the host.
+        if (scenario === "soft-denied-background") expect(softDenied).toEqual([70])
       } finally {
         sessionManager.dispose()
         await settleRunSavesForTests()
