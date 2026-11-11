@@ -6966,6 +6966,7 @@ export async function pump(
     try {
       if (released) {
         trace(`step-order: released execId=${released.execId} callId=${released.callId.replace(/\r?\n/g, "\\n")}`)
+        replaySafety.recordReleasedExec(released.execId)
         next = { done: false, value: released.frame }
       } else if (toolStep.hostCalls > 0) {
         if (lastFrameMoved) quietFrom = Date.now()
@@ -7777,6 +7778,7 @@ export async function pump(
           }
           if (decision === "hold") {
             holdExec(order, { callId: orderedCallId, execId: parsed.id, frame, request: parsed, pending: undefined })
+            replaySafety.recordHeldExec(parsed.id)
             trace(
               `step-order: HELD execId=${parsed.id} toolName=${parsed.toolName} ` +
                 `callId=${orderedCallId.replace(/\r?\n/g, "\\n")} held=${order.held.length}`,
@@ -8196,6 +8198,7 @@ export async function pump(
             rethrowTransportWriteFailure(error)
             failRunProtocol("Cursor unsupported exec deny reply failed", RUN_REPLY_FAILED)
           }
+          replaySafety.recordProviderAnswer(esmId, "refusal")
           trace(`exec: SOFT-DENIED ${variant.requestName} id=${esmId}`)
           continue
         }

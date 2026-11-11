@@ -74,7 +74,8 @@ export function takeAppendedInjection(
  * - `edit-handshake`: the empty read before an edit creates a new file;
  * - `task-attachment`: the placeholder read of a Task's attachment.
  * The last two are only complete with their call's host result: the edit's write, the Task.
- * Fork: `refusal`, the provider's refusal of a call (a refusal burst, a held call cancelled after a refused change).
+ * Fork: `refusal`, the provider's refusal of a call (a refusal burst, a held call cancelled after a refused change,
+ * a soft-denied Cursor-native exec the host cannot run).
  */
 export type ProviderAnswer = "terminal-read" | "missing-read" | "edit-handshake" | "task-attachment" | "refusal"
 
@@ -87,6 +88,8 @@ type ReplayExec = {
   answer?: ProviderAnswer
   /** Fork: an exec handed to a host tool. */
   host?: true
+  /** Fork: an exec step order still holds back: nothing ran it and the host has not seen it. */
+  held?: true
 }
 
 /** Plain Run-owned state retained across host tool-step pump calls. */
@@ -196,15 +199,16 @@ export function historyCoverage(state: ReplaySafetyState | undefined, completed:
 
 /**
  * Fork: the execs `historyCoverage` finds history short of, for a lost held Run's check: an exec without an answer
- * and without its result, or an edit handshake or Task attachment read without its call's host result.
+ * and without its result, or an edit handshake or Task attachment read without its call's host result. An exec step
+ * order still holds ran nothing and never reached the host, so a rebuild leaves it out like an unfinished call.
  */
 export function uncoveredExecs(state: ReplaySafetyState | undefined, completed: ReadonlySet<string>): ReplayExec[] {
   const execs = state?.execs ?? []
   const hostExecs = execs.filter((exec) => !exec.answer)
   const resultHeld = (exec: ReplayExec) => completed.has(`${exec.sessionId}:${exec.id}`)
-  return execs.filter((exec) => !exec.answer
+  return execs.filter((exec) => !exec.held && (!exec.answer
     ? !resultHeld(exec)
-    : OWNED_ANSWERS.has(exec.answer) && !(exec.callId && hostExecs.some((owner) => owner.callId === exec.callId && resultHeld(owner))))
+    : OWNED_ANSWERS.has(exec.answer) && !(exec.callId && hostExecs.some((owner) => owner.callId === exec.callId && resultHeld(owner)))))
 }
 
 /** Fork: the Run accepted a checkpoint it may resume from. */
@@ -324,11 +328,25 @@ export class AttemptReplaySafety {
     execs.push({ sessionId: this.sessionId, id, ...(callId ? { callId } : {}) })
   }
 
+  /** Fork: step order holds a recorded exec back until the calls before it finish. */
+  recordHeldExec(id: number): void {
+    const exec = this.state.execs?.find((entry) => entry.sessionId === this.sessionId && entry.id === id)
+    if (exec && !exec.host && !exec.answer) exec.held = true
+  }
+
+  /** Fork: a held exec is dispatched again: to the host, or to an answer of the provider's own. */
+  recordReleasedExec(id: number): void {
+    const exec = this.state.execs?.find((entry) => entry.sessionId === this.sessionId && entry.id === id)
+    if (exec) delete exec.held
+  }
+
   /** Fork: a recorded exec goes to a host tool, so its result must reach host history before a rebuild. */
   recordHostExec(id: number): void {
     const exec = this.state.execs?.find((entry) => entry.sessionId === this.sessionId && entry.id === id)
-    if (exec) exec.host = true
-    else {
+    if (exec) {
+      exec.host = true
+      delete exec.held
+    } else {
       this.markHistoryUnsafe(`unrecorded-host-exec id=${id}`)
       this.state.attempt!.unrebuildable ??= "unrecorded-host-exec"
     }
@@ -367,7 +385,10 @@ export class AttemptReplaySafety {
    */
   recordProviderAnswer(id: number, answer: ProviderAnswer): void {
     const exec = this.state.execs?.find(exec => exec.sessionId === this.sessionId && exec.id === id)
-    if (exec) exec.answer = answer
+    if (exec) {
+      exec.answer = answer
+      delete exec.held
+    }
     if (exec?.callId && OWNED_ANSWERS.has(answer)) {
       ((this.state.sinceCheckpoint ??= {}).ownedAnswers ??= []).push(`${this.sessionId}:${id}`)
     }

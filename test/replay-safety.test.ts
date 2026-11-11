@@ -550,6 +550,31 @@ describe("display tool lifecycle", () => {
     expect(uncoveredExecs(state, new Set()).map(exec => exec.id)).toEqual([1, 2])
   })
 
+  it("leaves out an exec step order still holds, but not one it released", () => {
+    const state: ReplaySafetyState = {}
+    const step = new AttemptReplaySafety("run-1", state)
+    step.recordExec(1, "first")
+    step.recordHostExec(1)
+    for (const id of [2, 3, 4, 5]) {
+      step.recordExec(id, `call-${id}`)
+      step.recordHeldExec(id)
+    }
+    expect(uncoveredExecs(state, new Set(["run-1:1"]))).toEqual([])
+    expect(uncoveredExecs(state, new Set()).map(exec => exec.id)).toEqual([1])
+
+    const next = new AttemptReplaySafety("run-1", state)
+    next.recordReleasedExec(2)
+    next.recordHostExec(2)
+    // A held call cancelled behind a refused change is refused without a release.
+    next.recordProviderAnswer(3, "refusal")
+    next.recordReleasedExec(4)
+    next.recordProviderAnswer(4, "edit-handshake")
+    next.recordHeldExec(2)
+    expect(state.execs?.filter(exec => exec.held).map(exec => exec.id)).toEqual([5])
+    expect(uncoveredExecs(state, new Set(["run-1:1"])).map(exec => exec.id)).toEqual([2, 4])
+    expect(uncoveredExecs(state, new Set(["run-1:1", "run-1:2"])).map(exec => exec.id)).toEqual([4])
+  })
+
   it("carries into a resumed Run only the calls past its checkpoint something besides the provider ran", () => {
     const state: ReplaySafetyState = {}
     const answer = (pass: AttemptReplaySafety, id: number, callId: string, kind: ProviderAnswer = "edit-handshake") => {

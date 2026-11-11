@@ -1293,12 +1293,15 @@ describe("host calls still running when the Run dies", () => {
     { type: "function" as const, name: "read", inputSchema: { type: "object", properties: { filePath: { type: "string" } } } },
   ]
 
-  /** The step's first call is a command (`held`) or a read (`open`); either waits in its step for the next listed call. */
-  const setup = (step: "held" | "open",
+  /**
+   * The step's first call is a command (`held`) or a read (`open`); either waits in its step for the next listed call.
+   * `ordered`: the next call's exec comes at once, and step order holds it behind the command.
+   */
+  const setup = (step: "held" | "open" | "ordered",
     cut: "reset" | "clean-close" | "clean-end" | "trailers-end" | "null-error" | "reply-write" | "final" | "invalid-argument"
       | "kv-final" | "none", key: string,
     before?: "unknown-frame" | "cursor-run-call" | "catalog-lookup" | "catalog-started" | "provider-exec" | "terminal-poll"
-      | "refusal" | "missing-read",
+      | "refusal" | "missing-read" | "soft-denied" | "handshake-without-write",
     queued?: "next-step" | "cursor-run-call" | "appended-user" | "unknown-frame" | "exec-abort" | "checkpoint"
       | "catalog-lookup" | "catalog-started" | "catalog-invalid" | "own-completion") => {
     const requests: RunRequest[] = []
@@ -1333,6 +1336,15 @@ describe("host calls still running when the Run dies", () => {
       if (before === "provider-exec") send({ exec_server_message: { id: 90, list_mcp_resources_exec_args: {} } })
       if (before === "refusal") send({ exec_server_message: { id: 90, grep_args: { pattern: "first" } } })
       if (before === "missing-read") send({ exec_server_message: { id: 90, read_args: { path: "missing.txt" } } })
+      // ExecServerMessage{id #1 = 90, force_background_shell_args #30}: a Cursor-native exec the host cannot run.
+      if (before === "soft-denied") stream.write(frame(Uint8Array.of(0x12, 5, 0x08, 90, 0xf2, 0x01, 0)))
+      if (before === "handshake-without-write") {
+        // Cursor ends the edit after its handshake read without a write: no host result stands for the read.
+        const edit = { edit_tool_call: { args: { path: "created.txt" } } }
+        send({ interaction_update: { tool_call_started: { call_id: "edit", tool_call: edit } } })
+        send({ exec_server_message: { id: 90, read_args: { path: "created.txt", tool_call_id: "edit" } } })
+        send({ interaction_update: { tool_call_completed: { call_id: "edit", tool_call: edit } } })
+      }
       if (before === "terminal-poll") {
         const env = sessionManager.findOpenByOpenCodeSessionId(key)!.requestContext.env as { project_folder: string }
         const record = path.join(env.project_folder, "terminals", "7.txt")
@@ -1355,6 +1367,7 @@ describe("host calls still running when the Run dies", () => {
       send({ exec_server_message: step === "open"
         ? { id: 1, read_args: { path: "notes.txt", tool_call_id: "first" } }
         : { id: 1, shell_stream_args: { command, tool_call_id: "first" } } })
+      if (step === "ordered") send({ exec_server_message: { id: 2, shell_stream_args: { command, tool_call_id: "second" } } })
       // Frames Cursor sends while the host runs the call; the held reader queues them for the next pump.
       setTimeout(() => {
         if (queued === "next-step") {
@@ -1431,7 +1444,10 @@ describe("host calls still running when the Run dies", () => {
     const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN,
       workspaceRoot: root, cacheDir: root, retry: { baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
     const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Run the slow command" }] }]
-    const options = { prompt, tools, headers: { "x-opencode-session-id": key } }
+    const write = { type: "function" as const, name: "write", inputSchema: { type: "object",
+      properties: { filePath: { type: "string" }, content: { type: "string" } }, required: ["filePath", "content"] } }
+    const options = { prompt, tools: before === "handshake-without-write" ? [...tools, write] : tools,
+      headers: { "x-opencode-session-id": key } }
     const read = async (abortSignal?: AbortSignal) => {
       const parts: LanguageModelV3StreamPart[] = []
       await connect()
@@ -1508,6 +1524,9 @@ describe("host calls still running when the Run dies", () => {
     ["held", "clean-end", undefined, undefined], ["open", "clean-end", undefined, undefined],
     ["held", "clean-end", undefined, "next-step"], ["held", "trailers-end", undefined, undefined],
     ["open", "trailers-end", undefined, undefined],
+    // Fork: nothing ran the call step order still held, and the soft-denied exec ran nothing on the host.
+    ["ordered", "reset", undefined, undefined], ["ordered", "clean-close", undefined, undefined],
+    ["held", "reset", "soft-denied", undefined],
   ] as const) {
     it(`ends the step on its running host call and rebuilds from its result (${step} step, ${cut}${before ? `, ${before}` : ""}${queued ? `, queued ${queued}` : ""})`, async () => {
       const { requests, prompt, read, cleanup, waitForCut } = setup(step, cut, `ses_held_tool_cut_${step}_${cut}_${before}_${queued}`, before, queued)
@@ -1546,7 +1565,8 @@ describe("host calls still running when the Run dies", () => {
     ["held", "clean-close", undefined, "catalog-invalid"], ["held", "final", undefined, "appended-user"],
     ["held", "kv-final", undefined, undefined], ["held", "none", undefined, undefined],
     ["held", "null-error", undefined, undefined], ["open", "null-error", undefined, undefined],
-    ["held", "reset", "provider-exec", undefined],
+    ["held", "reset", "provider-exec", undefined], ["ordered", "reset", "provider-exec", undefined],
+    ["held", "reset", "handshake-without-write", undefined],
   ] as const) {
     it(`ends the turn once the running call's result is in when the Run cannot be rebuilt (${step} step, ${cut}${before ? `, ${before}` : ""}${queued ? `, queued ${queued}` : ""})`, async () => {
       const { requests, prompt, read, cleanup, waitForCut } = setup(step, cut, `ses_held_tool_refuse_${step}_${cut}_${before}_${queued}`, before, queued)
@@ -1569,7 +1589,7 @@ describe("host calls still running when the Run dies", () => {
         // Cursor's own final error wins over the provider's refusal.
         if (cut === "final" || cut === "kv-final") expect((error as APICallError).message).not.toContain("continue")
         else if (cut !== "invalid-argument" && cut !== "null-error") expect((error as APICallError).message).toContain("continue")
-        const why = { "provider-exec": "provider-answered-exec id=90" }
+        const why = { "provider-exec": "provider-answered-exec id=90", "handshake-without-write": "provider-answered-exec id=90" }
         if (before && before in why) expect((error as APICallError).message).toContain(why[before as keyof typeof why])
         expect(requests).toHaveLength(1)
       } finally {
