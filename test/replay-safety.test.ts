@@ -470,8 +470,9 @@ describe("display tool lifecycle", () => {
     const number = (fn: number, value: number) => [...varint(fn << 3), ...varint(value)]
     const args = message(1, lengthDelimited(1, text("545432")), number(2, 1_800_000))
     // A timed-out wait as Cursor stores it: success { still_running { task_id, runtime_ms, output_file_path, output_length } }.
-    const running = (...extra: number[][]) => message(2, lengthDelimited(1, text("545432")), number(2, 1_800_000),
-      lengthDelimited(3, text("/terminals/545432.txt")), number(4, 812), ...extra)
+    const runningFields = [lengthDelimited(1, text("545432")), number(2, 1_800_000),
+      lengthDelimited(3, text("/terminals/545432.txt")), number(4, 812)]
+    const running = (...extra: number[][]) => message(2, ...runningFields, ...extra)
     const success = (...fields: number[][]) => message(2, message(4, ...fields))
     const wait = (...fields: number[][]) => message(42, ...fields)
     const fetch = message(37, message(1, lengthDelimited(1, text("https://example.com"))))
@@ -518,6 +519,15 @@ describe("display tool lifecycle", () => {
     ] as const) {
       expect([why, analyzeTool(field, "other", [...tool]).toolLifecycle?.wait]).toEqual([why, undefined])
     }
+    // Every stored Await has task_id; Cursor CLI defaults a missing block_until_ms.
+    expect(analyzeTool(2, "wait", wait(message(1, lengthDelimited(1, text("545432"))))).toolLifecycle?.wait).toBe(true)
+    expect(analyzeTool(2, "other", wait(message(1, number(2, 1_800_000)))).toolLifecycle?.wait).toBeUndefined()
+    // Every stored timed-out wait has task_id, runtime_ms, output_file_path and output_length.
+    for (const missing of [0, 1, 2, 3]) {
+      const partial = message(2, ...runningFields.filter((_, index) => index !== missing))
+      expect([missing + 1, analyzeTool(3, "other", wait(args, success(partial))).toolLifecycle?.wait]).toEqual([missing + 1, undefined])
+    }
+    expect(analyzeTool(3, "other", wait(args, success(message(2)))).toolLifecycle?.wait).toBeUndefined()
 
     const state: ReplaySafetyState = {}
     const earlier = new AttemptReplaySafety("run-1", state)

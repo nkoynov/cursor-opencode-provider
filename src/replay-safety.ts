@@ -484,11 +484,14 @@ const AWAIT_ARGS: Record<number, number> = { 1: 2, 2: 0, 3: 2 }
 // output_length is an observation history lacks, but every timed-out wait has one, and a rebuild repeats nothing after it.
 const AWAIT_STILL_RUNNING: Record<number, number> = { 1: 2, 2: 0, 3: 2, 4: 0, 5: 0 }
 
-/** Fields only from `spec` (field number to wire type), each at most once. */
-function strictFields(bytes: Uint8Array | undefined, spec: Record<number, number>): StrictRawField[] | undefined {
+/** Fields only from `spec` (field number to wire type), each at most once, and every `required` one present. */
+function strictFields(
+  bytes: Uint8Array | undefined, spec: Record<number, number>, required: readonly number[] = [],
+): StrictRawField[] | undefined {
   const fields = bytes && readAllFieldsStrict(bytes)
   return fields && fields.every(field => spec[field.fn] === field.wt)
-    && Object.entries(spec).every(([fn, wt]) => optionalField(fields, Number(fn), wt)) ? fields : undefined
+    && Object.entries(spec).every(([fn, wt]) => optionalField(fields, Number(fn), wt))
+    && required.every(fn => fields.some(field => field.fn === fn)) ? fields : undefined
 }
 
 /** The bytes of a message's only field, a length-delimited `fn`. */
@@ -513,10 +516,11 @@ function awaitVariant(topLevel: StrictRawField | undefined, completed: boolean):
   if (variants.length !== 1 || variants[0]!.fn !== 42 || variants[0]!.wt !== 2) return false
   const wait = strictFields(variants[0]!.bytes, { 1: 2, 2: 2 })
   const args = wait?.find(field => field.fn === 1)
-  if (!args || !strictFields(args.bytes, AWAIT_ARGS)) return false
+  // Every stored Await had task_id and every stored timed-out wait all four fields; Cursor CLI defaults a missing block_until_ms.
+  if (!args || !strictFields(args.bytes, AWAIT_ARGS, [1])) return false
   const result = wait!.find(field => field.fn === 2)
   if (!completed || !result) return completed === !!result
-  return !!strictFields(soleMessage(soleMessage(result.bytes, 4), 2), AWAIT_STILL_RUNNING)
+  return !!strictFields(soleMessage(soleMessage(result.bytes, 4), 2), AWAIT_STILL_RUNNING, [1, 2, 3, 4])
 }
 
 function catalogVariant(topLevel: StrictRawField | undefined): boolean {
