@@ -340,12 +340,17 @@ export class AttemptReplaySafety {
     if (exec) delete exec.held
   }
 
-  /** Fork: a recorded exec goes to a host tool, so its result must reach host history before a rebuild. */
-  recordHostExec(id: number): void {
+  /**
+   * Fork: a recorded exec goes to a host tool, so its result must reach host history before a rebuild.
+   * `callId`: the display call it serves when the exec names none (a generated image's write); its host result
+   * stands for that call too.
+   */
+  recordHostExec(id: number, callId?: string): void {
     const exec = this.state.execs?.find((entry) => entry.sessionId === this.sessionId && entry.id === id)
     if (exec) {
       exec.host = true
       delete exec.held
+      if (callId && !exec.callId) exec.callId = callId
     } else {
       this.markHistoryUnsafe(`unrecorded-host-exec id=${id}`)
       this.state.attempt!.unrebuildable ??= "unrecorded-host-exec"

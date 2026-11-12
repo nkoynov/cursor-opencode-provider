@@ -1710,6 +1710,126 @@ describe("host calls still running when the Run dies", () => {
     }, 30_000)
   }
 
+  // Fork: a generated image's write names no call; the host's save of it stands for its GenerateImage call.
+  for (const images of ["one", "two-open"] as const) {
+    it(`${images === "one" ? "rebuilds" : "refuses"} a lost held Run of parallel Task calls after an earlier GenerateImage (${images})`, async () => {
+      const key = `ses_held_tool_generated_image_${images}`
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-held-tool-image-"))
+      const png = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, 0x49, 0x48, 0x44, 0x52])
+      const generate = (callId: string) => ({ generate_image_tool_call: { args: { description: `sprite ${callId}` } } })
+      const generations = images === "one" ? ["gen"] : ["gen-1", "gen-2"]
+      const reviewers = ["opus", "gpt", "grok"]
+      const requests: RunRequest[] = []
+      let cutSent!: () => void
+      const cutDone = new Promise<void>((resolve) => { cutSent = resolve })
+      scripted = (stream, message) => {
+        const send = (value: Record<string, unknown>) => stream.write(frame(encodeMessage("AgentServerMessage", value)))
+        if (message.run_request) {
+          requests.push(message.run_request as RunRequest)
+          if (requests.length > 1) {
+            send({ interaction_update: { text_delta: { text: "Reviews are in." } } })
+            send({ interaction_update: { turn_ended: {} } })
+            stream.end()
+            return
+          }
+          send({ conversation_checkpoint_update: Uint8Array.of(10, 1, 7) })
+          for (const callId of generations) {
+            send({ interaction_update: { tool_call_started: { call_id: callId, tool_call: generate(callId) } } })
+          }
+          send({ exec_server_message: { id: 1, write_args: { path: "/elsewhere/assets/sprite.png", file_bytes: png } } })
+        } else if (message.exec_client_message) {
+          const reply = message.exec_client_message as { id: number; write_result?: unknown }
+          if (reply.id !== 1 || !reply.write_result) return
+          for (const callId of generations) {
+            send({ interaction_update: { tool_call_completed: { call_id: callId, tool_call: generate(callId) } } })
+          }
+          send({ interaction_update: { text_delta: { text: "Asking three reviewers." } } })
+          for (const [index, agent] of reviewers.entries()) {
+            const args = { description: `Review (${agent})`, prompt: `Review the sprite as ${agent}.` }
+            send({ interaction_update: { tool_call_started: { call_id: agent, tool_call: { task_tool_call: { args } } } } })
+            send({ interaction_update: { tool_requests_listed: { call_count: reviewers.length } } })
+            send({ exec_server_message: { id: 2 + index, subagent_args: { tool_call_id: agent, prompt: args.prompt, subagent_type: agent } } })
+          }
+          setTimeout(() => {
+            stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR)
+            cutSent()
+          }, 50)
+        }
+      }
+      const connections: http2.ClientHttp2Session[] = []
+      const connect = async () => {
+        const current = connections.at(-1)
+        if (current && !current.closed && !current.destroyed) return
+        const next = http2.connect(`http://127.0.0.1:${(server.address() as net.AddressInfo).port}`)
+        await new Promise<void>((resolve, reject) => {
+          next.once("connect", () => resolve())
+          next.once("error", reject)
+        })
+        connections.push(next)
+        cacheHttp2SessionForTests(ORIGIN, next)
+      }
+      setHostCacheDirOverride(root)
+      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN,
+        workspaceRoot: root, cacheDir: root, retry: { baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
+      const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Draw it, then get it reviewed" }] }]
+      const options = { prompt, headers: { "x-opencode-session-id": key }, tools: [
+        { type: "function" as const, name: "cursor_image_save", inputSchema: { type: "object", properties: { image_id: { type: "string" } } } },
+        { type: "function" as const, name: "subagent", inputSchema: { type: "object",
+          properties: { description: { type: "string" }, prompt: { type: "string" }, agent: { type: "string" } } } },
+      ] }
+      const read = async () => {
+        const parts: LanguageModelV3StreamPart[] = []
+        await connect()
+        const { stream } = await model.doStream(options)
+        const reader = stream.getReader()
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) return parts
+          parts.push(value)
+        }
+      }
+      const pushResults = (calls: Extract<LanguageModelV3StreamPart, { type: "tool-call" }>[], output: (index: number) => string) => {
+        prompt.push({ role: "assistant", content: calls.map((call) =>
+          ({ type: "tool-call" as const, toolCallId: call.toolCallId, toolName: call.toolName, input: JSON.parse(call.input) })) })
+        prompt.push({ role: "tool", content: calls.map((call, index) => ({ type: "tool-result" as const, toolCallId: call.toolCallId,
+          toolName: call.toolName, output: { type: "text" as const, value: output(index) } })) })
+      }
+      try {
+        const save = hostCalls(await read())
+        expect(save.map((call) => call.toolName)).toEqual(["cursor_image_save"])
+        pushResults(save, () => "Saved the image to assets/sprite.png")
+        const tasks = hostCalls(await read())
+        expect(tasks.map((call) => call.toolName)).toEqual(["subagent", "subagent", "subagent"])
+        await cutDone
+        for (let i = 0; i < 500 && sessionManager.findOpenByOpenCodeSessionId(key); i++) await Bun.sleep(10)
+        expect(requests).toHaveLength(1)
+        pushResults(tasks, (index) => `<subagent state="completed">${reviewers[index]} approves</subagent>`)
+        if (images === "two-open") {
+          // Neither GenerateImage call can be told to be the one the write served: each stays Cursor's own.
+          const error = await read().catch((caught: unknown) => caught)
+          expect(APICallError.isInstance(error)).toBe(true)
+          expect((error as APICallError).message).toContain("after a call Cursor ran itself")
+          expect(requests).toHaveLength(1)
+          return
+        }
+        const rebuilt = await read()
+        expect(hostCalls(rebuilt)).toHaveLength(0)
+        expect(rebuilt.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
+        expect(requests).toHaveLength(2)
+        expect(requests[1]!.action.resume_action).toBeUndefined()
+        const text = requests[1]!.action.user_message_action!.user_message.text
+        expect(text.match(/Saved the image to assets\/sprite\.png/g)).toHaveLength(1)
+        for (const agent of reviewers) expect(text.match(new RegExp(`${agent} approves`, "g"))).toHaveLength(1)
+      } finally {
+        sessionManager.dispose()
+        await settleRunSavesForTests()
+        for (const connection of connections) connection.destroy()
+        setHostCacheDirOverride(undefined)
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    }, 30_000)
+  }
+
   for (const cut of ["final", "none", "reset"] as const) {
     it(`reads a lost Run's verdict before the unfinished plan notice (${cut})`, async () => {
       const key = `ses_held_tool_plan_${cut}`

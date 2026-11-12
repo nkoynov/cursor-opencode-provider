@@ -7975,7 +7975,7 @@ export async function pump(
               trace(`recovery: input-image write answered at once; Cursor neither waits for nor completes it execId=${parsed.id}`)
             }
             if (displayCallId) session.displayToolCalls.delete(displayCallId)
-            replaySafety.recordHostExec(parsed.id)
+            replaySafety.recordHostExec(parsed.id, generateImageCallId)
             // The write reaches the host as the save tool: Cursor's later outcome adds no row.
             if (displayCallId) session.editToolCalls?.delete(displayCallId)
             const savedRow = earlyRows.claim(displayCallId)

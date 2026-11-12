@@ -5,6 +5,7 @@ import {
   announcedCallsClaimed,
   AttemptReplaySafety,
   describeFrameLayout,
+  heldRunLossRebuildable,
   historyCoverage,
   hostExecs,
   markResumeCheckpoint,
@@ -459,6 +460,26 @@ describe("display tool lifecycle", () => {
     // Cursor completed it, so it ran on Cursor's side and history lacks it.
     only.recordToolLifecycle(analyze(3, "next-edit").toolLifecycle)
     expect(announcedCallsClaimed(fresh, fresh.attempt!.announcedCalls)).toBe(false)
+  })
+
+  it("lets a host exec that names no call claim the display call it serves", () => {
+    const state: ReplaySafetyState = {}
+    const image = new AttemptReplaySafety("run-1", state)
+    image.recordToolLifecycle({ kind: "started", callId: "gen" })
+    image.recordExec(1)
+    image.recordHostExec(1, "gen")
+    image.recordToolLifecycle({ kind: "completed", callId: "gen" })
+    const step = new AttemptReplaySafety("run-1", state)
+    step.recordToolLifecycle({ kind: "started", callId: "task" })
+    step.recordExec(2, "task")
+    step.recordHostExec(2)
+    expect(state.completedCalls).toBeUndefined()
+    expect(heldRunLossRebuildable(state)).toBe(true)
+    // An exec that names its own call keeps it.
+    step.recordToolLifecycle({ kind: "started", callId: "own" })
+    step.recordExec(3, "edit")
+    step.recordHostExec(3, "own")
+    expect(state.execs?.find((exec) => exec.id === 3)?.callId).toBe("edit")
   })
 
   it("tells host execs from execs the provider answered, per attempt", () => {
