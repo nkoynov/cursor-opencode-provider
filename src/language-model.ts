@@ -4,7 +4,7 @@ import path from "node:path"
 import { createHash } from "node:crypto"
 import { APICallError } from "@ai-sdk/provider"
 import protobuf from "protobufjs"
-import { endlessRetriesEnabled, newRetryBudget, turnRetryBudget, forgetRetryBudget, noteRunFailure, reserveRetry, resetRetryBudgetsForTests, type RetryBudget } from "./retry-budget.js"
+import { endlessRetriesEnabled, newRetryBudget, turnRetryBudget, forgetRetryBudget, noteRunFailure, noteStepCompleted, reserveRetry, resetRetryBudgetsForTests, type RetryBudget } from "./retry-budget.js"
 import { isOfflineFailure, startOfflineWait, waitOffline, type OfflineWait } from "./offline.js"
 import type { LanguageModelV3, LanguageModelV3CallOptions, LanguageModelV3StreamResult, LanguageModelV3GenerateResult, LanguageModelV3StreamPart, LanguageModelV3Usage, LanguageModelV3FinishReason } from "@ai-sdk/provider"
 import type { CreateCursorOptions, CursorRetryOptions } from "./index.js"
@@ -2098,6 +2098,7 @@ export async function pumpWithRecovery(input: {
         // Only the pass that opened a Run sees a gzip refusal. A Run held for tools must not keep its request.
         pumpedSession.resendRunRequest = undefined
       }
+      if (!pumpedSession.closeError) noteStepCompleted(retryBudget)
       if (pumpedSession.closed && pumpedSession.pending.size === 0) {
         forgetRetryBudget(pumpedSession.openCodeSessionId, retryBudget)
       }

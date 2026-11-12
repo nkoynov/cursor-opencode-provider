@@ -85,13 +85,21 @@ export function retryCategory(failure: CursorProviderError): "server" | "transpo
 }
 
 /**
- * Only stalls back to back share the stall window: any other failure, or a new checkpoint Cursor saved
- * after the window opened, ends it, including on recovery paths that never reserve a retry.
+ * Only stalls back to back share the stall window: any other failure, a completed step, or a new checkpoint
+ * Cursor saved after the window opened, ends it, including on recovery paths that never reserve a retry.
  */
 export function noteRunFailure(budget: RetryBudget, failure: CursorProviderError, checkpointAcceptedAt: number | undefined): void {
   const progressed = checkpointAcceptedAt !== undefined && budget.stallStartedAt !== undefined
     && checkpointAcceptedAt > budget.stallStartedAt
   if (progressed || failure.code !== "CURSOR_SEMANTIC_IDLE_TIMEOUT") budget.stallStartedAt = undefined
+}
+
+/**
+ * Fork: a step the host received from a Run that did not fail is progress too. Cursor saves no
+ * checkpoint while it generates images, for dozens of steps and many minutes.
+ */
+export function noteStepCompleted(budget: RetryBudget): void {
+  budget.stallStartedAt = undefined
 }
 
 /** Reserve one retry before either reopening locally or handing it to OpenCode. */
