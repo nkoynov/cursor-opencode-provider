@@ -479,9 +479,10 @@ export type ReplayToolLifecycle = {
 
 // Cursor CLI 2026.11.11 `agent.v1`: AwaitArgs {task_id #1, block_until_ms #2, regex #3}; AwaitTaskStillRunning
 // {task_id #1, runtime_ms #2, output_file_path #3, output_length #4, regex_requested #5, regex_match #6, wake_reason #7}.
-// Without regex_match, which is shell output the model saw.
+// A timed-out wait carries neither regex_match nor wake_reason (none of 170 stored Await results had wake_reason).
 const AWAIT_ARGS: Record<number, number> = { 1: 2, 2: 0, 3: 2 }
-const AWAIT_STILL_RUNNING: Record<number, number> = { 1: 2, 2: 0, 3: 2, 4: 0, 5: 0, 7: 2 }
+// output_length is an observation history lacks, but every timed-out wait has one, and a rebuild repeats nothing after it.
+const AWAIT_STILL_RUNNING: Record<number, number> = { 1: 2, 2: 0, 3: 2, 4: 0, 5: 0 }
 
 /** Fields only from `spec` (field number to wire type), each at most once. */
 function strictFields(bytes: Uint8Array | undefined, spec: Record<number, number>): StrictRawField[] | undefined {
@@ -498,8 +499,9 @@ function soleMessage(bytes: Uint8Array | undefined, fn: number): Uint8Array | un
 
 /**
  * Fork: the lifecycle's tool call is only `await_tool_call` #42 {args #1, result #2}, beside Cursor's call id and
- * timestamps: a start with its args alone, or a completion whose AwaitResult is `still_running` #2 (directly or in
- * `success` #4). A finished task's `complete` carries its exit code, and `error` what went wrong; history holds neither.
+ * timestamps: a start with its args alone, or a completion whose AwaitResult is `success` #4 holding `still_running` #2,
+ * the shape of a wait that timed out. A finished task's `complete` carries its exit code, `error` what went wrong, and a
+ * wake reason why the wait ended early; history holds none of them.
  */
 function awaitVariant(topLevel: StrictRawField | undefined, completed: boolean): boolean {
   const update = nestedFields(topLevel, 1).find(field => field.fn === (completed ? 3 : 2))
@@ -514,8 +516,7 @@ function awaitVariant(topLevel: StrictRawField | undefined, completed: boolean):
   if (!args || !strictFields(args.bytes, AWAIT_ARGS)) return false
   const result = wait!.find(field => field.fn === 2)
   if (!completed || !result) return completed === !!result
-  const running = soleMessage(result.bytes, 2) ?? soleMessage(soleMessage(result.bytes, 4), 2)
-  return !!strictFields(running, AWAIT_STILL_RUNNING)
+  return !!strictFields(soleMessage(soleMessage(result.bytes, 4), 2), AWAIT_STILL_RUNNING)
 }
 
 function catalogVariant(topLevel: StrictRawField | undefined): boolean {

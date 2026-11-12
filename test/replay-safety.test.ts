@@ -469,8 +469,10 @@ describe("display tool lifecycle", () => {
     const message = (fn: number, ...fields: number[][]) => lengthDelimited(fn, Uint8Array.from(fields.flat()))
     const number = (fn: number, value: number) => [...varint(fn << 3), ...varint(value)]
     const args = message(1, lengthDelimited(1, text("545432")), number(2, 1_800_000))
+    // A timed-out wait as Cursor stores it: success { still_running { task_id, runtime_ms, output_file_path, output_length } }.
     const running = (...extra: number[][]) => message(2, lengthDelimited(1, text("545432")), number(2, 1_800_000),
-      lengthDelimited(3, text("/terminals/545432.txt")), number(4, 812), lengthDelimited(7, text("timeout")), ...extra)
+      lengthDelimited(3, text("/terminals/545432.txt")), number(4, 812), ...extra)
+    const success = (...fields: number[][]) => message(2, message(4, ...fields))
     const wait = (...fields: number[][]) => message(42, ...fields)
     const fetch = message(37, message(1, lengthDelimited(1, text("https://example.com"))))
     const analyzeTool = (field: 2 | 3, callId: string, tool: number[]) => {
@@ -484,30 +486,35 @@ describe("display tool lifecycle", () => {
       }
       return analyzeReplayFrame(frame, { interactionUpdate: decoded.interaction_update })
     }
-    const timedOut = wait(args, message(2, running()))
+    const timedOut = wait(args, success(running()))
     expect(analyzeTool(2, "wait", wait(args)).toolLifecycle).toEqual({ kind: "started", callId: "wait", wait: true })
     expect(analyzeTool(3, "wait", timedOut).toolLifecycle).toEqual({ kind: "completed", callId: "wait", wait: true })
-    expect(analyzeTool(3, "wait", wait(args, message(2, message(4, running())))).toolLifecycle)
+    // A wait for a pattern that never appeared.
+    expect(analyzeTool(3, "wait", wait(args, success(running(number(5, 1))))).toolLifecycle)
       .toEqual({ kind: "completed", callId: "wait", wait: true })
     // Fails closed: a frame beside the wait, history short of what the wait returned, or bytes the schema lacks.
     for (const [why, field, tool] of [
       ["call beside it", 3, [...timedOut, ...fetch]],
       ["started with a result", 2, timedOut],
       ["completed without a result", 3, wait(args)],
-      ["finished task", 3, wait(args, message(2, message(1, lengthDelimited(1, text("545432")), number(7, 0))))],
-      ["finished task in success", 3, wait(args, message(2, message(4, message(1, lengthDelimited(1, text("545432"))))))],
+      ["still running outside success", 3, wait(args, message(2, running()))],
+      ["finished task", 3, wait(args, success(message(1, lengthDelimited(1, text("545432")), number(7, 0))))],
+      ["finished task outside success", 3, wait(args, message(2, message(1, lengthDelimited(1, text("545432")))))],
       ["error", 3, wait(args, message(2, message(3, lengthDelimited(1, text("no such task")))))],
-      ["matched output", 3, wait(args, message(2, running(lengthDelimited(6, text("BUILD OK")))))],
-      ["unknown await field", 3, wait(args, message(2, running()), lengthDelimited(99, text("x")))],
+      ["matched output", 3, wait(args, success(running(number(5, 1), lengthDelimited(6, text("BUILD OK")))))],
+      ["wake reason regex_match", 3, wait(args, success(running(number(5, 1), lengthDelimited(7, text("regex_match")))))],
+      ["wake reason timeout", 3, wait(args, success(running(lengthDelimited(7, text("timeout")))))],
+      ["unknown wake reason", 3, wait(args, success(running(lengthDelimited(7, text("shell_exit")))))],
+      ["unknown await field", 3, wait(args, success(running()), lengthDelimited(99, text("x")))],
       ["unknown args field", 2, wait(message(1, lengthDelimited(1, text("545432")), number(9, 1)))],
-      ["unknown result field", 3, wait(args, message(2, running(lengthDelimited(99, text("x")))))],
-      ["two results", 3, wait(args, message(2, running(), running()))],
+      ["unknown result field", 3, wait(args, success(running(lengthDelimited(99, text("x")))))],
+      ["two results", 3, wait(args, message(2, message(4, running(), running())))],
       ["repeated args", 2, wait(args, args)],
       ["repeated task id", 2, wait(message(1, lengthDelimited(1, text("545432")), lengthDelimited(1, text("1"))))],
-      ["repeated output length", 3, wait(args, message(2, running(number(4, 900))))],
+      ["repeated output length", 3, wait(args, success(running(number(4, 900))))],
       ["block_until_ms as bytes", 2, wait(message(1, lengthDelimited(1, text("545432")), lengthDelimited(2, text("1"))))],
       ["result as varint", 3, wait(args, number(2, 1))],
-      ["output length as bytes", 3, wait(args, message(2, message(2, lengthDelimited(1, text("545432")), lengthDelimited(4, text("8")))))],
+      ["output length as bytes", 3, wait(args, success(message(2, lengthDelimited(1, text("545432")), lengthDelimited(4, text("8")))))],
     ] as const) {
       expect([why, analyzeTool(field, "other", [...tool]).toolLifecycle?.wait]).toEqual([why, undefined])
     }
@@ -522,7 +529,7 @@ describe("display tool lifecycle", () => {
     const step = new AttemptReplaySafety("run-1", state)
     expect(heldRunLossRebuildable(state)).toBe(true)
     step.recordToolLifecycle(analyzeTool(2, "unknown", wait(args)).toolLifecycle)
-    step.recordToolLifecycle(analyzeTool(3, "unknown", wait(args, message(2, running()), lengthDelimited(99, text("x")))).toolLifecycle)
+    step.recordToolLifecycle(analyzeTool(3, "unknown", wait(args, success(running(lengthDelimited(7, text("regex_match")))))).toolLifecycle)
     expect(heldRunLossRebuildable(state)).toBe(false)
   })
 
