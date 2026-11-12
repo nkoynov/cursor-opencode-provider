@@ -36,6 +36,8 @@ import {
   runHistoryImages,
 } from "../src/protocol/sent-history-images.js"
 import { toolsToDescriptors } from "../src/protocol/tools.js"
+import { CursorRetryExhaustedError, CursorTransportError } from "../src/errors.js"
+import { newRetryBudget } from "../src/retry-budget.js"
 import { sessionManager, type Frame } from "../src/session.js"
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
 import { sessionFixture } from "./session-fixture.js"
@@ -673,6 +675,64 @@ describe("a generated image's write", () => {
     const metadata = await saveStep(run, 1, "saved")
     expect(metadata).toMatchObject({ generateImageCallId: "gen-1" })
     expect(metadata?.inputImage).toBeUndefined()
+  })
+})
+
+describe("the turn's stall window in an image-generation chain", () => {
+  const stallPolicy = { baseDelayMs: 0, maxDelayMs: 0 }
+  const windowOpenedLongAgo = () => ({ ...newRetryBudget(), transport: 1, retries: 1, stallStartedAt: Date.now() - 200_000 })
+  const stallWhenOutOfFrames = (run: ReturnType<typeof imageRun>) => {
+    const next = run.session.frames.next.bind(run.session.frames)
+    run.session.frames.next = async () => {
+      const value = await next()
+      if (value.done) {
+        throw new CursorTransportError("Cursor Run sent no frames for 30000ms",
+          { transient: true, replaySafe: true, code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
+      }
+      return value
+    }
+  }
+
+  async function imageStepsThenStall(steps: number) {
+    const frames = Array.from({ length: steps }, (_, index) =>
+      [generateImageStarted(`gen-${index}`), imageWrite(index + 1, PNG_B, `/elsewhere/assets/image-${index}.png`)]).flat()
+    const run = imageRun(frames)
+    stallWhenOutOfFrames(run)
+    const after = imageRun([ended()], [], "after-stall", run.workspace)
+    const retryBudget = windowOpenedLongAgo()
+    const pumpStep = () => {
+      const step = collect()
+      return pumpWithRecovery({
+        initialSession: run.session,
+        controller: step.controller,
+        retryPolicy: stallPolicy,
+        retryBudget,
+        canRebaseFromHistory: () => true,
+        recover: async () => after.session,
+      }).then((session) => ({ session, parts: step.parts }))
+    }
+    for (let index = 0; index < steps; index++) {
+      const { parts } = await pumpStep()
+      const save = parts.find((part) => part.type === "tool-call")
+      expect(save).toMatchObject({ toolName: CURSOR_IMAGE_SAVE_TOOL })
+      await deliverContinuationResults(run.session, [{
+        sessionId: run.session.sessionId, execId: index + 1,
+        toolCallId: save!.type === "tool-call" ? save!.toolCallId : "",
+        toolName: CURSOR_IMAGE_SAVE_TOOL, output: "Saved the generated image",
+      }])
+    }
+    expect(run.session.resumeCheckpoint).toBeUndefined()
+    return { final: await pumpStep().then(({ session }) => session), retryBudget }
+  }
+
+  it("retries a stall after image steps the host received, though Cursor saved no checkpoint", async () => {
+    const { final, retryBudget } = await imageStepsThenStall(3)
+    expect(final.sessionId).toBe("after-stall")
+    expect(retryBudget.retries).toBe(2)
+  })
+
+  it("still ends the turn on a stall with no step since the window opened", async () => {
+    await expect(imageStepsThenStall(0)).rejects.toBeInstanceOf(CursorRetryExhaustedError)
   })
 })
 
