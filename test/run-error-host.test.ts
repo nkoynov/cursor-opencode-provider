@@ -1831,8 +1831,9 @@ describe("host calls still running when the Run dies", () => {
   }
 
   // Fork: an AwaitShell Cursor ran on a background shell has no side effect, whether or not a poll named its call.
-  for (const earlier of ["await-unnamed-polls", "await-no-polls", "await-named-polls", "web-fetch"] as const) {
-    const rebuilds = earlier !== "web-fetch"
+  // A wait that saw its shell finish (`await-finished`) returned an exit code history lacks, unless a poll named it.
+  for (const earlier of ["await-unnamed-polls", "await-no-polls", "await-named-polls", "web-fetch", "await-finished"] as const) {
+    const rebuilds = earlier !== "web-fetch" && earlier !== "await-finished"
     it(`${rebuilds ? "rebuilds" : "refuses"} a lost held Run of parallel Task calls after an earlier Cursor-run call (${earlier})`, async () => {
       const key = `ses_held_tool_await_${earlier}`
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-held-tool-await-"))
@@ -1897,7 +1898,17 @@ describe("host calls still running when the Run dies", () => {
                   ...earlier === "await-named-polls" ? { tool_call_id: "wait" } : {} } } })
               }
             }
-            send({ interaction_update: { tool_call_completed: { call_id: "wait", tool_call: wait } } })
+            // The schema lacks AwaitToolCall.result #2: AwaitResult still_running #2 / complete #1 { task_id #1,
+            // runtime_ms #2, output_file_path #3, output_length #4, then wake_reason #7 or exit_code #7 }.
+            const bytes = (fn: number, value: number[]) => [...varint((fn << 3) | 2), ...varint(value.length), ...value]
+            const text = (fn: number, value: string) => bytes(fn, [...Buffer.from(value)])
+            const number = (fn: number, value: number) => [...varint(fn << 3), ...varint(value)]
+            const task = [...text(1, "545432"), ...number(2, 1_800_000), ...text(3, "terminals/545432.txt"), ...number(4, 812),
+              ...earlier === "await-finished" ? number(7, 0) : text(7, "timeout")]
+            const result = bytes(2, bytes(earlier === "await-finished" ? 1 : 2, task))
+            const args = bytes(1, [...text(1, "545432"), ...number(2, 1_800_000)])
+            const completed = bytes(3, [...text(1, "wait"), ...bytes(2, bytes(42, [...args, ...result]))])
+            stream.write(frame(Uint8Array.from(bytes(1, completed))))
           }
           call(2, "check", { shell_stream_args: { command: "tail -1 build.log" } })
         } else if (reply.id === 3) {

@@ -477,7 +477,30 @@ export type ReplayToolLifecycle = {
   kind: "started" | "completed"; callId: string; catalog?: true; unverifiedCatalog?: true; wait?: true
 }
 
-/** Fork: the lifecycle's tool call is only `await_tool_call` #42, beside Cursor's call id and timestamps. */
+// Cursor CLI 2026.11.11 `agent.v1`: AwaitArgs {task_id #1, block_until_ms #2, regex #3}; AwaitTaskStillRunning
+// {task_id #1, runtime_ms #2, output_file_path #3, output_length #4, regex_requested #5, regex_match #6, wake_reason #7}.
+// Without regex_match, which is shell output the model saw.
+const AWAIT_ARGS: Record<number, number> = { 1: 2, 2: 0, 3: 2 }
+const AWAIT_STILL_RUNNING: Record<number, number> = { 1: 2, 2: 0, 3: 2, 4: 0, 5: 0, 7: 2 }
+
+/** Fields only from `spec` (field number to wire type), each at most once. */
+function strictFields(bytes: Uint8Array | undefined, spec: Record<number, number>): StrictRawField[] | undefined {
+  const fields = bytes && readAllFieldsStrict(bytes)
+  return fields && fields.every(field => spec[field.fn] === field.wt)
+    && Object.entries(spec).every(([fn, wt]) => optionalField(fields, Number(fn), wt)) ? fields : undefined
+}
+
+/** The bytes of a message's only field, a length-delimited `fn`. */
+function soleMessage(bytes: Uint8Array | undefined, fn: number): Uint8Array | undefined {
+  const fields = bytes && readAllFieldsStrict(bytes)
+  return fields?.length === 1 && fields[0]!.fn === fn && fields[0]!.wt === 2 ? fields[0]!.bytes : undefined
+}
+
+/**
+ * Fork: the lifecycle's tool call is only `await_tool_call` #42 {args #1, result #2}, beside Cursor's call id and
+ * timestamps: a start with its args alone, or a completion whose AwaitResult is `still_running` #2 (directly or in
+ * `success` #4). A finished task's `complete` carries its exit code, and `error` what went wrong; history holds neither.
+ */
 function awaitVariant(topLevel: StrictRawField | undefined, completed: boolean): boolean {
   const update = nestedFields(topLevel, 1).find(field => field.fn === (completed ? 3 : 2))
   const call = update?.bytes && readAllFieldsStrict(update.bytes)?.find(field => field.fn === 2)
@@ -485,7 +508,14 @@ function awaitVariant(topLevel: StrictRawField | undefined, completed: boolean):
   if (!toolFields || !optionalField(toolFields, 57, 2)
     || !optionalField(toolFields, 59, 0) || !optionalField(toolFields, 60, 0)) return false
   const variants = toolFields.filter(field => ![57, 59, 60].includes(field.fn))
-  return variants.length === 1 && variants[0]!.fn === 42 && variants[0]!.wt === 2
+  if (variants.length !== 1 || variants[0]!.fn !== 42 || variants[0]!.wt !== 2) return false
+  const wait = strictFields(variants[0]!.bytes, { 1: 2, 2: 2 })
+  const args = wait?.find(field => field.fn === 1)
+  if (!args || !strictFields(args.bytes, AWAIT_ARGS)) return false
+  const result = wait!.find(field => field.fn === 2)
+  if (!completed || !result) return completed === !!result
+  const running = soleMessage(result.bytes, 2) ?? soleMessage(soleMessage(result.bytes, 4), 2)
+  return !!strictFields(running, AWAIT_STILL_RUNNING)
 }
 
 function catalogVariant(topLevel: StrictRawField | undefined): boolean {

@@ -463,27 +463,66 @@ describe("display tool lifecycle", () => {
   })
 
   it("leaves history nothing to hold for an AwaitShell Cursor ran, but not for a call beside it", () => {
-    // ToolCall await_tool_call #42 { args #1 { task_id #1 } }; web_fetch_tool_call #37 { args #1 { url #1 } }.
-    const wait = lengthDelimited(42, Uint8Array.from(lengthDelimited(1, Uint8Array.from(lengthDelimited(1, new TextEncoder().encode("545432"))))))
-    const fetch = lengthDelimited(37, Uint8Array.from(lengthDelimited(1, Uint8Array.from(lengthDelimited(1, new TextEncoder().encode("https://example.com"))))))
+    // Cursor CLI 2026.11.11: ToolCall await_tool_call #42 { args #1 { task_id #1, block_until_ms #2, regex #3 },
+    // result #2 AwaitResult { complete #1, still_running #2, error #3, success #4 { complete #1, still_running #2 } } }.
+    const text = (value: string) => new TextEncoder().encode(value)
+    const message = (fn: number, ...fields: number[][]) => lengthDelimited(fn, Uint8Array.from(fields.flat()))
+    const number = (fn: number, value: number) => [...varint(fn << 3), ...varint(value)]
+    const args = message(1, lengthDelimited(1, text("545432")), number(2, 1_800_000))
+    const running = (...extra: number[][]) => message(2, lengthDelimited(1, text("545432")), number(2, 1_800_000),
+      lengthDelimited(3, text("/terminals/545432.txt")), number(4, 812), lengthDelimited(7, text("timeout")), ...extra)
+    const wait = (...fields: number[][]) => message(42, ...fields)
+    const fetch = message(37, message(1, lengthDelimited(1, text("https://example.com"))))
     const analyzeTool = (field: 2 | 3, callId: string, tool: number[]) => {
-      const frame = updateFrame(field, [...lengthDelimited(1, new TextEncoder().encode(callId)), ...lengthDelimited(2, Uint8Array.from(tool))])
-      const decoded = decodeMessage<{ interaction_update: Record<string, unknown> }>("AgentServerMessage", frame)
+      const frame = updateFrame(field, [...lengthDelimited(1, text(callId)), ...lengthDelimited(2, Uint8Array.from(tool))])
+      let decoded: { interaction_update?: Record<string, unknown> }
+      try {
+        decoded = decodeMessage<{ interaction_update: Record<string, unknown> }>("AgentServerMessage", frame)
+      } catch {
+        // The decoder already refuses a wrong wire type on a field the schema declares; the pump fails the Run on it.
+        decoded = {}
+      }
       return analyzeReplayFrame(frame, { interactionUpdate: decoded.interaction_update })
     }
-    expect(analyzeTool(2, "wait", wait).toolLifecycle).toEqual({ kind: "started", callId: "wait", wait: true })
-    expect(analyzeTool(3, "wait", wait).toolLifecycle).toEqual({ kind: "completed", callId: "wait", wait: true })
-    expect(analyzeTool(3, "mixed", [...wait, ...fetch]).toolLifecycle).toEqual({ kind: "completed", callId: "mixed" })
+    const timedOut = wait(args, message(2, running()))
+    expect(analyzeTool(2, "wait", wait(args)).toolLifecycle).toEqual({ kind: "started", callId: "wait", wait: true })
+    expect(analyzeTool(3, "wait", timedOut).toolLifecycle).toEqual({ kind: "completed", callId: "wait", wait: true })
+    expect(analyzeTool(3, "wait", wait(args, message(2, message(4, running())))).toolLifecycle)
+      .toEqual({ kind: "completed", callId: "wait", wait: true })
+    // Fails closed: a frame beside the wait, history short of what the wait returned, or bytes the schema lacks.
+    for (const [why, field, tool] of [
+      ["call beside it", 3, [...timedOut, ...fetch]],
+      ["started with a result", 2, timedOut],
+      ["completed without a result", 3, wait(args)],
+      ["finished task", 3, wait(args, message(2, message(1, lengthDelimited(1, text("545432")), number(7, 0))))],
+      ["finished task in success", 3, wait(args, message(2, message(4, message(1, lengthDelimited(1, text("545432"))))))],
+      ["error", 3, wait(args, message(2, message(3, lengthDelimited(1, text("no such task")))))],
+      ["matched output", 3, wait(args, message(2, running(lengthDelimited(6, text("BUILD OK")))))],
+      ["unknown await field", 3, wait(args, message(2, running()), lengthDelimited(99, text("x")))],
+      ["unknown args field", 2, wait(message(1, lengthDelimited(1, text("545432")), number(9, 1)))],
+      ["unknown result field", 3, wait(args, message(2, running(lengthDelimited(99, text("x")))))],
+      ["two results", 3, wait(args, message(2, running(), running()))],
+      ["repeated args", 2, wait(args, args)],
+      ["repeated task id", 2, wait(message(1, lengthDelimited(1, text("545432")), lengthDelimited(1, text("1"))))],
+      ["repeated output length", 3, wait(args, message(2, running(number(4, 900))))],
+      ["block_until_ms as bytes", 2, wait(message(1, lengthDelimited(1, text("545432")), lengthDelimited(2, text("1"))))],
+      ["result as varint", 3, wait(args, number(2, 1))],
+      ["output length as bytes", 3, wait(args, message(2, message(2, lengthDelimited(1, text("545432")), lengthDelimited(4, text("8")))))],
+    ] as const) {
+      expect([why, analyzeTool(field, "other", [...tool]).toolLifecycle?.wait]).toEqual([why, undefined])
+    }
 
     const state: ReplaySafetyState = {}
     const earlier = new AttemptReplaySafety("run-1", state)
-    for (const field of [2, 3] as const) earlier.recordToolLifecycle(analyzeTool(field, "wait", wait).toolLifecycle)
+    earlier.recordToolLifecycle(analyzeTool(2, "wait", wait(args)).toolLifecycle)
+    earlier.recordToolLifecycle(analyzeTool(3, "wait", timedOut).toolLifecycle)
     expect(state.announcedCalls).toBeUndefined()
     expect(state.completedCalls).toBeUndefined()
     expect(earlier.applyTo(failure())).toMatchObject({ replaySafe: false, replayBarrier: "stateful" })
     const step = new AttemptReplaySafety("run-1", state)
     expect(heldRunLossRebuildable(state)).toBe(true)
-    for (const field of [2, 3] as const) step.recordToolLifecycle(analyzeTool(field, "mixed", [...wait, ...fetch]).toolLifecycle)
+    step.recordToolLifecycle(analyzeTool(2, "unknown", wait(args)).toolLifecycle)
+    step.recordToolLifecycle(analyzeTool(3, "unknown", wait(args, message(2, running()), lengthDelimited(99, text("x")))).toolLifecycle)
     expect(heldRunLossRebuildable(state)).toBe(false)
   })
 
