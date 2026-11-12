@@ -1830,6 +1830,167 @@ describe("host calls still running when the Run dies", () => {
     }, 30_000)
   }
 
+  // Fork: an AwaitShell Cursor ran on a background shell has no side effect, whether or not a poll named its call.
+  for (const earlier of ["await-unnamed-polls", "await-no-polls", "await-named-polls", "web-fetch"] as const) {
+    const rebuilds = earlier !== "web-fetch"
+    it(`${rebuilds ? "rebuilds" : "refuses"} a lost held Run of parallel Task calls after an earlier Cursor-run call (${earlier})`, async () => {
+      const key = `ses_held_tool_await_${earlier}`
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-held-tool-await-"))
+      const reviewers = ["opus", "gpt", "grok"]
+      const shell = "make assets > build.log 2>&1"
+      const notice = `<shell id="545432" state="completed" command="${shell}">\nbuild finished\n</shell>`
+      const requests: RunRequest[] = []
+      const injections: string[] = []
+      let cutSent!: () => void
+      const cutDone = new Promise<void>((resolve) => { cutSent = resolve })
+      scripted = (stream, message) => {
+        const send = (value: Record<string, unknown>) => stream.write(frame(encodeMessage("AgentServerMessage", value)))
+        const call = (id: number, callId: string, variant: Record<string, unknown>) => {
+          const [kind, args] = Object.entries(variant)[0]!
+          const display = kind === "read_args" ? { read_tool_call: { args } }
+            : kind === "subagent_args" ? { task_tool_call: { args: { description: callId, prompt: (args as { prompt: string }).prompt } } }
+            : { shell_tool_call: { args } }
+          send({ interaction_update: { tool_call_started: { call_id: callId, tool_call: display } } })
+          send({ exec_server_message: { id, [kind]: { ...args as object, tool_call_id: callId } } })
+        }
+        if (message.run_request) {
+          requests.push(message.run_request as RunRequest)
+          if (requests.length > 1) {
+            send({ interaction_update: { text_delta: { text: "Reviews are in." } } })
+            send({ interaction_update: { turn_ended: {} } })
+            stream.end()
+            return
+          }
+          send({ conversation_checkpoint_update: Uint8Array.of(10, 1, 7) })
+          call(1, "build", { shell_stream_args: { command: `${shell} &` } })
+          return
+        }
+        const injection = (message.conversation_action as { inject_context_action?: {
+          injection_id: string; user_context: { user_message: { text: string; message_id: string } } } } | undefined)?.inject_context_action
+        if (injection) {
+          const { text, message_id } = injection.user_context.user_message
+          injections.push(text)
+          send({ interaction_update: { context_injection_state: { injection_id: injection.injection_id, state: { delivered: {} } } } })
+          send({ interaction_update: { user_message_appended: { user_message: { text, message_id } } } })
+          // The note follows the check's result; Cursor's next step comes after its echo.
+          call(3, "log", { read_args: { path: "build.log" } })
+          return
+        }
+        const reply = message.exec_client_message as { id: number; shell_stream?: { exit?: unknown }; read_result?: unknown } | undefined
+        if (!reply || !(reply.shell_stream?.exit || reply.read_result)) return
+        if (reply.id === 1) {
+          if (earlier === "web-fetch") {
+            const fetch = { web_fetch_tool_call: { args: { url: "https://example.com/status" } } }
+            send({ interaction_update: { tool_call_started: { call_id: "fetch", tool_call: fetch } } })
+            send({ interaction_update: { tool_call_completed: { call_id: "fetch", tool_call: fetch } } })
+          } else {
+            // Cursor waits on the background shell itself, polling its terminal record, and its wait times out.
+            const wait = { await_tool_call: { args: { task_id: "545432", block_until_ms: 1_800_000 } } }
+            send({ interaction_update: { tool_call_started: { call_id: "wait", tool_call: wait } } })
+            if (earlier !== "await-no-polls") {
+              const env = sessionManager.findOpenByOpenCodeSessionId(key)!.requestContext.env as { project_folder: string }
+              const record = path.join(env.project_folder, "terminals", "545432.txt")
+              fs.mkdirSync(path.dirname(record), { recursive: true })
+              fs.writeFileSync(record, "running\n")
+              for (const poll of [100, 101, 102]) {
+                send({ exec_server_message: { id: poll, read_args: { path: record,
+                  ...earlier === "await-named-polls" ? { tool_call_id: "wait" } : {} } } })
+              }
+            }
+            send({ interaction_update: { tool_call_completed: { call_id: "wait", tool_call: wait } } })
+          }
+          call(2, "check", { shell_stream_args: { command: "tail -1 build.log" } })
+        } else if (reply.id === 3) {
+          send({ interaction_update: { text_delta: { text: "Asking three reviewers." } } })
+          send({ interaction_update: { tool_requests_listed: { call_count: reviewers.length } } })
+          for (const [index, agent] of reviewers.entries()) {
+            call(4 + index, agent, { subagent_args: { prompt: `Review the build as ${agent}.`, subagent_type: agent } })
+          }
+          setTimeout(() => {
+            stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR)
+            cutSent()
+          }, 50)
+        }
+      }
+      const connections: http2.ClientHttp2Session[] = []
+      const connect = async () => {
+        const current = connections.at(-1)
+        if (current && !current.closed && !current.destroyed) return
+        const next = http2.connect(`http://127.0.0.1:${(server.address() as net.AddressInfo).port}`)
+        await new Promise<void>((resolve, reject) => {
+          next.once("connect", () => resolve())
+          next.once("error", reject)
+        })
+        connections.push(next)
+        cacheHttp2SessionForTests(ORIGIN, next)
+      }
+      fs.writeFileSync(path.join(root, "build.log"), "done\n")
+      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN,
+        workspaceRoot: root, cacheDir: root, retry: { baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
+      const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Build the assets, then get them reviewed" }] }]
+      const options = { prompt, headers: { "x-opencode-session-id": key }, tools: [
+        ...tools,
+        { type: "function" as const, name: "subagent", inputSchema: { type: "object",
+          properties: { description: { type: "string" }, prompt: { type: "string" }, agent: { type: "string" } } } },
+      ] }
+      const read = async () => {
+        const parts: LanguageModelV3StreamPart[] = []
+        await connect()
+        const { stream } = await model.doStream(options)
+        const reader = stream.getReader()
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) return parts
+          parts.push(value)
+        }
+      }
+      const pushResults = (calls: Extract<LanguageModelV3StreamPart, { type: "tool-call" }>[], output: (index: number) => string) => {
+        prompt.push({ role: "assistant", content: calls.map((call) =>
+          ({ type: "tool-call" as const, toolCallId: call.toolCallId, toolName: call.toolName, input: JSON.parse(call.input) })) })
+        prompt.push({ role: "tool", content: calls.map((call, index) => ({ type: "tool-result" as const, toolCallId: call.toolCallId,
+          toolName: call.toolName, output: { type: "text" as const, value: output(index) } })) })
+      }
+      try {
+        for (const [tool, output] of [["bash", "Started in the background (shell 545432, pid 1693562)"],
+          ["bash", "done"], ["read", "done"]] as const) {
+          const calls = hostCalls(await read())
+          expect(calls.map((call) => call.toolName)).toEqual([tool])
+          pushResults(calls, () => output)
+          // OpenCode's note that the background shell finished, delivered into the Run as a host note.
+          if (output === "done" && tool === "bash") prompt.push({ role: "user", content: [{ type: "text", text: notice }] })
+        }
+        const tasks = hostCalls(await read())
+        expect(tasks.map((call) => call.toolName)).toEqual(["subagent", "subagent", "subagent"])
+        expect(injections).toEqual([notice])
+        await cutDone
+        for (let i = 0; i < 500 && sessionManager.findOpenByOpenCodeSessionId(key); i++) await Bun.sleep(10)
+        expect(requests).toHaveLength(1)
+        pushResults(tasks, (index) => `<subagent state="completed">${reviewers[index]} approves</subagent>`)
+        if (!rebuilds) {
+          const error = await read().catch((caught: unknown) => caught)
+          expect(APICallError.isInstance(error)).toBe(true)
+          expect((error as APICallError).message).toContain("after a call Cursor ran itself")
+          expect(requests).toHaveLength(1)
+          return
+        }
+        const rebuilt = await read()
+        expect(hostCalls(rebuilt)).toHaveLength(0)
+        expect(rebuilt.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
+        expect(requests).toHaveLength(2)
+        expect(requests[1]!.action.resume_action).toBeUndefined()
+        const text = requests[1]!.action.user_message_action!.user_message.text
+        expect(text.match(/build finished/g)).toHaveLength(1)
+        for (const agent of reviewers) expect(text.match(new RegExp(`${agent} approves`, "g"))).toHaveLength(1)
+      } finally {
+        sessionManager.dispose()
+        await settleRunSavesForTests()
+        for (const connection of connections) connection.destroy()
+        setHostCacheDirOverride(undefined)
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    }, 30_000)
+  }
+
   for (const cut of ["final", "none", "reset"] as const) {
     it(`reads a lost Run's verdict before the unfinished plan notice (${cut})`, async () => {
       const key = `ses_held_tool_plan_${cut}`

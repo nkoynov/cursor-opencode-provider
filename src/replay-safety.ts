@@ -281,6 +281,12 @@ export class AttemptReplaySafety {
       trace(`replay: display completion of claimed callId=${lifecycle.callId} sessionId=${this.sessionId}`)
       return
     }
+    // Fork: Cursor runs AwaitShell itself, and a wait changes nothing, so history needs nothing for it.
+    if (lifecycle?.wait) {
+      trace(`replay: Cursor-side wait ${lifecycle.kind} callId=${lifecycle.callId} sessionId=${this.sessionId}`)
+      this.mark("display-tool-lifecycle", true)
+      return
+    }
     if (lifecycle?.kind === "started" && !claimed) {
       // Fork: the unfinished-call exemption would otherwise let a rebuild drop Cursor's own lookup.
       if (this.state.catalogCalls?.[lifecycle.callId] || lifecycle.unverifiedCatalog) {
@@ -465,9 +471,22 @@ export type DecodedReplayFrame = {
 
 /**
  * Fork: `unverifiedCatalog` marks a frame failing `inlineCatalog` that is a catalog lookup, or whose tool call is too
- * malformed to tell.
+ * malformed to tell. `wait` marks an AwaitShell call and nothing else (`awaitVariant`).
  */
-export type ReplayToolLifecycle = { kind: "started" | "completed"; callId: string; catalog?: true; unverifiedCatalog?: true }
+export type ReplayToolLifecycle = {
+  kind: "started" | "completed"; callId: string; catalog?: true; unverifiedCatalog?: true; wait?: true
+}
+
+/** Fork: the lifecycle's tool call is only `await_tool_call` #42, beside Cursor's call id and timestamps. */
+function awaitVariant(topLevel: StrictRawField | undefined, completed: boolean): boolean {
+  const update = nestedFields(topLevel, 1).find(field => field.fn === (completed ? 3 : 2))
+  const call = update?.bytes && readAllFieldsStrict(update.bytes)?.find(field => field.fn === 2)
+  const toolFields = call?.bytes && readAllFieldsStrict(call.bytes)
+  if (!toolFields || !optionalField(toolFields, 57, 2)
+    || !optionalField(toolFields, 59, 0) || !optionalField(toolFields, 60, 0)) return false
+  const variants = toolFields.filter(field => ![57, 59, 60].includes(field.fn))
+  return variants.length === 1 && variants[0]!.fn === 42 && variants[0]!.wt === 2
+}
 
 function catalogVariant(topLevel: StrictRawField | undefined): boolean {
   const update = nestedFields(topLevel, 1).find(field => field.fn === 2 || field.fn === 3)
@@ -718,7 +737,8 @@ export function analyzeReplayFrame(
       ...(!malformed && typeof callId === "string" && callId.length > 0
         ? { toolLifecycle: { kind: started ? "started" : "completed", callId,
           ...(inlineCatalog(topLevel, !!completed) ? { catalog: true as const }
-            : catalogVariant(topLevel) ? { unverifiedCatalog: true as const } : {}),
+            : catalogVariant(topLevel) ? { unverifiedCatalog: true as const }
+            : awaitVariant(topLevel, !!completed) ? { wait: true as const } : {}),
         } }
         : {}),
     }

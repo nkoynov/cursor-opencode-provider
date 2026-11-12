@@ -462,6 +462,31 @@ describe("display tool lifecycle", () => {
     expect(announcedCallsClaimed(fresh, fresh.attempt!.announcedCalls)).toBe(false)
   })
 
+  it("leaves history nothing to hold for an AwaitShell Cursor ran, but not for a call beside it", () => {
+    // ToolCall await_tool_call #42 { args #1 { task_id #1 } }; web_fetch_tool_call #37 { args #1 { url #1 } }.
+    const wait = lengthDelimited(42, Uint8Array.from(lengthDelimited(1, Uint8Array.from(lengthDelimited(1, new TextEncoder().encode("545432"))))))
+    const fetch = lengthDelimited(37, Uint8Array.from(lengthDelimited(1, Uint8Array.from(lengthDelimited(1, new TextEncoder().encode("https://example.com"))))))
+    const analyzeTool = (field: 2 | 3, callId: string, tool: number[]) => {
+      const frame = updateFrame(field, [...lengthDelimited(1, new TextEncoder().encode(callId)), ...lengthDelimited(2, Uint8Array.from(tool))])
+      const decoded = decodeMessage<{ interaction_update: Record<string, unknown> }>("AgentServerMessage", frame)
+      return analyzeReplayFrame(frame, { interactionUpdate: decoded.interaction_update })
+    }
+    expect(analyzeTool(2, "wait", wait).toolLifecycle).toEqual({ kind: "started", callId: "wait", wait: true })
+    expect(analyzeTool(3, "wait", wait).toolLifecycle).toEqual({ kind: "completed", callId: "wait", wait: true })
+    expect(analyzeTool(3, "mixed", [...wait, ...fetch]).toolLifecycle).toEqual({ kind: "completed", callId: "mixed" })
+
+    const state: ReplaySafetyState = {}
+    const earlier = new AttemptReplaySafety("run-1", state)
+    for (const field of [2, 3] as const) earlier.recordToolLifecycle(analyzeTool(field, "wait", wait).toolLifecycle)
+    expect(state.announcedCalls).toBeUndefined()
+    expect(state.completedCalls).toBeUndefined()
+    expect(earlier.applyTo(failure())).toMatchObject({ replaySafe: false, replayBarrier: "stateful" })
+    const step = new AttemptReplaySafety("run-1", state)
+    expect(heldRunLossRebuildable(state)).toBe(true)
+    for (const field of [2, 3] as const) step.recordToolLifecycle(analyzeTool(field, "mixed", [...wait, ...fetch]).toolLifecycle)
+    expect(heldRunLossRebuildable(state)).toBe(false)
+  })
+
   it("lets a host exec that names no call claim the display call it serves", () => {
     const state: ReplaySafetyState = {}
     const image = new AttemptReplaySafety("run-1", state)
