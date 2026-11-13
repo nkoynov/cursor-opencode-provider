@@ -414,6 +414,7 @@ describe("checkpoint eligibility across host results", () => {
     "inline-catalog", "spilled-catalog", "unfinished-catalog", "unacknowledged-checkpoint",
     "terminal-poll", "terminal-poll-after-result",
     "missing-read", "missing-read-after-result", "refused-read", "new-file-edit",
+    "await-sleep", "await-timed-out", "await-named-poll", "await-finished", "web-fetch",
   ] as const) {
     it(`recovers a post-result drop only from represented completed work (${scenario})`, async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-result-history-"))
@@ -490,6 +491,46 @@ describe("checkpoint eligibility across host results", () => {
             if (scenario === "missing-read" || scenario === "refused-read") {
               send({ exec_server_message: { id: 60, read_args: { path: path.join(root, "absent.txt"), tool_call_id: "absent" } } })
             }
+            // AwaitShell runs in Cursor; only its lifecycle reaches the provider. The schema lacks AwaitToolCall.result #2:
+            // AwaitResult success #4 { complete #1 / still_running #2 { task_id #1, runtime_ms #2, output_file_path #3,
+            // output_length #4, exit_code #7 } }. A sleep's args hold only block_until_ms #2.
+            if (scenario === "await-sleep" || scenario === "await-timed-out" || scenario === "await-named-poll"
+              || scenario === "await-finished") {
+              const varint = (value: number) => {
+                const out: number[] = []
+                for (; value > 0x7f; value >>>= 7) out.push((value & 0x7f) | 0x80)
+                return [...out, value]
+              }
+              const bytes = (fn: number, value: number[]) => [...varint((fn << 3) | 2), ...varint(value.length), ...value]
+              const text = (fn: number, value: string) => bytes(fn, [...Buffer.from(value)])
+              const number = (fn: number, value: number) => [...varint(fn << 3), ...varint(value)]
+              const sleep = scenario === "await-sleep"
+              const argFields = sleep ? number(2, 20_000) : [...text(1, "7"), ...number(2, 30_000)]
+              send({ interaction_update: { tool_call_started: { call_id: "wait", tool_call: { await_tool_call: {
+                args: sleep ? { block_until_ms: 20_000 } : { task_id: "7", block_until_ms: 30_000 },
+              } } } } })
+              if (!sleep) {
+                const env = sessionManager.findOpenByOpenCodeSessionId(`ses_result_history_${scenario}`)!.requestContext.env as { project_folder: string }
+                const record = path.join(env.project_folder, "terminals", "7.txt")
+                fs.mkdirSync(path.dirname(record), { recursive: true })
+                fs.writeFileSync(record, "running\n")
+                for (const poll of [50, 51]) {
+                  send({ exec_server_message: { id: poll, read_args: { path: record,
+                    ...scenario === "await-named-poll" ? { tool_call_id: "wait" } : {} } } })
+                }
+              }
+              const task = [...text(1, "7"), ...number(2, 30_000), ...text(3, "terminals/7.txt"), ...number(4, 812)]
+              const result = bytes(2, bytes(4, sleep ? bytes(1, number(2, 20_000))
+                : scenario === "await-finished" ? bytes(1, [...task, ...number(7, 0)]) : bytes(2, task)))
+              const completion = bytes(3, [...text(1, "wait"), ...bytes(2, bytes(42, [...bytes(1, argFields), ...result]))])
+              stream.write(frame(Uint8Array.from(bytes(1, completion))))
+            }
+            // A call Cursor ran itself whose result history cannot hold.
+            if (scenario === "web-fetch") {
+              const fetch = { web_fetch_tool_call: { args: { url: "https://example.com/status" } } }
+              send({ interaction_update: { tool_call_started: { call_id: "fetch", tool_call: fetch } } })
+              send({ interaction_update: { tool_call_completed: { call_id: "fetch", tool_call: fetch } } })
+            }
             // A new file's edit: the provider answers its read with an empty file, then the write goes to the host.
             if (newFileEdit) {
               const target = path.join(root, "created.txt")
@@ -564,7 +605,9 @@ describe("checkpoint eligibility across host results", () => {
         if (scenario === "missing-history") prompt.splice(1, 2)
         if (scenario === "complete" || scenario === "announced" || scenario === "announced-shell" || scenario === "inline-catalog"
           || scenario === "unacknowledged-checkpoint" || scenario === "terminal-poll"
-          || scenario === "missing-read" || scenario === "new-file-edit") {
+          || scenario === "missing-read" || scenario === "new-file-edit"
+          // A wait that timed out, or a plain sleep, changed nothing and told the model nothing history lacks.
+          || scenario === "await-sleep" || scenario === "await-timed-out" || scenario === "await-named-poll") {
           const parts = await read()
           expect(parts.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
           expect(parts.some(part => part.type === "tool-call")).toBe(false)
