@@ -483,6 +483,10 @@ export type ReplayToolLifecycle = {
 const AWAIT_ARGS: Record<number, number> = { 1: 2, 2: 0, 3: 2 }
 // output_length is an observation history lacks, but every timed-out wait has one, and a rebuild repeats nothing after it.
 const AWAIT_STILL_RUNNING: Record<number, number> = { 1: 2, 2: 0, 3: 2, 4: 0, 5: 0 }
+// An AwaitShell with no task sleeps: args {block_until_ms #2}, result success #4 holding `complete` #1 {runtime_ms #2},
+// runtime_ms equal to block_until_ms in every captured sleep (vm3c1 2026-11-13: 1234, 5000, 20000, 20000 ms).
+const SLEEP_ARGS: Record<number, number> = { 2: 0 }
+const SLEEP_COMPLETE: Record<number, number> = { 2: 0 }
 
 /** Fields only from `spec` (field number to wire type), each at most once, and every `required` one present. */
 function strictFields(
@@ -503,8 +507,9 @@ function soleMessage(bytes: Uint8Array | undefined, fn: number): Uint8Array | un
 /**
  * Fork: the lifecycle's tool call is only `await_tool_call` #42 {args #1, result #2}, beside Cursor's call id and
  * timestamps: a start with its args alone, or a completion whose AwaitResult is `success` #4 holding `still_running` #2,
- * the shape of a wait that timed out. A finished task's `complete` carries its exit code, `error` what went wrong, and a
- * wake reason why the wait ended early; history holds none of them.
+ * the shape of a wait that timed out, or a sleep (no task) whose `complete` holds only its full runtime. A finished task's
+ * `complete` carries its exit code, `error` what went wrong, and a wake reason why the wait ended early; history holds
+ * none of them.
  */
 function awaitVariant(topLevel: StrictRawField | undefined, completed: boolean): boolean {
   const update = nestedFields(topLevel, 1).find(field => field.fn === (completed ? 3 : 2))
@@ -516,11 +521,14 @@ function awaitVariant(topLevel: StrictRawField | undefined, completed: boolean):
   if (variants.length !== 1 || variants[0]!.fn !== 42 || variants[0]!.wt !== 2) return false
   const wait = strictFields(variants[0]!.bytes, { 1: 2, 2: 2 })
   const args = wait?.find(field => field.fn === 1)
-  // Every stored Await had task_id and every stored timed-out wait all four fields; Cursor CLI defaults a missing block_until_ms.
-  if (!args || !strictFields(args.bytes, AWAIT_ARGS, [1])) return false
+  const sleep = strictFields(args?.bytes, SLEEP_ARGS, [2])
+  // Every stored task wait had task_id and every stored timed-out wait all four fields; Cursor CLI defaults a missing block_until_ms.
+  if (!args || (!sleep && !strictFields(args.bytes, AWAIT_ARGS, [1]))) return false
   const result = wait!.find(field => field.fn === 2)
   if (!completed || !result) return completed === !!result
-  return !!strictFields(soleMessage(soleMessage(result.bytes, 4), 2), AWAIT_STILL_RUNNING, [1, 2, 3, 4])
+  if (!sleep) return !!strictFields(soleMessage(soleMessage(result.bytes, 4), 2), AWAIT_STILL_RUNNING, [1, 2, 3, 4])
+  const runtime = strictFields(soleMessage(soleMessage(result.bytes, 4), 1), SLEEP_COMPLETE, [2])
+  return !!runtime && runtime[0]!.varint === sleep[0]!.varint
 }
 
 function catalogVariant(topLevel: StrictRawField | undefined): boolean {

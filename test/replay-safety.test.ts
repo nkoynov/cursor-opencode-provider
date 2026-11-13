@@ -519,9 +519,9 @@ describe("display tool lifecycle", () => {
     ] as const) {
       expect([why, analyzeTool(field, "other", [...tool]).toolLifecycle?.wait]).toEqual([why, undefined])
     }
-    // Every stored Await has task_id; Cursor CLI defaults a missing block_until_ms.
+    // Every stored task wait has task_id; Cursor CLI defaults a missing block_until_ms.
     expect(analyzeTool(2, "wait", wait(message(1, lengthDelimited(1, text("545432"))))).toolLifecycle?.wait).toBe(true)
-    expect(analyzeTool(2, "other", wait(message(1, number(2, 1_800_000)))).toolLifecycle?.wait).toBeUndefined()
+    expect(analyzeTool(2, "other", wait(message(1))).toolLifecycle?.wait).toBeUndefined()
     // Every stored timed-out wait has task_id, runtime_ms, output_file_path and output_length.
     for (const missing of [0, 1, 2, 3]) {
       const partial = message(2, ...runningFields.filter((_, index) => index !== missing))
@@ -540,6 +540,73 @@ describe("display tool lifecycle", () => {
     expect(heldRunLossRebuildable(state)).toBe(true)
     step.recordToolLifecycle(analyzeTool(2, "unknown", wait(args)).toolLifecycle)
     step.recordToolLifecycle(analyzeTool(3, "unknown", wait(args, success(running(lengthDelimited(7, text("regex_match")))))).toolLifecycle)
+    expect(heldRunLossRebuildable(state)).toBe(false)
+  })
+
+  it("leaves history nothing to hold for an AwaitShell Cursor ran as a plain sleep, only in the shape Cursor sends", () => {
+    // Captured on a vm3 clone (2026-11-13): args { block_until_ms #2 }, result success #4 { complete #1 { runtime_ms #2 } }.
+    const text = (value: string) => new TextEncoder().encode(value)
+    const message = (fn: number, ...fields: number[][]) => lengthDelimited(fn, Uint8Array.from(fields.flat()))
+    const number = (fn: number, value: number) => [...varint(fn << 3), ...varint(value)]
+    const args = message(1, number(2, 30_000))
+    const complete = (...fields: number[][]) => message(2, message(4, message(1, ...fields)))
+    const slept = complete(number(2, 30_000))
+    const wait = (...fields: number[][]) => message(42, ...fields)
+    const analyzeTool = (field: 2 | 3, callId: string, tool: number[]) => {
+      const frame = updateFrame(field, [...lengthDelimited(1, text(callId)), ...lengthDelimited(2, Uint8Array.from(tool))])
+      let decoded: { interaction_update?: Record<string, unknown> }
+      try {
+        decoded = decodeMessage<{ interaction_update: Record<string, unknown> }>("AgentServerMessage", frame)
+      } catch {
+        decoded = {}
+      }
+      return analyzeReplayFrame(frame, { interactionUpdate: decoded.interaction_update })
+    }
+    expect(analyzeTool(2, "sleep", wait(args)).toolLifecycle).toEqual({ kind: "started", callId: "sleep", wait: true })
+    expect(analyzeTool(3, "sleep", wait(args, slept)).toolLifecycle).toEqual({ kind: "completed", callId: "sleep", wait: true })
+    const taskArgs = message(1, lengthDelimited(1, text("545432")), number(2, 30_000))
+    for (const [why, field, tool] of [
+      ["completed without a result", 3, wait(args)],
+      ["started with a result", 2, wait(args, slept)],
+      ["cut short", 3, wait(args, complete(number(2, 12_000)))],
+      ["ran past its limit", 3, wait(args, complete(number(2, 30_001)))],
+      ["no runtime", 3, wait(args, complete())],
+      ["runtime as bytes", 3, wait(args, complete(lengthDelimited(2, text("30000"))))],
+      ["repeated runtime", 3, wait(args, complete(number(2, 30_000), number(2, 30_000)))],
+      ["task id in the result", 3, wait(args, complete(lengthDelimited(1, text("545432")), number(2, 30_000)))],
+      ["output file", 3, wait(args, complete(number(2, 30_000), lengthDelimited(3, text("/terminals/545432.txt"))))],
+      ["output length", 3, wait(args, complete(number(2, 30_000), number(4, 812)))],
+      ["regex requested", 3, wait(args, complete(number(2, 30_000), number(5, 1)))],
+      ["regex match", 3, wait(args, complete(number(2, 30_000), lengthDelimited(6, text("BUILD OK"))))],
+      ["exit code", 3, wait(args, complete(number(2, 30_000), number(7, 0)))],
+      ["wake reason timeout", 3, wait(args, complete(number(2, 30_000), lengthDelimited(8, text("timeout"))))],
+      ["wake reason steer", 3, wait(args, complete(number(2, 12_000), lengthDelimited(8, text("user_message"))))],
+      ["unknown result field", 3, wait(args, complete(number(2, 30_000), number(99, 1)))],
+      ["still running", 3, wait(args, message(2, message(4, message(2, number(2, 30_000)))))],
+      ["complete outside success", 3, wait(args, message(2, message(1, number(2, 30_000))))],
+      ["error", 3, wait(args, message(2, message(3, lengthDelimited(1, text("no such task")))))],
+      ["success beside complete", 3, wait(args, message(2, message(4, message(1, number(2, 30_000)), message(2, number(2, 30_000)))))],
+      ["regex without a task", 2, wait(message(1, number(2, 30_000), lengthDelimited(3, text("OK"))))],
+      ["empty task id", 3, wait(message(1, lengthDelimited(1, text("")), number(2, 30_000)), slept)],
+      ["task wait with a sleep's result", 3, wait(taskArgs, slept)],
+      ["block_until_ms as bytes", 2, wait(message(1, lengthDelimited(2, text("30000"))))],
+      ["repeated block_until_ms", 2, wait(message(1, number(2, 30_000), number(2, 30_000)))],
+      ["unknown args field", 2, wait(message(1, number(2, 30_000), number(9, 1)))],
+      ["unknown await field", 3, wait(args, slept, lengthDelimited(99, text("x")))],
+    ] as const) {
+      expect([why, analyzeTool(field, "other", [...tool]).toolLifecycle?.wait]).toEqual([why, undefined])
+    }
+
+    const state: ReplaySafetyState = {}
+    const earlier = new AttemptReplaySafety("run-1", state)
+    earlier.recordToolLifecycle(analyzeTool(2, "sleep", wait(args)).toolLifecycle)
+    earlier.recordToolLifecycle(analyzeTool(3, "sleep", wait(args, slept)).toolLifecycle)
+    expect(state.announcedCalls).toBeUndefined()
+    expect(state.completedCalls).toBeUndefined()
+    const step = new AttemptReplaySafety("run-1", state)
+    expect(heldRunLossRebuildable(state)).toBe(true)
+    step.recordToolLifecycle(analyzeTool(2, "woken", wait(args)).toolLifecycle)
+    step.recordToolLifecycle(analyzeTool(3, "woken", wait(args, complete(number(2, 12_000)))).toolLifecycle)
     expect(heldRunLossRebuildable(state)).toBe(false)
   })
 

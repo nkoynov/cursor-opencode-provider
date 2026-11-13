@@ -1832,11 +1832,13 @@ describe("host calls still running when the Run dies", () => {
 
   // Fork: an AwaitShell Cursor ran on a background shell has no side effect, whether or not a poll named its call.
   // A wait that saw its shell finish (`await-finished`) returned an exit code history lacks, unless a poll named it,
-  // and one woken early (`await-woken`) a reason history lacks.
+  // and one woken early (`await-woken`) a reason history lacks. A plain sleep naming no shell (`await-sleep`) has no side
+  // effect either, but one that ended before its limit (`await-sleep-short`) may have been woken by something history lacks.
   for (const earlier of [
     "await-unnamed-polls", "await-no-polls", "await-named-polls", "web-fetch", "await-finished", "await-woken",
+    "await-sleep", "await-sleep-short",
   ] as const) {
-    const rebuilds = earlier !== "web-fetch" && earlier !== "await-finished" && earlier !== "await-woken"
+    const rebuilds = !["web-fetch", "await-finished", "await-woken", "await-sleep-short"].includes(earlier)
     it(`${rebuilds ? "rebuilds" : "refuses"} a lost held Run of parallel Task calls after an earlier Cursor-run call (${earlier})`, async () => {
       const key = `ses_held_tool_await_${earlier}`
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-held-tool-await-"))
@@ -1887,6 +1889,16 @@ describe("host calls still running when the Run dies", () => {
             const fetch = { web_fetch_tool_call: { args: { url: "https://example.com/status" } } }
             send({ interaction_update: { tool_call_started: { call_id: "fetch", tool_call: fetch } } })
             send({ interaction_update: { tool_call_completed: { call_id: "fetch", tool_call: fetch } } })
+          } else if (earlier === "await-sleep" || earlier === "await-sleep-short") {
+            // A sleep reads no terminal record: args { block_until_ms #2 }, result success #4 { complete #1 { runtime_ms #2 } }.
+            const bytes = (fn: number, value: number[]) => [...varint((fn << 3) | 2), ...varint(value.length), ...value]
+            const number = (fn: number, value: number) => [...varint(fn << 3), ...varint(value)]
+            const args = bytes(1, number(2, 30_000))
+            send({ interaction_update: { tool_call_started: { call_id: "wait",
+              tool_call: { await_tool_call: { args: { block_until_ms: 30_000 } } } } } })
+            const result = bytes(2, bytes(4, bytes(1, number(2, earlier === "await-sleep" ? 30_000 : 12_000))))
+            const completed = bytes(3, [...bytes(1, [...Buffer.from("wait")]), ...bytes(2, bytes(42, [...args, ...result]))])
+            stream.write(frame(Uint8Array.from(bytes(1, completed))))
           } else {
             // Cursor waits on the background shell itself, polling its terminal record, and its wait times out.
             const wait = { await_tool_call: { args: { task_id: "545432", block_until_ms: 1_800_000 } } }
