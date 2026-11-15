@@ -279,9 +279,9 @@ export function buildSoftBackgroundCommand(policy: CursorShellPolicy): string {
     ? Math.max(1, Math.ceil(policy.hardTimeoutMs / POLL_INTERVAL_MS))
     : undefined
   const lines = [
-    ...payloadShellLines("cursor_payload_shell", "cursor_payload_options", policy.shellPath ?? resolveCursorShellPath()),
+    ...payloadShellLines("cursor_payload_shell", policy.shellPath ?? resolveCursorShellPath()),
     'cursor_shell_log="$(mktemp "${TMPDIR:-/tmp}/cursor-opencode-shell.XXXXXX")" || exit 1',
-    `nohup "$cursor_payload_shell" $cursor_payload_options -c ${shellQuote(policy.command)} >"$cursor_shell_log" 2>&1 </dev/null &`,
+    `nohup "$cursor_payload_shell" "$@" -c ${shellQuote(policy.command)} >"$cursor_shell_log" 2>&1 </dev/null &`,
     "cursor_shell_pid=$!",
   ]
   if (hardPolls !== undefined) {
@@ -358,9 +358,9 @@ export function buildSoftBackgroundCommand(policy: CursorShellPolicy): string {
  */
 export function buildBackgroundShellCommand(command: string, shellPath?: string): string {
   return [
-    ...payloadShellLines("cursor_payload_shell", "cursor_payload_options", shellPath ?? resolveCursorShellPath()),
+    ...payloadShellLines("cursor_payload_shell", shellPath ?? resolveCursorShellPath()),
     'bg_log="$(mktemp "${TMPDIR:-/tmp}/cursor-opencode-bg.XXXXXX")" || exit 1',
-    `nohup "$cursor_payload_shell" $cursor_payload_options -c ${shellQuote(command)} >"$bg_log" 2>&1 </dev/null &`,
+    `nohup "$cursor_payload_shell" "$@" -c ${shellQuote(command)} >"$bg_log" 2>&1 </dev/null &`,
     "bg_pid=$!",
     `printf '${BACKGROUND_SHELL_MARKER}%s:%s\\n' "$bg_pid" "$bg_log"`,
   ].join("\n")
@@ -389,7 +389,7 @@ function writeShellEnvInjector(wrapperBody: string, command: string, shellPath?:
     "  return 0",
     "fi",
     "unset BASH_ENV ZDOTDIR ENV CURSOR_OPENCODE_WRAP_ACTIVE",
-    `exec /bin/sh ${shellQuote(wrapperPath)}`,
+    `exec /bin/sh ${shellQuote(wrapperPath)} ${shellQuote(shellPath ?? resolveCursorShellPath())}`,
     "",
   ].join("\n")
   writeFileSync(bashEnvPath, injector, { mode: 0o600 })
@@ -399,8 +399,6 @@ function writeShellEnvInjector(wrapperBody: string, command: string, shellPath?:
     env: {
       BASH_ENV: bashEnvPath,
       ZDOTDIR: dir,
-      CURSOR_SHELL_EXECUTABLE: shellPath ?? resolveCursorShellPath(),
-      CURSOR_SHELL_OPTIONS: "",
     },
   }
 }
@@ -556,15 +554,20 @@ export function prepareCursorShellCreate(event: {
     const script = [
       "#!/bin/sh",
       // OpenCode 2.2.7+ runs zsh as `zsh +o nomatch -c <command>`. Prints the
-      // option words before `-c`; a subshell, so inherited names stay as they were.
+      // options before `-c` when each is an `-o`/`+o` name pair or a flag that
+      // leaves the command and startup alone; a subshell, so no name leaks.
       "cursor_options() (",
       "  cursor_flag= cursor_command= cursor_seen=0 cursor_words= cursor_name=",
       "  for cursor_arg do",
       '    if [ "$cursor_seen" -ge 2 ]; then',
-      '      case $cursor_flag in *[!A-Za-z0-9_+-]*) exit 1 ;; esac',
-      '      if [ -n "$cursor_name" ]; then cursor_name=',
+      '      if [ -n "$cursor_name" ]; then',
+      "        cursor_name=",
+      "        case $cursor_flag in [A-Za-z]*) ;; *) exit 1 ;; esac",
+      "        case $cursor_flag in *[!A-Za-z_]*) exit 1 ;; esac",
+      `        cursor_key=$(printf '%s' "$cursor_flag" | tr -d _ | tr '[:upper:]' '[:lower:]')`,
+      "        case ${cursor_key#no} in login|interactive|shinstdin|singlecommand|onecmd|rcs|globalrcs|privileged|restricted|exec) exit 1 ;; esac",
       "      else",
-      "        case $cursor_flag in -o|+o) cursor_name=1 ;; [+-]?*) ;; *) exit 1 ;; esac",
+      "        case $cursor_flag in -o|+o) cursor_name=1 ;; [+-][aCefuvx]) ;; *) exit 1 ;; esac",
       "      fi",
       '      cursor_words="$cursor_words${cursor_words:+ }$cursor_flag"',
       "    fi",
@@ -575,10 +578,9 @@ export function prepareCursorShellCreate(event: {
       `  [ -z "$cursor_name" ] && [ "$cursor_flag" = -c ] && [ "$cursor_command" = ${shellQuote(event.command)} ] && printf '%s\\n' "$cursor_words"`,
       ")",
       'if cursor_options "$@" >/dev/null; then',
-      `  export CURSOR_SHELL_EXECUTABLE=${shellQuote(event.shell)}`,
-      '  CURSOR_SHELL_OPTIONS=$(cursor_options "$@")',
-      "  export CURSOR_SHELL_OPTIONS",
-      ...niceExecLines(`/bin/sh ${shellQuote(wrap.wrapperPath)}`, nice).map((line) => `  ${line}`),
+      "  IFS=' '",
+      `  set -- ${shellQuote(event.shell)} $(cursor_options "$@")`,
+      ...niceExecLines(`/bin/sh ${shellQuote(wrap.wrapperPath)} "$@"`, nice).map((line) => `  ${line}`),
       "fi",
       // A later host hook changed the command: execute exactly what the host
       // approved instead of the provider's earlier command snapshot.

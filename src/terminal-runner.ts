@@ -23,16 +23,18 @@ export const TIMEOUT_EXIT_CODE = 124
 export type ManagedTerminal = { command: string; directory: string; file: string; shellId: number }
 
 /**
- * Set `shell` to the payload shell and `options` to the options the host
- * passed before `-c` (OpenCode 2.2.7+ runs zsh with `+o nomatch`), both as the
- * create-hook adapter exported them. Options are expanded unquoted, so only
- * option words of a safe alphabet are kept.
+ * Set `shell` to the payload shell and leave its options in "$@". Only the
+ * create-hook adapter and the shell.env injector pass them, as the wrapper's
+ * arguments: the host shell and the options before its `-c` (OpenCode 2.2.7+
+ * runs zsh with `+o nomatch`). Run inline without arguments, the payload uses
+ * `fallback`. Nothing comes from the environment, which a payload's children
+ * inherit, so the names an older build exported are dropped before it starts.
  */
-export function payloadShellLines(shell: string, options: string, fallback: string): string[] {
+export function payloadShellLines(shell: string, fallback: string): string[] {
   return [
-    `${shell}=${quote(fallback)}`, `${options}=`,
-    `if [ -n "$CURSOR_SHELL_EXECUTABLE" ]; then ${shell}="$CURSOR_SHELL_EXECUTABLE"; ${options}="\${CURSOR_SHELL_OPTIONS-}"; fi`,
-    `case $${options} in *[!A-Za-z0-9_+\\ -]*|[!+-]*) ${options}= ;; esac`,
+    `${shell}=${quote(fallback)}`,
+    `if [ "$#" -gt 0 ]; then ${shell}=$1; shift; fi`,
+    "unset CURSOR_SHELL_EXECUTABLE CURSOR_SHELL_OPTIONS",
   ]
 }
 
@@ -169,14 +171,14 @@ export function createManagedTerminal(policy: CursorShellPolicy, root: string): 
     fs.writeFileSync(path.join(directory, "group.sh"), [
       "#!/bin/sh", `job=${quote(directory)}`,
       // The supervisor naps between checks; USR1 wakes it when state changes.
-      'supervisor="$1"',
+      'supervisor="$1"', 'payload_shell="$2"', "shift 2",
       // Keep the leader alive until completion or cancellation so a reused
       // PID/PGID can never receive the supervisor's cancellation signal.
       "trap ':' TERM INT HUP",
       // The supervisor holds the lifeline's only write end. Its exit, however
       // abrupt (KILL, OOM, crash), is EOF here and stops an unfinished group.
       'exec 3<"$job/lifeline" || exit 1',
-      '"$CURSOR_SHELL_EXECUTABLE" $CURSOR_SHELL_OPTIONS -c "$(cat "$job/command.sh")" 3<&- &', "payload=$!",
+      '"$payload_shell" "$@" -c "$(cat "$job/command.sh")" 3<&- &', "payload=$!",
       "(",
       "  trap '' TERM INT HUP",
       '  while read -r state; do [ "$state" != completed ] || exit 0; done <&3',
@@ -220,8 +222,7 @@ export function createManagedTerminal(policy: CursorShellPolicy, root: string): 
       `hard_seconds=${quote(String((policy.hardTimeoutMs ?? 0) / 1000))}`,
       `max_output=${MAX_RUNTIME_WRITE_BYTES}`,
       `runtime=${quote(process.execPath)}`,
-      ...payloadShellLines("payload_shell", "payload_options", policy.shellPath ?? process.env.SHELL ?? "/bin/sh"),
-      'export CURSOR_SHELL_EXECUTABLE="$payload_shell" CURSOR_SHELL_OPTIONS="$payload_options"',
+      ...payloadShellLines("payload_shell", policy.shellPath ?? process.env.SHELL ?? "/bin/sh"),
     ].join("\n")
     fs.writeFileSync(path.join(directory, "runner.sh"), setup + "\n" + IS_OURS + "\n" + SUPERVISOR, { mode: 0o700 })
     const delimiter = commandDelimiter(policy.command)
@@ -241,7 +242,7 @@ export function createManagedTerminal(policy: CursorShellPolicy, root: string): 
       // where setsid is not a standard executable. Else require setsid.
       'cursor_runner=$(command -v bash 2>/dev/null || true)',
       'if [ -z "$cursor_runner" ]; then cursor_runner=/bin/sh; fi',
-      'nohup "$cursor_runner" "$cursor_job/runner.sh" >"$cursor_job/launcher.log" 2>&1 </dev/null &',
+      'nohup "$cursor_runner" "$cursor_job/runner.sh" "$@" >"$cursor_job/launcher.log" 2>&1 </dev/null &',
       "cursor_supervisor=$!",
       // Each deadline is one sleep that marks a file when it elapses. Counting
       // short polls instead drifts with process-start cost (over 50% on
@@ -448,9 +449,9 @@ exec 4<>"$job/lifeline" || fail 'Could not initialize terminal supervision'
 BUN_BE_BUN=1 "$runtime" "$job/collector.cjs" "$job" "$terminal" "$max_output" "$supervisor" 2>/dev/null 4>&- &
 collector=$!
 if [ "$group_mode" = setsid ]; then
-  setsid sh "$job/group.sh" "$supervisor" >"$job/pipe" 2>&1 </dev/null 4>&- &
+  setsid sh "$job/group.sh" "$supervisor" "$payload_shell" "$@" >"$job/pipe" 2>&1 </dev/null 4>&- &
 else
-  sh "$job/group.sh" "$supervisor" >"$job/pipe" 2>&1 </dev/null 4>&- &
+  sh "$job/group.sh" "$supervisor" "$payload_shell" "$@" >"$job/pipe" 2>&1 </dev/null 4>&- &
 fi
 command_pid=$!
 start_poll=0

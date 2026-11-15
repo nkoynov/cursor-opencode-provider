@@ -8,6 +8,14 @@ import path from "node:path"
  * run, and the directory is removed either way, so a run never leaves anything
  * in the caller's TMPDIR. Child processes inherit it through the environment.
  */
+/**
+ * A provider running the caller (an agent's shell) exports its own shell and
+ * debug settings; tests that need them set them explicitly.
+ */
+for (const name of Object.keys(process.env)) {
+  if (name.startsWith("CURSOR_SHELL_") || name.startsWith("CURSOR_PROVIDER_DEBUG")) delete process.env[name]
+}
+
 const runTmp = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-test-"))
 process.env.TMPDIR = runTmp
 process.env.TMP = runTmp

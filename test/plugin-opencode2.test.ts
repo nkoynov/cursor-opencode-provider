@@ -2580,7 +2580,7 @@ describe("opencode2 setup", () => {
     expect(event.command).toBe("echo hello")
     expect(event.shell.endsWith("/bash")).toBe(true)
     expect(event.shell).not.toBe("/bin/bash")
-    expect(readFileSync(event.shell, "utf8")).toContain("CURSOR_SHELL_EXECUTABLE='/bin/bash'")
+    expect(readFileSync(event.shell, "utf8")).toContain(`set -- '/bin/bash' $(cursor_options "$@")`)
     expect(event.env).toEqual({})
   })
 

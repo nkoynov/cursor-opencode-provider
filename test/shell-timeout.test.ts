@@ -330,7 +330,7 @@ describe("Cursor shell timeout translation", () => {
     const wrapperMatch = injector.match(/exec \/bin\/sh '([^']+)'/)
     expect(wrapperMatch?.[1]).toBeString()
     const wrapper = readFileSync(wrapperMatch![1]!, "utf8")
-    expect(wrapper).toContain("nohup \"$cursor_payload_shell\" $cursor_payload_options -c 'zig translate-c /tmp/tiny.c -lc'")
+    expect(wrapper).toContain("nohup \"$cursor_payload_shell\" \"$@\" -c 'zig translate-c /tmp/tiny.c -lc'")
     expect(wrapper).toContain("__CURSOR_BACKGROUND_SHELL__")
     expect(wrapper).toContain("</dev/null &")
     expect(buildBackgroundShellCommand("echo hi")).toContain("__CURSOR_BACKGROUND_SHELL__")
@@ -557,21 +557,20 @@ describe("prepareCursorShellCreate correlation", () => {
   })
 
   const sentinels = {
-    cursor_flag: "keep-flag", cursor_command: "keep-command", cursor_arg: "keep-arg",
-    cursor_seen: "keep-seen", cursor_words: "keep-words", cursor_name: "keep-name", CURSOR_SHELL_OPTIONS: "+o keep",
+    cursor_flag: "keep-flag", cursor_command: "keep-command", cursor_arg: "keep-arg", cursor_seen: "keep-seen",
+    cursor_words: "keep-words", cursor_name: "keep-name", cursor_key: "keep-key",
+    CURSOR_SHELL_EXECUTABLE: "/bin/sh", CURSOR_SHELL_OPTIONS: "-c printf",
   }
+  const sentinelLines = (prefix: string) =>
+    Object.entries(sentinels).filter(([key]) => key.startsWith(prefix)).map(([key, value]) => `${key}=${value}`)
   // A host shell that records its argv and the adapter's variable names, then says how it ran.
   const recordingShell = (file: string) => {
     writeFileSync(file, [
       "#!/bin/sh",
-      `{ printf '%s\\n' "$*"; env | grep -E '^(cursor_[a-z]+|CURSOR_SHELL_OPTIONS)=' | sort; } >"$0.record"`,
+      `{ printf '%s\\n' "$*"; env | grep -E '^(cursor_[a-z]+|CURSOR_SHELL_[A-Z]+)=' | sort; } >"$0.record"`,
       "echo unwrapped", "",
     ].join("\n"), { mode: 0o700 })
     return `${file}.record`
-  }
-  const hostEnv = () => {
-    const { CURSOR_SHELL_EXECUTABLE: _executable, CURSOR_SHELL_OPTIONS: _options, ...env } = process.env
-    return env
   }
   async function readWhenWritten(file: string): Promise<string> {
     for (let i = 0; i < 120 && !(existsSync(file) && readFileSync(file, "utf8").includes("\n")); i++) await Bun.sleep(25)
@@ -581,9 +580,16 @@ describe("prepareCursorShellCreate correlation", () => {
   it.each([
     ["bash", ["-c", "echo adapted"], ""],
     ["zsh", ["+o", "nomatch", "-c", "echo adapted"], "+o nomatch"],
+    ["bash", ["-e", "-o", "pipefail", "-c", "echo adapted"], "-e -o pipefail"],
     ["zsh", ["+o", "nomatch", "-c", "echo rewritten"], undefined],
     ["zsh", ["script.zsh", "-c", "echo adapted"], undefined],
-  ])("the %s adapter wraps %j with the host's options, leaving inherited names as they were", async (name, args, options) => {
+    ["zsh", ["-l", "-c", "echo adapted"], undefined],
+    ["zsh", ["-s", "-c", "echo adapted"], undefined],
+    ["zsh", ["-o", "login", "-c", "echo adapted"], undefined],
+    ["zsh", ["+o", "NO_RCS", "-c", "echo adapted"], undefined],
+    ["zsh", ["-o", "-c", "echo adapted"], undefined],
+    ["bash", ["-c", "printf", "-c", "echo adapted"], undefined],
+  ])("the %s adapter wraps %j only with options that leave the command alone, and changes no inherited name", async (name, args, options) => {
     const base = mkdtempSync(path.join(tmpdir(), "cursor-shell-args-"))
     try {
       const host = path.join(base, name)
@@ -594,16 +600,16 @@ describe("prepareCursorShellCreate correlation", () => {
       const event = { command: "echo adapted", cwd: base, timeout: 0, shell: host, env: {} as Record<string, string | undefined> }
       prepareCursorShellCreate(event)
       expect(event.shell).not.toBe(host)
-      const stdout = Bun.spawnSync([event.shell, ...args], { env: { ...hostEnv(), ...sentinels }, stdout: "pipe", stderr: "pipe" }).stdout.toString()
+      const stdout = Bun.spawnSync([event.shell, ...args], { env: { ...process.env, ...sentinels }, stdout: "pipe", stderr: "pipe" }).stdout.toString()
       const recorded = await readWhenWritten(record)
-      const inherited = Object.entries(sentinels).filter(([key]) => key.startsWith("cursor_")).map(([key, value]) => `${key}=${value}`)
       if (options !== undefined) {
         expect(stdout).not.toContain("unwrapped")
         await reapBackgroundSpawn(stdout)
-        expect(recorded.split("\n").sort()).toEqual(["", `${options}${options ? " " : ""}-c echo adapted`, `CURSOR_SHELL_OPTIONS=${options}`, ...inherited].sort())
+        // The payload gets the host's options and none of the provider's names.
+        expect(recorded.split("\n").sort()).toEqual(["", `${options}${options ? " " : ""}-c echo adapted`, ...sentinelLines("cursor_")].sort())
       } else {
         expect(stdout).toBe("unwrapped\n")
-        expect(recorded.split("\n").sort()).toEqual(["", args.join(" "), `CURSOR_SHELL_OPTIONS=${sentinels.CURSOR_SHELL_OPTIONS}`, ...inherited].sort())
+        expect(recorded.split("\n").sort()).toEqual(["", args.join(" "), ...sentinelLines("")].sort())
       }
       releaseCursorShellEnv(id)
     } finally {
@@ -611,29 +617,36 @@ describe("prepareCursorShellCreate correlation", () => {
     }
   })
 
-  it.each([
-    ["+o nomatch", true, "+o nomatch -c echo payload"],
-    ["+o nomatch; touch injected", true, "-c echo payload"],
-    ["nomatch", true, "-c echo payload"],
-    ["+o *", true, "-c echo payload"],
-    ["+o nomatch", false, "-c echo payload"],
-  ])("background payloads take the adapter's options %j (executable exported: %p) only as plain option words", async (options, exported, argv) => {
+  it("background wrappers take the payload shell and its options from their own arguments", async () => {
     const base = mkdtempSync(path.join(tmpdir(), "cursor-shell-payload-"))
     try {
       const shell = path.join(base, "zsh")
       const record = recordingShell(shell)
-      const env = { ...hostEnv(), CURSOR_SHELL_OPTIONS: options, ...(exported ? { CURSOR_SHELL_EXECUTABLE: shell } : {}) }
-      const spawned = Bun.spawnSync(["/bin/sh", "-c", buildBackgroundShellCommand("echo payload", shell)], { env, stdout: "pipe" }).stdout.toString()
-      expect((await readWhenWritten(record)).split("\n")[0]).toBe(argv)
+      const run = (wrapper: string) => Bun.spawnSync(["/bin/sh", "-c", wrapper, "sh", shell, "+o", "nomatch"], { stdout: "pipe" }).stdout.toString()
+      const spawned = run(buildBackgroundShellCommand("echo payload", "/bin/sh"))
+      expect((await readWhenWritten(record)).split("\n")[0]).toBe("+o nomatch -c echo payload")
       await reapBackgroundSpawn(spawned)
       rmSync(record)
-      const policy = { command: "echo payload", workingDirectory: base, timeoutMs: 2000, timeoutBehavior: CURSOR_TIMEOUT_BACKGROUND, shellPath: shell }
-      const soft = Bun.spawnSync(["/bin/sh", "-c", buildSoftBackgroundCommand(policy)], { env, stdout: "pipe" }).stdout.toString()
-      expect(soft).toContain("unwrapped\n")
-      expect(soft).toContain("__CURSOR_SHELL_EXIT__0\n")
-      expect(readFileSync(record, "utf8").split("\n")[0]).toBe(argv)
+      const policy = { command: "echo payload", workingDirectory: base, timeoutMs: 2000, timeoutBehavior: CURSOR_TIMEOUT_BACKGROUND, shellPath: "/bin/sh" }
+      expect(run(buildSoftBackgroundCommand(policy))).toBe("unwrapped\n\n__CURSOR_SHELL_EXIT__0\n")
+      expect(readFileSync(record, "utf8").split("\n")[0]).toBe("+o nomatch -c echo payload")
     } finally {
       rmSync(base, { recursive: true, force: true })
+    }
+  })
+
+  it.each(["background", "soft-background"])("the %s wrapper runs the approved payload unchanged under inherited CURSOR_SHELL_* names", async kind => {
+    const env = { ...process.env, CURSOR_SHELL_EXECUTABLE: "/bin/sh", CURSOR_SHELL_OPTIONS: "-c printf" }
+    const command = 'echo expected "[${CURSOR_SHELL_EXECUTABLE-unset}][${CURSOR_SHELL_OPTIONS-unset}]"'
+    if (kind === "background") {
+      const stdout = Bun.spawnSync(["/bin/sh", "-c", buildBackgroundShellCommand(command, "/bin/sh")], { env, stdout: "pipe" }).stdout.toString()
+      const log = /__CURSOR_BACKGROUND_SHELL__\d+:([^\r\n]+)/.exec(stdout)![1]!
+      expect(await readWhenWritten(log)).toBe("expected [unset][unset]\n")
+      await reapBackgroundSpawn(stdout)
+    } else {
+      const policy = { command, workingDirectory: tmpdir(), timeoutMs: 2000, timeoutBehavior: CURSOR_TIMEOUT_BACKGROUND, shellPath: "/bin/sh" }
+      const stdout = Bun.spawnSync(["/bin/sh", "-c", buildSoftBackgroundCommand(policy)], { env, stdout: "pipe" }).stdout.toString()
+      expect(stdout).toBe("expected [unset][unset]\n\n__CURSOR_SHELL_EXIT__0\n")
     }
   })
 
@@ -649,7 +662,7 @@ describe("prepareCursorShellCreate correlation", () => {
       prepareCursorShellArgs(id, { command }, { deferToShellHook: true })
       const event = { command, cwd: base, timeout: 0, shell: zsh!, env: {} as Record<string, string | undefined> }
       prepareCursorShellCreate(event)
-      const stdout = Bun.spawnSync([event.shell, "+o", "nomatch", "-c", command], { env: hostEnv(), stdout: "pipe" }).stdout.toString()
+      const stdout = Bun.spawnSync([event.shell, "+o", "nomatch", "-c", command], { stdout: "pipe" }).stdout.toString()
       const log = /__CURSOR_BACKGROUND_SHELL__\d+:([^\r\n]+)/.exec(stdout)![1]!
       expect(await readWhenWritten(log)).toBe("/nonexistent-cursor-glob-*\n")
       await reapBackgroundSpawn(stdout)
