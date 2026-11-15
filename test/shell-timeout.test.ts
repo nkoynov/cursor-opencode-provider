@@ -586,6 +586,7 @@ describe("prepareCursorShellCreate correlation", () => {
     ["zsh", ["script.zsh", "-c", "echo adapted"], undefined],
     ["zsh", ["-l", "-c", "echo adapted"], undefined],
     ["zsh", ["-s", "-c", "echo adapted"], undefined],
+    ["zsh", ["-f", "-c", "echo adapted"], undefined],
     ["zsh", ["-o", "login", "-c", "echo adapted"], undefined],
     ["zsh", ["+o", "NO_RCS", "-c", "echo adapted"], undefined],
     ["zsh", ["-o", "-c", "echo adapted"], undefined],
@@ -612,6 +613,30 @@ describe("prepareCursorShellCreate correlation", () => {
         expect(stdout).toBe("unwrapped\n")
         expect(recorded.split("\n").sort()).toEqual(["", args.join(" "), ...sentinelLines("")].sort())
       }
+      releaseCursorShellEnv(id)
+    } finally {
+      rmSync(base, { recursive: true, force: true })
+    }
+  })
+
+  it("runs the host shell unwrapped when the adapter cannot check an option name", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "cursor-shell-tr-"))
+    try {
+      const host = path.join(base, "zsh")
+      const record = recordingShell(host)
+      const broken = path.join(base, "bin")
+      mkdirSync(broken)
+      writeFileSync(path.join(broken, "tr"), "#!/bin/sh\nexit 1\n", { mode: 0o700 })
+      const id = "cursor_args_tr"
+      registerCursorShellCall(id, { background_shell_spawn: true, command: "echo adapted", working_directory: base })
+      prepareCursorShellArgs(id, { command: "echo adapted" }, { deferToShellHook: true })
+      const event = { command: "echo adapted", cwd: base, timeout: 0, shell: host, env: {} as Record<string, string | undefined> }
+      prepareCursorShellCreate(event)
+      const args = ["-o", "interactive", "-c", "echo adapted"]
+      const env = { ...process.env, PATH: `${broken}${path.delimiter}${process.env.PATH}` }
+      const stdout = Bun.spawnSync([event.shell, ...args], { env, stdout: "pipe", stderr: "pipe" }).stdout.toString()
+      expect(stdout).toBe("unwrapped\n")
+      expect((await readWhenWritten(record)).split("\n")[0]).toBe(args.join(" "))
       releaseCursorShellEnv(id)
     } finally {
       rmSync(base, { recursive: true, force: true })

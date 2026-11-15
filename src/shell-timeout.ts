@@ -555,7 +555,8 @@ export function prepareCursorShellCreate(event: {
       "#!/bin/sh",
       // OpenCode 2.2.7+ runs zsh as `zsh +o nomatch -c <command>`. Prints the
       // options before `-c` when each is an `-o`/`+o` name pair or a flag that
-      // leaves the command and startup alone; a subshell, so no name leaks.
+      // leaves the command and startup alone (not zsh's -f, which is NO_RCS);
+      // a subshell, so no name leaks. A failed name check refuses the wrap.
       "cursor_options() (",
       "  cursor_flag= cursor_command= cursor_seen=0 cursor_words= cursor_name=",
       "  for cursor_arg do",
@@ -564,10 +565,12 @@ export function prepareCursorShellCreate(event: {
       "        cursor_name=",
       "        case $cursor_flag in [A-Za-z]*) ;; *) exit 1 ;; esac",
       "        case $cursor_flag in *[!A-Za-z_]*) exit 1 ;; esac",
-      `        cursor_key=$(printf '%s' "$cursor_flag" | tr -d _ | tr '[:upper:]' '[:lower:]')`,
+      `        cursor_key=$(printf '%s' "$cursor_flag" | tr -d _ | tr '[:upper:]' '[:lower:]') || exit 1`,
+      "        case $cursor_key in [a-z]*) ;; *) exit 1 ;; esac",
+      "        case $cursor_key in *[!a-z]*) exit 1 ;; esac",
       "        case ${cursor_key#no} in login|interactive|shinstdin|singlecommand|onecmd|rcs|globalrcs|privileged|restricted|exec) exit 1 ;; esac",
       "      else",
-      "        case $cursor_flag in -o|+o) cursor_name=1 ;; [+-][aCefuvx]) ;; *) exit 1 ;; esac",
+      "        case $cursor_flag in -o|+o) cursor_name=1 ;; [+-][aCeuvx]) ;; *) exit 1 ;; esac",
       "      fi",
       '      cursor_words="$cursor_words${cursor_words:+ }$cursor_flag"',
       "    fi",
