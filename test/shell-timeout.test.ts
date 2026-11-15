@@ -556,6 +556,34 @@ describe("prepareCursorShellCreate correlation", () => {
     releaseCursorShellEnv(id)
   })
 
+  it.each([
+    ["bash", ["-c", "echo adapted"], true],
+    ["zsh", ["+o", "nomatch", "-c", "echo adapted"], true],
+    ["zsh", ["+o", "nomatch", "-c", "echo rewritten"], false],
+  ])("the %s adapter runs the wrapper only for the approved command: %j", async (name, args, wrapped) => {
+    const base = mkdtempSync(path.join(tmpdir(), "cursor-shell-args-"))
+    try {
+      const host = path.join(base, name)
+      writeFileSync(host, "#!/bin/sh\necho unwrapped\n", { mode: 0o700 })
+      const id = `cursor_args_${name}`
+      registerCursorShellCall(id, { background_shell_spawn: true, command: "echo adapted", working_directory: base })
+      prepareCursorShellArgs(id, { command: "echo adapted" }, { deferToShellHook: true })
+      const event = { command: "echo adapted", cwd: base, timeout: 0, shell: host, env: {} as Record<string, string | undefined> }
+      prepareCursorShellCreate(event)
+      expect(event.shell).not.toBe(host)
+      const stdout = Bun.spawnSync([event.shell, ...args], { stdout: "pipe", stderr: "pipe" }).stdout.toString()
+      if (wrapped) {
+        expect(stdout).not.toContain("unwrapped")
+        await reapBackgroundSpawn(stdout)
+      } else {
+        expect(stdout).toBe("unwrapped\n")
+      }
+      releaseCursorShellEnv(id)
+    } finally {
+      rmSync(base, { recursive: true, force: true })
+    }
+  })
+
   it("uses the working directory to disambiguate identical commands", () => {
     const first = "cursor_cmd_first"
     const second = "cursor_cmd_second"

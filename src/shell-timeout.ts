@@ -556,7 +556,10 @@ export function prepareCursorShellCreate(event: {
     const executable = join(directory, basename(event.shell))
     const script = [
       "#!/bin/sh",
-      `if [ "$1" = -c ] && [ "$2" = ${shellQuote(event.command)} ]; then`,
+      // OpenCode 2.2.7+ runs zsh as `zsh +o nomatch -c <command>`: match the last two arguments.
+      "cursor_flag= cursor_command=",
+      'for cursor_arg do cursor_flag=$cursor_command; cursor_command=$cursor_arg; done',
+      `if [ "$cursor_flag" = -c ] && [ "$cursor_command" = ${shellQuote(event.command)} ]; then`,
       `  export CURSOR_SHELL_EXECUTABLE=${shellQuote(event.shell)}`,
       ...niceExecLines(`/bin/sh ${shellQuote(wrap.wrapperPath)}`, nice).map((line) => `  ${line}`),
       "fi",
