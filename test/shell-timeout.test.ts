@@ -567,13 +567,14 @@ describe("prepareCursorShellCreate correlation", () => {
   const recordingShell = (file: string) => {
     writeFileSync(file, [
       "#!/bin/sh",
-      `{ printf '%s\\n' "$*"; env | grep -E '^(cursor_[a-z]+|CURSOR_SHELL_[A-Z]+)=' | sort; } >"$0.record"`,
+      `{ printf '%s\\n' "$*"; env | grep -E '^(cursor_[a-z]+|CURSOR_SHELL_[A-Z]+)=' | sort; } >"$0.record.tmp"`,
+      `mv "$0.record.tmp" "$0.record"`,
       "echo unwrapped", "",
     ].join("\n"), { mode: 0o700 })
     return `${file}.record`
   }
   async function readWhenWritten(file: string): Promise<string> {
-    for (let i = 0; i < 120 && !(existsSync(file) && readFileSync(file, "utf8").includes("\n")); i++) await Bun.sleep(25)
+    for (let i = 0; i < 120 && !(existsSync(file) && readFileSync(file, "utf8").endsWith("\n")); i++) await Bun.sleep(25)
     return readFileSync(file, "utf8")
   }
 
