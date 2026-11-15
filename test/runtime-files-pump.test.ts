@@ -253,7 +253,7 @@ for (const host of [1, 2] as const) describe(`OpenCode ${host} runtime pump`, ()
     await pump(f.session, f.controller, ids)
     expect(calls(f.parts)).toHaveLength(1)
     const args = JSON.parse(calls(f.parts)[0]!.input)
-    expect(args.command).toContain("nohup \"$cursor_payload_shell\" -c 'sleep 1'")
+    expect(args.command).toContain("nohup \"$cursor_payload_shell\" $cursor_payload_options -c 'sleep 1'")
     expect(messages(f.writes).some(m => m.exec_client_message?.background_shell_spawn_result)).toBe(false)
   })
 

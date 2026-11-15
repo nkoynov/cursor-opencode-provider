@@ -231,6 +231,29 @@ describe("managed terminal supervisor", () => {
     expect(await waitDone(terminal)).toContain("exit_code: 0")
   })
 
+  it.each([
+    ["+o nomatch", "+o nomatch -c printf payload"],
+    ["+o nomatch; touch injected", "-c printf payload"],
+  ])("passes the adapter's shell options %j to the managed payload as plain option words", async (options, argv) => {
+    const shell = path.join(root, "zsh")
+    fs.writeFileSync(shell, `#!/bin/sh\nprintf '%s\\n' "$*" >"$0.argv"\nwhile [ "$1" != -c ]; do shift; done\nexec /bin/sh "$@"\n`, { mode: 0o700 })
+    const terminal = job("printf payload", { backgroundSpawn: true })
+    await launch(terminal, "/bin/sh", { ...process.env, CURSOR_SHELL_EXECUTABLE: shell, CURSOR_SHELL_OPTIONS: options })
+    expect(await waitDone(terminal)).toContain("payload")
+    expect(fs.readFileSync(`${shell}.argv`, "utf8")).toBe(`${argv}\n`)
+  })
+
+  it("keeps zsh's nomatch option for an unmatched glob in a managed payload", async () => {
+    const zsh = Bun.which("zsh")
+    // Without NixOS's /etc/zshenv, nixpkgs' built-in zshenv runs `emulate zsh`, which resets command-line options.
+    if (!zsh || Bun.spawnSync([zsh, "+o", "nomatch", "-c", "[[ -o nomatch ]]"]).exitCode !== 1) return
+    const terminal = job("print -r -- /nonexistent-cursor-glob-*", { backgroundSpawn: true, shellPath: zsh })
+    await launch(terminal, "/bin/sh", { ...process.env, CURSOR_SHELL_EXECUTABLE: zsh, CURSOR_SHELL_OPTIONS: "+o nomatch" })
+    const record = await waitDone(terminal)
+    expect(record).toContain("/nonexistent-cursor-glob-*\n")
+    expect(record).toContain("exit_code: 0")
+  })
+
   it("keeps aborted output readable when the collector and supervisor are terminated together", async () => {
     const terminal = job("printf preserved; sleep 30", { backgroundSpawn: true })
     const launched = await launch(terminal)

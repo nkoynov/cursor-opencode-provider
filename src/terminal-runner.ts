@@ -23,6 +23,20 @@ export const TIMEOUT_EXIT_CODE = 124
 export type ManagedTerminal = { command: string; directory: string; file: string; shellId: number }
 
 /**
+ * Set `shell` to the payload shell and `options` to the options the host
+ * passed before `-c` (OpenCode 2.2.7+ runs zsh with `+o nomatch`), both as the
+ * create-hook adapter exported them. Options are expanded unquoted, so only
+ * option words of a safe alphabet are kept.
+ */
+export function payloadShellLines(shell: string, options: string, fallback: string): string[] {
+  return [
+    `${shell}=${quote(fallback)}`, `${options}=`,
+    `if [ -n "$CURSOR_SHELL_EXECUTABLE" ]; then ${shell}="$CURSOR_SHELL_EXECUTABLE"; ${options}="\${CURSOR_SHELL_OPTIONS-}"; fi`,
+    `case $${options} in *[!A-Za-z0-9_+\\ -]*|[!+-]*) ${options}= ;; esac`,
+  ]
+}
+
+/**
  * Soft-background launcher tail: wait out Cursor's foreground window, then
  * return the finished result, a hard timeout, or the output so far plus a
  * background handle.
@@ -162,7 +176,7 @@ export function createManagedTerminal(policy: CursorShellPolicy, root: string): 
       // The supervisor holds the lifeline's only write end. Its exit, however
       // abrupt (KILL, OOM, crash), is EOF here and stops an unfinished group.
       'exec 3<"$job/lifeline" || exit 1',
-      '"$CURSOR_SHELL_EXECUTABLE" -c "$(cat "$job/command.sh")" 3<&- &', "payload=$!",
+      '"$CURSOR_SHELL_EXECUTABLE" $CURSOR_SHELL_OPTIONS -c "$(cat "$job/command.sh")" 3<&- &', "payload=$!",
       "(",
       "  trap '' TERM INT HUP",
       '  while read -r state; do [ "$state" != completed ] || exit 0; done <&3',
@@ -206,9 +220,8 @@ export function createManagedTerminal(policy: CursorShellPolicy, root: string): 
       `hard_seconds=${quote(String((policy.hardTimeoutMs ?? 0) / 1000))}`,
       `max_output=${MAX_RUNTIME_WRITE_BYTES}`,
       `runtime=${quote(process.execPath)}`,
-      `payload_shell=${quote(policy.shellPath ?? process.env.SHELL ?? "/bin/sh")}`,
-      '[ -z "$CURSOR_SHELL_EXECUTABLE" ] || payload_shell="$CURSOR_SHELL_EXECUTABLE"',
-      'export CURSOR_SHELL_EXECUTABLE="$payload_shell"',
+      ...payloadShellLines("payload_shell", "payload_options", policy.shellPath ?? process.env.SHELL ?? "/bin/sh"),
+      'export CURSOR_SHELL_EXECUTABLE="$payload_shell" CURSOR_SHELL_OPTIONS="$payload_options"',
     ].join("\n")
     fs.writeFileSync(path.join(directory, "runner.sh"), setup + "\n" + IS_OURS + "\n" + SUPERVISOR, { mode: 0o700 })
     const delimiter = commandDelimiter(policy.command)
