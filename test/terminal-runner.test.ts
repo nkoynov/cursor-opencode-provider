@@ -37,8 +37,8 @@ function job(command: string, overrides: Record<string, unknown> = {}) {
   jobs.push(terminal)
   return terminal
 }
-async function launch(terminal: ManagedTerminal, shell = "/bin/sh", env = process.env) {
-  const proc = Bun.spawn([shell, "-c", terminal.command], { env, stdout: "pipe", stderr: "pipe" })
+async function launch(terminal: ManagedTerminal, shell = "/bin/sh", env = process.env, args: string[] = []) {
+  const proc = Bun.spawn([shell, "-c", terminal.command, ...(args.length ? ["sh", ...args] : [])], { env, stdout: "pipe", stderr: "pipe" })
   const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited])
   return { stdout, stderr, code }
 }
@@ -229,6 +229,34 @@ describe("managed terminal supervisor", () => {
     const terminal = job(command, { shellPath })
     expect((await launch(terminal)).stdout).toContain("two")
     expect(await waitDone(terminal)).toContain("exit_code: 0")
+  })
+
+  it("passes the payload shell and options the launcher was given to the managed payload", async () => {
+    const shell = path.join(root, "zsh")
+    fs.writeFileSync(shell, `#!/bin/sh\nprintf '%s\\n' "$*" >"$0.argv"\nwhile [ "$1" != -c ]; do shift; done\nexec /bin/sh "$@"\n`, { mode: 0o700 })
+    const terminal = job("printf payload", { backgroundSpawn: true })
+    await launch(terminal, "/bin/sh", process.env, [shell, "+o", "nomatch"])
+    expect(await waitDone(terminal)).toContain("payload")
+    expect(fs.readFileSync(`${shell}.argv`, "utf8")).toBe("+o nomatch -c printf payload\n")
+  })
+
+  it("runs the approved managed payload unchanged under an inherited CURSOR_SHELL_EXECUTABLE", async () => {
+    const terminal = job('echo expected "[${CURSOR_SHELL_EXECUTABLE-unset}]"', { backgroundSpawn: true, shellPath: "/bin/sh" })
+    await launch(terminal, "/bin/sh", { ...process.env, CURSOR_SHELL_EXECUTABLE: "/bin/zsh-missing" })
+    const record = await waitDone(terminal)
+    expect(record).toContain("---\nexpected [unset]\n")
+    expect(record).toContain("exit_code: 0")
+  })
+
+  it("keeps zsh's nomatch option for an unmatched glob in a managed payload", async () => {
+    const zsh = Bun.which("zsh")
+    // Without NixOS's /etc/zshenv, nixpkgs' built-in zshenv runs `emulate zsh`, which resets command-line options.
+    if (!zsh || Bun.spawnSync([zsh, "+o", "nomatch", "-c", "[[ -o nomatch ]]"]).exitCode !== 1) return
+    const terminal = job("print -r -- /nonexistent-cursor-glob-*", { backgroundSpawn: true, shellPath: zsh })
+    await launch(terminal, "/bin/sh", process.env, [zsh, "+o", "nomatch"])
+    const record = await waitDone(terminal)
+    expect(record).toContain("/nonexistent-cursor-glob-*\n")
+    expect(record).toContain("exit_code: 0")
   })
 
   it("keeps aborted output readable when the collector and supervisor are terminated together", async () => {

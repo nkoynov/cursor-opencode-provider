@@ -329,7 +329,7 @@ describe("Cursor shell timeout translation", () => {
     const wrapperMatch = injector.match(/exec \/bin\/sh '([^']+)'/)
     expect(wrapperMatch?.[1]).toBeString()
     const wrapper = readFileSync(wrapperMatch![1]!, "utf8")
-    expect(wrapper).toContain("nohup \"$cursor_payload_shell\" -c 'zig translate-c /tmp/tiny.c -lc'")
+    expect(wrapper).toContain("nohup \"$cursor_payload_shell\" \"$@\" -c 'zig translate-c /tmp/tiny.c -lc'")
     expect(wrapper).toContain("__CURSOR_BACKGROUND_SHELL__")
     expect(wrapper).toContain("</dev/null &")
     expect(buildBackgroundShellCommand("echo hi")).toContain("__CURSOR_BACKGROUND_SHELL__")
@@ -550,6 +550,148 @@ describe("prepareCursorShellCreate correlation", () => {
     expect(matched.shell).not.toBe("/bin/sh")
     expect(path.basename(matched.shell)).toBe("sh")
     releaseCursorShellEnv(id)
+  })
+
+  const sentinels = {
+    cursor_flag: "keep-flag", cursor_command: "keep-command", cursor_arg: "keep-arg", cursor_seen: "keep-seen",
+    cursor_words: "keep-words", cursor_name: "keep-name", cursor_key: "keep-key",
+    CURSOR_SHELL_EXECUTABLE: "/bin/sh",
+  }
+  const sentinelLines = (prefix: string) =>
+    Object.entries(sentinels).filter(([key]) => key.startsWith(prefix)).map(([key, value]) => `${key}=${value}`)
+  // A host shell that records its argv and the adapter's variable names, then says how it ran.
+  const recordingShell = (file: string) => {
+    writeFileSync(file, [
+      "#!/bin/sh",
+      `{ printf '%s\\n' "$*"; env | grep -E '^(cursor_[a-z]+|CURSOR_SHELL_[A-Z]+)=' | sort; } >"$0.record.tmp"`,
+      `mv "$0.record.tmp" "$0.record"`,
+      "echo unwrapped", "",
+    ].join("\n"), { mode: 0o700 })
+    return `${file}.record`
+  }
+  async function readWhenWritten(file: string): Promise<string> {
+    for (let i = 0; i < 120 && !(existsSync(file) && readFileSync(file, "utf8").endsWith("\n")); i++) await Bun.sleep(25)
+    return readFileSync(file, "utf8")
+  }
+
+  it.each([
+    ["bash", ["-c", "echo adapted"], ""],
+    ["zsh", ["+o", "nomatch", "-c", "echo adapted"], "+o nomatch"],
+    ["bash", ["-e", "-o", "pipefail", "-c", "echo adapted"], "-e -o pipefail"],
+    ["zsh", ["+o", "nomatch", "-c", "echo rewritten"], undefined],
+    ["zsh", ["script.zsh", "-c", "echo adapted"], undefined],
+    ["zsh", ["-l", "-c", "echo adapted"], undefined],
+    ["zsh", ["-s", "-c", "echo adapted"], undefined],
+    ["zsh", ["-f", "-c", "echo adapted"], undefined],
+    ["zsh", ["-o", "login", "-c", "echo adapted"], undefined],
+    ["zsh", ["+o", "NO_RCS", "-c", "echo adapted"], undefined],
+    ["zsh", ["-o", "-c", "echo adapted"], undefined],
+    ["bash", ["-c", "printf", "-c", "echo adapted"], undefined],
+  ])("the %s adapter wraps %j only with options that leave the command alone, and changes no inherited name", async (name, args, options) => {
+    const base = mkdtempSync(path.join(tmpdir(), "cursor-shell-args-"))
+    try {
+      const host = path.join(base, name)
+      const record = recordingShell(host)
+      const id = `cursor_args_${name}`
+      registerCursorShellCall(id, { background_shell_spawn: true, command: "echo adapted", working_directory: base })
+      prepareCursorShellArgs(id, { command: "echo adapted" }, { deferToShellHook: true })
+      const event = { command: "echo adapted", cwd: base, timeout: 0, shell: host, env: {} as Record<string, string | undefined> }
+      prepareCursorShellCreate(event)
+      expect(event.shell).not.toBe(host)
+      const stdout = Bun.spawnSync([event.shell, ...args], { env: { ...process.env, ...sentinels }, stdout: "pipe", stderr: "pipe" }).stdout.toString()
+      const recorded = await readWhenWritten(record)
+      if (options !== undefined) {
+        expect(stdout).not.toContain("unwrapped")
+        await reapBackgroundSpawn(stdout)
+        // The payload gets the host's options and none of the provider's names.
+        expect(recorded.split("\n").sort()).toEqual(["", `${options}${options ? " " : ""}-c echo adapted`, ...sentinelLines("cursor_")].sort())
+      } else {
+        expect(stdout).toBe("unwrapped\n")
+        expect(recorded.split("\n").sort()).toEqual(["", args.join(" "), ...sentinelLines("")].sort())
+      }
+      releaseCursorShellEnv(id)
+    } finally {
+      rmSync(base, { recursive: true, force: true })
+    }
+  })
+
+  it("runs the host shell unwrapped when the adapter cannot check an option name", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "cursor-shell-tr-"))
+    try {
+      const host = path.join(base, "zsh")
+      const record = recordingShell(host)
+      const broken = path.join(base, "bin")
+      mkdirSync(broken)
+      writeFileSync(path.join(broken, "tr"), "#!/bin/sh\nexit 1\n", { mode: 0o700 })
+      const id = "cursor_args_tr"
+      registerCursorShellCall(id, { background_shell_spawn: true, command: "echo adapted", working_directory: base })
+      prepareCursorShellArgs(id, { command: "echo adapted" }, { deferToShellHook: true })
+      const event = { command: "echo adapted", cwd: base, timeout: 0, shell: host, env: {} as Record<string, string | undefined> }
+      prepareCursorShellCreate(event)
+      const args = ["-o", "interactive", "-c", "echo adapted"]
+      const env = { ...process.env, PATH: `${broken}${path.delimiter}${process.env.PATH}` }
+      const stdout = Bun.spawnSync([event.shell, ...args], { env, stdout: "pipe", stderr: "pipe" }).stdout.toString()
+      expect(stdout).toBe("unwrapped\n")
+      expect((await readWhenWritten(record)).split("\n")[0]).toBe(args.join(" "))
+      releaseCursorShellEnv(id)
+    } finally {
+      rmSync(base, { recursive: true, force: true })
+    }
+  })
+
+  it("background wrappers take the payload shell and its options from their own arguments", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "cursor-shell-payload-"))
+    try {
+      const shell = path.join(base, "zsh")
+      const record = recordingShell(shell)
+      const run = (wrapper: string) => Bun.spawnSync(["/bin/sh", "-c", wrapper, "sh", shell, "+o", "nomatch"], { stdout: "pipe" }).stdout.toString()
+      const spawned = run(buildBackgroundShellCommand("echo payload", "/bin/sh"))
+      expect((await readWhenWritten(record)).split("\n")[0]).toBe("+o nomatch -c echo payload")
+      await reapBackgroundSpawn(spawned)
+      rmSync(record)
+      const policy = { command: "echo payload", workingDirectory: base, timeoutMs: 2000, timeoutBehavior: CURSOR_TIMEOUT_BACKGROUND, shellPath: "/bin/sh" }
+      expect(run(buildSoftBackgroundCommand(policy))).toBe("unwrapped\n\n__CURSOR_SHELL_EXIT__0\n")
+      expect(readFileSync(record, "utf8").split("\n")[0]).toBe("+o nomatch -c echo payload")
+    } finally {
+      rmSync(base, { recursive: true, force: true })
+    }
+  })
+
+  it.each(["background", "soft-background"])("the %s wrapper runs the approved payload unchanged under an inherited CURSOR_SHELL_EXECUTABLE", async kind => {
+    const env = { ...process.env, CURSOR_SHELL_EXECUTABLE: "/bin/zsh-missing" }
+    const command = 'echo expected "[${CURSOR_SHELL_EXECUTABLE-unset}]"'
+    if (kind === "background") {
+      const stdout = Bun.spawnSync(["/bin/sh", "-c", buildBackgroundShellCommand(command, "/bin/sh")], { env, stdout: "pipe" }).stdout.toString()
+      const log = /__CURSOR_BACKGROUND_SHELL__\d+:([^\r\n]+)/.exec(stdout)![1]!
+      expect(await readWhenWritten(log)).toBe("expected [unset]\n")
+      await reapBackgroundSpawn(stdout)
+    } else {
+      const policy = { command, workingDirectory: tmpdir(), timeoutMs: 2000, timeoutBehavior: CURSOR_TIMEOUT_BACKGROUND, shellPath: "/bin/sh" }
+      const stdout = Bun.spawnSync(["/bin/sh", "-c", buildSoftBackgroundCommand(policy)], { env, stdout: "pipe" }).stdout.toString()
+      expect(stdout).toBe("expected [unset]\n\n__CURSOR_SHELL_EXIT__0\n")
+    }
+  })
+
+  const zsh = Bun.which("zsh")
+  // Without NixOS's /etc/zshenv, nixpkgs' built-in zshenv runs `emulate zsh`, which resets command-line options.
+  const zshHonoursOptions = !!zsh && Bun.spawnSync([zsh, "+o", "nomatch", "-c", "[[ -o nomatch ]]"]).exitCode === 1
+  it.skipIf(!zshHonoursOptions)("a detached zsh payload keeps OpenCode's nomatch semantics for an unmatched glob", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "cursor-shell-zsh-"))
+    try {
+      const command = "print -r -- /nonexistent-cursor-glob-*"
+      const id = "cursor_zsh_nomatch"
+      registerCursorShellCall(id, { background_shell_spawn: true, command, working_directory: base })
+      prepareCursorShellArgs(id, { command }, { deferToShellHook: true })
+      const event = { command, cwd: base, timeout: 0, shell: zsh!, env: {} as Record<string, string | undefined> }
+      prepareCursorShellCreate(event)
+      const stdout = Bun.spawnSync([event.shell, "+o", "nomatch", "-c", command], { stdout: "pipe" }).stdout.toString()
+      const log = /__CURSOR_BACKGROUND_SHELL__\d+:([^\r\n]+)/.exec(stdout)![1]!
+      expect(await readWhenWritten(log)).toBe("/nonexistent-cursor-glob-*\n")
+      await reapBackgroundSpawn(stdout)
+      releaseCursorShellEnv(id)
+    } finally {
+      rmSync(base, { recursive: true, force: true })
+    }
   })
 
   it("uses the working directory to disambiguate identical commands", () => {
