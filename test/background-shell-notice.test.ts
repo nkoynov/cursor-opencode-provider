@@ -449,6 +449,60 @@ describe("background shell notices", () => {
     expect(calls).toBe(2)
   })
 
+  test("a post that fails after its session was deleted, or after a newer watch of the record, is not retried", async () => {
+    for (const replace of [false, true]) {
+      resetBackgroundShellNotices({ manualPolling: true })
+      let calls = 0
+      let reject!: (error: Error) => void
+      const pending = async () => {
+        calls++
+        if (calls === 1) await new Promise((_, fail) => { reject = fail })
+      }
+      registerBackgroundShellNotifier(pending)
+      const file = terminalFile(LIVE_PID, { status: "succeeded" })
+      watchBackgroundShell({ sessionID: "ses_a", shellId: SHELL_ID, pid: LIVE_PID, file, command: "x", notifier: pending, now: 0 })
+      noteSessionExecution("ses_a", "succeeded")
+      pollBackgroundShells(1000)
+      if (replace) watchBackgroundShell({ sessionID: "ses_a", shellId: SHELL_ID, pid: LIVE_PID, file: terminalFile(LIVE_PID), command: "y", notifier: pending, now: 1500 })
+      else forgetBackgroundShells("ses_a")
+      reject(new Error("gone"))
+      await Bun.sleep(0)
+      noteSessionExecution("ses_a", "succeeded")
+      pollBackgroundShells(2000)
+      await Bun.sleep(0)
+      expect({ replace, calls }).toEqual({ replace, calls: 1 })
+    }
+  })
+
+  test("a session's turn starting while its note posts is still seen", async () => {
+    resetBackgroundShellNotices({ manualPolling: true })
+    let reject!: (error: Error) => void
+    const posted: BackgroundShellNote[] = []
+    let first = true
+    const flaky = async (note: BackgroundShellNote) => {
+      if (first) { first = false; await new Promise((_, fail) => { reject = fail }) }
+      posted.push(note)
+    }
+    registerBackgroundShellNotifier(flaky)
+    const file = terminalFile(LIVE_PID)
+    watchBackgroundShell({ sessionID: "ses_a", shellId: SHELL_ID, pid: LIVE_PID, file, command: "x", notifier: flaky, now: 0 })
+    noteAgentShellCommand("ses_a", "call_kill", "fuser -k 8000/tcp", 1000)
+    terminalFile(LIVE_PID, { status: "failed", exitCode: 143 })
+    noteSessionExecution("ses_a", "succeeded")
+    pollBackgroundShells(1500)
+    noteSessionExecution("ses_a", "started")
+    reject(new Error("busy"))
+    await Bun.sleep(0)
+    pollBackgroundShells(2500)
+    await Bun.sleep(0)
+    expect(posted).toEqual([])
+    noteSessionExecution("ses_a", "succeeded")
+    pollBackgroundShells(3500)
+    await Bun.sleep(0)
+    expect(posted).toHaveLength(1)
+    expect(posted[0]!.resume).toBe(false)
+  })
+
   test("a retried post keeps the stopped shell's resume: false", async () => {
     resetBackgroundShellNotices({ manualPolling: true })
     const posted: BackgroundShellNote[] = []
@@ -509,6 +563,12 @@ describe("shells the agent stopped itself", () => {
     expect(parseKillCommand("pkill -f 'a|b'")?.names[0]?.pattern).toBe("a|b")
     expect(parseKillCommand("pkill -s 12 web")).toMatchObject({ names: [], unresolved: true })
     expect(parseKillCommand("pkill -U bob web")).toMatchObject({ names: [], unresolved: true })
+    for (const command of ["pkill -P123 node", "pkill --parent=123 node", "pkill -n node", "pkill -v node", "pkill 'node[0-9]'", "killall -u bob node", "killall -i node", "killall -o 5m node"]) {
+      expect({ command, parsed: parseKillCommand(command) }).toMatchObject({ command, parsed: { names: [], unresolved: true } })
+    }
+    expect(parseKillCommand("pkill -q 7 web")?.names.map((name) => name.pattern)).toEqual(["web"])
+    expect(parseKillCommand("killall -e a-very-long-server-name")?.names[0]?.exact).toBe(true)
+    expect(parseKillCommand("killall -r 'node|deno'")?.names[0]).toMatchObject({ pattern: "node|deno", regex: true })
     expect(parseKillCommand("pkill web")?.unresolved).toBe(false)
   })
 
@@ -516,7 +576,8 @@ describe("shells the agent stopped itself", () => {
     for (const command of [
       "command -v kill", "command -V pkill", "type kill", "which killall", "kill -l", "kill -L", "kill --list", "kill --help",
       "pkill --help", "killall --version", "fuser -l", "kill -0 4242", "kill -s 0 4242 && echo up", "kill -s SIG0 4242",
-      "kill --signal=SIG0 4242", "kill --signal 0 4242", "kill -SIG0 4242", "kill -n 0 4242", "pkill -0 server",
+      "kill --signal=SIG0 4242", "kill --signal 0 4242", "kill -SIG0 4242", "kill -n 0 4242", "kill -s0 4242", "kill -n0 4242",
+      "kill -sSIG0 4242", "killall -s0 node", "fuser -k -0 8000/tcp", "pkill -0 server",
       "pkill --signal=0 server", "killall -s 0 node", "killall -SIG0 node", "fuser 8000/tcp", "echo kill 4242",
       "git commit -m 'kill the server'", "touch demo.stop",
     ]) {
@@ -532,6 +593,15 @@ describe("shells the agent stopped itself", () => {
     expect(leading("kill $(cat /tmp/server.pid)")).toBe(true)
     expect(leading("sleep 60; pkill \"$NAME\"")).toBe(false)
     expect(leading("curl -s localhost:8000 && fuser -k 8000/tcp")).toBe(false)
+    expect(leading("false && kill 4242")).toBe(false)
+    expect(parseKillCommand("fuser --kill 8000/tcp")).toMatchObject({ unresolved: true, leading: true })
+  })
+
+  test("only kills that run right away bring their targets", () => {
+    expect(parseKillCommand("kill 4242; sleep 60; kill 4343")).toMatchObject({ pids: [4242], unresolved: false })
+    expect(parseKillCommand("pkill web; sleep 60; fuser -k 8000/tcp")).toMatchObject({ names: [{ pattern: "web" }], unresolved: false })
+    expect(parseKillCommand("sleep 60; kill 4242")).toMatchObject({ pids: [], names: [], unresolved: false, leading: false })
+    expect(parseKillCommand("cat <<EOF\nkill 4242\nEOF")).toBeUndefined()
   })
 
   test.skipIf(process.platform !== "linux")("a pkill whose name matches one of the shell's processes is the agent's stop", () => {
@@ -550,7 +620,7 @@ describe("shells the agent stopped itself", () => {
     const file = terminalFile(LIVE_PID)
     watch(LIVE_PID, file)
     noteAgentShellCommand("ses_a", "call_other", "pkill qkzz-no-such-process", 900)
-    noteAgentShellCommand("ses_a", "call_kill", `sleep 2; pkill ${name}`, 1000)
+    noteAgentShellCommand("ses_a", "call_kill", `pkill ${name}; sleep 2`, 1000)
     terminalFile(LIVE_PID, { status: "succeeded", exitCode: 0 })
     pollBackgroundShells(1500)
     noteAgentShellCommandEnded("call_kill", 3000)
@@ -610,17 +680,24 @@ describe("shells the agent stopped itself", () => {
     expect(notes[0]!.resume).toBeUndefined()
   })
 
-  test.skipIf(process.platform !== "linux")("in a compound command, a kill by pid counts from when the command ends", () => {
-    const file = terminalFile(LIVE_PID)
-    watch(LIVE_PID, file)
-    noteAgentShellCommand("ses_a", "call_kill", `sleep 60; kill ${payload()}`, 1000)
-    terminalFile(LIVE_PID, { status: "failed", exitCode: 143 })
-    pollBackgroundShells(61_000)
-    noteAgentShellCommandEnded("call_kill", 61_100)
-    noteSessionExecution("ses_a", "succeeded")
-    pollBackgroundShells(62_000)
-    expect(notes).toHaveLength(1)
-    expect(notes[0]!.resume).toBe(false)
+  test.skipIf(process.platform !== "linux")("a kill by pid counts while its command still runs, but not behind a slow or guarded command", () => {
+    for (const [command, stopped] of [
+      [`kill ${payload()}; sleep 60`, true],
+      [`sleep 60; kill ${payload()}`, false],
+      [`false && kill ${payload()}`, false],
+      [`cat > notes.txt <<'EOF'\nkill ${payload()}\nEOF`, false],
+    ] as const) {
+      notes.length = 0
+      const file = terminalFile(LIVE_PID)
+      watch(LIVE_PID, file)
+      noteAgentShellCommand("ses_a", `call_${command}`, command, 1000)
+      terminalFile(LIVE_PID, { status: "failed", exitCode: 143 })
+      pollBackgroundShells(45_000)
+      noteAgentShellCommandEnded(`call_${command}`, 61_000)
+      noteSessionExecution("ses_a", "succeeded")
+      pollBackgroundShells(62_000)
+      expect({ command, resume: notes[0]?.resume }).toEqual({ command, resume: stopped ? false : undefined })
+    }
   })
 
   test("a death by signal right after a kill without pids is the agent's stop", () => {

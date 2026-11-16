@@ -39,6 +39,7 @@ type WatchedShell = {
   targetedBy?: string
   targetedUntil?: number
   stoppedByAgent?: boolean
+  posting?: boolean
   retried?: boolean
 }
 
@@ -183,9 +184,8 @@ export function noteAgentShellCommand(sessionID: string, executionID: string, co
     watch.targetedUntil = undefined
     trace(`background shell: shell=${watch.shellId} named by kill command execution=${executionID}`)
   }
-  // A target that can't be resolved (`pkill "$NAME"`, `fuser -k PORT/tcp`, `xargs kill`) counts only when nothing
-  // runs before the kill that could outlast an unrelated shell's end.
-  if (!kill.unresolved || !kill.leading) return
+  // A target that can't be resolved (`pkill "$NAME"`, `fuser -k PORT/tcp`, `xargs kill`) falls back to timing.
+  if (!kill.unresolved) return
   const kills = state.kills ??= new Map()
   kills.set(executionID, { sessionID, startedAt: now })
   while (kills.size > MAX_KILLS) kills.delete(kills.keys().next().value!)
@@ -210,7 +210,8 @@ export function forgetBackgroundShells(sessionID: string): void {
 }
 
 export function pollBackgroundShells(now = Date.now()): void {
-  for (const [file, watch] of state.watches) {
+  for (const watch of state.watches.values()) {
+    if (watch.posting) continue
     if (!watch.end) probe(watch, now)
     if (!watch.end) continue
     if (!watch.observed) {
@@ -220,9 +221,9 @@ export function pollBackgroundShells(now = Date.now()): void {
       const notifier = state.notifiers.has(watch.notifier) ? watch.notifier : state.notifiers.values().next().value
       if (!notifier) continue
       post(notifier, watch, stopped)
+      continue
     }
-    state.watches.delete(file)
-    if (![...state.watches.values()].some((other) => other.sessionID === watch.sessionID)) state.sessions.delete(watch.sessionID)
+    unwatch(watch)
   }
   for (const [id, kill] of state.kills ?? []) {
     if (now - kill.startedAt > KILL_SETTLE_MS + POLL_INTERVAL_MS) state.kills!.delete(id)
@@ -328,7 +329,13 @@ const QUICK_PROGRAMS = new Set([
   "head", "tail", "cut", "tr", "sort", "uniq", "test", "[", "kill", "pkill", "killall", "fuser", "xargs",
 ])
 const NOT_A_KILL = new Set(["-l", "-L", "--list", "--table", "--help", "--version", "-V"])
-const PKILL_FILTERS = new Set(["-g", "-G", "-P", "-s", "-t", "-u", "-U", "-F", "--pidfile", "--session", "--terminal", "--ns", "--nslist", "--parent", "--pgroup", "--group", "--euid", "--uid", "-v", "--inverse"])
+// Options whose meaning for which processes match is implemented here; any other option leaves the name unresolved.
+const NAME_FLAGS: Record<"pkill" | "killall", { flags: string; long: string[]; withValue: string[] }> = {
+  pkill: { flags: "efixA", long: ["--echo", "--full", "--ignore-case", "--exact", "--ignore-ancestors"], withValue: ["-q", "--queue"] },
+  killall: { flags: "eIqvwgr", long: ["--exact", "--ignore-case", "--quiet", "--verbose", "--wait", "--process-group", "--regexp"], withValue: [] },
+}
+// Patterns made only of characters that mean the same in a POSIX extended regex and a JavaScript one.
+const PORTABLE_PATTERN = /^[\w./ :=@,+^$|*?()-]+$/
 
 export type KillName = { program: "pkill" | "killall"; pattern: string; full: boolean; exact: boolean; regex: boolean; ignoreCase: boolean }
 export type ParsedKill = { pids: number[]; names: KillName[]; unresolved: boolean; leading: boolean }
@@ -363,10 +370,25 @@ function normalSignal(text: string): string {
   return text.toUpperCase().replace(/^SIG/, "")
 }
 
+const SIGNAL_NAMES = new Set([
+  "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "IOT", "BUS", "FPE", "KILL", "USR1", "SEGV", "USR2", "PIPE", "ALRM", "TERM",
+  "STKFLT", "CHLD", "CLD", "CONT", "STOP", "TSTP", "TTIN", "TTOU", "URG", "XCPU", "XFSZ", "VTALRM", "PROF", "WINCH", "IO",
+  "POLL", "PWR", "SYS",
+])
+
+/** `-9`, `-TERM`, `-SIGKILL`, `-RTMIN+2`: an option that names a signal, so not a pkill or killall flag like `-P123`. */
+function signalOption(text: string): string | undefined {
+  const name = /^-(\d+|[A-Z][A-Z0-9+-]*)$/.exec(text)?.[1]
+  if (name === undefined) return undefined
+  const normal = normalSignal(name)
+  return /^\d+$/.test(normal) || SIGNAL_NAMES.has(normal) || /^RTM(?:IN|AX)(?:[+-]\d+)?$/.test(normal) ? name : undefined
+}
+
 /**
- * A command that runs kill, pkill, killall or `fuser -k` with a real signal: the pids kill names (process groups by
- * their leader), the names pkill and killall match, whether any target can't be resolved, and whether the kill runs
- * before anything that takes time.
+ * A command that runs kill, pkill, killall or `fuser -k` with a real signal. Only kills that run right away count
+ * (nothing but quick commands before them): the pids kill names (process groups by their leader), the names pkill
+ * and killall match, and whether one of their targets can't be resolved. `leading` says whether the first kill ran
+ * right away.
  */
 export function parseKillCommand(command: string): ParsedKill | undefined {
   const parsed: ParsedKill = { pids: [], names: [], unresolved: false, leading: true }
@@ -374,10 +396,20 @@ export function parseKillCommand(command: string): ParsedKill | undefined {
   let quickSoFar = true
   for (const segment of shellSegments(command)) {
     const run = commandWords(segment)
-    const isKill = run !== undefined && KILL_PROGRAMS.has(run.program) && parseKillSegment(run.program, run.args, run.viaXargs, parsed)
-    if (isKill && !found) parsed.leading = quickSoFar
-    found ||= isKill
-    if (run && !QUICK_PROGRAMS.has(run.program)) quickSoFar = false
+    const kill: ParsedKill = { pids: [], names: [], unresolved: false, leading: quickSoFar }
+    const isKill = run !== undefined && KILL_PROGRAMS.has(run.program) && parseKillSegment(run.program, run.args, run.viaXargs, kill)
+    if (isKill) {
+      if (!found) parsed.leading = quickSoFar
+      found = true
+      if (quickSoFar) {
+        parsed.pids.push(...kill.pids)
+        parsed.names.push(...kill.names)
+        parsed.unresolved ||= kill.unresolved
+      }
+    }
+    // A heredoc's lines are data, and nothing after a guard is known to run.
+    if (segment.some((word) => word.text.startsWith("<<"))) break
+    if (!run || !QUICK_PROGRAMS.has(run.program)) quickSoFar = false
   }
   return found ? parsed : undefined
 }
@@ -386,16 +418,16 @@ function parseKillSegment(program: string, args: Word[], viaXargs: boolean, pars
   const texts = args.map((arg) => arg.text)
   if (texts.some((text) => NOT_A_KILL.has(text))) return false
   if (program === "fuser") {
-    if (!texts.some((text) => /^-[a-zA-Z]*k/.test(text))) return false
-    const signal = texts.find((text) => /^-(\d+|[A-Z][A-Z0-9+-]*)$/.test(text))
-    if (signal && normalSignal(signal.slice(1)) === "0") return false
+    if (!texts.some((text) => /^-[a-zA-Z]*k/.test(text) || text === "--kill")) return false
+    if (texts.some((text) => signalOption(text) !== undefined && normalSignal(signalOption(text)!) === "0")) return false
     parsed.unresolved = true
     return true
   }
   let signal: string | undefined
   const operands: Word[] = []
-  let filtered = false
-  const name: Omit<KillName, "pattern"> = { program: program === "killall" ? "killall" : "pkill", full: false, exact: false, regex: program === "pkill", ignoreCase: false }
+  let resolvable = !viaXargs
+  const named = program === "killall" ? "killall" : "pkill"
+  const name: Omit<KillName, "pattern"> = { program: named, full: false, exact: false, regex: named === "pkill", ignoreCase: false }
   let rest = false
   for (let i = 0; i < args.length; i++) {
     const text = texts[i]!
@@ -406,36 +438,37 @@ function parseKillSegment(program: string, args: Word[], viaXargs: boolean, pars
       operands.push(args[i]!)
       continue
     }
-    if (text === "--signal") { signal = texts[++i]; continue }
+    if (text === "--signal") { signal = texts[++i] ?? ""; continue }
     if (text.startsWith("--signal=")) { signal = text.slice("--signal=".length); continue }
+    const short = /^-([sn])(.*)$/.exec(text)
+    if (short && (program === "kill" || (program === "killall" && short[1] === "s"))) {
+      signal = short[2] || (texts[++i] ?? "")
+      continue
+    }
     if (program === "kill") {
-      if (text === "-s" || text === "-n") signal = texts[++i]
       // Only a first `-N` / `-NAME` is a signal; kill's other options take no operand.
-      else if (i === 0 && /^-[A-Za-z0-9+-]+$/.test(text)) signal = text.slice(1)
+      if (i === 0 && /^-[A-Za-z0-9+-]+$/.test(text)) signal = text.slice(1)
       continue
     }
-    if (program === "killall" && text === "-s") { signal = texts[++i]; continue }
-    const killallFilters = ["-u", "--user", "-o", "-y", "--older-than", "--younger-than", "-n", "--ns"]
-    if (program === "pkill" ? PKILL_FILTERS.has(text) : killallFilters.includes(text)) {
-      filtered = true
-      if (!["-v", "--inverse"].includes(text)) i++
+    const signalName = signalOption(text)
+    if (signalName !== undefined) { signal = signalName; continue }
+    const options = NAME_FLAGS[named]
+    if (options.withValue.includes(text)) { i++; continue }
+    if (text.startsWith("--")) {
+      if (!options.long.includes(text)) resolvable = false
+      else if (text === "--full") name.full = true
+      else if (text === "--exact") name.exact = true
+      else if (text === "--ignore-case") name.ignoreCase = true
+      else if (text === "--regexp") name.regex = true
       continue
     }
-    // Signal names have two letters or more; `-I` and `-U` are options.
-    if (/^-(\d+|[A-Z][A-Z0-9+-]+)$/.test(text)) { signal = text.slice(1); continue }
-    if (!text.startsWith("--")) {
-      for (const flag of text.slice(1)) {
-        if (flag === "f" && program === "pkill") name.full = true
-        else if (flag === "x" && program === "pkill") name.exact = true
-        else if (flag === (program === "pkill" ? "i" : "I")) name.ignoreCase = true
-        else if (flag === "r" && program === "killall") name.regex = true
-        else if ((flag === "v" || flag === "n" || flag === "o") && program === "pkill") filtered = true
-      }
-    } else if (text === "--full") name.full = true
-    else if (text === "--exact") name.exact = true
-    else if (text === "--ignore-case") name.ignoreCase = true
-    else if (text === "--regexp") name.regex = true
-    else if (text === "--newest" || text === "--oldest") filtered = true
+    for (const flag of text.slice(1)) {
+      if (!options.flags.includes(flag)) resolvable = false
+      else if (flag === "f") name.full = true
+      else if (flag === "x" || (flag === "e" && named === "killall")) name.exact = true
+      else if (flag === "i" || flag === "I") name.ignoreCase = true
+      else if (flag === "r") name.regex = true
+    }
   }
   if (signal !== undefined && normalSignal(signal) === "0") return false
   if (viaXargs || operands.length === 0) parsed.unresolved = true
@@ -444,8 +477,9 @@ function parseKillSegment(program: string, args: Word[], viaXargs: boolean, pars
       const pid = Number(operand.text.replace(/^-/, ""))
       if (!operand.dynamic && /^-?\d+$/.test(operand.text) && Number.isSafeInteger(pid) && pid > 1) parsed.pids.push(pid)
       else parsed.unresolved = true
-    } else if (operand.dynamic || filtered) parsed.unresolved = true
-    else parsed.names.push({ ...name, pattern: operand.text })
+    } else if (resolvable && !operand.dynamic && (!name.regex || PORTABLE_PATTERN.test(operand.text))) {
+      parsed.names.push({ ...name, pattern: operand.text })
+    } else parsed.unresolved = true
   }
   return true
 }
@@ -457,7 +491,9 @@ function nameMatches(name: KillName, pid: number): boolean {
     if (name.program === "killall" && !name.regex) {
       const wanted = name.ignoreCase ? name.pattern.toLowerCase() : name.pattern
       const fold = (text: string) => name.ignoreCase ? text.toLowerCase() : text
-      return fold(comm) === wanted.slice(0, 15) || fold(basename(argv[0] ?? "")) === wanted
+      // killall compares names longer than comm's 15 bytes by their first 15 unless -e asks for all of it.
+      if (fold(basename(argv[0] ?? "")) === wanted) return true
+      return fold(comm) === (wanted.length > 15 && name.exact ? wanted : wanted.slice(0, 15))
     }
     const subject = name.full ? argv.join(" ") : comm
     const pattern = name.exact ? `^(?:${name.pattern})$` : name.pattern
@@ -533,15 +569,22 @@ function post(notifier: BackgroundShellNotifier, watch: WatchedShell, stopped = 
     `background shell: posting note shell=${watch.shellId} sessionID=${watch.sessionID} state=${end.state} ` +
       `exit=${end.exitCode ?? "-"} resume=${note.resume ?? true} stoppedByAgent=${stopped}`,
   )
-  notifier(note).catch((error: unknown) => {
+  // The watch stays until the post settles, so a deleted session or a newer watch of the record wins over a retry.
+  watch.posting = true
+  notifier(note).then(() => unwatch(watch), (error: unknown) => {
     trace(`background shell: note for shell=${watch.shellId} failed: ${error instanceof Error ? error.message : String(error)}`)
-    if (watch.retried || state.watches.has(watch.file)) return
+    watch.posting = false
     // Once more on the next poll: a note held through a turn has no other copy.
+    if (watch.retried) unwatch(watch)
     watch.retried = true
-    state.watches.set(watch.file, watch)
-    if (session && !state.sessions.has(watch.sessionID)) state.sessions.set(watch.sessionID, session)
-    ensureTimer()
   })
+}
+
+function unwatch(watch: WatchedShell): void {
+  if (state.watches.get(watch.file) !== watch) return
+  state.watches.delete(watch.file)
+  if (![...state.watches.values()].some((other) => other.sessionID === watch.sessionID)) state.sessions.delete(watch.sessionID)
+  if (state.watches.size === 0) stopTimer()
 }
 
 function probe(watch: WatchedShell, now: number): void {
