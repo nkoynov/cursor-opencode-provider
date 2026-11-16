@@ -1,4 +1,4 @@
-import { closeSync, fstatSync, openSync, readFileSync, readSync, constants } from "node:fs"
+import { closeSync, fstatSync, openSync, readdirSync, readFileSync, readSync, constants } from "node:fs"
 import { basename, resolve } from "node:path"
 import { trace } from "./debug.js"
 
@@ -36,7 +36,10 @@ type WatchedShell = {
   observed?: boolean
   /** When a kill command of its session named one of its processes. */
   targetedAt?: number
+  targetedBy?: string
+  targetedUntil?: number
   stoppedByAgent?: boolean
+  retried?: boolean
 }
 
 type SessionState = { busy: boolean; stopped?: boolean }
@@ -160,28 +163,40 @@ export function noteSessionExecution(sessionID: string, event: "started" | "succ
 }
 
 /**
- * Call before a session's shell command runs. A kill command's pids are matched while their
+ * Call before a session's shell command runs. A kill command's targets are matched while their
  * processes still exist, so a watched shell they belong to is known to be the agent's own stop.
  */
 export function noteAgentShellCommand(sessionID: string, executionID: string, command: string, now = Date.now()): void {
-  if (!sessionID || !executionID || state.watches.size === 0) return
+  if (!sessionID || !executionID) return
+  const watches = [...state.watches.values()].filter((watch) => watch.sessionID === sessionID && !watch.end)
+  if (watches.length === 0) return
   const kill = parseKillCommand(command)
   if (!kill) return
+  const table = kill.names.length > 0 ? processTable() : undefined
+  const stat = table ? (pid: number) => table.get(pid) : procStat
+  for (const watch of watches) {
+    const named = kill.pids.some((pid) => descendsFrom(pid, watch.pid, stat))
+      || (table !== undefined && kill.names.some((name) => [...table.keys()].some((pid) => descendsFrom(pid, watch.pid, stat) && nameMatches(name, pid))))
+    if (!named) continue
+    watch.targetedAt = now
+    watch.targetedBy = executionID
+    watch.targetedUntil = undefined
+    trace(`background shell: shell=${watch.shellId} named by kill command execution=${executionID}`)
+  }
+  // A target that can't be resolved (`pkill "$NAME"`, `fuser -k PORT/tcp`, `xargs kill`) counts only when nothing
+  // runs before the kill that could outlast an unrelated shell's end.
+  if (!kill.unresolved || !kill.leading) return
   const kills = state.kills ??= new Map()
   kills.set(executionID, { sessionID, startedAt: now })
   while (kills.size > MAX_KILLS) kills.delete(kills.keys().next().value!)
-  for (const watch of state.watches.values()) {
-    if (watch.sessionID !== sessionID || watch.end) continue
-    if (kill.pids.some((pid) => descendsFrom(pid, watch.pid))) {
-      watch.targetedAt = now
-      trace(`background shell: shell=${watch.shellId} named by kill command execution=${executionID}`)
-    }
-  }
 }
 
 export function noteAgentShellCommandEnded(executionID: string, now = Date.now()): void {
   const kill = state.kills?.get(executionID)
   if (kill) kill.endedAt = now
+  for (const watch of state.watches.values()) {
+    if (watch.targetedBy === executionID) watch.targetedUntil = now + TARGETED_STOP_MS
+  }
 }
 
 export function forgetBackgroundShells(sessionID: string): void {
@@ -210,7 +225,7 @@ export function pollBackgroundShells(now = Date.now()): void {
     if (![...state.watches.values()].some((other) => other.sessionID === watch.sessionID)) state.sessions.delete(watch.sessionID)
   }
   for (const [id, kill] of state.kills ?? []) {
-    if (kill.endedAt !== undefined && now - kill.endedAt > TARGETED_STOP_MS) state.kills!.delete(id)
+    if (now - kill.startedAt > KILL_SETTLE_MS + POLL_INTERVAL_MS) state.kills!.delete(id)
   }
   if (state.watches.size === 0) stopTimer()
 }
@@ -231,11 +246,11 @@ function holdNote(watch: WatchedShell, now: number, stopped: boolean): boolean {
 function stoppedByAgent(watch: WatchedShell): boolean {
   const seen = watch.endSeenAt
   if (seen === undefined) return false
-  if (watch.targetedAt !== undefined && seen >= watch.targetedAt && seen - watch.targetedAt <= TARGETED_STOP_MS) return true
+  if (watch.targetedAt !== undefined && seen >= watch.targetedAt
+    && seen <= (watch.targetedUntil ?? watch.targetedAt + STOPPED_HOLD_MS)) return true
   if (!endedBySignal(watch.end!)) return false
   for (const kill of state.kills?.values() ?? []) {
-    if (kill.sessionID !== watch.sessionID || seen < kill.startedAt) continue
-    if (seen - (kill.endedAt ?? kill.startedAt) <= KILL_SETTLE_MS) return true
+    if (kill.sessionID === watch.sessionID && seen >= kill.startedAt && seen - kill.startedAt <= KILL_SETTLE_MS) return true
   }
   return false
 }
@@ -244,45 +259,212 @@ function endedBySignal(end: ShellEnd): boolean {
   return end.exitCode !== undefined && end.exitCode > 128 && end.exitCode <= 128 + 64
 }
 
-const KILL_PROGRAMS = new Set(["kill", "pkill", "killall", "fuser"])
-const COMMAND_PREFIXES = new Set(["sudo", "command", "exec", "builtin", "nohup", "env", "xargs"])
-const SIGNAL_ZERO = /^-(?:0|SIG0|s0|-signal=0)$/i
+type Word = { text: string; dynamic: boolean }
 
-/** A command that runs kill, pkill, killall or `fuser -k`, with the pids kill names (process groups by their leader). */
-export function parseKillCommand(command: string): { pids: number[] } | undefined {
-  let found = false
-  const pids: number[] = []
-  for (const segment of command.split(/\$\(|[;&|\n()`{}]/)) {
-    const words = segment.trim().split(/\s+/).map((word) => word.replace(/^["']|["']$/g, "")).filter(Boolean)
-    // Prefixes and their options (`sudo -n`, `xargs -r`, `env -u X`) before the program.
-    while (words.length > 0) {
-      const word = words[0]!
-      if (COMMAND_PREFIXES.has(word.split("/").pop()!) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) words.shift()
-      else if (word.startsWith("-") && words.length > 1) words.splice(0, word === "-u" ? 2 : 1)
-      else break
+/** Words of each simple command; quotes are removed, and `dynamic` marks a `$` expansion outside single quotes. */
+function shellSegments(command: string): Word[][] {
+  const segments: Word[][] = [[]]
+  let word: Word | undefined
+  let quote: "'" | '"' | undefined
+  const endWord = () => {
+    if (word) segments.at(-1)!.push(word)
+    word = undefined
+  }
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i]!
+    if (quote === "'") {
+      if (c === "'") quote = undefined
+      else word!.text += c
+      continue
     }
-    const program = words[0]?.split("/").pop()
-    if (!program || !KILL_PROGRAMS.has(program)) continue
-    const args = words.slice(1)
-    if (program === "fuser" && !args.some((arg) => /^-[a-zA-Z]*k/.test(arg))) continue
-    // Signal 0 only tests whether the process exists.
-    if (args.some((arg, i) => SIGNAL_ZERO.test(arg) || ((arg === "-s" || arg === "-n" || arg === "--signal") && args[i + 1] === "0"))) continue
-    found = true
-    if (program !== "kill") continue
-    let operands = false
-    for (let i = 0; i < args.length; i++) {
-      const arg = args[i]!
-      if (!operands && arg === "--") { operands = true; continue }
-      if (!operands && (arg === "-s" || arg === "-n")) { i++; continue }
-      if (!operands && /^-/.test(arg) && !/^-\d+$/.test(arg)) continue
-      // A leading `-9` is a signal; a later `-123` is a process group.
-      if (!operands && i === 0 && /^-\d+$/.test(arg)) continue
-      operands = true
-      const pid = Number(arg.replace(/^-/, ""))
-      if (Number.isSafeInteger(pid) && pid > 1) pids.push(pid)
+    if (c === "\\" && i + 1 < command.length) {
+      word ??= { text: "", dynamic: false }
+      word.text += command[++i]
+      continue
+    }
+    if (quote === '"') {
+      if (c === '"') quote = undefined
+      else {
+        if (c === "$" || c === "`") word!.dynamic = true
+        word!.text += c
+      }
+      continue
+    }
+    if (c === "'" || c === '"') {
+      word ??= { text: "", dynamic: false }
+      quote = c
+    } else if (/\s/.test(c) && c !== "\n") {
+      endWord()
+    } else if (/[;&|\n()`{}]/.test(c)) {
+      endWord()
+      if (segments.at(-1)!.length > 0) segments.push([])
+    } else {
+      word ??= { text: "", dynamic: false }
+      if (c === "$") word.dynamic = true
+      word.text += c
     }
   }
-  return found ? { pids } : undefined
+  endWord()
+  return segments.filter((segment) => segment.length > 0)
+}
+
+type Prefix = { withValue: string[]; notRun?: string[]; positional?: number }
+const PREFIXES: Record<string, Prefix> = {
+  sudo: { withValue: ["-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-T"] },
+  env: { withValue: ["-u", "-C", "-S", "--unset", "--chdir"] },
+  command: { withValue: [], notRun: ["-v", "-V"] },
+  exec: { withValue: ["-a"] },
+  builtin: { withValue: [] },
+  nohup: { withValue: [] },
+  time: { withValue: ["-f", "-o"] },
+  nice: { withValue: ["-n"] },
+  timeout: { withValue: ["-s", "-k", "--signal", "--kill-after"], positional: 1 },
+  xargs: { withValue: ["-I", "-n", "-P", "-L", "-d", "-E", "-s", "-a", "--max-args", "--max-procs", "--delimiter", "--arg-file"] },
+}
+const KILL_PROGRAMS = new Set(["kill", "pkill", "killall", "fuser"])
+// Commands that may run before a kill without an end of their own that could be taken for the kill's doing.
+const QUICK_PROGRAMS = new Set([
+  "cd", "export", "set", "true", ":", "echo", "printf", "cat", "lsof", "pgrep", "ps", "ss", "grep", "awk", "sed",
+  "head", "tail", "cut", "tr", "sort", "uniq", "test", "[", "kill", "pkill", "killall", "fuser", "xargs",
+])
+const NOT_A_KILL = new Set(["-l", "-L", "--list", "--table", "--help", "--version", "-V"])
+const PKILL_FILTERS = new Set(["-g", "-G", "-P", "-s", "-t", "-u", "-U", "-F", "--pidfile", "--session", "--terminal", "--ns", "--nslist", "--parent", "--pgroup", "--group", "--euid", "--uid", "-v", "--inverse"])
+
+export type KillName = { program: "pkill" | "killall"; pattern: string; full: boolean; exact: boolean; regex: boolean; ignoreCase: boolean }
+export type ParsedKill = { pids: number[]; names: KillName[]; unresolved: boolean; leading: boolean }
+
+/** The program word of a simple command after its prefixes, or undefined when the command doesn't run it. */
+function commandWords(words: Word[]): { program: string; args: Word[]; viaXargs: boolean } | undefined {
+  let i = 0
+  let viaXargs = false
+  while (i < words.length) {
+    const text = words[i]!.text
+    const prefix = PREFIXES[text.split("/").pop()!]
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(text)) { i++; continue }
+    if (!prefix) break
+    if (text.endsWith("xargs")) viaXargs = true
+    i++
+    let positional = prefix.positional ?? 0
+    while (i < words.length) {
+      const option = words[i]!.text
+      if (prefix.notRun?.includes(option)) return undefined
+      if (option === "--") { i++; break }
+      if (option.startsWith("-") && option.length > 1) i += prefix.withValue.includes(option) ? 2 : 1
+      else if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(option) && text === "env") i++
+      else if (positional > 0) { positional--; i++ }
+      else break
+    }
+  }
+  const program = words[i]?.text.split("/").pop()
+  return program ? { program, args: words.slice(i + 1), viaXargs } : undefined
+}
+
+function normalSignal(text: string): string {
+  return text.toUpperCase().replace(/^SIG/, "")
+}
+
+/**
+ * A command that runs kill, pkill, killall or `fuser -k` with a real signal: the pids kill names (process groups by
+ * their leader), the names pkill and killall match, whether any target can't be resolved, and whether the kill runs
+ * before anything that takes time.
+ */
+export function parseKillCommand(command: string): ParsedKill | undefined {
+  const parsed: ParsedKill = { pids: [], names: [], unresolved: false, leading: true }
+  let found = false
+  let quickSoFar = true
+  for (const segment of shellSegments(command)) {
+    const run = commandWords(segment)
+    const isKill = run !== undefined && KILL_PROGRAMS.has(run.program) && parseKillSegment(run.program, run.args, run.viaXargs, parsed)
+    if (isKill && !found) parsed.leading = quickSoFar
+    found ||= isKill
+    if (run && !QUICK_PROGRAMS.has(run.program)) quickSoFar = false
+  }
+  return found ? parsed : undefined
+}
+
+function parseKillSegment(program: string, args: Word[], viaXargs: boolean, parsed: ParsedKill): boolean {
+  const texts = args.map((arg) => arg.text)
+  if (texts.some((text) => NOT_A_KILL.has(text))) return false
+  if (program === "fuser") {
+    if (!texts.some((text) => /^-[a-zA-Z]*k/.test(text))) return false
+    const signal = texts.find((text) => /^-(\d+|[A-Z][A-Z0-9+-]*)$/.test(text))
+    if (signal && normalSignal(signal.slice(1)) === "0") return false
+    parsed.unresolved = true
+    return true
+  }
+  let signal: string | undefined
+  const operands: Word[] = []
+  let filtered = false
+  const name: Omit<KillName, "pattern"> = { program: program === "killall" ? "killall" : "pkill", full: false, exact: false, regex: program === "pkill", ignoreCase: false }
+  let rest = false
+  for (let i = 0; i < args.length; i++) {
+    const text = texts[i]!
+    if (!rest && text === "--") { rest = true; continue }
+    // After `--`, an operand, or kill's signal, kill's `-123` is a process group.
+    if (rest || !text.startsWith("-") || text === "-" || (program === "kill" && i > 0 && /^-\d+$/.test(text))) {
+      rest = true
+      operands.push(args[i]!)
+      continue
+    }
+    if (text === "--signal") { signal = texts[++i]; continue }
+    if (text.startsWith("--signal=")) { signal = text.slice("--signal=".length); continue }
+    if (program === "kill") {
+      if (text === "-s" || text === "-n") signal = texts[++i]
+      // Only a first `-N` / `-NAME` is a signal; kill's other options take no operand.
+      else if (i === 0 && /^-[A-Za-z0-9+-]+$/.test(text)) signal = text.slice(1)
+      continue
+    }
+    if (program === "killall" && text === "-s") { signal = texts[++i]; continue }
+    const killallFilters = ["-u", "--user", "-o", "-y", "--older-than", "--younger-than", "-n", "--ns"]
+    if (program === "pkill" ? PKILL_FILTERS.has(text) : killallFilters.includes(text)) {
+      filtered = true
+      if (!["-v", "--inverse"].includes(text)) i++
+      continue
+    }
+    // Signal names have two letters or more; `-I` and `-U` are options.
+    if (/^-(\d+|[A-Z][A-Z0-9+-]+)$/.test(text)) { signal = text.slice(1); continue }
+    if (!text.startsWith("--")) {
+      for (const flag of text.slice(1)) {
+        if (flag === "f" && program === "pkill") name.full = true
+        else if (flag === "x" && program === "pkill") name.exact = true
+        else if (flag === (program === "pkill" ? "i" : "I")) name.ignoreCase = true
+        else if (flag === "r" && program === "killall") name.regex = true
+        else if ((flag === "v" || flag === "n" || flag === "o") && program === "pkill") filtered = true
+      }
+    } else if (text === "--full") name.full = true
+    else if (text === "--exact") name.exact = true
+    else if (text === "--ignore-case") name.ignoreCase = true
+    else if (text === "--regexp") name.regex = true
+    else if (text === "--newest" || text === "--oldest") filtered = true
+  }
+  if (signal !== undefined && normalSignal(signal) === "0") return false
+  if (viaXargs || operands.length === 0) parsed.unresolved = true
+  for (const operand of operands) {
+    if (program === "kill") {
+      const pid = Number(operand.text.replace(/^-/, ""))
+      if (!operand.dynamic && /^-?\d+$/.test(operand.text) && Number.isSafeInteger(pid) && pid > 1) parsed.pids.push(pid)
+      else parsed.unresolved = true
+    } else if (operand.dynamic || filtered) parsed.unresolved = true
+    else parsed.names.push({ ...name, pattern: operand.text })
+  }
+  return true
+}
+
+function nameMatches(name: KillName, pid: number): boolean {
+  try {
+    const comm = readFileSync(`/proc/${pid}/comm`, "utf8").replace(/\n$/, "")
+    const argv = name.full || name.program === "killall" ? readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean) : []
+    if (name.program === "killall" && !name.regex) {
+      const wanted = name.ignoreCase ? name.pattern.toLowerCase() : name.pattern
+      const fold = (text: string) => name.ignoreCase ? text.toLowerCase() : text
+      return fold(comm) === wanted.slice(0, 15) || fold(basename(argv[0] ?? "")) === wanted
+    }
+    const subject = name.full ? argv.join(" ") : comm
+    const pattern = name.exact ? `^(?:${name.pattern})$` : name.pattern
+    return new RegExp(pattern, name.ignoreCase ? "i" : "").test(subject)
+  } catch {
+    return false
+  }
 }
 
 type ProcStat = { ppid: number; pgrp: number; session: number }
@@ -297,18 +479,34 @@ function procStat(pid: number): ProcStat | undefined {
   }
 }
 
+function processTable(): Map<number, ProcStat> {
+  const table = new Map<number, ProcStat>()
+  let entries: string[] = []
+  try {
+    entries = readdirSync("/proc")
+  } catch {
+    return table
+  }
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue
+    const stat = procStat(Number(entry))
+    if (stat) table.set(Number(entry), stat)
+  }
+  return table
+}
+
 // Linux only: elsewhere no pid matches, and only a death by signal right after the kill counts.
-function descendsFrom(pid: number, ancestor: number): boolean {
-  const start = procStat(pid)
+function descendsFrom(pid: number, ancestor: number, stat: (pid: number) => ProcStat | undefined = procStat): boolean {
+  const start = stat(pid)
   if (!start) return false
   // A daemonized descendant's parent is init, but it keeps the payload's process group and session.
   for (const from of new Set([pid, start.pgrp, start.session])) {
     let current = from
     for (let depth = 0; depth < 64 && current > 1; depth++) {
       if (current === ancestor) return true
-      const stat = current === pid ? start : procStat(current)
-      if (!stat) break
-      current = stat.ppid
+      const next = current === pid ? start : stat(current)
+      if (!next) break
+      current = next.ppid
     }
   }
   return false
@@ -337,6 +535,12 @@ function post(notifier: BackgroundShellNotifier, watch: WatchedShell, stopped = 
   )
   notifier(note).catch((error: unknown) => {
     trace(`background shell: note for shell=${watch.shellId} failed: ${error instanceof Error ? error.message : String(error)}`)
+    if (watch.retried || state.watches.has(watch.file)) return
+    // Once more on the next poll: a note held through a turn has no other copy.
+    watch.retried = true
+    state.watches.set(watch.file, watch)
+    if (session && !state.sessions.has(watch.sessionID)) state.sessions.set(watch.sessionID, session)
+    ensureTimer()
   })
 }
 
