@@ -9,6 +9,7 @@ import {
   captureCursorShellResult,
   capturedCursorShellOutcome,
   cursorShellExitCode,
+  forgetCursorShellOutcome,
   registerCursorShellCall,
   resetCursorShellCalls,
   type CursorShellPolicy,
@@ -643,9 +644,9 @@ describe("shells the agent stopped itself", () => {
     watch(LIVE_PID, file)
     noteAgentShellCommand("ses_a", "call_other", "pkill qkzz-no-such-process", 900)
     noteAgentShellCommand("ses_a", "call_kill", `pkill ${name}; sleep 2`, 1000)
-    terminalFile(LIVE_PID, { status: "succeeded", exitCode: 0 })
+    terminalFile(LIVE_PID, { status: "failed", exitCode: 143 })
     pollBackgroundShells(1500)
-    noteAgentShellCommandEnded("call_kill", 3000)
+    noteAgentShellCommandEnded("call_kill", 3000, 0)
     noteSessionExecution("ses_a", "succeeded")
     pollBackgroundShells(3500)
     expect(notes).toHaveLength(1)
@@ -654,9 +655,17 @@ describe("shells the agent stopped itself", () => {
 
   test.skipIf(process.platform !== "linux")("killall matches a short name by the process name, not by an argv[0] alias", () => {
     const alias = `qk${process.pid % 100000}al`
-    const child = Bun.spawn({ cmd: ["sleep", "30"], argv0: alias })
+    // coreutils picks its program by argv[0], so a JavaScript runtime stands in for the server.
+    const child = Bun.spawn({ cmd: [process.execPath, "-e", "setTimeout(() => {}, 30000)"], argv0: alias })
     children.push(child)
-    Bun.sleepSync(100)
+    const deadline = Date.now() + 3000
+    while (Date.now() < deadline) {
+      try {
+        if (readFileSync(`/proc/${child.pid}/cmdline`, "utf8").startsWith(`${alias}\0`)) break
+      } catch { /* starting */ }
+      Bun.sleepSync(20)
+    }
+    expect(readFileSync(`/proc/${child.pid}/cmdline`, "utf8").split("\0")[0]).toBe(alias)
     const file = terminalFile(LIVE_PID)
     watch(LIVE_PID, file)
     noteAgentShellCommand("ses_a", "call_kill", `killall ${alias}`, 1000)
@@ -682,7 +691,7 @@ describe("shells the agent stopped itself", () => {
     const file = terminalFile(LIVE_PID)
     watch(LIVE_PID, file)
     noteAgentShellCommand("ses_a", "call_kill", `kill ${payload()}`, 1000)
-    noteAgentShellCommandEnded("call_kill", 1100)
+    noteAgentShellCommandEnded("call_kill", 1100, 0)
     terminalFile(LIVE_PID, { status: "succeeded", exitCode: 0 })
     pollBackgroundShells(3000)
     pollBackgroundShells(3000 + MAX_HOLD_MS)
@@ -717,11 +726,14 @@ describe("shells the agent stopped itself", () => {
     expect(notes[0]!.resume).toBeUndefined()
   })
 
-  test.skipIf(process.platform !== "linux")("a kill behind other commands counts for the signal it sends, or any end once it is known to have run", () => {
+  test.skipIf(process.platform !== "linux")("a kill counts once it is known to have run, or for a right-away kill's own signal; never a crash", () => {
     // [command, the shell's exit, the command's own exit, the agent's stop?]
     for (const [command, exitCode, commandExit, stopped] of [
-      [`kill ${payload()}; sleep 60`, 0, 0, true],
-      [`curl -s localhost:8000 -o page.html; kill ${payload()}`, 143, 1, true],
+      [`kill ${payload()}`, 0, 0, true],
+      [`kill ${payload()}; sleep 60`, 143, 0, true],
+      [`kill ${payload()}; sleep 60`, 0, 0, false],
+      [`curl -s localhost:8000 -o page.html; kill ${payload()}`, 143, 1, false],
+      [`sleep 60; kill ${payload()}`, 143, 1, false],
       [`until curl -fs localhost:8000; do sleep 0.1; done && kill ${payload()}`, 143, 0, true],
       [`curl -s localhost:8000 -o page.html; kill -9 ${payload()}`, 137, 0, true],
       [`curl -s localhost:8000 -o page.html; kill ${payload()}`, 0, 0, true],
@@ -753,7 +765,8 @@ describe("shells the agent stopped itself", () => {
     // [command shape, each shell's exit, the command's exit, which shells are the agent's stop]
     for (const [shape, exitCode, commandExit, stopped] of [
       ["sleep 1; kill A; kill B", 0, 0, [false, true]],
-      ["curl -s x; kill -9 A; kill B", 143, 1, [false, true]],
+      ["curl -s x; kill -9 A; kill B", 143, 0, [false, true]],
+      ["curl -s x; kill -9 A; kill B", 143, 1, [false, false]],
       ["curl -s x; kill A B", 0, 0, [false, false]],
     ] as const) {
       notes.length = 0
@@ -775,6 +788,38 @@ describe("shells the agent stopped itself", () => {
       pollBackgroundShells(4000)
       const resume = files.map((file) => notes.find((note) => note.metadata.file === file)?.resume === false)
       expect({ shape, resume }).toEqual({ shape, resume: [...stopped] })
+    }
+  })
+
+  test.skipIf(process.platform !== "linux")("a kill call that failed or was refused names nothing", () => {
+    for (const command of [`kill ${payload()}`, "fuser -k 8000/tcp"]) {
+      notes.length = 0
+      const file = terminalFile(LIVE_PID)
+      watch(LIVE_PID, file)
+      noteAgentShellCommand("ses_a", `call_${command}`, command, 1000)
+      terminalFile(LIVE_PID, { status: "failed", exitCode: command.startsWith("fuser") ? 137 : 143 })
+      pollBackgroundShells(1500)
+      noteAgentShellCommandEnded(`call_${command}`, 1600, undefined, true)
+      noteSessionExecution("ses_a", "succeeded")
+      pollBackgroundShells(2000)
+      expect({ command, resume: notes[0]?.resume }).toEqual({ command, resume: undefined })
+    }
+  })
+
+  test.skipIf(process.platform !== "linux")("without pids, two unresolved kills, or one that found nothing, start a turn", () => {
+    for (const [command, commandExit] of [
+      ["fuser -k -TERM 8000/tcp; fuser -k -KILL 9000/tcp", 0],
+      ["fuser -k 8000/tcp", 1],
+    ] as const) {
+      notes.length = 0
+      const file = terminalFile(LIVE_PID)
+      watch(LIVE_PID, file)
+      noteAgentShellCommand("ses_a", `call_${command}`, command, 1000)
+      noteAgentShellCommandEnded(`call_${command}`, 1200, commandExit)
+      terminalFile(LIVE_PID, { status: "failed", exitCode: 137 })
+      noteSessionExecution("ses_a", "succeeded")
+      pollBackgroundShells(2000)
+      expect({ command, resume: notes[0]?.resume }).toEqual({ command, resume: undefined })
     }
   })
 
@@ -908,6 +953,9 @@ describe("completion notes from supervised terminal records", () => {
     expect(cursorShellExitCode("cursor_exit_fg", 0)).toBe(3)
     expect(cursorShellExitCode("cursor_exit_uncaptured", 0)).toBe(0)
     expect(cursorShellExitCode("cursor_exit_uncaptured", null)).toBeUndefined()
+    // A reused call id starts without the earlier call's outcome.
+    forgetCursorShellOutcome("cursor_exit_fg")
+    expect(cursorShellExitCode("cursor_exit_fg", undefined)).toBeUndefined()
   }, 15_000)
 
   test("reports a background spawn's exit code and output", async () => {

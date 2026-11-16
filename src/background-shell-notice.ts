@@ -49,7 +49,7 @@ type WatchedShell = {
 
 type SessionState = { busy: boolean; stopped?: boolean }
 
-type KillCommand = { sessionID: string; startedAt: number; endedAt?: number; signals?: number[] }
+type KillCommand = { sessionID: string; startedAt: number; endedAt?: number; signals?: number[]; last?: boolean }
 
 type NoticeState = {
   watches: Map<string, WatchedShell>
@@ -201,20 +201,31 @@ export function noteAgentShellCommand(sessionID: string, executionID: string, co
     watch.targetedVerified = false
     trace(`background shell: shell=${watch.shellId} named by kill command execution=${executionID}${rightAway.length > 0 ? "" : " (later)"}`)
   }
-  // A target that can't be resolved (`pkill "$NAME"`, `fuser -k PORT/tcp`, `xargs kill`) falls back to timing.
-  const unresolved = kill.kills.filter((entry) => entry.rightAway && entry.unresolved)
-  if (unresolved.length === 0) return
+  // A target that can't be resolved (`pkill "$NAME"`, `fuser -k PORT/tcp`, `xargs kill`) falls back to timing, but only
+  // for one such kill with one signal: two of them can't be told apart.
+  const unresolved = kill.kills.filter((entry) => entry.unresolved)
+  if (unresolved.length !== 1 || !unresolved[0]!.rightAway || unresolved[0]!.signals.length !== 1) return
   const kills = state.kills ??= new Map()
-  kills.set(executionID, { sessionID, startedAt: now, signals: [...new Set(unresolved.flatMap((entry) => entry.signals))] })
+  kills.set(executionID, { sessionID, startedAt: now, signals: unresolved[0]!.signals, last: unresolved[0]!.last })
   while (kills.size > MAX_KILLS) kills.delete(kills.keys().next().value!)
 }
 
-/** `exitCode` is the whole command's: 0 with a kill as its last command means that kill signalled a live process. */
-export function noteAgentShellCommandEnded(executionID: string, now = Date.now(), exitCode?: number): void {
+/**
+ * `exitCode` is the whole command's own: 0 with a kill as its last command means that kill signalled a live process.
+ * A call that failed (refused, errored) may never have run its kill, so it names nothing.
+ */
+export function noteAgentShellCommandEnded(executionID: string, now = Date.now(), exitCode?: number, failed = false): void {
   const kill = state.kills?.get(executionID)
-  if (kill) kill.endedAt = now
+  if (kill) {
+    kill.endedAt = now
+    if (failed || (kill.last && exitCode !== undefined && exitCode !== 0)) state.kills!.delete(executionID)
+  }
   for (const watch of state.watches.values()) {
     if (watch.targetedBy !== executionID) continue
+    if (failed) {
+      watch.targetedAt = watch.targetedBy = watch.targetSignals = undefined
+      continue
+    }
     watch.targetedUntil = now + TARGETED_STOP_MS
     if (watch.targetedLastIsKill && exitCode === 0) watch.targetedVerified = true
   }
@@ -236,8 +247,10 @@ export function pollBackgroundShells(now = Date.now()): void {
     if (!watch.end) probe(watch, now)
     if (!watch.end) continue
     if (!watch.observed) {
-      // Kept once found: the kill records it rests on expire while the note is held.
-      const stopped = watch.stoppedByAgent ||= stoppedByAgent(watch)
+      // Kept once the kill command has ended: the records it rests on expire while the note is held, but until then a
+      // refused or failed call can still take it back.
+      const stopped = watch.stoppedByAgent || stoppedByAgent(watch)
+      if (stopped && killSettled(watch)) watch.stoppedByAgent = true
       if (holdNote(watch, now, stopped)) continue
       const notifier = state.notifiers.has(watch.notifier) ? watch.notifier : state.notifiers.values().next().value
       if (!notifier) continue
@@ -273,14 +286,26 @@ function stoppedByAgent(watch: WatchedShell): boolean {
   if (signal !== undefined && CRASH_SIGNALS.has(signal)) return false
   if (watch.targetedAt !== undefined && seen >= watch.targetedAt
     && seen <= (watch.targetedUntil ?? watch.targetedAt + STOPPED_HOLD_MS)) {
-    if (signal !== undefined ? sends(watch.targetSignals, signal) : !watch.targetedLater || watch.targetedVerified) return true
+    // A kill behind other commands may never have run, and any shell can end by itself: unless the kill is known to
+    // have signalled this shell, only a right-away kill's own signal counts.
+    if (signal !== undefined && !sends(watch.targetSignals, signal)) return false
+    return watch.targetedVerified === true || (!watch.targetedLater && signal !== undefined)
   }
   if (signal === undefined) return false
-  for (const kill of state.kills?.values() ?? []) {
+  for (const [id, kill] of state.kills ?? []) {
+    if (id === watch.targetedBy) continue
     if (kill.sessionID === watch.sessionID && seen >= kill.startedAt && seen - kill.startedAt <= KILL_SETTLE_MS
       && sends(kill.signals, signal)) return true
   }
   return false
+}
+
+function killSettled(watch: WatchedShell): boolean {
+  if (watch.targetedBy !== undefined && watch.targetedUntil === undefined) return false
+  for (const kill of state.kills?.values() ?? []) {
+    if (kill.sessionID === watch.sessionID && kill.endedAt === undefined) return false
+  }
+  return true
 }
 
 function endSignal(end: ShellEnd): number | undefined {

@@ -887,6 +887,11 @@ export function capturedCursorShellOutcome(toolCallId: string): CursorShellOutco
  * The command's own exit status. A captured outcome other than an exit (backgrounded, timed out, aborted) has none:
  * the host's exit then belongs to the launcher, not to the command.
  */
+/** Call when a shell call starts, so an outcome left by an earlier call with the same id can't be taken for its own. */
+export function forgetCursorShellOutcome(toolCallId: string): void {
+  outcomes.delete(toolCallId)
+}
+
 export function cursorShellExitCode(toolCallId: string, hostExit: unknown): number | undefined {
   const outcome = outcomes.get(toolCallId)
   if (outcome) return outcome.kind === "exit" ? outcome.code : undefined

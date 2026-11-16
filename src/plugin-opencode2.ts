@@ -30,6 +30,7 @@ import {
   captureCursorShellFailure,
   capturedCursorShellOutcome,
   cursorShellExitCode,
+  forgetCursorShellOutcome,
   prepareCursorShellCreate,
   prepareCursorShellArgs,
   releaseCursorShellEnv,
@@ -437,6 +438,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
         if (!isShellTool(event.tool) || typeof event.input !== "object" || event.input === null) return
         const executionID = toolExecutionID(event)
         const input = event.input as Record<string, unknown>
+        forgetCursorShellOutcome(executionID)
         if (typeof input.command === "string") noteAgentShellCommand(event.sessionID, executionID, input.command)
         prepareCursorShellArgs(executionID, input, {
           deferToShellHook: hasShellEnvHook,
@@ -503,7 +505,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
           }
           if (shellNotifier) watchCursorBackgroundShell(executionID, event.sessionID, shellNotifier)
         } finally {
-          noteAgentShellCommandEnded(executionID, Date.now(), shellExitCode(executionID, event))
+          noteAgentShellCommandEnded(executionID, Date.now(), shellExitCode(executionID, event), event.status !== "completed")
           releaseCursorShellEnv(executionID)
         }
       }),
