@@ -453,6 +453,7 @@ nap() {
 (
   while read -r handoff; do [ "$handoff" != detached ] || exit 0; done
   [ ! -f "$job/finishing" ] || exit 0
+  : >"$job/launch-cancelled"
   ! is_ours "$supervisor" "$job/runner.sh" || kill -TERM "$supervisor" 2>/dev/null
 ) <&5 5<&- &
 handoff_watcher=$!
@@ -486,7 +487,9 @@ start_poll=0
 while [ ! -f "$job/group-ready" ] && [ "$aborted" = 0 ] && kill -0 "$command_pid" 2>/dev/null && [ "$start_poll" -lt 100 ]; do
   nap 0.1; start_poll=$((start_poll + 1))
 done
-if [ ! -f "$job/group-ready" ] || [ "$aborted" = 1 ]; then
+# A launch cancelled once its command started is finalized below as aborted.
+if [ "$aborted" = 1 ] && [ -f "$job/launch-cancelled" ]; then :
+elif [ ! -f "$job/group-ready" ] || [ "$aborted" = 1 ]; then
   stop_group; stop_job "$collector"; fail 'Background command group failed to initialize'
 fi
 printf '%s\n' "$supervisor" >"$job/ready"
@@ -576,6 +579,6 @@ printf '%s\n' "$code" >"$job/done"
 # survives immediate cleanup of job/done by a result consumer.
 printf 'completed\n' >&4
 wait "$command_pid" 2>/dev/null || true
-rm -f "$job/pipe" "$job/lifeline" "$job/handoff" "$job/command.sh" "$job/group.sh" "$job/collector.cjs" "$job/runner.sh" "$job/command-exit" "$job/group-ready" "$job/finishing" "$job/collected"
+rm -f "$job/pipe" "$job/lifeline" "$job/handoff" "$job/command.sh" "$job/group.sh" "$job/collector.cjs" "$job/runner.sh" "$job/command-exit" "$job/group-ready" "$job/finishing" "$job/collected" "$job/launch-cancelled"
 exit 0
 `

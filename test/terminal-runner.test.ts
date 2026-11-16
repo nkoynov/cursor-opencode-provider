@@ -592,6 +592,30 @@ fs.createReadStream(job + "/pipe").on("data", chunk => fs.writeSync(fd, chunk))
     expect(await waitFor(() => processesFor(terminal).length === 0)).toBe(true)
   }, 20_000)
 
+  it.each([
+    ["kills the launcher's process group", "group", "SIGKILL"],
+    ["terminates only the launcher", "launcher", "SIGTERM"],
+  ] as const)("finalizes an aborted record when the host %s after the command started but before it is ready", async (_name, target, signal) => {
+    if (!Bun.which("setsid")) return
+    const terminal = job("sleep 30 & echo $! > child.pid; wait", { timeoutMs: 30_000 })
+    const groupScript = path.join(terminal.directory, "group.sh")
+    const ready = `printf ready >"$job/group-ready"`
+    const script = fs.readFileSync(groupScript, "utf8")
+    expect(script.split(ready)).toHaveLength(2)
+    fs.writeFileSync(groupScript, script.replace(ready, `while [ ! -f "$job/go" ]; do sleep 0.01; done\n${ready}`))
+    const launcher = launchLeader(terminal)
+    expect(await waitFor(() => fs.existsSync(path.join(root, "child.pid")))).toBe(true)
+    const child = Number(fs.readFileSync(path.join(root, "child.pid"), "utf8"))
+    process.kill(target === "group" ? -launcher.pid : launcher.pid, signal)
+    await launcher.result
+    const record = await waitDone(terminal)
+    expect(record).toContain("status: aborted")
+    expect(record).toContain("exit_code: 143")
+    expect(fs.existsSync(path.join(terminal.directory, "error"))).toBe(false)
+    expect(await waitFor(() => !alive(child))).toBe(true)
+    expect(await waitFor(() => processesFor(terminal).length === 0)).toBe(true)
+  }, 20_000)
+
   it("retains live jobs when provider wrapper state is released", async () => {
     const terminal = job("sleep 0.5; printf survived", { backgroundSpawn: true })
     await launch(terminal)
