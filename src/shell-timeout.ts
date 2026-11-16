@@ -890,6 +890,7 @@ export function capturedCursorShellOutcome(toolCallId: string): CursorShellOutco
 /** Call when a shell call starts, so an outcome left by an earlier call with the same id can't be taken for its own. */
 export function forgetCursorShellOutcome(toolCallId: string): void {
   outcomes.delete(toolCallId)
+  failures.delete(toolCallId)
 }
 
 export function cursorShellExitCode(toolCallId: string, hostExit: unknown): number | undefined {

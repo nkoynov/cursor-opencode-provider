@@ -6,8 +6,10 @@ import { createManagedTerminal, type ManagedTerminal } from "../src/terminal-run
 import { runtimeLayout } from "../src/runtime-files.js"
 import {
   CURSOR_TIMEOUT_BACKGROUND,
+  captureCursorShellFailure,
   captureCursorShellResult,
   capturedCursorShellOutcome,
+  consumeCursorShellResult,
   cursorShellExitCode,
   forgetCursorShellOutcome,
   registerCursorShellCall,
@@ -489,6 +491,7 @@ describe("background shell notices", () => {
     const file = terminalFile(LIVE_PID)
     watchBackgroundShell({ sessionID: "ses_a", shellId: SHELL_ID, pid: LIVE_PID, file, command: "x", notifier: flaky, now: 0 })
     noteAgentShellCommand("ses_a", "call_kill", "fuser -k 8000/tcp", 1000)
+    noteAgentShellCommandEnded("call_kill", 1100)
     terminalFile(LIVE_PID, { status: "failed", exitCode: 137 })
     noteSessionExecution("ses_a", "succeeded")
     pollBackgroundShells(1500)
@@ -517,6 +520,7 @@ describe("background shell notices", () => {
     const file = terminalFile(LIVE_PID)
     watchBackgroundShell({ sessionID: "ses_a", shellId: SHELL_ID, pid: LIVE_PID, file, command: "x", notifier: flaky, now: 0 })
     noteAgentShellCommand("ses_a", "call_kill", "fuser -k 8000/tcp", 1000)
+    noteAgentShellCommandEnded("call_kill", 1100)
     terminalFile(LIVE_PID, { status: "failed", exitCode: 137 })
     noteSessionExecution("ses_a", "succeeded")
     pollBackgroundShells(1500)
@@ -802,7 +806,25 @@ describe("shells the agent stopped itself", () => {
       noteAgentShellCommandEnded(`call_${command}`, 1600, undefined, true)
       noteSessionExecution("ses_a", "succeeded")
       pollBackgroundShells(2000)
-      expect({ command, resume: notes[0]?.resume }).toEqual({ command, resume: undefined })
+      expect({ command, count: notes.length, resume: notes[0]?.resume }).toEqual({ command, count: 1, resume: undefined })
+    }
+  })
+
+  test.skipIf(process.platform !== "linux")("a single-pid kill that exits non-zero, one whose end never comes, or a reused call id names nothing", () => {
+    for (const shape of ["failed kill", "no end", "reused id"] as const) {
+      notes.length = 0
+      const file = terminalFile(LIVE_PID)
+      watch(LIVE_PID, file)
+      const id = `call_${shape}`
+      noteAgentShellCommand("ses_a", id, `kill ${payload()}`, 1000)
+      if (shape === "reused id") noteAgentShellCommand("ses_a", id, "echo hello", 1100)
+      terminalFile(LIVE_PID, { status: "failed", exitCode: 143 })
+      pollBackgroundShells(1500)
+      if (shape === "failed kill") noteAgentShellCommandEnded(id, 1600, 1)
+      if (shape === "reused id") noteAgentShellCommandEnded(id, 1600, 0)
+      noteSessionExecution("ses_a", "succeeded")
+      pollBackgroundShells(2000)
+      expect({ shape, count: notes.length, resume: notes[0]?.resume }).toEqual({ shape, count: 1, resume: undefined })
     }
   })
 
@@ -819,7 +841,7 @@ describe("shells the agent stopped itself", () => {
       terminalFile(LIVE_PID, { status: "failed", exitCode: 137 })
       noteSessionExecution("ses_a", "succeeded")
       pollBackgroundShells(2000)
-      expect({ command, resume: notes[0]?.resume }).toEqual({ command, resume: undefined })
+      expect({ command, count: notes.length, resume: notes[0]?.resume }).toEqual({ command, count: 1, resume: undefined })
     }
   })
 
@@ -953,9 +975,16 @@ describe("completion notes from supervised terminal records", () => {
     expect(cursorShellExitCode("cursor_exit_fg", 0)).toBe(3)
     expect(cursorShellExitCode("cursor_exit_uncaptured", 0)).toBe(0)
     expect(cursorShellExitCode("cursor_exit_uncaptured", null)).toBeUndefined()
-    // A reused call id starts without the earlier call's outcome.
+    // A reused call id starts without the earlier call's outcome or failure.
     forgetCursorShellOutcome("cursor_exit_fg")
     expect(cursorShellExitCode("cursor_exit_fg", undefined)).toBeUndefined()
+    registerCursorShellCall("cursor_exit_err", { shell_stream: true, command: "x", working_directory: dir, timeout_ms: 300, timeout_behavior: CURSOR_TIMEOUT_BACKGROUND })
+    captureCursorShellFailure("cursor_exit_err", new Error("refused"))
+    expect(consumeCursorShellResult("cursor_exit_err", "").error).toBe("refused")
+    registerCursorShellCall("cursor_exit_err", { shell_stream: true, command: "x", working_directory: dir, timeout_ms: 300, timeout_behavior: CURSOR_TIMEOUT_BACKGROUND })
+    captureCursorShellFailure("cursor_exit_err", new Error("refused"))
+    forgetCursorShellOutcome("cursor_exit_err")
+    expect(consumeCursorShellResult("cursor_exit_err", "").error).toBeUndefined()
   }, 15_000)
 
   test("reports a background spawn's exit code and output", async () => {

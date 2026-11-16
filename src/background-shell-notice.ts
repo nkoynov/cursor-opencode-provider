@@ -172,6 +172,7 @@ export function noteSessionExecution(sessionID: string, event: "started" | "succ
  * processes still exist, so a watched shell they belong to is known to be the agent's own stop.
  */
 export function noteAgentShellCommand(sessionID: string, executionID: string, command: string, now = Date.now()): void {
+  if (executionID) forgetKill(executionID)
   // Process ancestry comes from /proc and the signal numbers are Linux's.
   if (!sessionID || !executionID || process.platform !== "linux") return
   const watches = [...state.watches.values()].filter((watch) => watch.sessionID === sessionID && !watch.end)
@@ -222,13 +223,27 @@ export function noteAgentShellCommandEnded(executionID: string, now = Date.now()
   }
   for (const watch of state.watches.values()) {
     if (watch.targetedBy !== executionID) continue
-    if (failed) {
-      watch.targetedAt = watch.targetedBy = watch.targetSignals = undefined
+    // A single-PID kill that ended the command with a failure signalled nothing.
+    if (failed || (watch.targetedLastIsKill && exitCode !== undefined && exitCode !== 0)) {
+      untarget(watch)
       continue
     }
     watch.targetedUntil = now + TARGETED_STOP_MS
     if (watch.targetedLastIsKill && exitCode === 0) watch.targetedVerified = true
   }
+}
+
+/** An execution id the host reuses starts without what its earlier call, whose end never came, left behind. */
+function forgetKill(executionID: string): void {
+  state.kills?.delete(executionID)
+  for (const watch of state.watches.values()) {
+    if (watch.targetedBy === executionID && !watch.stoppedByAgent) untarget(watch)
+  }
+}
+
+function untarget(watch: WatchedShell): void {
+  watch.targetedAt = watch.targetedBy = watch.targetSignals = watch.targetedUntil = undefined
+  watch.targetedLater = watch.targetedLastIsKill = watch.targetedVerified = undefined
 }
 
 export function forgetBackgroundShells(sessionID: string): void {
@@ -254,7 +269,8 @@ export function pollBackgroundShells(now = Date.now()): void {
       if (holdNote(watch, now, stopped)) continue
       const notifier = state.notifiers.has(watch.notifier) ? watch.notifier : state.notifiers.values().next().value
       if (!notifier) continue
-      post(notifier, watch, stopped)
+      // A match whose kill command never reported its end stays a guess: it may hold the note, not silence it.
+      post(notifier, watch, watch.stoppedByAgent === true)
       continue
     }
     unwatch(watch)
