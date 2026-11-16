@@ -36,6 +36,7 @@ type WatchedShell = {
   observed?: boolean
   /** When a kill command of its session named one of its processes. */
   targetedAt?: number
+  stoppedByAgent?: boolean
 }
 
 type SessionState = { busy: boolean; stopped?: boolean }
@@ -89,7 +90,9 @@ const state: NoticeState = globals[NOTICES] ??= {
 export function registerBackgroundShellNotifier(notifier: BackgroundShellNotifier): () => void {
   state.notifiers.add(notifier)
   state.supported = true
-  if (state.watches.size > 0) ensureTimer()
+  // A reloaded plugin's timer would keep polling with the old module's code.
+  stopTimer()
+  ensureTimer()
   return () => {
     state.notifiers.delete(notifier)
   }
@@ -196,7 +199,8 @@ export function pollBackgroundShells(now = Date.now()): void {
     if (!watch.end) probe(watch, now)
     if (!watch.end) continue
     if (!watch.observed) {
-      const stopped = stoppedByAgent(watch)
+      // Kept once found: the kill records it rests on expire while the note is held.
+      const stopped = watch.stoppedByAgent ||= stoppedByAgent(watch)
       if (holdNote(watch, now, stopped)) continue
       const notifier = state.notifiers.has(watch.notifier) ? watch.notifier : state.notifiers.values().next().value
       if (!notifier) continue
@@ -231,18 +235,18 @@ function stoppedByAgent(watch: WatchedShell): boolean {
   if (!endedBySignal(watch.end!)) return false
   for (const kill of state.kills?.values() ?? []) {
     if (kill.sessionID !== watch.sessionID || seen < kill.startedAt) continue
-    if (kill.endedAt === undefined || seen - kill.endedAt <= KILL_SETTLE_MS) return true
+    if (seen - (kill.endedAt ?? kill.startedAt) <= KILL_SETTLE_MS) return true
   }
   return false
 }
 
 function endedBySignal(end: ShellEnd): boolean {
-  if (end.state !== "completed") return true
   return end.exitCode !== undefined && end.exitCode > 128 && end.exitCode <= 128 + 64
 }
 
 const KILL_PROGRAMS = new Set(["kill", "pkill", "killall", "fuser"])
-const COMMAND_PREFIXES = new Set(["sudo", "command", "exec", "builtin", "nohup", "env"])
+const COMMAND_PREFIXES = new Set(["sudo", "command", "exec", "builtin", "nohup", "env", "xargs"])
+const SIGNAL_ZERO = /^-(?:0|SIG0|s0|-signal=0)$/i
 
 /** A command that runs kill, pkill, killall or `fuser -k`, with the pids kill names (process groups by their leader). */
 export function parseKillCommand(command: string): { pids: number[] } | undefined {
@@ -250,11 +254,19 @@ export function parseKillCommand(command: string): { pids: number[] } | undefine
   const pids: number[] = []
   for (const segment of command.split(/\$\(|[;&|\n()`{}]/)) {
     const words = segment.trim().split(/\s+/).map((word) => word.replace(/^["']|["']$/g, "")).filter(Boolean)
-    while (words.length > 0 && (COMMAND_PREFIXES.has(words[0]!) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]!))) words.shift()
+    // Prefixes and their options (`sudo -n`, `xargs -r`, `env -u X`) before the program.
+    while (words.length > 0) {
+      const word = words[0]!
+      if (COMMAND_PREFIXES.has(word.split("/").pop()!) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) words.shift()
+      else if (word.startsWith("-") && words.length > 1) words.splice(0, word === "-u" ? 2 : 1)
+      else break
+    }
     const program = words[0]?.split("/").pop()
     if (!program || !KILL_PROGRAMS.has(program)) continue
     const args = words.slice(1)
     if (program === "fuser" && !args.some((arg) => /^-[a-zA-Z]*k/.test(arg))) continue
+    // Signal 0 only tests whether the process exists.
+    if (args.some((arg, i) => SIGNAL_ZERO.test(arg) || ((arg === "-s" || arg === "-n" || arg === "--signal") && args[i + 1] === "0"))) continue
     found = true
     if (program !== "kill") continue
     let operands = false

@@ -471,6 +471,12 @@ describe("shells the agent stopped itself", () => {
     expect(parseKillCommand("kill \"$SERVER_PID\"")).toEqual({ pids: [] })
     expect(parseKillCommand("fuser -k 8000/tcp")).toEqual({ pids: [] })
     expect(parseKillCommand("pkill -f 'uvicorn app'")).toEqual({ pids: [] })
+    expect(parseKillCommand("lsof -ti :8000 | xargs kill")).toEqual({ pids: [] })
+    expect(parseKillCommand("sudo -n kill 4242")).toEqual({ pids: [4242] })
+    expect(parseKillCommand("env -u X kill 4242")).toEqual({ pids: [4242] })
+    expect(parseKillCommand("kill -0 4242")).toBeUndefined()
+    expect(parseKillCommand("kill -s 0 4242 && echo up")).toBeUndefined()
+    expect(parseKillCommand("pkill -0 server")).toBeUndefined()
     expect(parseKillCommand("fuser 8000/tcp")).toBeUndefined()
     expect(parseKillCommand("echo kill 4242")).toBeUndefined()
     expect(parseKillCommand("git commit -m 'kill the server'")).toBeUndefined()
@@ -543,6 +549,22 @@ describe("shells the agent stopped itself", () => {
     }
   })
 
+  test("without pids, a shell that ends long into a still-running kill command, or without an exit code, still starts a turn", () => {
+    for (const [end, seen] of [
+      [{ status: "failed", exitCode: 143 }, 1000 + KILL_SETTLE_MS + 1000],
+      [{ status: "aborted", exitCode: "unknown" }, 1500],
+    ] as const) {
+      notes.length = 0
+      const file = terminalFile(GONE_PID)
+      watch(GONE_PID, file)
+      noteAgentShellCommand("ses_a", `call_${seen}`, "sleep 60; pkill -f web", 1000)
+      noteSessionExecution("ses_a", "succeeded")
+      terminalFile(GONE_PID, end)
+      pollBackgroundShells(seen)
+      expect({ end, resume: notes[0]?.resume, count: notes.length }).toEqual({ end, resume: undefined, count: 1 })
+    }
+  })
+
   test("another session's kill does not count", () => {
     const file = terminalFile(LIVE_PID)
     watch(LIVE_PID, file)
@@ -560,6 +582,10 @@ describe("shells the agent stopped itself", () => {
     noteAgentShellCommand("ses_a", "call_kill", "pkill -f server", 1000)
     terminalFile(LIVE_PID, { status: "failed", exitCode: 143 })
     pollBackgroundShells(1500)
+    noteAgentShellCommandEnded("call_kill", 1600)
+    // Past the kill record's expiry, the note is still the agent's stop.
+    pollBackgroundShells(1600 + TARGETED_STOP_MS + 1000)
+    expect(notes).toEqual([])
     pollBackgroundShells(1500 + STOPPED_HOLD_MS - 1)
     expect(notes).toEqual([])
     pollBackgroundShells(1500 + STOPPED_HOLD_MS)
