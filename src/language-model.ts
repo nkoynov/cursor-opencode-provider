@@ -9238,7 +9238,7 @@ export function groundCheckpointTurnText(
 }
 
 const BACKGROUND_SHELL_GUIDANCE =
-  "- Background shells report back: when a command started with `block_until_ms: 0`, or moved to the background after its `block_until_ms`, finishes, a `<shell …>` system update gives its exit code and output, and starts a new turn if yours has ended. Unless you need the result to continue, do not wait for it with AwaitShell, sleep, or repeated reads; keep working, or end your response and you will be resumed when it finishes."
+  "- Background shells report back: when a command started with `block_until_ms: 0`, or moved to the background after its `block_until_ms`, finishes, a `<shell …>` system update gives its exit code and output, and starts a new turn if yours has ended; one you stopped yourself (kill, pkill, fuser -k) starts none, and its update comes with the next message. Unless you need the result to continue, do not wait for it with AwaitShell, sleep, or repeated reads; keep working, or end your response and you will be resumed when it finishes."
 
 /**
  * An epoch-advertised tool the host left out of this step. OpenCode 2 moves

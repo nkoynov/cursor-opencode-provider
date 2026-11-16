@@ -1,4 +1,4 @@
-import { closeSync, fstatSync, openSync, readSync, constants } from "node:fs"
+import { closeSync, fstatSync, openSync, readFileSync, readSync, constants } from "node:fs"
 import { basename, resolve } from "node:path"
 import { trace } from "./debug.js"
 
@@ -34,14 +34,20 @@ type WatchedShell = {
   goneSince?: number
   lastReadAt?: number
   observed?: boolean
+  /** When a kill command of its session named one of its processes. */
+  targetedAt?: number
 }
 
 type SessionState = { busy: boolean; stopped?: boolean }
+
+type KillCommand = { sessionID: string; startedAt: number; endedAt?: number }
 
 type NoticeState = {
   watches: Map<string, WatchedShell>
   notifiers: Set<BackgroundShellNotifier>
   sessions: Map<string, SessionState>
+  /** By tool execution id. Optional: a state an older build created on reload lacks it. */
+  kills?: Map<string, KillCommand>
   supported: boolean
   timer?: ReturnType<typeof setInterval>
   manualPolling?: boolean
@@ -53,7 +59,14 @@ export const AWAIT_GRACE_MS = 2000
 export const BUSY_SETTLE_MS = 10_000
 export const MAX_HOLD_MS = 60_000
 export const RUNNER_GONE_GRACE_MS = 3000
+// A server the agent killed by pid may take a while to shut down.
+export const TARGETED_STOP_MS = 30_000
+// Without a pid that names the shell, only a death by signal this soon after a kill command counts.
+export const KILL_SETTLE_MS = 5000
+// The note of a shell the agent stopped waits out the turn, never starting one of its own.
+export const STOPPED_HOLD_MS = 30 * 60_000
 const MAX_WATCHES = 256
+const MAX_KILLS = 64
 const HEADER_LIMIT_BYTES = 1024 * 1024
 const TAIL_WINDOW_BYTES = 64 * 1024
 const FOOTER_WINDOW_BYTES = 1024 * 1024
@@ -142,10 +155,38 @@ export function noteSessionExecution(sessionID: string, event: "started" | "succ
   state.sessions.set(sessionID, event === "started" ? { busy: true } : { busy: false, stopped: event === "interrupted" })
 }
 
+/**
+ * Call before a session's shell command runs. A kill command's pids are matched while their
+ * processes still exist, so a watched shell they belong to is known to be the agent's own stop.
+ */
+export function noteAgentShellCommand(sessionID: string, executionID: string, command: string, now = Date.now()): void {
+  if (!sessionID || !executionID || state.watches.size === 0) return
+  const kill = parseKillCommand(command)
+  if (!kill) return
+  const kills = state.kills ??= new Map()
+  kills.set(executionID, { sessionID, startedAt: now })
+  while (kills.size > MAX_KILLS) kills.delete(kills.keys().next().value!)
+  for (const watch of state.watches.values()) {
+    if (watch.sessionID !== sessionID || watch.end) continue
+    if (kill.pids.some((pid) => descendsFrom(pid, watch.pid))) {
+      watch.targetedAt = now
+      trace(`background shell: shell=${watch.shellId} named by kill command execution=${executionID}`)
+    }
+  }
+}
+
+export function noteAgentShellCommandEnded(executionID: string, now = Date.now()): void {
+  const kill = state.kills?.get(executionID)
+  if (kill) kill.endedAt = now
+}
+
 export function forgetBackgroundShells(sessionID: string): void {
   state.sessions.delete(sessionID)
   for (const [file, watch] of state.watches) {
     if (watch.sessionID === sessionID) state.watches.delete(file)
+  }
+  for (const [id, kill] of state.kills ?? []) {
+    if (kill.sessionID === sessionID) state.kills!.delete(id)
   }
 }
 
@@ -154,26 +195,113 @@ export function pollBackgroundShells(now = Date.now()): void {
     if (!watch.end) probe(watch, now)
     if (!watch.end) continue
     if (!watch.observed) {
-      if (holdNote(watch, now)) continue
+      const stopped = stoppedByAgent(watch)
+      if (holdNote(watch, now, stopped)) continue
       const notifier = state.notifiers.has(watch.notifier) ? watch.notifier : state.notifiers.values().next().value
       if (!notifier) continue
-      post(notifier, watch)
+      post(notifier, watch, stopped)
     }
     state.watches.delete(file)
     if (![...state.watches.values()].some((other) => other.sessionID === watch.sessionID)) state.sessions.delete(watch.sessionID)
   }
+  for (const [id, kill] of state.kills ?? []) {
+    if (kill.endedAt !== undefined && now - kill.endedAt > TARGETED_STOP_MS) state.kills!.delete(id)
+  }
   if (state.watches.size === 0) stopTimer()
 }
 
-function holdNote(watch: WatchedShell, now: number): boolean {
+function holdNote(watch: WatchedShell, now: number, stopped: boolean): boolean {
   const sinceEnd = now - (watch.endSeenAt ?? now)
+  if (stopped) {
+    if (watch.lastReadAt !== undefined && now - watch.lastReadAt < AWAIT_GRACE_MS) return true
+    // Posted mid-turn, the note would be taken after the turn's last message and answered there.
+    return (state.sessions.get(watch.sessionID)?.busy ?? false) && sinceEnd < STOPPED_HOLD_MS
+  }
   if (sinceEnd >= MAX_HOLD_MS) return false
   if (watch.lastReadAt !== undefined && now - watch.lastReadAt < AWAIT_GRACE_MS) return true
   // Mid-turn, give the model a moment to await a command that ended quickly.
   return (state.sessions.get(watch.sessionID)?.busy ?? false) && sinceEnd < BUSY_SETTLE_MS
 }
 
-function post(notifier: BackgroundShellNotifier, watch: WatchedShell): void {
+function stoppedByAgent(watch: WatchedShell): boolean {
+  const seen = watch.endSeenAt
+  if (seen === undefined) return false
+  if (watch.targetedAt !== undefined && seen >= watch.targetedAt && seen - watch.targetedAt <= TARGETED_STOP_MS) return true
+  if (!endedBySignal(watch.end!)) return false
+  for (const kill of state.kills?.values() ?? []) {
+    if (kill.sessionID !== watch.sessionID || seen < kill.startedAt) continue
+    if (kill.endedAt === undefined || seen - kill.endedAt <= KILL_SETTLE_MS) return true
+  }
+  return false
+}
+
+function endedBySignal(end: ShellEnd): boolean {
+  if (end.state !== "completed") return true
+  return end.exitCode !== undefined && end.exitCode > 128 && end.exitCode <= 128 + 64
+}
+
+const KILL_PROGRAMS = new Set(["kill", "pkill", "killall", "fuser"])
+const COMMAND_PREFIXES = new Set(["sudo", "command", "exec", "builtin", "nohup", "env"])
+
+/** A command that runs kill, pkill, killall or `fuser -k`, with the pids kill names (process groups by their leader). */
+export function parseKillCommand(command: string): { pids: number[] } | undefined {
+  let found = false
+  const pids: number[] = []
+  for (const segment of command.split(/\$\(|[;&|\n()`{}]/)) {
+    const words = segment.trim().split(/\s+/).map((word) => word.replace(/^["']|["']$/g, "")).filter(Boolean)
+    while (words.length > 0 && (COMMAND_PREFIXES.has(words[0]!) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]!))) words.shift()
+    const program = words[0]?.split("/").pop()
+    if (!program || !KILL_PROGRAMS.has(program)) continue
+    const args = words.slice(1)
+    if (program === "fuser" && !args.some((arg) => /^-[a-zA-Z]*k/.test(arg))) continue
+    found = true
+    if (program !== "kill") continue
+    let operands = false
+    for (let i = 0; i < args.length; i++) {
+      const arg = args[i]!
+      if (!operands && arg === "--") { operands = true; continue }
+      if (!operands && (arg === "-s" || arg === "-n")) { i++; continue }
+      if (!operands && /^-/.test(arg) && !/^-\d+$/.test(arg)) continue
+      // A leading `-9` is a signal; a later `-123` is a process group.
+      if (!operands && i === 0 && /^-\d+$/.test(arg)) continue
+      operands = true
+      const pid = Number(arg.replace(/^-/, ""))
+      if (Number.isSafeInteger(pid) && pid > 1) pids.push(pid)
+    }
+  }
+  return found ? { pids } : undefined
+}
+
+type ProcStat = { ppid: number; pgrp: number; session: number }
+
+function procStat(pid: number): ProcStat | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8")
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ")
+    return { ppid: Number(fields[1]), pgrp: Number(fields[2]), session: Number(fields[3]) }
+  } catch {
+    return undefined
+  }
+}
+
+// Linux only: elsewhere no pid matches, and only a death by signal right after the kill counts.
+function descendsFrom(pid: number, ancestor: number): boolean {
+  const start = procStat(pid)
+  if (!start) return false
+  // A daemonized descendant's parent is init, but it keeps the payload's process group and session.
+  for (const from of new Set([pid, start.pgrp, start.session])) {
+    let current = from
+    for (let depth = 0; depth < 64 && current > 1; depth++) {
+      if (current === ancestor) return true
+      const stat = current === pid ? start : procStat(current)
+      if (!stat) break
+      current = stat.ppid
+    }
+  }
+  return false
+}
+
+function post(notifier: BackgroundShellNotifier, watch: WatchedShell, stopped = false): void {
   const end = watch.end!
   const session = state.sessions.get(watch.sessionID)
   const note: BackgroundShellNote = {
@@ -187,12 +315,12 @@ function post(notifier: BackgroundShellNotifier, watch: WatchedShell): void {
       ...(end.exitCode !== undefined ? { exit: end.exitCode } : {}),
       file: watch.file,
     },
-    // After a Stop, the note waits for the user's next message instead of starting a turn.
-    ...(session && !session.busy && session.stopped ? { resume: false } : {}),
+    // After a Stop, or for a shell the agent stopped itself, the note waits for the next message instead of starting a turn.
+    ...(stopped || (session && !session.busy && session.stopped) ? { resume: false } : {}),
   }
   trace(
     `background shell: posting note shell=${watch.shellId} sessionID=${watch.sessionID} state=${end.state} ` +
-      `exit=${end.exitCode ?? "-"} resume=${note.resume ?? true}`,
+      `exit=${end.exitCode ?? "-"} resume=${note.resume ?? true} stoppedByAgent=${stopped}`,
   )
   notifier(note).catch((error: unknown) => {
     trace(`background shell: note for shell=${watch.shellId} failed: ${error instanceof Error ? error.message : String(error)}`)
@@ -458,6 +586,7 @@ export function resetBackgroundShellNotices(options: { manualPolling?: boolean }
   state.watches.clear()
   state.notifiers.clear()
   state.sessions.clear()
+  state.kills?.clear()
   state.supported = false
   state.manualPolling = options.manualPolling
 }

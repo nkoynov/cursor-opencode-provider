@@ -36,6 +36,8 @@ import {
 } from "./shell-timeout.js"
 import {
   forgetBackgroundShells,
+  noteAgentShellCommand,
+  noteAgentShellCommandEnded,
   noteSessionExecution,
   registerBackgroundShellNotifier,
   watchBackgroundShell,
@@ -434,6 +436,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
         if (!isShellTool(event.tool) || typeof event.input !== "object" || event.input === null) return
         const executionID = toolExecutionID(event)
         const input = event.input as Record<string, unknown>
+        if (typeof input.command === "string") noteAgentShellCommand(event.sessionID, executionID, input.command)
         prepareCursorShellArgs(executionID, input, {
           deferToShellHook: hasShellEnvHook,
           preferWrapperCommand: !hasShellEnvHook,
@@ -450,6 +453,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
           if (refusal) rememberRefusal(executionID, refusal)
         } else refusals.delete(executionID)
         if (!isShellTool(event.tool)) return
+        noteAgentShellCommandEnded(executionID)
         try {
           if (event.status !== "completed") {
             if (event.status === "error") captureCursorShellFailure(executionID, event.error)
