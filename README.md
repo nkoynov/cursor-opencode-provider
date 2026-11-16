@@ -352,7 +352,10 @@ on a single timer, so it reports within the host's own timeout; a spawn
 reports its shell ID even when the command has already finished. A background
 request made through OpenCode 2.x's own shell `background` option stays an
 OpenCode background job with the host's completion notice. Supervision
-requires POSIX bash or `setsid`. When this conversation has no usable terminal storage, the unmanaged `nohup`
+requires POSIX bash or `setsid`. OpenCode 2.3 and later kill an exited
+command's process group when they stop tracking it, so a background shell
+outlives that only where `setsid` gives its supervisor its own session (not
+on macOS). When this conversation has no usable terminal storage, the unmanaged `nohup`
 fallback requires a POSIX shell. Native Windows PowerShell/`cmd` background
 wrapping is unsupported; see [Known limitations](#known-limitations).
 Transcript storage is supplied

@@ -67,7 +67,7 @@ function softBackgroundWindow(policy: CursorShellPolicy, shellId: number): strin
     'if [ -f "$cursor_job/done" ]; then',
     ...capturedOutput('$(cat "$cursor_job/output-bytes")'),
     '  if [ -f "$cursor_job/timedout" ]; then',
-    `    printf '\\n__CURSOR_SHELL_TIMEOUT__%s\\n' ${policy.hardTimeoutMs ?? 0}; exit ${TIMEOUT_EXIT_CODE}`,
+    `    printf '\\n__CURSOR_SHELL_TIMEOUT__%s\\n' ${policy.hardTimeoutMs ?? 0}; cursor_detach; exit ${TIMEOUT_EXIT_CODE}`,
     "  fi",
     // `done` exists before the supervisor's single write fills it; once that
     // supervisor is gone, whatever it wrote is all there is.
@@ -76,16 +76,17 @@ function softBackgroundWindow(policy: CursorShellPolicy, shellId: number): strin
     '  case "$cursor_code" in [0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5]) ;; *) printf "\\nTerminal record has no valid exit status\\n"; cursor_code=1 ;; esac',
     '  printf "\\n__CURSOR_SHELL_EXIT__%s\\n" "$cursor_code"',
     // The host records this status; the marker alone reaches only the live turn.
-    '  exit "$cursor_code"',
+    '  cursor_detach; exit "$cursor_code"',
     'elif [ -f "$cursor_job/timedout" ]; then',
     ...capturedOutput('$(( $(wc -c <"$cursor_terminal") - cursor_header ))'),
-    `  printf '\\n__CURSOR_SHELL_TIMEOUT__%s\\n' ${policy.hardTimeoutMs ?? 0}; exit ${TIMEOUT_EXIT_CODE}`,
+    `  printf '\\n__CURSOR_SHELL_TIMEOUT__%s\\n' ${policy.hardTimeoutMs ?? 0}; cursor_detach; exit ${TIMEOUT_EXIT_CODE}`,
     "else",
     '  if ! kill -0 "$cursor_supervisor" 2>/dev/null || [ -f "$cursor_job/error" ]; then cat "$cursor_job/error" 2>/dev/null; printf "\\n__CURSOR_SHELL_EXIT__1\\n"; exit 1; fi',
     // A soft handoff returns what the foreground window produced, as the
     // command would have shown before it moved to the background.
     ...capturedOutput('$(( $(wc -c <"$cursor_terminal") - cursor_header ))'),
     `  printf '\\n__CURSOR_SHELL_BACKGROUND__%s:%s:%s\\n' ${shellId} "$cursor_supervisor" "$cursor_terminal"`,
+    "  cursor_detach",
     "fi",
   ]
 }
@@ -236,13 +237,27 @@ export function createManagedTerminal(policy: CursorShellPolicy, root: string): 
       'mkdir "$cursor_job/claimed" 2>/dev/null || { printf "Background terminal was released before it started\\n\\n__CURSOR_SHELL_EXIT__1\\n"; exit 1; }',
       `cat >"$cursor_job/command.sh" <<'${delimiter}' || { rmdir "$cursor_job/claimed"; exit 1; }`,
       body + delimiter,
+      // This launcher holds the handoff FIFO's only write end. The supervisor
+      // stops the command when that end closes before "detached" arrives.
+      'mkfifo "$cursor_job/handoff" || { rmdir "$cursor_job/claimed"; exit 1; }',
+      'exec 5<>"$cursor_job/handoff"',
+      'cursor_detach() { printf "detached\\n" >&5; }',
       `cursor_terminal=${quote(file)}`,
       IS_OURS,
       // Bash job control gives the command its own process group on macOS,
       // where setsid is not a standard executable. Else require setsid.
       'cursor_runner=$(command -v bash 2>/dev/null || true)',
       'if [ -z "$cursor_runner" ]; then cursor_runner=/bin/sh; fi',
-      'nohup "$cursor_runner" "$cursor_job/runner.sh" "$@" >"$cursor_job/launcher.log" 2>&1 </dev/null &',
+      // The host signals this launcher's process group to cancel it, and
+      // OpenCode 2.3+ also kills that group when it forgets the exited
+      // command, so the supervisor needs its own session. Without setsid
+      // (macOS) it stays in the group. A non-leader's setsid does not fork,
+      // so $! is the supervisor.
+      'if command -v setsid >/dev/null 2>&1; then',
+      '  nohup setsid "$cursor_runner" "$cursor_job/runner.sh" "$@" >"$cursor_job/launcher.log" 2>&1 </dev/null 5<"$cursor_job/handoff" &',
+      "else",
+      '  nohup "$cursor_runner" "$cursor_job/runner.sh" "$@" >"$cursor_job/launcher.log" 2>&1 </dev/null 5<"$cursor_job/handoff" &',
+      "fi",
       "cursor_supervisor=$!",
       // Each deadline is one sleep that marks a file when it elapses. Counting
       // short polls instead drifts with process-start cost (over 50% on
@@ -258,11 +273,14 @@ export function createManagedTerminal(policy: CursorShellPolicy, root: string): 
       `    trap 'cursor_stopping=1; if [ -n "$cursor_nap" ]; then cursor_stop_sleep; exit 0; fi' TERM INT HUP`,
       '    sleep "$1" & cursor_nap=$!',
       '    if [ "$cursor_stopping" = 1 ]; then cursor_stop_sleep; exit 0; fi',
-      '    wait "$cursor_nap" && : >"$cursor_job/$2" ) >/dev/null 2>&1 </dev/null &',
+      '    wait "$cursor_nap" && : >"$cursor_job/$2" ) >/dev/null 2>&1 </dev/null 5>&- &',
       "  cursor_timer=$!",
       "}",
       'cursor_cancel_deadline() { [ -n "$cursor_timer" ] || return 0; kill "$cursor_timer" 2>/dev/null; wait "$cursor_timer" 2>/dev/null; cursor_timer=""; }',
       'trap cursor_cancel_deadline 0',
+      // dash skips the EXIT trap on a fatal signal, which would leave the
+      // deadline running after a TERM that reached only this launcher.
+      "trap 'exit 129' HUP", "trap 'exit 130' INT", "trap 'exit 143' TERM",
       `cursor_deadline ${START_DEADLINE_SECONDS} start-expired`,
       'while [ ! -f "$cursor_job/ready" ] && [ ! -f "$cursor_job/error" ] && [ ! -f "$cursor_job/start-expired" ] && kill -0 "$cursor_supervisor" 2>/dev/null; do',
       `  sleep ${LAUNCHER_POLL_SECONDS}`, "done",
@@ -277,7 +295,7 @@ export function createManagedTerminal(policy: CursorShellPolicy, root: string): 
         // A spawn reports its handle as soon as the command is running. A
         // command that already finished is still a successful spawn; its
         // output and exit status are in the terminal record.
-        ? [`printf '\\n__CURSOR_BACKGROUND_SHELL__%s:%s:%s\\n' ${shellId} "$cursor_supervisor" "$cursor_terminal"`]
+        ? [`printf '\\n__CURSOR_BACKGROUND_SHELL__%s:%s:%s\\n' ${shellId} "$cursor_supervisor" "$cursor_terminal"`, "cursor_detach"]
         : softBackgroundWindow(policy, shellId)),
     ].join("\n")
     return { command, directory, file, shellId }
@@ -429,6 +447,16 @@ nap() {
   sleep "$1" & napper=$!
   wait "$napper" 2>/dev/null || kill -KILL "$napper" 2>/dev/null
 }
+# The launcher holds the handoff's write end until it hands the command off.
+# A launcher the host cancelled, timed out or killed closes it without
+# "detached", and that stops the command as a TERM to this supervisor does.
+(
+  while read -r handoff; do [ "$handoff" != detached ] || exit 0; done
+  [ ! -f "$job/finishing" ] || exit 0
+  ! is_ours "$supervisor" "$job/runner.sh" || kill -TERM "$supervisor" 2>/dev/null
+) <&5 5<&- &
+handoff_watcher=$!
+exec 5<&-
 safe_dirs || fail 'Runtime terminal directory is unavailable'
 cd -- "$workdir" || fail 'Background command working directory is unavailable'
 [ -f "$job/command.sh" ] || fail 'Background command was not written'
@@ -513,6 +541,8 @@ elif [ -f "$job/command-exit" ]; then code=$(cat "$job/command-exit")
 else code=lost; fi
 if [ "$aborted" = 1 ]; then stop_group; code=143; fi
 : >"$job/finishing"
+# The watcher usually ended long ago at the handoff, so its PID may be reused.
+! is_ours "$handoff_watcher" "$job/runner.sh" || stop_job "$handoff_watcher"
 stop_job "$updater"
 stop_job "$watchdog"
 # Descendants can still hold stdout after the command exits. Give them a
@@ -546,6 +576,6 @@ printf '%s\n' "$code" >"$job/done"
 # survives immediate cleanup of job/done by a result consumer.
 printf 'completed\n' >&4
 wait "$command_pid" 2>/dev/null || true
-rm -f "$job/pipe" "$job/lifeline" "$job/command.sh" "$job/group.sh" "$job/collector.cjs" "$job/runner.sh" "$job/command-exit" "$job/group-ready" "$job/finishing" "$job/collected"
+rm -f "$job/pipe" "$job/lifeline" "$job/handoff" "$job/command.sh" "$job/group.sh" "$job/collector.cjs" "$job/runner.sh" "$job/command-exit" "$job/group-ready" "$job/finishing" "$job/collected"
 exit 0
 `

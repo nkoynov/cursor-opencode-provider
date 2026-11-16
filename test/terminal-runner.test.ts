@@ -42,6 +42,12 @@ async function launch(terminal: ManagedTerminal, shell = "/bin/sh", env = proces
   const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited])
   return { stdout, stderr, code }
 }
+/** Runs the launcher as its own process-group leader, as OpenCode 2.3's process daemon does. */
+function launchLeader(terminal: ManagedTerminal, shell = "/bin/sh") {
+  const proc = Bun.spawn([Bun.which("setsid")!, shell, "-c", terminal.command], { stdout: "pipe", stderr: "pipe" })
+  const result = Promise.all([new Response(proc.stdout).text(), proc.exited]).then(([stdout, code]) => ({ stdout, code }))
+  return { pid: proc.pid, result }
+}
 async function waitFor(predicate: () => boolean, ms = 6000) {
   const end = Date.now() + ms
   while (!predicate() && Date.now() < end) await Bun.sleep(25)
@@ -198,7 +204,7 @@ describe("managed terminal supervisor", () => {
   // A helper forked moments before the supervisor stops it can receive that
   // TERM before resetting the supervisor's trap, which discards it.
   it.each([
-    ["header updater", "(\n  while ", "(\n  trap '' TERM\n  while "],
+    ["header updater", "(\n  while [ ", "(\n  trap '' TERM\n  while [ "],
     ["hard-timeout watchdog", '(\n    cursor_nap=""', "(\n    trap '' TERM; sleep 1\n    cursor_nap=\"\""],
   ])("finishes the record when the %s misses its stop signal", async (_name, start, missed) => {
     const terminal = job("true", { timeoutMs: 5000, hardTimeoutMs: 30_000 })
@@ -546,6 +552,45 @@ fs.createReadStream(job + "/pipe").on("data", chunk => fs.writeSync(fd, chunk))
     expect(record).toContain("status: aborted")
     expect(record).toContain("exit_code: 143")
   })
+
+  // OpenCode 2.3's process daemon SIGKILLs an exited command's process group
+  // once 25 later commands have exited.
+  it.each([
+    ["spawned", { backgroundSpawn: true }],
+    ["soft-backgrounded", { timeoutMs: 300 }],
+  ] as const)("keeps a %s command running when the host kills its exited launcher's process group", async (_name, overrides) => {
+    if (!Bun.which("setsid")) return
+    for (const shell of ["/bin/sh", "/bin/bash", "/bin/zsh"]) {
+      if (!fs.existsSync(shell)) continue
+      const terminal = job("sleep 1; printf finished; exit 3", overrides)
+      const launcher = launchLeader(terminal, shell)
+      expect((await launcher.result).stdout).toMatch(/__CURSOR_(BACKGROUND_SHELL|SHELL_BACKGROUND)__/)
+      try { process.kill(-launcher.pid, "SIGKILL") } catch { /* no member left */ }
+      const record = await waitDone(terminal)
+      expect(record).toContain("---\nfinished\n---\nexit_code: 3\n")
+      expect(record).toContain("status: failed")
+      expect(await waitFor(() => processesFor(terminal).length === 0)).toBe(true)
+    }
+  }, 30_000)
+
+  it.each([
+    ["kills the launcher's process group", "group", "SIGKILL"],
+    ["terminates the launcher's process group", "group", "SIGTERM"],
+    ["terminates only the launcher", "launcher", "SIGTERM"],
+  ] as const)("stops the command when the host %s during the foreground window", async (_name, target, signal) => {
+    if (!Bun.which("setsid")) return
+    const terminal = job("sleep 30 & echo $! > child.pid; wait", { timeoutMs: 30_000 })
+    const launcher = launchLeader(terminal)
+    expect(await waitFor(() => fs.existsSync(path.join(terminal.directory, "ready")) && fs.existsSync(path.join(root, "child.pid")))).toBe(true)
+    const child = Number(fs.readFileSync(path.join(root, "child.pid"), "utf8"))
+    process.kill(target === "group" ? -launcher.pid : launcher.pid, signal)
+    await launcher.result
+    const record = await waitDone(terminal)
+    expect(record).toContain("status: aborted")
+    expect(record).toContain("exit_code: 143")
+    expect(await waitFor(() => !alive(child))).toBe(true)
+    expect(await waitFor(() => processesFor(terminal).length === 0)).toBe(true)
+  }, 20_000)
 
   it("retains live jobs when provider wrapper state is released", async () => {
     const terminal = job("sleep 0.5; printf survived", { backgroundSpawn: true })

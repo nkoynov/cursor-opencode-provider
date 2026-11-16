@@ -115,6 +115,13 @@ Operator setup: [OpenCode 2.x](../../docs/opencode-2.md).
   what the host approved. Preserve command and basename via an executable
   adapter; retain native `background` ownership and its completion notice
   (`test/shell-timeout.test.ts`).
+- **2.3 kills an exited command's process group.** Its process daemon keeps
+  the last 25 exited commands and SIGKILLs the oldest one's group when it
+  forgets it; supervisors that shared their launcher's group died minutes
+  later. Detach work that outlives the call into its own session and detect
+  a cancelled launch from a handoff FIFO closing without its message, not
+  from group signals (`test/terminal-runner.test.ts`, exited launcher's
+  process group; foreground window).
 - **Anonymous creates need narrow attribution.** A global gate stalled every
   shell; use identical-command lanes and the live execution input when another
   hook rewrites it (`test/shell-timeout.test.ts`).
