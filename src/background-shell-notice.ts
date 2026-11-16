@@ -260,7 +260,7 @@ function endedBySignal(end: ShellEnd): boolean {
   return end.exitCode !== undefined && end.exitCode > 128 && end.exitCode <= 128 + 64
 }
 
-type Word = { text: string; dynamic: boolean }
+type Word = { text: string; dynamic: boolean; operator?: boolean }
 
 /** Words of each simple command; quotes are removed, and `dynamic` marks a `$` expansion outside single quotes. */
 function shellSegments(command: string): Word[][] {
@@ -299,6 +299,11 @@ function shellSegments(command: string): Word[][] {
     } else if (/[;&|\n()`{}]/.test(c)) {
       endWord()
       if (segments.at(-1)!.length > 0) segments.push([])
+      if ((c === "&" || c === "|") && command[i + 1] === c) {
+        segments.at(-1)!.push({ text: c + c, dynamic: false, operator: true })
+        segments.push([])
+        i++
+      }
     } else {
       word ??= { text: "", dynamic: false }
       if (c === "$") word.dynamic = true
@@ -328,6 +333,7 @@ const QUICK_PROGRAMS = new Set([
   "cd", "export", "set", "true", ":", "echo", "printf", "cat", "lsof", "pgrep", "ps", "ss", "grep", "awk", "sed",
   "head", "tail", "cut", "tr", "sort", "uniq", "test", "[", "kill", "pkill", "killall", "fuser", "xargs",
 ])
+const ALWAYS_SUCCEED = new Set(["cd", "export", "set", "true", ":", "echo", "printf"])
 const NOT_A_KILL = new Set(["-l", "-L", "--list", "--table", "--help", "--version", "-V"])
 // Options whose meaning for which processes match is implemented here; any other option leaves the name unresolved.
 const NAME_FLAGS: Record<"pkill" | "killall", { flags: string; long: string[]; withValue: string[] }> = {
@@ -376,12 +382,17 @@ const SIGNAL_NAMES = new Set([
   "POLL", "PWR", "SYS",
 ])
 
+/** A signal Linux delivers, or 0, which only tests that the process exists. */
+function signalKind(name: string): "zero" | "signal" | "invalid" {
+  const normal = normalSignal(name)
+  if (/^\d+$/.test(normal)) return Number(normal) === 0 ? "zero" : Number(normal) <= 64 ? "signal" : "invalid"
+  return SIGNAL_NAMES.has(normal) || /^RTM(?:IN|AX)(?:[+-]\d{1,2})?$/.test(normal) ? "signal" : "invalid"
+}
+
 /** `-9`, `-TERM`, `-SIGKILL`, `-RTMIN+2`: an option that names a signal, so not a pkill or killall flag like `-P123`. */
 function signalOption(text: string): string | undefined {
   const name = /^-(\d+|[A-Z][A-Z0-9+-]*)$/.exec(text)?.[1]
-  if (name === undefined) return undefined
-  const normal = normalSignal(name)
-  return /^\d+$/.test(normal) || SIGNAL_NAMES.has(normal) || /^RTM(?:IN|AX)(?:[+-]\d+)?$/.test(normal) ? name : undefined
+  return name !== undefined && signalKind(name) !== "invalid" ? name : undefined
 }
 
 /**
@@ -394,8 +405,15 @@ export function parseKillCommand(command: string): ParsedKill | undefined {
   const parsed: ParsedKill = { pids: [], names: [], unresolved: false, leading: true }
   let found = false
   let quickSoFar = true
+  let previous: string | undefined
   for (const segment of shellSegments(command)) {
+    if (segment[0]?.operator) {
+      // What follows `&&` runs only if the command before it succeeded, and what follows `||` only if it failed.
+      if (segment[0].text === "||" || !ALWAYS_SUCCEED.has(previous ?? "")) quickSoFar = false
+      continue
+    }
     const run = commandWords(segment)
+    previous = run?.program
     const kill: ParsedKill = { pids: [], names: [], unresolved: false, leading: quickSoFar }
     const isKill = run !== undefined && KILL_PROGRAMS.has(run.program) && parseKillSegment(run.program, run.args, run.viaXargs, kill)
     if (isKill) {
@@ -407,8 +425,8 @@ export function parseKillCommand(command: string): ParsedKill | undefined {
         parsed.unresolved ||= kill.unresolved
       }
     }
-    // A heredoc's lines are data, and nothing after a guard is known to run.
-    if (segment.some((word) => word.text.startsWith("<<"))) break
+    // A heredoc's lines (`<<EOF`, `3<<EOF`, `<<<`) are data.
+    if (segment.some((word) => word.text.includes("<<"))) break
     if (!run || !QUICK_PROGRAMS.has(run.program)) quickSoFar = false
   }
   return found ? parsed : undefined
@@ -419,7 +437,7 @@ function parseKillSegment(program: string, args: Word[], viaXargs: boolean, pars
   if (texts.some((text) => NOT_A_KILL.has(text))) return false
   if (program === "fuser") {
     if (!texts.some((text) => /^-[a-zA-Z]*k/.test(text) || text === "--kill")) return false
-    if (texts.some((text) => signalOption(text) !== undefined && normalSignal(signalOption(text)!) === "0")) return false
+    if (texts.some((text) => signalOption(text) !== undefined && signalKind(signalOption(text)!) === "zero")) return false
     parsed.unresolved = true
     return true
   }
@@ -470,14 +488,15 @@ function parseKillSegment(program: string, args: Word[], viaXargs: boolean, pars
       else if (flag === "r") name.regex = true
     }
   }
-  if (signal !== undefined && normalSignal(signal) === "0") return false
+  // Signal 0 kills nothing, and an unknown signal makes the command fail.
+  if (signal !== undefined && signalKind(signal) !== "signal") return false
   if (viaXargs || operands.length === 0) parsed.unresolved = true
   for (const operand of operands) {
     if (program === "kill") {
       const pid = Number(operand.text.replace(/^-/, ""))
       if (!operand.dynamic && /^-?\d+$/.test(operand.text) && Number.isSafeInteger(pid) && pid > 1) parsed.pids.push(pid)
       else parsed.unresolved = true
-    } else if (resolvable && !operand.dynamic && (!name.regex || PORTABLE_PATTERN.test(operand.text))) {
+    } else if (resolvable && !operand.dynamic && (!name.regex || (PORTABLE_PATTERN.test(operand.text) && !operand.text.includes("(?")))) {
       parsed.names.push({ ...name, pattern: operand.text })
     } else parsed.unresolved = true
   }
@@ -491,9 +510,9 @@ function nameMatches(name: KillName, pid: number): boolean {
     if (name.program === "killall" && !name.regex) {
       const wanted = name.ignoreCase ? name.pattern.toLowerCase() : name.pattern
       const fold = (text: string) => name.ignoreCase ? text.toLowerCase() : text
-      // killall compares names longer than comm's 15 bytes by their first 15 unless -e asks for all of it.
-      if (fold(basename(argv[0] ?? "")) === wanted) return true
-      return fold(comm) === (wanted.length > 15 && name.exact ? wanted : wanted.slice(0, 15))
+      if (wanted.length <= 15) return fold(comm) === wanted
+      // A name longer than comm's 15 bytes matches the command's own name, or with -e only that.
+      return fold(basename(argv[0] ?? "")) === wanted || (!name.exact && fold(comm) === wanted.slice(0, 15))
     }
     const subject = name.full ? argv.join(" ") : comm
     const pattern = name.exact ? `^(?:${name.pattern})$` : name.pattern

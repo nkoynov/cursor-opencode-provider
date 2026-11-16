@@ -563,7 +563,7 @@ describe("shells the agent stopped itself", () => {
     expect(parseKillCommand("pkill -f 'a|b'")?.names[0]?.pattern).toBe("a|b")
     expect(parseKillCommand("pkill -s 12 web")).toMatchObject({ names: [], unresolved: true })
     expect(parseKillCommand("pkill -U bob web")).toMatchObject({ names: [], unresolved: true })
-    for (const command of ["pkill -P123 node", "pkill --parent=123 node", "pkill -n node", "pkill -v node", "pkill 'node[0-9]'", "killall -u bob node", "killall -i node", "killall -o 5m node"]) {
+    for (const command of ["pkill '(?:node)'", "pkill '(?=node)'", "pkill -P123 node", "pkill --parent=123 node", "pkill -n node", "pkill -v node", "pkill 'node[0-9]'", "killall -u bob node", "killall -i node", "killall -o 5m node"]) {
       expect({ command, parsed: parseKillCommand(command) }).toMatchObject({ command, parsed: { names: [], unresolved: true } })
     }
     expect(parseKillCommand("pkill -q 7 web")?.names.map((name) => name.pattern)).toEqual(["web"])
@@ -577,7 +577,7 @@ describe("shells the agent stopped itself", () => {
       "command -v kill", "command -V pkill", "type kill", "which killall", "kill -l", "kill -L", "kill --list", "kill --help",
       "pkill --help", "killall --version", "fuser -l", "kill -0 4242", "kill -s 0 4242 && echo up", "kill -s SIG0 4242",
       "kill --signal=SIG0 4242", "kill --signal 0 4242", "kill -SIG0 4242", "kill -n 0 4242", "kill -s0 4242", "kill -n0 4242",
-      "kill -sSIG0 4242", "killall -s0 node", "fuser -k -0 8000/tcp", "pkill -0 server",
+      "kill -sSIG0 4242", "kill -00 4242", "kill -s00 4242", "kill -999 4242", "kill -s BOGUS 4242", "killall -s0 node", "fuser -k -0 8000/tcp", "pkill -0 server",
       "pkill --signal=0 server", "killall -s 0 node", "killall -SIG0 node", "fuser 8000/tcp", "echo kill 4242",
       "git commit -m 'kill the server'", "touch demo.stop",
     ]) {
@@ -594,6 +594,11 @@ describe("shells the agent stopped itself", () => {
     expect(leading("sleep 60; pkill \"$NAME\"")).toBe(false)
     expect(leading("curl -s localhost:8000 && fuser -k 8000/tcp")).toBe(false)
     expect(leading("false && kill 4242")).toBe(false)
+    expect(leading("test -f /tmp/x.pid && kill 4242")).toBe(false)
+    expect(leading("true || kill 4242")).toBe(false)
+    expect(leading("cd /w && kill 4242")).toBe(true)
+    expect(parseKillCommand("kill 4242 || true")).toMatchObject({ pids: [4242], leading: true })
+    expect(parseKillCommand("cat 3<<EOF\nkill 4242\nEOF")).toBeUndefined()
     expect(parseKillCommand("fuser --kill 8000/tcp")).toMatchObject({ unresolved: true, leading: true })
   })
 
@@ -628,6 +633,21 @@ describe("shells the agent stopped itself", () => {
     pollBackgroundShells(3500)
     expect(notes).toHaveLength(1)
     expect(notes[0]!.resume).toBe(false)
+  })
+
+  test.skipIf(process.platform !== "linux")("killall matches a short name by the process name, not by an argv[0] alias", () => {
+    const alias = `qk${process.pid % 100000}al`
+    const child = Bun.spawn({ cmd: ["sleep", "30"], argv0: alias })
+    children.push(child)
+    Bun.sleepSync(100)
+    const file = terminalFile(LIVE_PID)
+    watch(LIVE_PID, file)
+    noteAgentShellCommand("ses_a", "call_kill", `killall ${alias}`, 1000)
+    terminalFile(LIVE_PID, { status: "succeeded", exitCode: 0 })
+    noteSessionExecution("ses_a", "succeeded")
+    pollBackgroundShells(1500)
+    expect(notes).toHaveLength(1)
+    expect(notes[0]!.resume).toBeUndefined()
   })
 
   test.skipIf(process.platform !== "linux")("a pkill whose name matches none of the shell's processes leaves the note as it was", () => {
