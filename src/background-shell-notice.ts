@@ -172,34 +172,40 @@ export function noteSessionExecution(sessionID: string, event: "started" | "succ
  * processes still exist, so a watched shell they belong to is known to be the agent's own stop.
  */
 export function noteAgentShellCommand(sessionID: string, executionID: string, command: string, now = Date.now()): void {
-  if (!sessionID || !executionID) return
+  // Process ancestry comes from /proc and the signal numbers are Linux's.
+  if (!sessionID || !executionID || process.platform !== "linux") return
   const watches = [...state.watches.values()].filter((watch) => watch.sessionID === sessionID && !watch.end)
   if (watches.length === 0) return
   const kill = parseKillCommand(command)
   if (!kill) return
-  const table = kill.names.length + kill.laterNames.length > 0 ? processTable() : undefined
+  const table = kill.kills.some((entry) => entry.names.length > 0) ? processTable() : undefined
   const stat = table ? (pid: number) => table.get(pid) : procStat
-  const targets = (watch: WatchedShell, pids: number[], killNames: KillName[]) =>
-    pids.some((pid) => descendsFrom(pid, watch.pid, stat))
-    || (table !== undefined && killNames.length > 0
-      && [...table.keys()].some((pid) => descendsFrom(pid, watch.pid, stat) && killNames.some((name) => nameMatches(name, pid))))
+  const targets = (watch: WatchedShell, entry: KillEntry) =>
+    entry.pids.some((pid) => descendsFrom(pid, watch.pid, stat))
+    || (table !== undefined && entry.names.length > 0
+      && [...table.keys()].some((pid) => descendsFrom(pid, watch.pid, stat) && entry.names.some((name) => nameMatches(name, pid))))
   for (const watch of watches) {
-    const rightAway = targets(watch, kill.pids, kill.names)
-    if (!rightAway && !targets(watch, kill.laterPids, kill.laterNames)) continue
+    const matching = kill.kills.filter((entry) => targets(watch, entry))
+    if (matching.length === 0) continue
+    const rightAway = matching.filter((entry) => entry.rightAway)
+    // A kill behind other commands may never run (`curl /crash && kill PID`), or run after the shell ended by itself.
+    const counted = rightAway.length > 0 ? rightAway : matching
     watch.targetedAt = now
     watch.targetedBy = executionID
     watch.targetedUntil = undefined
-    watch.targetSignals = rightAway ? kill.signals : kill.laterSignals
-    // A kill behind other commands may never run (`curl /crash && kill PID`), or run after the shell ended by itself.
-    watch.targetedLater = !rightAway
-    watch.targetedLastIsKill = kill.lastIsKill
+    watch.targetSignals = [...new Set(counted.flatMap((entry) => entry.signals))]
+    watch.targetedLater = rightAway.length === 0
+    // The command's exit status is its last kill's, and that proves a signal reached this shell only when it is the
+    // kill's one target.
+    watch.targetedLastIsKill = matching.length === 1 && matching[0]!.last && matching[0]!.pids.length === 1 && matching[0]!.names.length === 0
     watch.targetedVerified = false
-    trace(`background shell: shell=${watch.shellId} named by kill command execution=${executionID}${rightAway ? "" : " (later)"}`)
+    trace(`background shell: shell=${watch.shellId} named by kill command execution=${executionID}${rightAway.length > 0 ? "" : " (later)"}`)
   }
   // A target that can't be resolved (`pkill "$NAME"`, `fuser -k PORT/tcp`, `xargs kill`) falls back to timing.
-  if (!kill.unresolved) return
+  const unresolved = kill.kills.filter((entry) => entry.rightAway && entry.unresolved)
+  if (unresolved.length === 0) return
   const kills = state.kills ??= new Map()
-  kills.set(executionID, { sessionID, startedAt: now, signals: kill.signals })
+  kills.set(executionID, { sessionID, startedAt: now, signals: [...new Set(unresolved.flatMap((entry) => entry.signals))] })
   while (kills.size > MAX_KILLS) kills.delete(kills.keys().next().value!)
 }
 
@@ -370,7 +376,11 @@ const NAME_FLAGS: Record<"pkill" | "killall", { flags: string; long: string[]; w
 const PORTABLE_PATTERN = /^[\w./ :=@,+^$|*?()-]+$/
 
 export type KillName = { program: "pkill" | "killall"; pattern: string; full: boolean; exact: boolean; regex: boolean; ignoreCase: boolean }
+/** One simple kill command: what it targets and sends, whether it runs right away, and whether it ends the command. */
+export type KillEntry = { pids: number[]; names: KillName[]; signals: number[]; unresolved: boolean; rightAway: boolean; last: boolean }
+
 export type ParsedKill = {
+  kills: KillEntry[]
   pids: number[]
   names: KillName[]
   /** What the right-away kills send; empty when one sends a real-time signal. */
@@ -429,20 +439,32 @@ const NON_ENDING_SIGNALS = new Set([17, 18, 19, 20, 21, 22, 23, 28])
 /** A signal Linux delivers, or 0, which only tests that the process exists. */
 function signalKind(name: string): "zero" | "signal" | "invalid" {
   const normal = normalSignal(name)
-  if (/^\d+$/.test(normal)) return Number(normal) === 0 ? "zero" : Number(normal) <= 64 ? "signal" : "invalid"
-  return normal in SIGNAL_NUMBERS || /^RTM(?:IN|AX)(?:[+-]\d{1,2})?$/.test(normal) ? "signal" : "invalid"
+  if (/^\d+$/.test(normal) && Number(normal) === 0) return "zero"
+  return signalNumber(name) === undefined ? "invalid" : "signal"
 }
 
-/** The signal's number, or undefined for the real-time ones, whose numbers depend on the C library. */
+// glibc keeps 32 and 33 for itself, so procps and bash name 34 RTMIN and 64 RTMAX.
+const RTMIN = 34
+const RTMAX = 64
+
 function signalNumber(name: string): number | undefined {
   const normal = normalSignal(name)
-  return /^\d+$/.test(normal) ? Number(normal) : SIGNAL_NUMBERS[normal]
+  if (/^\d+$/.test(normal)) return Number(normal) >= 1 && Number(normal) <= RTMAX ? Number(normal) : undefined
+  if (normal in SIGNAL_NUMBERS) return SIGNAL_NUMBERS[normal]
+  const realTime = /^RTM(IN|AX)(?:([+-])(\d{1,2}))?$/.exec(normal)
+  if (!realTime) return undefined
+  const offset = Number(realTime[3] ?? 0)
+  if (realTime[2] === (realTime[1] === "IN" ? "-" : "+") && offset > 0) return undefined
+  const number = realTime[1] === "IN" ? RTMIN + offset : RTMAX - offset
+  return number >= RTMIN && number <= RTMAX ? number : undefined
 }
 
 /** `-9`, `-TERM`, `-SIGKILL`, `-RTMIN+2`: an option that names a signal, so not a pkill or killall flag like `-P123`. */
 function signalOption(text: string): string | undefined {
-  const name = /^-(\d+|[A-Z][A-Z0-9+-]*)$/.exec(text)?.[1]
-  return name !== undefined && signalKind(name) !== "invalid" ? name : undefined
+  // pkill takes `-kill` too; a lowercase word is a signal only when it is a whole signal name, not flags like `-fx`.
+  const name = /^-(\d+|[A-Z][A-Z0-9+-]*|[a-z][a-z0-9+-]{2,})$/.exec(text)?.[1]
+  if (name === undefined || signalKind(name) === "invalid") return undefined
+  return /^[a-z]/.test(name) && !(name.toUpperCase().replace(/^SIG/, "") in SIGNAL_NUMBERS) ? undefined : name
 }
 
 /**
@@ -471,6 +493,7 @@ export function parseKillCommand(command: string): ParsedKill | undefined {
     if (isKill) {
       if (!found) parsed.leading = quickSoFar
       found = true
+      parsed.kills.push({ pids: kill.pids, names: kill.names, signals: kill.signals, unresolved: kill.unresolved, rightAway: quickSoFar, last: false })
       if (quickSoFar) {
         parsed.pids.push(...kill.pids)
         parsed.names.push(...kill.names)
@@ -493,11 +516,12 @@ export function parseKillCommand(command: string): ParsedKill | undefined {
   }
   if (realTime.now) parsed.signals = []
   if (realTime.later) parsed.laterSignals = []
+  if (parsed.lastIsKill) parsed.kills.at(-1)!.last = true
   return found ? parsed : undefined
 }
 
 function emptyKill(leading: boolean): ParsedKill {
-  return { pids: [], names: [], signals: [], laterPids: [], laterNames: [], laterSignals: [], unresolved: false, leading, lastIsKill: false }
+  return { kills: [], pids: [], names: [], signals: [], laterPids: [], laterNames: [], laterSignals: [], unresolved: false, leading, lastIsKill: false }
 }
 
 function parseKillSegment(program: string, args: Word[], viaXargs: boolean, parsed: ParsedKill): boolean {

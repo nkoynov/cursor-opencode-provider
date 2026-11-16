@@ -8,6 +8,7 @@ import {
   CURSOR_TIMEOUT_BACKGROUND,
   captureCursorShellResult,
   capturedCursorShellOutcome,
+  cursorShellExitCode,
   registerCursorShellCall,
   resetCursorShellCalls,
   type CursorShellPolicy,
@@ -56,8 +57,8 @@ type RecordFields = {
 }
 
 // The supervisor's record: a fixed-width header, the output, then the completion footer.
-function terminalFile(pid: number, input: RecordFields = {}): string {
-  const file = join(dir, `${SHELL_ID}.txt`)
+function terminalFile(pid: number, input: RecordFields = {}, shellId = SHELL_ID): string {
+  const file = join(dir, `${shellId}.txt`)
   const status = input.status ?? "running"
   const header = [
     "---",
@@ -474,7 +475,7 @@ describe("background shell notices", () => {
     }
   })
 
-  test("a session's turn starting while its note posts is still seen", async () => {
+  test.skipIf(process.platform !== "linux")("a session's turn starting while its note posts is still seen", async () => {
     resetBackgroundShellNotices({ manualPolling: true })
     let reject!: (error: Error) => void
     const posted: BackgroundShellNote[] = []
@@ -503,7 +504,7 @@ describe("background shell notices", () => {
     expect(posted[0]!.resume).toBe(false)
   })
 
-  test("a retried post keeps the stopped shell's resume: false", async () => {
+  test.skipIf(process.platform !== "linux")("a retried post keeps the stopped shell's resume: false", async () => {
     resetBackgroundShellNotices({ manualPolling: true })
     const posted: BackgroundShellNote[] = []
     let fail = true
@@ -600,7 +601,15 @@ describe("shells the agent stopped itself", () => {
     expect(parseKillCommand("fuser -k 8000/tcp")).toMatchObject({ signals: [9] })
     expect(parseKillCommand("curl -s x; kill -KILL 4242")).toMatchObject({ laterSignals: [9], lastIsKill: true })
     expect(parseKillCommand("kill 4242 || true")).toMatchObject({ lastIsKill: false })
-    expect(parseKillCommand("kill -RTMIN+2 4242")).toMatchObject({ signals: [] })
+    expect(parseKillCommand("kill -RTMIN+2 4242")).toMatchObject({ signals: [36] })
+    expect(parseKillCommand("kill -RTMAX-1 4242")).toMatchObject({ signals: [63] })
+    for (const command of ["kill -RTMIN-1 4242", "kill -RTMAX+1 4242", "kill -RTMIN+99 4242", "kill -65 4242"]) {
+      expect({ command, parsed: parseKillCommand(command) }).toEqual({ command, parsed: undefined })
+    }
+    expect(parseKillCommand("pkill -kill node")).toMatchObject({ signals: [9], names: [{ pattern: "node" }] })
+    expect(parseKillCommand("pkill -fx node")?.names[0]).toMatchObject({ full: true, exact: true })
+    expect(parseKillCommand("curl x; kill -9 1; kill 2")?.kills.map((entry) => [entry.signals, entry.rightAway, entry.last]))
+      .toEqual([[[9], false, false], [[15], false, true]])
     expect(leading("test -f /tmp/x.pid && kill 4242")).toBe(false)
     expect(leading("true || kill 4242")).toBe(false)
     expect(leading("cd /w && kill 4242")).toBe(true)
@@ -740,7 +749,36 @@ describe("shells the agent stopped itself", () => {
     }
   })
 
-  test("a death by signal right after a kill without pids is the agent's stop", () => {
+  test.skipIf(process.platform !== "linux")("each kill of a command counts for its own targets and signal", () => {
+    // [command shape, each shell's exit, the command's exit, which shells are the agent's stop]
+    for (const [shape, exitCode, commandExit, stopped] of [
+      ["sleep 1; kill A; kill B", 0, 0, [false, true]],
+      ["curl -s x; kill -9 A; kill B", 143, 1, [false, true]],
+      ["curl -s x; kill A B", 0, 0, [false, false]],
+    ] as const) {
+      notes.length = 0
+      resetBackgroundShellNotices({ manualPolling: true })
+      registerBackgroundShellNotifier(notifier)
+      // Each child stands in for a shell's supervisor.
+      const pids = [payload(), payload()]
+      const files = pids.map((pid, i) => {
+        const file = terminalFile(pid, {}, 5000 + i)
+        watchBackgroundShell({ sessionID: "ses_a", shellId: 5000 + i, pid, file, command: `server ${i}`, notifier, now: 0 })
+        return file
+      })
+      const command = shape.replace("A", String(pids[0])).replace("B", String(pids[1]))
+      noteAgentShellCommand("ses_a", `call_${shape}`, command, 1000)
+      pids.forEach((pid, i) => terminalFile(pid, { status: exitCode === 0 ? "succeeded" : "failed", exitCode }, 5000 + i))
+      pollBackgroundShells(2000)
+      noteAgentShellCommandEnded(`call_${shape}`, 3000, commandExit)
+      noteSessionExecution("ses_a", "succeeded")
+      pollBackgroundShells(4000)
+      const resume = files.map((file) => notes.find((note) => note.metadata.file === file)?.resume === false)
+      expect({ shape, resume }).toEqual({ shape, resume: [...stopped] })
+    }
+  })
+
+  test.skipIf(process.platform !== "linux")("a death by signal right after a kill without pids is the agent's stop", () => {
     const file = terminalFile(LIVE_PID)
     watch(LIVE_PID, file)
     noteAgentShellCommand("ses_a", "call_kill", "fuser -k 8000/tcp", 1000)
@@ -795,7 +833,7 @@ describe("shells the agent stopped itself", () => {
     expect(notes[0]!.resume).toBeUndefined()
   })
 
-  test("a stopped shell's note goes without a turn once held for the cap", () => {
+  test.skipIf(process.platform !== "linux")("a stopped shell's note goes without a turn once held for the cap", () => {
     const file = terminalFile(LIVE_PID)
     watch(LIVE_PID, file)
     noteAgentShellCommand("ses_a", "call_kill", "fuser -k 8000/tcp", 1000)
@@ -859,6 +897,18 @@ describe("completion notes from supervised terminal records", () => {
     }
     return notes[0]
   }
+
+  test("a backgrounded call's host exit is the launcher's, not the command's", async () => {
+    const command = "sleep 0.3; exit 3"
+    await run("cursor_exit_bg", {
+      command, workingDirectory: dir, timeoutMs: 0, timeoutBehavior: 0, backgroundSpawn: true,
+    }, { background_shell_spawn: true, command, working_directory: dir })
+    expect(cursorShellExitCode("cursor_exit_bg", 0)).toBeUndefined()
+    captureCursorShellResult("cursor_exit_fg", "done\n", { exit: 3 })
+    expect(cursorShellExitCode("cursor_exit_fg", 0)).toBe(3)
+    expect(cursorShellExitCode("cursor_exit_uncaptured", 0)).toBe(0)
+    expect(cursorShellExitCode("cursor_exit_uncaptured", null)).toBeUndefined()
+  }, 15_000)
 
   test("reports a background spawn's exit code and output", async () => {
     const command = "sleep 0.3; printf 'a\\nb\\n'; exit 3"

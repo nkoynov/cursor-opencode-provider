@@ -884,6 +884,16 @@ export function capturedCursorShellOutcome(toolCallId: string): CursorShellOutco
 }
 
 /**
+ * The command's own exit status. A captured outcome other than an exit (backgrounded, timed out, aborted) has none:
+ * the host's exit then belongs to the launcher, not to the command.
+ */
+export function cursorShellExitCode(toolCallId: string, hostExit: unknown): number | undefined {
+  const outcome = outcomes.get(toolCallId)
+  if (outcome) return outcome.kind === "exit" ? outcome.code : undefined
+  return typeof hostExit === "number" && Number.isInteger(hostExit) && hostExit >= 0 ? hostExit : undefined
+}
+
+/**
  * OpenCode 2 appends `Exited with code N` as the result's last text block
  * (packages/core/src/shell/result.ts `notice`, v2.1.4), and sends that block
  * alone as a text result when the command printed nothing

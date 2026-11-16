@@ -29,6 +29,7 @@ import {
   captureCursorShellResult,
   captureCursorShellFailure,
   capturedCursorShellOutcome,
+  cursorShellExitCode,
   prepareCursorShellCreate,
   prepareCursorShellArgs,
   releaseCursorShellEnv,
@@ -853,10 +854,7 @@ function applyBackgroundShellLifecycle(event: any): void {
 }
 
 function shellExitCode(executionID: string, event: { status: string; result?: any }): number | undefined {
-  const outcome = capturedCursorShellOutcome(executionID)
-  if (outcome?.kind === "exit") return outcome.code
-  const exit = event.status === "completed" ? event.result?.metadata?.exit : undefined
-  return typeof exit === "number" && Number.isInteger(exit) ? exit : undefined
+  return cursorShellExitCode(executionID, event.status === "completed" ? event.result?.metadata?.exit : undefined)
 }
 
 function watchCursorBackgroundShell(executionID: string, sessionID: string, notifier: BackgroundShellNotifier): void {
