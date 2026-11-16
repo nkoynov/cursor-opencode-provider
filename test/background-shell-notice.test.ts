@@ -487,7 +487,7 @@ describe("background shell notices", () => {
     const file = terminalFile(LIVE_PID)
     watchBackgroundShell({ sessionID: "ses_a", shellId: SHELL_ID, pid: LIVE_PID, file, command: "x", notifier: flaky, now: 0 })
     noteAgentShellCommand("ses_a", "call_kill", "fuser -k 8000/tcp", 1000)
-    terminalFile(LIVE_PID, { status: "failed", exitCode: 143 })
+    terminalFile(LIVE_PID, { status: "failed", exitCode: 137 })
     noteSessionExecution("ses_a", "succeeded")
     pollBackgroundShells(1500)
     noteSessionExecution("ses_a", "started")
@@ -515,7 +515,7 @@ describe("background shell notices", () => {
     const file = terminalFile(LIVE_PID)
     watchBackgroundShell({ sessionID: "ses_a", shellId: SHELL_ID, pid: LIVE_PID, file, command: "x", notifier: flaky, now: 0 })
     noteAgentShellCommand("ses_a", "call_kill", "fuser -k 8000/tcp", 1000)
-    terminalFile(LIVE_PID, { status: "failed", exitCode: 143 })
+    terminalFile(LIVE_PID, { status: "failed", exitCode: 137 })
     noteSessionExecution("ses_a", "succeeded")
     pollBackgroundShells(1500)
     await Bun.sleep(0)
@@ -594,6 +594,13 @@ describe("shells the agent stopped itself", () => {
     expect(leading("sleep 60; pkill \"$NAME\"")).toBe(false)
     expect(leading("curl -s localhost:8000 && fuser -k 8000/tcp")).toBe(false)
     expect(leading("false && kill 4242")).toBe(false)
+    expect(parseKillCommand("kill -STOP 4242")).toBeUndefined()
+    expect(parseKillCommand("kill -s CONT 4242")).toBeUndefined()
+    expect(parseKillCommand("kill 4242")).toMatchObject({ signals: [15], lastIsKill: true })
+    expect(parseKillCommand("fuser -k 8000/tcp")).toMatchObject({ signals: [9] })
+    expect(parseKillCommand("curl -s x; kill -KILL 4242")).toMatchObject({ laterSignals: [9], lastIsKill: true })
+    expect(parseKillCommand("kill 4242 || true")).toMatchObject({ lastIsKill: false })
+    expect(parseKillCommand("kill -RTMIN+2 4242")).toMatchObject({ signals: [] })
     expect(leading("test -f /tmp/x.pid && kill 4242")).toBe(false)
     expect(leading("true || kill 4242")).toBe(false)
     expect(leading("cd /w && kill 4242")).toBe(true)
@@ -701,25 +708,35 @@ describe("shells the agent stopped itself", () => {
     expect(notes[0]!.resume).toBeUndefined()
   })
 
-  test.skipIf(process.platform !== "linux")("a kill by pid counts while its command runs; behind other commands, only a death by signal does", () => {
-    for (const [command, exitCode, stopped] of [
-      [`kill ${payload()}; sleep 60`, 0, true],
-      [`curl -s localhost:8000 -o page.html; kill ${payload()}`, 143, true],
-      [`until curl -fs localhost:8000; do sleep 0.1; done && kill ${payload()}`, 143, true],
-      [`sleep 60; kill ${payload()}`, 0, false],
-      [`sleep 60; kill ${payload()}`, 1, false],
-      [`cat > notes.txt <<'EOF'\nkill ${payload()}\nEOF`, 143, false],
+  test.skipIf(process.platform !== "linux")("a kill behind other commands counts for the signal it sends, or any end once it is known to have run", () => {
+    // [command, the shell's exit, the command's own exit, the agent's stop?]
+    for (const [command, exitCode, commandExit, stopped] of [
+      [`kill ${payload()}; sleep 60`, 0, 0, true],
+      [`curl -s localhost:8000 -o page.html; kill ${payload()}`, 143, 1, true],
+      [`until curl -fs localhost:8000; do sleep 0.1; done && kill ${payload()}`, 143, 0, true],
+      [`curl -s localhost:8000 -o page.html; kill -9 ${payload()}`, 137, 0, true],
+      [`curl -s localhost:8000 -o page.html; kill ${payload()}`, 0, 0, true],
+      [`curl -s localhost:8000 -o page.html; kill ${payload()}`, 0, 1, false],
+      [`curl -s localhost:8000 -o page.html; kill ${payload()} || true`, 0, 0, false],
+      [`curl -f localhost:8000/crash && kill ${payload()}`, 134, 22, false],
+      [`curl -f localhost:8000/crash && kill ${payload()}`, 139, 22, false],
+      [`curl -s localhost:8000; kill ${payload()}`, 137, 0, false],
+      [`kill ${payload()}`, 134, 0, false],
+      [`sleep 60; kill ${payload()}`, 0, 1, false],
+      [`sleep 60; kill ${payload()}`, 1, 1, false],
+      [`cat > notes.txt <<'EOF'\nkill ${payload()}\nEOF`, 143, 0, false],
     ] as const) {
       notes.length = 0
       const file = terminalFile(LIVE_PID)
       watch(LIVE_PID, file)
-      noteAgentShellCommand("ses_a", `call_${command}_${exitCode}`, command, 1000)
+      const id = `call_${command}_${exitCode}_${commandExit}`
+      noteAgentShellCommand("ses_a", id, command, 1000)
       terminalFile(LIVE_PID, { status: exitCode === 0 ? "succeeded" : "failed", exitCode })
       pollBackgroundShells(45_000)
-      noteAgentShellCommandEnded(`call_${command}_${exitCode}`, 61_000)
+      noteAgentShellCommandEnded(id, 61_000, commandExit)
       noteSessionExecution("ses_a", "succeeded")
       pollBackgroundShells(62_000)
-      expect({ command, resume: notes[0]?.resume }).toEqual({ command, resume: stopped ? false : undefined })
+      expect({ command, exitCode, commandExit, resume: notes[0]?.resume }).toEqual({ command, exitCode, commandExit, resume: stopped ? false : undefined })
     }
   })
 
@@ -782,7 +799,7 @@ describe("shells the agent stopped itself", () => {
     const file = terminalFile(LIVE_PID)
     watch(LIVE_PID, file)
     noteAgentShellCommand("ses_a", "call_kill", "fuser -k 8000/tcp", 1000)
-    terminalFile(LIVE_PID, { status: "failed", exitCode: 143 })
+    terminalFile(LIVE_PID, { status: "failed", exitCode: 137 })
     pollBackgroundShells(1500)
     noteAgentShellCommandEnded("call_kill", 1600)
     // Past the kill record's expiry, the note is still the agent's stop.
@@ -799,7 +816,7 @@ describe("shells the agent stopped itself", () => {
     const file = terminalFile(LIVE_PID)
     watch(LIVE_PID, file)
     noteAgentShellCommand("ses_a", "call_kill", "fuser -k 8000/tcp", 1000)
-    terminalFile(LIVE_PID, { status: "failed", exitCode: 143 })
+    terminalFile(LIVE_PID, { status: "failed", exitCode: 137 })
     pollBackgroundShells(1500)
     expect(recordBackgroundShellRead(file, "ses_a", { now: 1600 })).toBe(true)
     noteSessionExecution("ses_a", "succeeded")

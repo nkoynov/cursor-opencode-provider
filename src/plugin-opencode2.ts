@@ -453,7 +453,6 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
           if (refusal) rememberRefusal(executionID, refusal)
         } else refusals.delete(executionID)
         if (!isShellTool(event.tool)) return
-        noteAgentShellCommandEnded(executionID)
         try {
           if (event.status !== "completed") {
             if (event.status === "error") captureCursorShellFailure(executionID, event.error)
@@ -503,6 +502,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
           }
           if (shellNotifier) watchCursorBackgroundShell(executionID, event.sessionID, shellNotifier)
         } finally {
+          noteAgentShellCommandEnded(executionID, Date.now(), shellExitCode(executionID, event))
           releaseCursorShellEnv(executionID)
         }
       }),
@@ -850,6 +850,13 @@ function applyBackgroundShellLifecycle(event: any): void {
   }
   const phase = type.slice("session.execution.".length) as ExecutionPhase
   if (type.startsWith("session.execution.") && EXECUTION_PHASES.includes(phase)) noteSessionExecution(sessionID, phase)
+}
+
+function shellExitCode(executionID: string, event: { status: string; result?: any }): number | undefined {
+  const outcome = capturedCursorShellOutcome(executionID)
+  if (outcome?.kind === "exit") return outcome.code
+  const exit = event.status === "completed" ? event.result?.metadata?.exit : undefined
+  return typeof exit === "number" && Number.isInteger(exit) ? exit : undefined
 }
 
 function watchCursorBackgroundShell(executionID: string, sessionID: string, notifier: BackgroundShellNotifier): void {

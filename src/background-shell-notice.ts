@@ -38,7 +38,10 @@ type WatchedShell = {
   targetedAt?: number
   targetedBy?: string
   targetedUntil?: number
-  targetedNeedsSignal?: boolean
+  targetSignals?: number[]
+  targetedLater?: boolean
+  targetedLastIsKill?: boolean
+  targetedVerified?: boolean
   stoppedByAgent?: boolean
   posting?: boolean
   retried?: boolean
@@ -46,7 +49,7 @@ type WatchedShell = {
 
 type SessionState = { busy: boolean; stopped?: boolean }
 
-type KillCommand = { sessionID: string; startedAt: number; endedAt?: number }
+type KillCommand = { sessionID: string; startedAt: number; endedAt?: number; signals?: number[] }
 
 type NoticeState = {
   watches: Map<string, WatchedShell>
@@ -186,22 +189,28 @@ export function noteAgentShellCommand(sessionID: string, executionID: string, co
     watch.targetedAt = now
     watch.targetedBy = executionID
     watch.targetedUntil = undefined
-    // A kill behind other commands may run after the shell ended by itself; only a death by signal is its doing.
-    watch.targetedNeedsSignal = !rightAway
+    watch.targetSignals = rightAway ? kill.signals : kill.laterSignals
+    // A kill behind other commands may never run (`curl /crash && kill PID`), or run after the shell ended by itself.
+    watch.targetedLater = !rightAway
+    watch.targetedLastIsKill = kill.lastIsKill
+    watch.targetedVerified = false
     trace(`background shell: shell=${watch.shellId} named by kill command execution=${executionID}${rightAway ? "" : " (later)"}`)
   }
   // A target that can't be resolved (`pkill "$NAME"`, `fuser -k PORT/tcp`, `xargs kill`) falls back to timing.
   if (!kill.unresolved) return
   const kills = state.kills ??= new Map()
-  kills.set(executionID, { sessionID, startedAt: now })
+  kills.set(executionID, { sessionID, startedAt: now, signals: kill.signals })
   while (kills.size > MAX_KILLS) kills.delete(kills.keys().next().value!)
 }
 
-export function noteAgentShellCommandEnded(executionID: string, now = Date.now()): void {
+/** `exitCode` is the whole command's: 0 with a kill as its last command means that kill signalled a live process. */
+export function noteAgentShellCommandEnded(executionID: string, now = Date.now(), exitCode?: number): void {
   const kill = state.kills?.get(executionID)
   if (kill) kill.endedAt = now
   for (const watch of state.watches.values()) {
-    if (watch.targetedBy === executionID) watch.targetedUntil = now + TARGETED_STOP_MS
+    if (watch.targetedBy !== executionID) continue
+    watch.targetedUntil = now + TARGETED_STOP_MS
+    if (watch.targetedLastIsKill && exitCode === 0) watch.targetedVerified = true
   }
 }
 
@@ -253,17 +262,28 @@ function holdNote(watch: WatchedShell, now: number, stopped: boolean): boolean {
 function stoppedByAgent(watch: WatchedShell): boolean {
   const seen = watch.endSeenAt
   if (seen === undefined) return false
-  if (watch.targetedAt !== undefined && seen >= watch.targetedAt && (!watch.targetedNeedsSignal || endedBySignal(watch.end!))
-    && seen <= (watch.targetedUntil ?? watch.targetedAt + STOPPED_HOLD_MS)) return true
-  if (!endedBySignal(watch.end!)) return false
+  const signal = endSignal(watch.end!)
+  // A crash, or a signal the agent's kill doesn't send (the OOM killer's KILL after a TERM), is never its stop.
+  if (signal !== undefined && CRASH_SIGNALS.has(signal)) return false
+  if (watch.targetedAt !== undefined && seen >= watch.targetedAt
+    && seen <= (watch.targetedUntil ?? watch.targetedAt + STOPPED_HOLD_MS)) {
+    if (signal !== undefined ? sends(watch.targetSignals, signal) : !watch.targetedLater || watch.targetedVerified) return true
+  }
+  if (signal === undefined) return false
   for (const kill of state.kills?.values() ?? []) {
-    if (kill.sessionID === watch.sessionID && seen >= kill.startedAt && seen - kill.startedAt <= KILL_SETTLE_MS) return true
+    if (kill.sessionID === watch.sessionID && seen >= kill.startedAt && seen - kill.startedAt <= KILL_SETTLE_MS
+      && sends(kill.signals, signal)) return true
   }
   return false
 }
 
-function endedBySignal(end: ShellEnd): boolean {
-  return end.exitCode !== undefined && end.exitCode > 128 && end.exitCode <= 128 + 64
+function endSignal(end: ShellEnd): number | undefined {
+  return end.exitCode !== undefined && end.exitCode > 128 && end.exitCode <= 128 + 64 ? end.exitCode - 128 : undefined
+}
+
+/** An empty list stands for signals that have no fixed number here (`RTMIN+2`). */
+function sends(signals: readonly number[] | undefined, signal: number): boolean {
+  return signals === undefined || signals.length === 0 || signals.includes(signal)
 }
 
 type Word = { text: string; dynamic: boolean; operator?: boolean }
@@ -353,10 +373,15 @@ export type KillName = { program: "pkill" | "killall"; pattern: string; full: bo
 export type ParsedKill = {
   pids: number[]
   names: KillName[]
+  /** What the right-away kills send; empty when one sends a real-time signal. */
+  signals: number[]
   laterPids: number[]
   laterNames: KillName[]
+  laterSignals: number[]
   unresolved: boolean
   leading: boolean
+  /** The command's last simple command is a kill, so the command's exit status is that kill's. */
+  lastIsKill: boolean
 }
 
 /** The program word of a simple command after its prefixes, or undefined when the command doesn't run it. */
@@ -389,17 +414,29 @@ function normalSignal(text: string): string {
   return text.toUpperCase().replace(/^SIG/, "")
 }
 
-const SIGNAL_NAMES = new Set([
-  "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "IOT", "BUS", "FPE", "KILL", "USR1", "SEGV", "USR2", "PIPE", "ALRM", "TERM",
-  "STKFLT", "CHLD", "CLD", "CONT", "STOP", "TSTP", "TTIN", "TTOU", "URG", "XCPU", "XFSZ", "VTALRM", "PROF", "WINCH", "IO",
-  "POLL", "PWR", "SYS",
-])
+const SIGNAL_NUMBERS: Record<string, number> = {
+  HUP: 1, INT: 2, QUIT: 3, ILL: 4, TRAP: 5, ABRT: 6, IOT: 6, BUS: 7, FPE: 8, KILL: 9, USR1: 10, SEGV: 11, USR2: 12,
+  PIPE: 13, ALRM: 14, TERM: 15, STKFLT: 16, CHLD: 17, CLD: 17, CONT: 18, STOP: 19, TSTP: 20, TTIN: 21, TTOU: 22, URG: 23,
+  XCPU: 24, XFSZ: 25, VTALRM: 26, PROF: 27, WINCH: 28, IO: 29, POLL: 29, PWR: 30, SYS: 31,
+}
+const SIGTERM = 15
+const SIGKILL = 9
+// Deaths a process brings on itself; a kill sends one of these only when it names it.
+const CRASH_SIGNALS = new Set([4, 5, 6, 7, 8, 11, 24, 25, 31])
+// Signals that stop or notify a process without ending it.
+const NON_ENDING_SIGNALS = new Set([17, 18, 19, 20, 21, 22, 23, 28])
 
 /** A signal Linux delivers, or 0, which only tests that the process exists. */
 function signalKind(name: string): "zero" | "signal" | "invalid" {
   const normal = normalSignal(name)
   if (/^\d+$/.test(normal)) return Number(normal) === 0 ? "zero" : Number(normal) <= 64 ? "signal" : "invalid"
-  return SIGNAL_NAMES.has(normal) || /^RTM(?:IN|AX)(?:[+-]\d{1,2})?$/.test(normal) ? "signal" : "invalid"
+  return normal in SIGNAL_NUMBERS || /^RTM(?:IN|AX)(?:[+-]\d{1,2})?$/.test(normal) ? "signal" : "invalid"
+}
+
+/** The signal's number, or undefined for the real-time ones, whose numbers depend on the C library. */
+function signalNumber(name: string): number | undefined {
+  const normal = normalSignal(name)
+  return /^\d+$/.test(normal) ? Number(normal) : SIGNAL_NUMBERS[normal]
 }
 
 /** `-9`, `-TERM`, `-SIGKILL`, `-RTMIN+2`: an option that names a signal, so not a pkill or killall flag like `-P123`. */
@@ -415,10 +452,11 @@ function signalOption(text: string): string | undefined {
  * resolved. `leading` says whether the first kill ran right away.
  */
 export function parseKillCommand(command: string): ParsedKill | undefined {
-  const parsed: ParsedKill = { pids: [], names: [], laterPids: [], laterNames: [], unresolved: false, leading: true }
+  const parsed = emptyKill(true)
   let found = false
   let quickSoFar = true
   let previous: string | undefined
+  const realTime = { now: false, later: false }
   for (const segment of shellSegments(command)) {
     if (segment[0]?.operator) {
       // What follows `&&` runs only if the command before it succeeded, and what follows `||` only if it failed.
@@ -427,25 +465,39 @@ export function parseKillCommand(command: string): ParsedKill | undefined {
     }
     const run = commandWords(segment)
     previous = run?.program
-    const kill: ParsedKill = { pids: [], names: [], laterPids: [], laterNames: [], unresolved: false, leading: quickSoFar }
+    const kill = emptyKill(quickSoFar)
     const isKill = run !== undefined && KILL_PROGRAMS.has(run.program) && parseKillSegment(run.program, run.args, run.viaXargs, kill)
+    parsed.lastIsKill = isKill
     if (isKill) {
       if (!found) parsed.leading = quickSoFar
       found = true
       if (quickSoFar) {
         parsed.pids.push(...kill.pids)
         parsed.names.push(...kill.names)
+        parsed.signals.push(...kill.signals)
+        realTime.now ||= kill.signals.length === 0
         parsed.unresolved ||= kill.unresolved
       } else {
         parsed.laterPids.push(...kill.pids)
         parsed.laterNames.push(...kill.names)
+        parsed.laterSignals.push(...kill.signals)
+        realTime.later ||= kill.signals.length === 0
       }
     }
     // A heredoc's lines (`<<EOF`, `3<<EOF`, `<<<`) are data.
-    if (segment.some((word) => word.text.includes("<<"))) break
+    if (segment.some((word) => word.text.includes("<<"))) {
+      parsed.lastIsKill = false
+      break
+    }
     if (!run || !QUICK_PROGRAMS.has(run.program)) quickSoFar = false
   }
+  if (realTime.now) parsed.signals = []
+  if (realTime.later) parsed.laterSignals = []
   return found ? parsed : undefined
+}
+
+function emptyKill(leading: boolean): ParsedKill {
+  return { pids: [], names: [], signals: [], laterPids: [], laterNames: [], laterSignals: [], unresolved: false, leading, lastIsKill: false }
 }
 
 function parseKillSegment(program: string, args: Word[], viaXargs: boolean, parsed: ParsedKill): boolean {
@@ -453,7 +505,9 @@ function parseKillSegment(program: string, args: Word[], viaXargs: boolean, pars
   if (texts.some((text) => NOT_A_KILL.has(text))) return false
   if (program === "fuser") {
     if (!texts.some((text) => /^-[a-zA-Z]*k/.test(text) || text === "--kill")) return false
-    if (texts.some((text) => signalOption(text) !== undefined && signalKind(signalOption(text)!) === "zero")) return false
+    const fuserSignal = texts.map(signalOption).find((name) => name !== undefined)
+    if (fuserSignal !== undefined && signalKind(fuserSignal) === "zero") return false
+    if (!takeSignal(fuserSignal, SIGKILL, parsed)) return false
     parsed.unresolved = true
     return true
   }
@@ -506,6 +560,7 @@ function parseKillSegment(program: string, args: Word[], viaXargs: boolean, pars
   }
   // Signal 0 kills nothing, and an unknown signal makes the command fail.
   if (signal !== undefined && signalKind(signal) !== "signal") return false
+  if (!takeSignal(signal, SIGTERM, parsed)) return false
   if (viaXargs || operands.length === 0) parsed.unresolved = true
   for (const operand of operands) {
     if (program === "kill") {
@@ -516,6 +571,14 @@ function parseKillSegment(program: string, args: Word[], viaXargs: boolean, pars
       parsed.names.push({ ...name, pattern: operand.text })
     } else parsed.unresolved = true
   }
+  return true
+}
+
+/** Records the signal a kill sends; false for one that doesn't end a process (`-STOP`, `-CONT`). */
+function takeSignal(signal: string | undefined, fallback: number, parsed: ParsedKill): boolean {
+  const number = signal === undefined ? fallback : signalNumber(signal)
+  if (number !== undefined && NON_ENDING_SIGNALS.has(number)) return false
+  parsed.signals = number === undefined ? [] : [number]
   return true
 }
 
