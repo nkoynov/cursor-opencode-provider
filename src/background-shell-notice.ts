@@ -61,8 +61,9 @@ export const MAX_HOLD_MS = 60_000
 export const RUNNER_GONE_GRACE_MS = 3000
 // A server the agent killed by pid may take a while to shut down.
 export const TARGETED_STOP_MS = 30_000
-// Without a pid that names the shell, only a death by signal this soon after a kill command counts.
-export const KILL_SETTLE_MS = 5000
+// Without a pid that names the shell, only a death by signal this soon after a kill command counts. A killed
+// server's children can hold its output open until the supervisor stops its group, seven seconds on a loaded VM.
+export const KILL_SETTLE_MS = 20_000
 // The note of a shell the agent stopped waits out the turn, never starting one of its own.
 export const STOPPED_HOLD_MS = 30 * 60_000
 const MAX_WATCHES = 256
