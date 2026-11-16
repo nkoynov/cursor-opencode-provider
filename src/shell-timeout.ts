@@ -360,7 +360,13 @@ export function buildBackgroundShellCommand(command: string, shellPath?: string)
   return [
     ...payloadShellLines("cursor_payload_shell", shellPath ?? resolveCursorShellPath()),
     'bg_log="$(mktemp "${TMPDIR:-/tmp}/cursor-opencode-bg.XXXXXX")" || exit 1',
-    `nohup "$cursor_payload_shell" "$@" -c ${shellQuote(command)} >"$bg_log" 2>&1 </dev/null &`,
+    // OpenCode 2.3+ kills this launcher's process group when it forgets the
+    // exited command, so the spawn gets its own session where setsid exists.
+    "if command -v setsid >/dev/null 2>&1; then",
+    `  nohup setsid "$cursor_payload_shell" "$@" -c ${shellQuote(command)} >"$bg_log" 2>&1 </dev/null &`,
+    "else",
+    `  nohup "$cursor_payload_shell" "$@" -c ${shellQuote(command)} >"$bg_log" 2>&1 </dev/null &`,
+    "fi",
     "bg_pid=$!",
     `printf '${BACKGROUND_SHELL_MARKER}%s:%s\\n' "$bg_pid" "$bg_log"`,
   ].join("\n")
