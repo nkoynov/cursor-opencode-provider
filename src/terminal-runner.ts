@@ -447,6 +447,20 @@ nap() {
   sleep "$1" & napper=$!
   wait "$napper" 2>/dev/null || kill -KILL "$napper" 2>/dev/null
 }
+finish_record() {
+  printf '%s\n' "$(( $(wc -c <"$terminal") - header_bytes ))" >"$job/output-bytes" || fail 'Could not finalize terminal record'
+  write_header "$status" || fail 'Could not finalize terminal record'
+  printf '\n---\nexit_code: %s\nelapsed_ms: %s\nended_at: %s\n' "$code" "$(( ($(date +%s) - started) * 1000 ))" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >>"$terminal" || fail 'Could not finalize terminal record'
+  if [ -f "$job/error" ]; then printf 'output_storage_failed: true\n' >>"$terminal"; fi
+  printf '%s\n' '---' >>"$terminal" || fail 'Could not finalize terminal record'
+  printf '%s\n' "$code" >"$job/done"
+  # Disarm the FIFO watcher before releasing the leader. The explicit message
+  # survives immediate cleanup of job/done by a result consumer.
+  printf 'completed\n' >&4
+  [ -z "$command_pid" ] || wait "$command_pid" 2>/dev/null || true
+  rm -f "$job/pipe" "$job/lifeline" "$job/handoff" "$job/command.sh" "$job/group.sh" "$job/collector.cjs" "$job/runner.sh" "$job/command-exit" "$job/group-ready" "$job/finishing" "$job/collected" "$job/launch-cancelled"
+  exit 0
+}
 # The launcher holds the handoff's write end until it hands the command off.
 # A launcher the host cancelled, timed out or killed closes it without
 # "detached", and that stops the command as a TERM to this supervisor does.
@@ -471,9 +485,14 @@ else fail 'Background terminals require bash or setsid for command-group cancell
 safe_dirs && header running >"$terminal" || fail 'Could not initialize terminal record'
 header_bytes=$(( $(wc -c <"$terminal") ))
 printf '%s\n' "$header_bytes" >"$job/header-bytes" || fail 'Could not initialize terminal record'
-[ "$aborted" = 0 ] || fail 'Background terminal was cancelled before launch'
 # Held for the supervisor's whole life; every child closes its copy.
 exec 4<>"$job/lifeline" || fail 'Could not initialize terminal supervision'
+if [ "$aborted" = 1 ]; then
+  [ -f "$job/launch-cancelled" ] || fail 'Background terminal was cancelled before launch'
+  # The host cancelled the launch before its command started.
+  status=aborted code=143
+  finish_record
+fi
 # A compiled Bun host re-enters the runtime instead of its bundled CLI.
 BUN_BE_BUN=1 "$runtime" "$job/collector.cjs" "$job" "$terminal" "$max_output" "$supervisor" 2>/dev/null 4>&- &
 collector=$!
@@ -569,16 +588,5 @@ if [ -f "$job/error" ]; then aborted=1; code=1; fi
 if [ "$aborted" = 1 ]; then status=aborted
 elif [ "$code" = 0 ]; then status=succeeded
 else status=failed; fi
-printf '%s\n' "$(( $(wc -c <"$terminal") - header_bytes ))" >"$job/output-bytes" || fail 'Could not finalize terminal record'
-write_header "$status" || fail 'Could not finalize terminal record'
-printf '\n---\nexit_code: %s\nelapsed_ms: %s\nended_at: %s\n' "$code" "$(( ($(date +%s) - started) * 1000 ))" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >>"$terminal" || fail 'Could not finalize terminal record'
-if [ -f "$job/error" ]; then printf 'output_storage_failed: true\n' >>"$terminal"; fi
-printf '%s\n' '---' >>"$terminal" || fail 'Could not finalize terminal record'
-printf '%s\n' "$code" >"$job/done"
-# Disarm the FIFO watcher before releasing the leader. The explicit message
-# survives immediate cleanup of job/done by a result consumer.
-printf 'completed\n' >&4
-wait "$command_pid" 2>/dev/null || true
-rm -f "$job/pipe" "$job/lifeline" "$job/handoff" "$job/command.sh" "$job/group.sh" "$job/collector.cjs" "$job/runner.sh" "$job/command-exit" "$job/group-ready" "$job/finishing" "$job/collected" "$job/launch-cancelled"
-exit 0
+finish_record
 `
