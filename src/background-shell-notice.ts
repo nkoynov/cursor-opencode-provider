@@ -38,6 +38,7 @@ type WatchedShell = {
   targetedAt?: number
   targetedBy?: string
   targetedUntil?: number
+  targetedNeedsSignal?: boolean
   stoppedByAgent?: boolean
   posting?: boolean
   retried?: boolean
@@ -173,16 +174,21 @@ export function noteAgentShellCommand(sessionID: string, executionID: string, co
   if (watches.length === 0) return
   const kill = parseKillCommand(command)
   if (!kill) return
-  const table = kill.names.length > 0 ? processTable() : undefined
+  const table = kill.names.length + kill.laterNames.length > 0 ? processTable() : undefined
   const stat = table ? (pid: number) => table.get(pid) : procStat
+  const targets = (watch: WatchedShell, pids: number[], killNames: KillName[]) =>
+    pids.some((pid) => descendsFrom(pid, watch.pid, stat))
+    || (table !== undefined && killNames.length > 0
+      && [...table.keys()].some((pid) => descendsFrom(pid, watch.pid, stat) && killNames.some((name) => nameMatches(name, pid))))
   for (const watch of watches) {
-    const named = kill.pids.some((pid) => descendsFrom(pid, watch.pid, stat))
-      || (table !== undefined && kill.names.some((name) => [...table.keys()].some((pid) => descendsFrom(pid, watch.pid, stat) && nameMatches(name, pid))))
-    if (!named) continue
+    const rightAway = targets(watch, kill.pids, kill.names)
+    if (!rightAway && !targets(watch, kill.laterPids, kill.laterNames)) continue
     watch.targetedAt = now
     watch.targetedBy = executionID
     watch.targetedUntil = undefined
-    trace(`background shell: shell=${watch.shellId} named by kill command execution=${executionID}`)
+    // A kill behind other commands may run after the shell ended by itself; only a death by signal is its doing.
+    watch.targetedNeedsSignal = !rightAway
+    trace(`background shell: shell=${watch.shellId} named by kill command execution=${executionID}${rightAway ? "" : " (later)"}`)
   }
   // A target that can't be resolved (`pkill "$NAME"`, `fuser -k PORT/tcp`, `xargs kill`) falls back to timing.
   if (!kill.unresolved) return
@@ -247,7 +253,7 @@ function holdNote(watch: WatchedShell, now: number, stopped: boolean): boolean {
 function stoppedByAgent(watch: WatchedShell): boolean {
   const seen = watch.endSeenAt
   if (seen === undefined) return false
-  if (watch.targetedAt !== undefined && seen >= watch.targetedAt
+  if (watch.targetedAt !== undefined && seen >= watch.targetedAt && (!watch.targetedNeedsSignal || endedBySignal(watch.end!))
     && seen <= (watch.targetedUntil ?? watch.targetedAt + STOPPED_HOLD_MS)) return true
   if (!endedBySignal(watch.end!)) return false
   for (const kill of state.kills?.values() ?? []) {
@@ -344,7 +350,14 @@ const NAME_FLAGS: Record<"pkill" | "killall", { flags: string; long: string[]; w
 const PORTABLE_PATTERN = /^[\w./ :=@,+^$|*?()-]+$/
 
 export type KillName = { program: "pkill" | "killall"; pattern: string; full: boolean; exact: boolean; regex: boolean; ignoreCase: boolean }
-export type ParsedKill = { pids: number[]; names: KillName[]; unresolved: boolean; leading: boolean }
+export type ParsedKill = {
+  pids: number[]
+  names: KillName[]
+  laterPids: number[]
+  laterNames: KillName[]
+  unresolved: boolean
+  leading: boolean
+}
 
 /** The program word of a simple command after its prefixes, or undefined when the command doesn't run it. */
 function commandWords(words: Word[]): { program: string; args: Word[]; viaXargs: boolean } | undefined {
@@ -396,13 +409,13 @@ function signalOption(text: string): string | undefined {
 }
 
 /**
- * A command that runs kill, pkill, killall or `fuser -k` with a real signal. Only kills that run right away count
- * (nothing but quick commands before them): the pids kill names (process groups by their leader), the names pkill
- * and killall match, and whether one of their targets can't be resolved. `leading` says whether the first kill ran
- * right away.
+ * A command that runs kill, pkill, killall or `fuser -k` with a real signal: the pids kill names (process groups by
+ * their leader) and the names pkill and killall match, for kills that run right away (nothing but quick commands
+ * before them) and, as `later…`, for kills behind other commands; and whether a right-away kill's target can't be
+ * resolved. `leading` says whether the first kill ran right away.
  */
 export function parseKillCommand(command: string): ParsedKill | undefined {
-  const parsed: ParsedKill = { pids: [], names: [], unresolved: false, leading: true }
+  const parsed: ParsedKill = { pids: [], names: [], laterPids: [], laterNames: [], unresolved: false, leading: true }
   let found = false
   let quickSoFar = true
   let previous: string | undefined
@@ -414,7 +427,7 @@ export function parseKillCommand(command: string): ParsedKill | undefined {
     }
     const run = commandWords(segment)
     previous = run?.program
-    const kill: ParsedKill = { pids: [], names: [], unresolved: false, leading: quickSoFar }
+    const kill: ParsedKill = { pids: [], names: [], laterPids: [], laterNames: [], unresolved: false, leading: quickSoFar }
     const isKill = run !== undefined && KILL_PROGRAMS.has(run.program) && parseKillSegment(run.program, run.args, run.viaXargs, kill)
     if (isKill) {
       if (!found) parsed.leading = quickSoFar
@@ -423,6 +436,9 @@ export function parseKillCommand(command: string): ParsedKill | undefined {
         parsed.pids.push(...kill.pids)
         parsed.names.push(...kill.names)
         parsed.unresolved ||= kill.unresolved
+      } else {
+        parsed.laterPids.push(...kill.pids)
+        parsed.laterNames.push(...kill.names)
       }
     }
     // A heredoc's lines (`<<EOF`, `3<<EOF`, `<<<`) are data.

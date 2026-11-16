@@ -602,10 +602,11 @@ describe("shells the agent stopped itself", () => {
     expect(parseKillCommand("fuser --kill 8000/tcp")).toMatchObject({ unresolved: true, leading: true })
   })
 
-  test("only kills that run right away bring their targets", () => {
-    expect(parseKillCommand("kill 4242; sleep 60; kill 4343")).toMatchObject({ pids: [4242], unresolved: false })
+  test("kills behind other commands bring their targets apart, and no timing fallback", () => {
+    expect(parseKillCommand("kill 4242; sleep 60; kill 4343")).toMatchObject({ pids: [4242], laterPids: [4343], unresolved: false })
     expect(parseKillCommand("pkill web; sleep 60; fuser -k 8000/tcp")).toMatchObject({ names: [{ pattern: "web" }], unresolved: false })
-    expect(parseKillCommand("sleep 60; kill 4242")).toMatchObject({ pids: [], names: [], unresolved: false, leading: false })
+    expect(parseKillCommand("sleep 60; kill 4242")).toMatchObject({ pids: [], laterPids: [4242], names: [], unresolved: false, leading: false })
+    expect(parseKillCommand("curl -s x && pkill node")).toMatchObject({ names: [], laterNames: [{ pattern: "node" }] })
     expect(parseKillCommand("cat <<EOF\nkill 4242\nEOF")).toBeUndefined()
   })
 
@@ -700,20 +701,22 @@ describe("shells the agent stopped itself", () => {
     expect(notes[0]!.resume).toBeUndefined()
   })
 
-  test.skipIf(process.platform !== "linux")("a kill by pid counts while its command still runs, but not behind a slow or guarded command", () => {
-    for (const [command, stopped] of [
-      [`kill ${payload()}; sleep 60`, true],
-      [`sleep 60; kill ${payload()}`, false],
-      [`false && kill ${payload()}`, false],
-      [`cat > notes.txt <<'EOF'\nkill ${payload()}\nEOF`, false],
+  test.skipIf(process.platform !== "linux")("a kill by pid counts while its command runs; behind other commands, only a death by signal does", () => {
+    for (const [command, exitCode, stopped] of [
+      [`kill ${payload()}; sleep 60`, 0, true],
+      [`curl -s localhost:8000 -o page.html; kill ${payload()}`, 143, true],
+      [`until curl -fs localhost:8000; do sleep 0.1; done && kill ${payload()}`, 143, true],
+      [`sleep 60; kill ${payload()}`, 0, false],
+      [`sleep 60; kill ${payload()}`, 1, false],
+      [`cat > notes.txt <<'EOF'\nkill ${payload()}\nEOF`, 143, false],
     ] as const) {
       notes.length = 0
       const file = terminalFile(LIVE_PID)
       watch(LIVE_PID, file)
-      noteAgentShellCommand("ses_a", `call_${command}`, command, 1000)
-      terminalFile(LIVE_PID, { status: "failed", exitCode: 143 })
+      noteAgentShellCommand("ses_a", `call_${command}_${exitCode}`, command, 1000)
+      terminalFile(LIVE_PID, { status: exitCode === 0 ? "succeeded" : "failed", exitCode })
       pollBackgroundShells(45_000)
-      noteAgentShellCommandEnded(`call_${command}`, 61_000)
+      noteAgentShellCommandEnded(`call_${command}_${exitCode}`, 61_000)
       noteSessionExecution("ses_a", "succeeded")
       pollBackgroundShells(62_000)
       expect({ command, resume: notes[0]?.resume }).toEqual({ command, resume: stopped ? false : undefined })
