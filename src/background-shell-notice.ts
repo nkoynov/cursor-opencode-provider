@@ -41,6 +41,7 @@ type WatchedShell = {
   targetSignals?: number[]
   targetedLater?: boolean
   targetedLastIsKill?: boolean
+  targetedByLast?: boolean
   targetedVerified?: boolean
   stoppedByAgent?: boolean
   posting?: boolean
@@ -175,6 +176,10 @@ export function noteAgentShellCommand(sessionID: string, executionID: string, co
   if (executionID) forgetKill(executionID)
   // Process ancestry comes from /proc and the signal numbers are Linux's.
   if (!sessionID || !executionID || process.platform !== "linux") return
+  // A record finished before this command must not be seen as ending after it.
+  for (const watch of state.watches.values()) {
+    if (watch.sessionID === sessionID && !watch.end) probe(watch, now)
+  }
   const watches = [...state.watches.values()].filter((watch) => watch.sessionID === sessionID && !watch.end)
   if (watches.length === 0) return
   const kill = parseKillCommand(command)
@@ -199,6 +204,7 @@ export function noteAgentShellCommand(sessionID: string, executionID: string, co
     // The command's exit status is its last kill's, and that proves a signal reached this shell only when it is the
     // kill's one target.
     watch.targetedLastIsKill = matching.length === 1 && matching[0]!.last && matching[0]!.pids.length === 1 && matching[0]!.names.length === 0
+    watch.targetedByLast = matching.some((entry) => entry.last)
     watch.targetedVerified = false
     trace(`background shell: shell=${watch.shellId} named by kill command execution=${executionID}${rightAway.length > 0 ? "" : " (later)"}`)
   }
@@ -223,8 +229,9 @@ export function noteAgentShellCommandEnded(executionID: string, now = Date.now()
   }
   for (const watch of state.watches.values()) {
     if (watch.targetedBy !== executionID) continue
-    // A single-PID kill that ended the command with a failure signalled nothing.
-    if (failed || (watch.targetedLastIsKill && exitCode !== undefined && exitCode !== 0)) {
+    // A kill that ended the command with a failure may have signalled nothing: kill fails when any pid is gone,
+    // pkill and killall when nothing matched any more.
+    if (failed || (watch.targetedByLast && exitCode !== undefined && exitCode !== 0)) {
       untarget(watch)
       continue
     }
@@ -243,7 +250,7 @@ function forgetKill(executionID: string): void {
 
 function untarget(watch: WatchedShell): void {
   watch.targetedAt = watch.targetedBy = watch.targetSignals = watch.targetedUntil = undefined
-  watch.targetedLater = watch.targetedLastIsKill = watch.targetedVerified = undefined
+  watch.targetedLater = watch.targetedLastIsKill = watch.targetedByLast = watch.targetedVerified = undefined
 }
 
 export function forgetBackgroundShells(sessionID: string): void {
@@ -300,7 +307,7 @@ function stoppedByAgent(watch: WatchedShell): boolean {
   const signal = endSignal(watch.end!)
   // A crash, or a signal the agent's kill doesn't send (the OOM killer's KILL after a TERM), is never its stop.
   if (signal !== undefined && CRASH_SIGNALS.has(signal)) return false
-  if (watch.targetedAt !== undefined && seen >= watch.targetedAt
+  if (watch.targetedAt !== undefined && seen > watch.targetedAt
     && seen <= (watch.targetedUntil ?? watch.targetedAt + STOPPED_HOLD_MS)) {
     // A kill behind other commands may never have run, and any shell can end by itself: unless the kill is known to
     // have signalled this shell, only a right-away kill's own signal counts.
@@ -310,7 +317,7 @@ function stoppedByAgent(watch: WatchedShell): boolean {
   if (signal === undefined) return false
   for (const [id, kill] of state.kills ?? []) {
     if (id === watch.targetedBy) continue
-    if (kill.sessionID === watch.sessionID && seen >= kill.startedAt && seen - kill.startedAt <= KILL_SETTLE_MS
+    if (kill.sessionID === watch.sessionID && seen > kill.startedAt && seen - kill.startedAt <= KILL_SETTLE_MS
       && sends(kill.signals, signal)) return true
   }
   return false

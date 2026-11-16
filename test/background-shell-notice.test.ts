@@ -810,6 +810,47 @@ describe("shells the agent stopped itself", () => {
     }
   })
 
+  test.skipIf(process.platform !== "linux")("a shell whose record finished before the kill command is never its doing", () => {
+    for (const command of [`kill ${payload()}`, "fuser -k -TERM 8000/tcp"]) {
+      notes.length = 0
+      const file = terminalFile(LIVE_PID)
+      watch(LIVE_PID, file)
+      terminalFile(LIVE_PID, { status: "failed", exitCode: 143 })
+      noteAgentShellCommand("ses_a", `call_${command}`, command, 1000)
+      noteAgentShellCommandEnded(`call_${command}`, 1200, 0)
+      noteSessionExecution("ses_a", "succeeded")
+      pollBackgroundShells(2000)
+      expect({ command, count: notes.length, resume: notes[0]?.resume }).toEqual({ command, count: 1, resume: undefined })
+    }
+  })
+
+  test.skipIf(process.platform !== "linux")("a final pkill or multi-pid kill that exits non-zero names nothing", () => {
+    const name = `qk${process.pid % 100000}nz`
+    const script = join(dir, name)
+    writeFileSync(script, "#!/bin/sh\nsleep 30\n", { mode: 0o755 })
+    const child = Bun.spawn([script])
+    children.push(child)
+    const deadline = Date.now() + 3000
+    while (Date.now() < deadline) {
+      try {
+        if (readFileSync(`/proc/${child.pid}/comm`, "utf8").trim() === name) break
+      } catch { /* starting */ }
+      Bun.sleepSync(20)
+    }
+    for (const command of [`curl -s x; pkill ${name}`, `pkill ${name}`, `kill ${payload()} ${payload()}`]) {
+      notes.length = 0
+      const file = terminalFile(LIVE_PID)
+      watch(LIVE_PID, file)
+      noteAgentShellCommand("ses_a", `call_${command}`, command, 1000)
+      terminalFile(LIVE_PID, { status: "failed", exitCode: 143 })
+      pollBackgroundShells(1500)
+      noteAgentShellCommandEnded(`call_${command}`, 1600, 1)
+      noteSessionExecution("ses_a", "succeeded")
+      pollBackgroundShells(2000)
+      expect({ command, count: notes.length, resume: notes[0]?.resume }).toEqual({ command, count: 1, resume: undefined })
+    }
+  })
+
   test.skipIf(process.platform !== "linux")("a single-pid kill that exits non-zero, one whose end never comes, or a reused call id names nothing", () => {
     for (const shape of ["failed kill", "no end", "reused id"] as const) {
       notes.length = 0
