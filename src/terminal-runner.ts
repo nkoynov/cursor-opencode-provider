@@ -382,7 +382,14 @@ finally {
 `
 
 const SUPERVISOR = String.raw`
-started=$(date +%s)
+# bash 4.2 and later read the clock without starting a date process.
+if [ -n "$BASH_VERSION" ] && printf -v now '%(%s)T' -1 2>/dev/null && [ -n "$now" ]; then
+  clock() { printf -v now '%(%s)T' -1; }
+else
+  clock() { now=$(date +%s); }
+fi
+clock
+started=$now
 started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 supervisor=$$
 command_pid=""
@@ -392,14 +399,17 @@ watchdog=""
 aborted=0
 group_stopped=0
 group_mode=""
+napper=""
+tick_sleeps=""
 fail() { printf '%s\n' "$1" >"$job/error"; exit 1; }
 safe_dirs() { [ ! -L "$root" ] && [ ! -L "$terminals" ] && [ ! -L "$job" ] && [ -d "$job" ]; }
 # Every field has a fixed width, so the header is rewritten in place and
 # command output is appended once instead of being copied on every update.
 header() {
+  clock
   printf '%s\n' '---' "pid: $supervisor" "cwd: $cwd_value" "command: $command_value"
   [ "$title_value" = '""' ] || printf 'title: %s\n' "$title_value"
-  printf 'status: %-9s\nstarted_at: %s\nrunning_for_ms: %-15s\n---\n' "$1" "$started_at" "$(( ($(date +%s) - started) * 1000 ))"
+  printf 'status: %-9s\nstarted_at: %s\nrunning_for_ms: %-15s\n---\n' "$1" "$started_at" "$(( (now - started) * 1000 ))"
 }
 write_header() { safe_dirs && header "$1" 1<>"$terminal"; }
 owned_group() {
@@ -437,20 +447,52 @@ reap() {
 stop_job() {
   [ -z "$1" ] || { kill -TERM "-$1" 2>/dev/null || kill -TERM "$1" 2>/dev/null || true; reap "$1"; }
 }
-on_signal() { aborted=1; stop_group; }
+# A trapped signal interrupts a wait that has begun, but one that arrives just
+# before the wait would leave its change to the full nap, so it also ends the
+# nap's sleep. A wait that has just reaped the sleep frees its PID, so procfs
+# must still show it as this shell's child; reading it starts no process.
+wake() {
+  [ -n "$napper" ] || return 0
+  if [ -d /proc/self ]; then
+    read -r nap_pid nap_name nap_state nap_parent nap_rest <"/proc/$napper/stat" 2>/dev/null || return 0
+    [ "$nap_parent" = "$supervisor" ] || return 0
+  fi
+  kill -KILL "$napper" 2>/dev/null
+}
+on_signal() { aborted=1; wake; stop_group; }
 trap on_signal TERM INT HUP
 # group.sh and the collector send USR1 when there is something to observe.
-trap ':' USR1
+trap wake USR1
 # Sleep in a child so a trapped signal interrupts the wait at once, instead
 # of forking a short sleep many times per second for the job's whole life.
+# Senders write their state before they signal, so the condition "$2" is
+# checked again once the child exists, for a signal that came before $!.
 nap() {
-  sleep "$1" & napper=$!
-  wait "$napper" 2>/dev/null || kill -KILL "$napper" 2>/dev/null
+  sleep "$1" 4>&- & napper=$!
+  if "$2"; then wait "$napper" 2>/dev/null || kill -KILL "$napper" 2>/dev/null
+  else kill -KILL "$napper" 2>/dev/null; wait "$napper" 2>/dev/null; fi
+  napper=""
+}
+starting() { [ ! -f "$job/group-ready" ] && [ "$aborted" = 0 ] && kill -0 "$command_pid" 2>/dev/null; }
+running() { [ "$aborted" = 0 ] && [ ! -f "$job/command-exit" ] && [ ! -f "$job/error" ] && kill -0 "$command_pid" 2>/dev/null; }
+# The header updater's one-second wait. Under bash it reads the lifeline on
+# fd 6 instead of starting a sleep: nothing writes to the lifeline while the
+# updater runs, and its EOF is the supervisor's exit. Any read that does not
+# time out (EOF, or bash 3.2, whose timeout looks the same) falls back to sleep.
+tick() {
+  if [ "$group_mode" = bash ] && [ -z "$tick_sleeps" ]; then
+    read -r -t 1 -u 6 tick_line
+    [ "$?" -le 128 ] || return 0
+    tick_sleeps=1
+    kill -0 "$supervisor" 2>/dev/null || return 0
+  fi
+  sleep 1
 }
 finish_record() {
   printf '%s\n' "$(( $(wc -c <"$terminal") - header_bytes ))" >"$job/output-bytes" || fail 'Could not finalize terminal record'
   write_header "$status" || fail 'Could not finalize terminal record'
-  printf '\n---\nexit_code: %s\nelapsed_ms: %s\nended_at: %s\n' "$code" "$(( ($(date +%s) - started) * 1000 ))" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >>"$terminal" || fail 'Could not finalize terminal record'
+  clock
+  printf '\n---\nexit_code: %s\nelapsed_ms: %s\nended_at: %s\n' "$code" "$(( (now - started) * 1000 ))" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >>"$terminal" || fail 'Could not finalize terminal record'
   if [ -f "$job/error" ]; then printf 'output_storage_failed: true\n' >>"$terminal"; fi
   printf '%s\n' '---' >>"$terminal" || fail 'Could not finalize terminal record'
   printf '%s\n' "$code" >"$job/done"
@@ -503,8 +545,8 @@ else
 fi
 command_pid=$!
 start_poll=0
-while [ ! -f "$job/group-ready" ] && [ "$aborted" = 0 ] && kill -0 "$command_pid" 2>/dev/null && [ "$start_poll" -lt 100 ]; do
-  nap 0.1; start_poll=$((start_poll + 1))
+while starting && [ "$start_poll" -lt 100 ]; do
+  nap 0.1 starting; start_poll=$((start_poll + 1))
 done
 # A launch cancelled once its command started is finalized below as aborted.
 if [ "$aborted" = 1 ] && [ -f "$job/launch-cancelled" ]; then :
@@ -534,7 +576,7 @@ if [ "$hard_seconds" != 0 ]; then
 fi
 (
   while [ ! -f "$job/finishing" ] && kill -0 "$supervisor" 2>/dev/null; do
-    sleep 1
+    tick
     write_header running && continue
     printf 'Terminal output storage failed\n' >"$job/error"
     if is_ours "$supervisor" "$job/runner.sh"; then kill -TERM "$supervisor"; exit 1; fi
@@ -548,13 +590,14 @@ fi
   drain=0
   while [ "$drain" -lt 50 ] && kill -0 "$collector" 2>/dev/null; do sleep 0.1; drain=$((drain + 1)); done
   ! is_ours "$collector" "$job/collector.cjs" || kill -TERM "$collector" 2>/dev/null
-) 4>&- &
+) 6<"$job/lifeline" 4>&- &
 updater=$!
 # The nap is only a backstop: command exit, storage failure, timeouts and
-# cancellation all signal this process and end it early.
+# cancellation all signal this process and end it early. It also bounds how
+# long a group leader that dies without reporting goes unnoticed.
 while [ "$aborted" = 0 ] && [ ! -f "$job/command-exit" ] && kill -0 "$command_pid" 2>/dev/null; do
   if [ -f "$job/error" ]; then on_signal; break; fi
-  nap 1
+  nap 30 running
 done
 if [ "$aborted" = 1 ]; then stop_group; code=143
 elif [ -f "$job/command-exit" ]; then code=$(cat "$job/command-exit")
