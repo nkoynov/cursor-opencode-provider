@@ -763,8 +763,15 @@ These are failure lessons shared by both hosts, not a replacement for
   `supports_images` marked Grok 4.7, Composer 2.5 and Kimi K2.7 Code text-only
   though their Runs read images, Cursor CLI ignores it, and Cursor drops images
   for a text-only model without an error. Advertise images only from the live
-  probe record (`generate:images`), never the flag or a hardcoded id
+  probe record (`generate:images`), never Cursor's flag or a hardcoded guess
   (`test/image-input-probe.test.ts`, `test/model-selection-review.test.ts`).
+  When a first probe fails only on transient capacity (`capacity_limit`) and
+  blocks the release gate, models.dev may seed the record for that wire id if
+  its matching entry has `attachment: true` and `modalities.input` includes
+  `image` (0.8.7: `claude-sonnet-4` via models.dev `opencode`/`helicone`
+  Sonnet 4 rows). That is not Cursor Run evidence—Kimi K3-class mismatches
+  still exist—so retest with `generate:images -- --model <id>` once capacity
+  recovers, and never treat models.dev as stronger than a completed probe.
   PRs #84/#86/#95 showed that tier selection
   must precede speed preference, defaults must survive catalog partitioning,
   and unmatched hints must not rewrite an advertised tuple. Exercise marked
@@ -782,6 +789,13 @@ These are failure lessons shared by both hosts, not a replacement for
   legacy selections usable with their old static budget; dedicated entries
   provide the larger budget (`test/model-selection-review.test.ts`,
   `test/model-selection-run.test.ts`).
+  Compare accepted discovery tuples against each catalog independently.
+  Object-key collisions can drop a choice before either host sees it.
+  Preserve the wire id and tuple when escaping a key, and use own properties
+  for pricing lookups (`test/model-selection-review.test.ts`, `test/pricing.test.ts`).
+  Cache timestamps alone cannot distinguish roots or atomic replacements.
+  Bind the model snapshot to the Run's cache root and file generation and
+  verify the selected max-mode bit on the request (`test/model-selection-run.test.ts`).
 - **Inspect generator inputs before changing mappings.** Pricing and model
   metadata came from distinct markdown endpoints. Run the live pricing gate
   before a bump; the v0.6.4 failure forced a retag ([release gate](../../AGENTS.md#hard-stop--release--version-bump--tag-gate-non-optional)).
@@ -821,6 +835,7 @@ These are failure lessons shared by both hosts, not a replacement for
   bind (`runs nested isolation with no capabilities and keeps ancestor binds read-only`).
 - **OpenCode keeps the last matching permission rule.** A generated `*` allow after the env denies lets `.env` through, and `/tmp/*` allows every other temp directory. `scripts/configure-opencode.sh` puts the broad allow first and the `.env.example` exception last, and allows only the owned canonical roots. `scripts/opencode-permission.mjs` runs the upstream matcher from commit `958f965`.
 - **A deadline helper and its temp files need one owner.** `scripts/live-test.sh` resolves GNU `timeout` or `gtimeout`, or `LIVE_TEST_TIMEOUT`, and the same EXIT trap that owns the transcript files also owns the plugin-list files. Native Bun also extracts libraries and creates scratch directories; place the whole invocation in an owned TMPDIR subdirectory so cleanup removes runtime-created entries without touching an older run. The deadline command is a session leader. Cancellation signals that group and walks `ps -ax -o pid=,ppid=`, then `KILL`s what ignored `TERM`. A failed listing is a cleanup failure. A helper that turns `errexit` back on before returning skips the caller's diagnostics. Ordinary cancellation is covered by `test/review-scripts.test.ts`. SIGKILL of the script itself is not.
+- **A group signal does not test pid-targeted cancellation.** TERM sent only to the pid of `scripts/isolated-check.sh` or `scripts/isolate-run.sh`, as a tool runner's kill does, ran the EXIT trap and removed the archive or stage while the sandboxed command kept running, on `--live` with the key. Neither script signalled its child, and `forwards termination to the command session` signals the whole process group, which reaches the boundary directly. Run the boundary as a background session, forward TERM, INT, HUP and QUIT, kill it after `ISOLATE_TERM_GRACE`, and clean up only after it has stopped (`isolate_supervise`, `check_supervise`). A background job of a non-interactive bash starts with INT and QUIT ignored and cannot trap them, so the outer script forwards TERM and the helper restores both for the command. `SECONDS` has whole-second resolution; count 0.1 s sleeps. Bash runs the EXIT trap for HUP but not for QUIT, which left `scripts/live-test.sh`'s OpenCode running. macOS has no pid namespace, so a process that starts its own session is outside the kill. Signal only the script's pid in the test (`pid-targeted cancellation` in `test/review-scripts.test.ts`). A trap bash takes between two commands does not end the `wait` that follows: TERM trapped before `$!` was stored, or just before `wait` started, left `isolate-run.sh` waiting forever on a command that ignores TERM. The trap now runs the whole stop sequence (`isolate_sup_stop`). Force such a boundary in a test with a `BASH_ENV` hook whose DEBUG trap signals `$$` before the named command.
 - **A removed temp dir can come back.** Tests left about 200 TMPDIR entries per
   run ([#102](https://github.com/oakimov/cursor-opencode-provider/issues/102)):
   cutting the whole project-folder path put it outside a long cache root;
@@ -836,6 +851,35 @@ These are failure lessons shared by both hosts, not a replacement for
   process listing or a writer surviving termination must fail cleanup, not
   silently permit removal (`test/process-cleanup.test.ts`). Test log content
   separately from its path-bearing diagnostic header (`test/debug.test.ts`).
+  A fixture writer that opens its file with create can bring it back between
+  a remover's unlink and rmdir: the review fixture's defective runner then
+  failed with ENOTEMPTY and exit 1 instead of the expected status, about once
+  in six full runs. Create the file once and append without creating
+  (`test/review-eval.test.ts`).
+- **A test's default paths and hosts are the operator's.** Three `CursorPlugin
+  shell result hooks` tests called `plugin.config` with an empty temp cache and
+  the native data root, so each read the developer's `auth.json` and ran live
+  model discovery: about 1 s where an empty store takes 65 ms. A 2.x setup test
+  sent its placeholder token to Cursor, and the `pollForTokens` abort test
+  polled it. One slow answer reached Bun's 5 s timeout. Bun fails that test and
+  keeps running its body, so `withTempHostCache` restored the process-wide
+  cache root late: the scope entered meanwhile then restored the removed dir
+  as the root, and 14 later tests and the leftover check failed with it.
+  `test/preload.ts` owns the data root and refuses the network, and
+  `test/host-cache.ts` puts the roots back when the test ends
+  (`test/test-isolation.test.ts`). Redirect the variable the code reads first:
+  a fake `HOME` does not move the store while `XDG_DATA_HOME` is set.
+  The developer's machine hid a third caller: with a Cursor CLI installed the
+  client version comes from disk, and without one, as in CI, six Run tests
+  fetched Cursor's installer page. The preload fixes `CURSOR_CLIENT_VERSION`.
+  Look for such callers with a home that has none of the operator's installs.
+  PR #184 made snapshot age configurable, but an inherited seven-day setting
+  bypassed expiry branches and left a quarantine barrier unreachable. Clean CI
+  and tests that scoped their own override missed the caller's environment.
+  The preload clears inherited retention and fails/restores leaked overrides;
+  subprocess fixtures
+  cover long, short and invalid settings while preserving explicit test-owned
+  overrides and child-writer inheritance (`test/test-isolation.test.ts`).
 - **Match CI environments.** Narrow PATH fixtures omitted mkdir. Queued
   publication tests once read Linux's `/proc/locks`, which macOS lacks;
   observe the test contender at the real `flock` call after its approval peek,
@@ -867,6 +911,14 @@ These are failure lessons shared by both hosts, not a replacement for
   workflow rather than in a script the head might not contain. Strip
   temporary module copies from coverage and include Bun editor types
   (`scripts/strip-copied-coverage.ts`).
+  PR #187's jobs stopped before tests because every default Ubuntu archive
+  endpoint failed DNS resolution, also on fresh runners. Diagnose provisioning
+  separately from subject failures. An Ubuntu-registered mirror on an
+  independent domain preserves APT's signed metadata/package validation;
+  reject partial index updates rather than installing against stale indexes.
+  Share that bootstrap between merge and head coverage jobs, including when
+  the checked-out head predates a helper script (`uses the same signed Ubuntu
+  mirror setup` in `test/review-scripts.test.ts`).
 - **A green suite is not a branch audit.** A review missed a generator whose
   failed refresh retained the state that made the next invocation skip its
   promised retry, and it also promoted observations and policy preferences
@@ -936,6 +988,12 @@ These are failure lessons shared by both hosts, not a replacement for
   Parse the `--paginate` JSON stream locally, including later-page receipts,
   and reject partial or malformed output before inferring no prior review
   (`publishes and recovers later-page receipts with gh that has no slurp flag`).
+  A re-review can change the verdict without changing the PR head. Keep the
+  reviewer's existing summary current instead of leaving an earlier clean
+  post beside a newer contradictory one. Bind the replacement to the existing
+  review id, author and body digest, then verify its body at that same id;
+  summary edits retain the original commit/inline anchors, so new findings
+  need source locations in the summary (`review summary updates` regressions).
 - **A code verdict is not a command exit status.** A review labelled an isolated
   check passed while reporting its nonzero exit and failing self-tests. The
   result model also rejected clean code verdicts with established baseline or
@@ -970,7 +1028,7 @@ These are failure lessons shared by both hosts, not a replacement for
   Exercise the actual HTTP authorization scheme as well as JWT signatures;
   GitHub App JWT requests require Bearer authentication.
 - **Keep one current policy across docs and prompts.** A rebase can add review
-  rules; reviewer patches still need whole-path validation. A manual `caeliq-reviewer` review posts only after the maintainer approves the preview digest `show` printed for that payload and head (`scripts/review-publish.py`). The review request uses a GitHub App installation token minted from `REVIEW_APP_ID` and the app private key after the final pull read; the approval is read again after the mint. The Cloud Agent login, a user token, and the app client secret are not that credential (`test/review-publish.test.ts`). `post` reads that approval after the publication lock, after each read-only lookup, and again immediately before the send. The pull request, head, identity, preview digest, and approval generation are the ones current when the lock was acquired, so a denial, a replaced payload, or another valid approval is not sent on that operation. A send that does not confirm delivery stays unsettled and is not repeated. A confirmed review id and its comment ids remain delivery evidence when the summary marker is edited or the review is no longer listed, and are not posted again. The review records the repository, pull request, base, head, and linux runtime; `render` turns that structured result into the COMMENT payload, refuses an incomplete or malformed result, and anchors a comment only at a listed diff location. Earlier findings stay classified. `approve` and `post` name the rendered payload, the same file `show` froze. After the reviews lookup, and immediately before the send, `post` fetches the pull request again and then re-reads the pinned local operation. A moved base or head stops the send for a refreshed review and a new approval (`test/review-publish.test.ts`). A push after that fetch is outside the check. A returned review URL has to name the approved pull request. A response that shows GitHub rejected the request can be retried. The public-text scan flags secret values and local paths, including `~/...`, Markdown labels, `file://` autolinks, and a path written directly after a colon, and still allows public URLs and public identifiers such as `CURSOR_API_KEY`. The procedure stays in `docs/pr-review.md`. Changelog fixes
+  rules; reviewer patches still need whole-path validation. A manual `caeliq-reviewer` review posts only after the maintainer approves the preview digest `show` printed for that payload and head (`scripts/review-publish.py`). Without `--token-env`, `post`, `threads`, and `complete-resolutions.py` mint one GitHub App installation token from `REVIEW_APP_ID` and the app private key and send it as `GH_TOKEN` on every `gh` call in that run, including thread listing and the reads before publication. The approval is read again before the send. The Cloud Agent login, an ambient user token, and the app client secret are not that credential. `--token-env NAME` instead uses the personal access token (`ghp_` or `github_pat_`) in that environment variable for every `gh` call, and that token wins over ambient `GH_TOKEN` and `GITHUB_TOKEN`; the token is not a command-line argument (`test/review-publish.test.ts`). `post` reads that approval after the publication lock, after each read-only lookup, and again immediately before the send. The pull request, head, identity, preview digest, and approval generation are the ones current when the lock was acquired, so a denial, a replaced payload, or another valid approval is not sent on that operation. A send that does not confirm delivery stays unsettled and is not repeated. A confirmed review id and its comment ids remain delivery evidence when the summary marker is edited or the review is no longer listed, and are not posted again. The review records the repository, pull request, base, head, and linux runtime; `render` turns that structured result into the COMMENT payload, refuses an incomplete or malformed result, and anchors a comment only at a listed diff location. Earlier findings stay classified. `approve` and `post` name the rendered payload, the same file `show` froze. After the reviews lookup, and immediately before the send, `post` fetches the pull request again and then re-reads the pinned local operation. A moved base or head stops the send for a refreshed review and a new approval (`test/review-publish.test.ts`). A push after that fetch is outside the check. A returned review URL has to name the approved pull request. A response that shows GitHub rejected the request can be retried. The public-text scan flags secret values and local paths, including `~/...`, Markdown labels, `file://` autolinks, and a path written directly after a colon, and still allows public URLs and public identifiers such as `CURSOR_API_KEY`. The procedure stays in `docs/pr-review.md`. Changelog fixes
   compare with the release, not an intermediate PR state. A versioned heading
   or package version bump does not establish publication. Verify release status
   and keep entries in the maintainer-designated upcoming release. Concurrent changelog

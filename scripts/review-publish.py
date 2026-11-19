@@ -11,10 +11,14 @@ head, identity, preview digest, and approval generation. A denial or a
 different approval is not sent, even when the replacement is valid by
 itself. After the reviews lookup, and immediately before it sends, post
 reads the pull request again and then re-reads that pinned operation.
-It mints a GitHub App installation token and reads the approval once
-more. The review author is that app's bot. A client secret, a user
-token, and the ambient gh login are not used. A
-moved base or head is not sent; refresh the review and approve it again.
+Without --token-env, it mints a GitHub App installation token and reads
+the approval once more. The review author is that app's bot. A client
+secret and the ambient gh login are not used.
+--token-env NAME instead reads a GitHub personal access token (ghp_ or
+github_pat_) from the environment variable NAME and uses that token for
+review creation/updates and resolveReviewThread. The token value is never taken
+from the command line. A moved base or head is not sent; refresh the
+review and approve it again.
 A push after that read can still land on the approved commit. A request
 that was already sent is not cancelled. A send that does not confirm
 delivery is not repeated. A confirmed review id is delivery. A later post
@@ -26,6 +30,9 @@ not published. post keeps the returned ids.
 Structured re-reviews classify every open thread. Approved fixed/refuted
 thread actions run only after a confirmed review, with discussion snapshots,
 revision/approval checks, and resolved readback. Replies remain proposals.
+An optional update target edits the existing stamped COMMENT review summary
+in place, after checking its author and original body digest. The same preview
+approval and delivery-recovery gates apply; updates never create a fallback post.
 """
 
 from __future__ import annotations
@@ -140,13 +147,15 @@ def identity_of(payload: dict) -> str:
     }
     if "evidence" in payload:
         material["evidence"] = payload["evidence"]
+    if "update" in payload:
+        material["update"] = payload["update"]
     encoded = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
 RESULT_KEYS = {
     "owner", "repo", "pull", "base", "head", "runtime", "outcome",
-    "checks", "limitations", "diff", "prior", "findings", "mutations",
+    "checks", "limitations", "diff", "prior", "findings", "mutations", "update",
 }
 FINDING_KEYS = {
     "id", "severity", "rule", "title", "explanation", "trigger",
@@ -197,11 +206,24 @@ def text_field(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def validate_update(value: object) -> list[str]:
+    if not isinstance(value, dict) or set(value) != {"review", "author", "bodySha256"}:
+        return ["update"]
+    if any(not isinstance(value[key], int) or isinstance(value[key], bool) or value[key] < 1
+           for key in ("review", "author")):
+        return ["update"]
+    if not isinstance(value["bodySha256"], str) or not DIGEST.fullmatch(value["bodySha256"]):
+        return ["update"]
+    return []
+
+
 def validate_result(result: dict, *, require_commands: bool = False) -> list[str]:
     problems: list[str] = []
     extra = sorted(set(result) - RESULT_KEYS)
     if extra:
         problems.append("result.keys")
+    if "update" in result:
+        problems.extend(validate_update(result["update"]))
     if not isinstance(result.get("owner"), str) or not NAME.fullmatch(result.get("owner", "")):
         problems.append("owner")
     if not isinstance(result.get("repo"), str) or not NAME.fullmatch(result.get("repo", "")):
@@ -463,7 +485,11 @@ def finding_text(finding: dict, *, located: bool) -> str:
 
 
 def public_review(result: dict) -> tuple[str, list[dict]]:
-    anchors = {(item["path"], item["line"], item["side"]) for item in result["diff"]}
+    # GitHub can edit a submitted review's summary, but cannot move its commit
+    # or append inline comments to it. Re-review findings go in that summary.
+    anchors = set() if "update" in result else {
+        (item["path"], item["line"], item["side"]) for item in result["diff"]
+    }
     comments: list[dict] = []
     outside: list[dict] = []
     for finding in result["findings"]:
@@ -495,7 +521,7 @@ def public_review(result: dict) -> tuple[str, list[dict]]:
         lines.extend(["", "Limitations:"])
         lines.extend(f"- {item.strip()}" for item in result["limitations"])
     if outside:
-        lines.extend(["", "Findings outside the current diff:"])
+        lines.extend(["", "Findings:" if "update" in result else "Findings outside the current diff:"])
         for finding in outside:
             lines.extend(["", finding_text(finding, located=False)])
     if result["prior"]:
@@ -530,6 +556,8 @@ def publication_matches(payload: dict) -> list[str]:
     for field in ("owner", "repo", "pull", "base", "head", "runtime"):
         if payload.get(field) != result.get(field):
             problems.append(field)
+    if payload.get("update") != result.get("update"):
+        problems.append("update")
     body, comments = public_review(result)
     current = payload.get("body")
     if not isinstance(current, str) or MARKER.sub("", current).strip() != body.strip():
@@ -593,6 +621,10 @@ def validate(payload: dict) -> list[str]:
     if payload.get("event") != "COMMENT":
         problems.append("event")
     problems.extend(publication_matches(payload))
+    if "update" in payload:
+        problems.extend(validate_update(payload["update"]))
+        if payload.get("comments"):
+            problems.append("update.comments")
     body = payload.get("body")
     if not isinstance(body, str) or not body.strip():
         problems.append("body")
@@ -636,6 +668,44 @@ def redact_secret(text: str) -> str:
     text = re.sub(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_.-]+", "[redacted]", text)
     text = re.sub(r"\bgithub_pat_[A-Za-z0-9_]+", "[redacted]", text)
     return re.sub(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}", "[redacted]", text)
+
+
+# Names passed to --token-env. The named variable is removed from gh's
+# environment and its value is redacted from printed errors. The publication
+# credential, once chosen, is what gh receives. The set is process-local;
+# post, threads, and complete-resolutions are short-lived commands.
+_hidden_env: set[str] = set()
+# One credential for every gh call in this process: the --token-env PAT, or
+# the App installation token. None until begin_publication selects it.
+_publication_token: str | None = None
+_publication_required = False
+ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+PERSONAL_ACCESS_TOKEN = re.compile(r"^(?:ghp_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+)$")
+
+
+def env_label(name: str) -> str:
+    if SECRET.search(name) or re.search(r"(?:ghp|gho|ghu|ghs|ghr|github_pat)_", name, re.IGNORECASE):
+        return "The --token-env variable"
+    return name
+
+
+def personal_access_token(token_env: str) -> str:
+    """Read a PAT from the named environment variable. Never print the value."""
+    if not ENV_NAME.fullmatch(token_env or ""):
+        refuse_publication(
+            "--token-env needs the name of an environment variable, not the token. GitHub was not called."
+        )
+    value = os.environ.get(token_env)
+    label = env_label(token_env)
+    if value is None or not value.strip():
+        refuse_publication(f"{label} is missing or empty. GitHub was not called.")
+    token = value.strip()
+    if PERSONAL_ACCESS_TOKEN.fullmatch(token) is None:
+        refuse_publication(
+            f"{label} must be a GitHub personal access token (ghp_ or github_pat_). GitHub was not called."
+        )
+    _hidden_env.add(token_env)
+    return token
 
 
 def refuse_publication(message: str) -> None:
@@ -745,13 +815,32 @@ def load_app_material() -> tuple[str, bytes]:
 
 
 def publisher_env(token: str | None) -> dict[str, str]:
-    env = {key: value for key, value in os.environ.items() if not key.startswith("REVIEW_APP_")}
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("REVIEW_APP_") and key not in _hidden_env
+    }
     env.pop("GH_DEBUG", None)
     env["GH_HOST"] = "github.com"
     env["GH_PROMPT_DISABLED"] = "1"
+    # The publication credential and a --token-env PAT both win over ambient
+    # GH_TOKEN / GITHUB_TOKEN. An empty result is not an anonymous gh login.
+    if token is None:
+        token = _publication_token
+    if token is None:
+        for name in _hidden_env:
+            value = os.environ.get(name, "").strip()
+            if value:
+                token = value
+                break
+    if token is None and _publication_required:
+        refuse_publication("No GitHub credential is available. GitHub was not called.")
     if token is not None:
         env["GH_TOKEN"] = token
         env["GITHUB_TOKEN"] = token
+        for key, value in list(env.items()):
+            if key not in {"GH_TOKEN", "GITHUB_TOKEN"} and value == token:
+                del env[key]
     return env
 
 
@@ -809,7 +898,9 @@ def gh_api(
         data = json.dumps(payload).encode()
     completed = subprocess.run(command, input=data, capture_output=True, env=publisher_env(token))
     detail = completed.stderr.decode("utf-8", errors="replace")
-    for value in (token, os.environ.get("GH_TOKEN"), os.environ.get("GITHUB_TOKEN")):
+    secrets = [token, os.environ.get("GH_TOKEN"), os.environ.get("GITHUB_TOKEN")]
+    secrets.extend(os.environ.get(name) for name in _hidden_env)
+    for value in secrets:
         if value:
             detail = detail.replace(value, "[redacted]")
     return completed.returncode, completed.stdout, redact_secret(detail).encode()
@@ -1007,14 +1098,37 @@ def checked_thread(payload: dict, action: dict, token: str | None = None) -> dic
     return thread
 
 
-def resolve_threads(payload_path: Path, approval_path: Path, payload: dict, pinned: tuple, checkpoint_path: Path) -> None:
+def publication_token(owner: str, repo: str, token_env: str | None) -> str:
+    if token_env is None:
+        app_id, pem = load_app_material()
+        return installation_token(owner, repo, app_id, pem)
+    return personal_access_token(token_env)
+
+
+def begin_publication(owner: str, repo: str, token_env: str | None) -> str:
+    """Select the one credential for every later gh call in this process."""
+    global _publication_token, _publication_required
+    _publication_required = True
+    _publication_token = publication_token(owner, repo, token_env)
+    return _publication_token
+
+
+def resolve_threads(
+    payload_path: Path,
+    approval_path: Path,
+    payload: dict,
+    pinned: tuple,
+    checkpoint_path: Path,
+    token_env: str | None = None,
+) -> None:
     actions = resolution_targets(payload)
     if not actions:
         return
     require_same_operation(payload_path, approval_path, pinned)
     owner, repo, pull = payload["owner"], payload["repo"], payload["pull"]
-    app_id, pem = load_app_material()
-    token = installation_token(owner, repo, app_id, pem)
+    token = _publication_token
+    if token is None:
+        token = publication_token(str(owner), str(repo), token_env)
     require_same_operation(payload_path, approval_path, pinned)
     for action in actions:
         thread = checked_thread(payload, action, token)
@@ -1072,6 +1186,23 @@ def review_with_id(reviews: list[dict], review_id: object) -> dict | None:
         if review.get("id") == review_id:
             return review
     return None
+
+
+def checked_update_review(payload: dict, review: dict | None, *, original: bool = False, delivered: bool = False) -> dict:
+    target = payload["update"]
+    if (not isinstance(review, dict) or not review_matches(review, payload["owner"], payload["repo"], payload["pull"])
+            or review.get("id") != target["review"] or review.get("state") != "COMMENTED"
+            or not isinstance(review.get("user"), dict) or isinstance(review["user"].get("id"), bool)
+            or review["user"].get("id") != target["author"]):
+        raise SystemExit("The existing review target or author changed. No replacement review was created.")
+    body = review.get("body")
+    if not isinstance(body, str) or not MARKER.search(body):
+        raise SystemExit("The target is not a stamped harness review. No replacement review was created.")
+    if original and hashlib.sha256(body.encode()).hexdigest() != target["bodySha256"]:
+        raise SystemExit("The existing review body changed. Refresh its snapshot and approval before updating.")
+    if delivered and body != payload["body"]:
+        raise SystemExit("The review update is not visible with the approved body. No replacement review was created.")
+    return review
 
 
 def record_visible_review(
@@ -1607,7 +1738,7 @@ def review_body(payload: dict) -> dict:
     }
 
 
-def post(payload_path: Path, approval_path: Path) -> None:
+def post(payload_path: Path, approval_path: Path, token_env: str | None = None) -> None:
     if not approval_path.is_file():
         print("No approval file. GitHub was not called.", file=sys.stderr)
         raise SystemExit(4)
@@ -1636,6 +1767,7 @@ def post(payload_path: Path, approval_path: Path) -> None:
             print("The approval record was replaced. GitHub was not called.", file=sys.stderr)
             raise SystemExit(5)
         pinned = operation_key(payload, approval, digest)
+        begin_publication(str(owner), str(repo), token_env)
         if isinstance(payload.get("result"), dict):
             inventory = thread_inventory(owner, repo, pull)
             require_same_operation(payload_path, approval_path, pinned)
@@ -1657,8 +1789,8 @@ def post(payload_path: Path, approval_path: Path) -> None:
         for action in resolution_targets(payload):
             checked_thread(payload, action)
             require_same_operation(payload_path, approval_path, pinned)
-        post_locked(payload_path, approval_path, payload, approval, digest, pinned, checkpoint_path)
-        resolve_threads(payload_path, approval_path, payload, pinned, checkpoint_path)
+        post_locked(payload_path, approval_path, payload, approval, digest, pinned, checkpoint_path, token_env)
+        resolve_threads(payload_path, approval_path, payload, pinned, checkpoint_path, token_env)
         retain_receipt(payload_path, payload, checkpoint_path)
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
@@ -1673,9 +1805,12 @@ def post_locked(
     digest: str,
     pinned: tuple,
     checkpoint_path: Path,
+    token_env: str | None = None,
 ) -> None:
     owner, repo, pull = payload["owner"], payload["repo"], payload["pull"]
-    app_id, pem = load_app_material()
+    token = _publication_token
+    if not token:
+        refuse_publication("No GitHub credential is available. GitHub was not called.")
     approved_head = payload["head"]
     approved_base = payload["base"]
     marker = f"<!-- cursor-review:{approval['identity']} -->"
@@ -1686,12 +1821,16 @@ def post_locked(
     require_same_operation(payload_path, approval_path, pinned)
     existing = matching_review(reviews, marker)
     if existing is not None:
+        if "update" in payload:
+            checked_update_review(payload, existing, delivered=True)
         record_visible_review(owner, repo, pull, existing, digest, checkpoint_path, approved_head, True)
         return
     journal = read_json_object(checkpoint_path)
     if isinstance(journal, dict) and journal.get("state") == "posted":
         prior = review_with_id(reviews, journal.get("review_id"))
         if prior is not None:
+            if "update" in payload:
+                checked_update_review(payload, prior)
             record_visible_review(owner, repo, pull, prior, digest, checkpoint_path, approved_head, True)
             return
         label = journal.get("review_id")
@@ -1701,39 +1840,57 @@ def post_locked(
     if checkpoint_state(checkpoint_path) == "posting":
         print("The previous post did not confirm delivery. GitHub was not called again.", file=sys.stderr)
         raise SystemExit(1)
+    updating = "update" in payload
+    endpoint = f"repos/{owner}/{repo}/pulls/{pull}/reviews"
+    if updating:
+        checked_update_review(payload, review_with_id(reviews, payload["update"]["review"]), original=True)
+        endpoint += f"/{payload['update']['review']}"
     write_checkpoint(
         checkpoint_path,
         {"state": "posting", "payload_sha256": digest, "head": approved_head, "base": approved_base},
     )
     try:
+        if updating:
+            code, stdout, _stderr = gh_api("GET", endpoint, token=token)
+            require_same_operation(payload_path, approval_path, pinned)
+            if code != 0:
+                raise SystemExit("The existing review could not be rechecked. No review was updated.")
+            checked_update_review(payload, json_object(stdout), original=True)
         # The reviews lookup is the last preparatory read. Fetch the remote
-        # revision, mint the installation token, and re-read the pinned
-        # approval. A push after this fetch is not covered. A changed
-        # revision or approval is not sent.
+        # revision again and re-read the pinned approval. The credential was
+        # selected once, before the first gh call. A push after this fetch is
+        # not covered. A changed revision or approval is not sent.
         fetched_head, fetched_base, readable = read_pull(owner, repo, pull)
         reject_moved_revision(fetched_head, fetched_base, readable, approved_head, approved_base)
-        require_same_operation(payload_path, approval_path, pinned)
-        token = installation_token(str(owner), str(repo), app_id, pem)
         require_same_operation(payload_path, approval_path, pinned)
     except SystemExit:
         # The request was not sent. Drop the checkpoint so it is not an unsettled delivery.
         checkpoint_path.unlink(missing_ok=True)
         raise
     code, stdout, stderr = gh_api(
-        "POST",
-        f"repos/{owner}/{repo}/pulls/{pull}/reviews",
-        review_body(payload),
+        "PUT" if updating else "POST",
+        endpoint,
+        {"body": payload["body"]} if updating else review_body(payload),
         token=token,
     )
     if code != 0:
         if re.search(rb"\bHTTP\s+403\b", stderr, re.IGNORECASE):
-            print(
-                "GitHub denied the App review request (HTTP 403). Check this installation's "
-                "Pull requests: write grant and repository access. No discussion comment was sent.",
-                file=sys.stderr,
-            )
+            if token_env is None:
+                print(
+                    "GitHub denied the App review request (HTTP 403). Check this installation's "
+                    "Pull requests: write grant and repository access. No discussion comment was sent.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "GitHub denied the personal access token review request (HTTP 403). "
+                    "The token needs pull request write access. No discussion comment was sent.",
+                    file=sys.stderr,
+                )
         recovered = matching_review(reviews_of(owner, repo, pull), marker)
         if recovered is not None:
+            if updating:
+                checked_update_review(payload, recovered, delivered=True)
             record_visible_review(owner, repo, pull, recovered, digest, checkpoint_path, approved_head, True)
             return
         detail = stderr.decode("utf-8", errors="replace")
@@ -1751,6 +1908,11 @@ def post_locked(
     if not isinstance(created, dict) or not isinstance(created.get("id"), int) or isinstance(created.get("id"), bool):
         print("Delivery is unknown. GitHub was not called again.", file=sys.stderr)
         raise SystemExit(1)
+    if updating:
+        checked_update_review(payload, created, delivered=True)
+        visible = review_with_id(reviews_of(owner, repo, pull), payload["update"]["review"])
+        checked_update_review(payload, visible, delivered=True)
+        created = visible
     record_visible_review(owner, repo, pull, created, digest, checkpoint_path, approved_head, False)
 
 
@@ -1828,6 +1990,8 @@ def render(source: Path, dest: Path, ledger_path: Path | None = None) -> None:
         "result": result,
         "evidence": {"version": 1, "ledgerSha256": hashlib.sha256(ledger).hexdigest()},
     }
+    if "update" in result:
+        payload["update"] = result["update"]
     text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
     refuse_scan(text.encode(), payload)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1849,15 +2013,27 @@ def render(source: Path, dest: Path, ledger_path: Path | None = None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Show or post an approved COMMENT review.")
-    parser.add_argument("command", choices=("show", "stamp", "approve", "deny", "post", "render", "bind", "threads", "start", "cleanup", "auth-info"))
+    parser.add_argument("command", choices=("show", "stamp", "approve", "deny", "post", "render", "bind", "threads", "reviews", "start", "cleanup", "auth-info"))
     parser.add_argument("payload", nargs="?", type=Path)
     parser.add_argument("approval", nargs="?", type=Path)
     parser.add_argument("preview", nargs="?")
     parser.add_argument("extra", nargs="?")
     parser.add_argument("--discard-instruction")
+    parser.add_argument(
+        "--token-env",
+        metavar="NAME",
+        help=(
+            "post, threads and reviews: read a GitHub personal access token (ghp_ or github_pat_) from "
+            "environment variable NAME and send it as GH_TOKEN on every gh call, including "
+            "thread reads. NAME is the variable's name; do not pass the token on the command line. "
+            "Omit this option to mint a GitHub App installation token instead."
+        ),
+    )
     args = parser.parse_args()
     if args.discard_instruction is not None and args.command != "cleanup":
         parser.error("--discard-instruction is only valid with cleanup")
+    if args.token_env is not None and args.command not in {"post", "threads", "reviews"}:
+        parser.error("--token-env is only valid with post, threads and reviews")
     if args.command == "auth-info":
         auth_info()
     elif args.command == "cleanup":
@@ -1884,7 +2060,7 @@ def main() -> None:
         if args.payload is None or args.approval is None:
             parser.error("render requires a result file and an output file")
         render(args.payload, args.approval, Path(args.preview) if args.preview else None)
-    elif args.command in {"bind", "threads", "start"}:
+    elif args.command in {"bind", "threads", "reviews", "start"}:
         if args.payload is None or args.approval is None or args.preview is None:
             parser.error("bind requires owner, repo, and pull")
         try:
@@ -1893,15 +2069,23 @@ def main() -> None:
             parser.error("bind pull must be an integer")
         if args.command == "start":
             start_review(str(args.payload), str(args.approval), pull)
-        elif args.command == "threads":
-            json.dump(thread_inventory(str(args.payload), str(args.approval), pull), sys.stdout, indent=2)
+        elif args.command in {"threads", "reviews"}:
+            begin_publication(str(args.payload), str(args.approval), args.token_env)
+            if args.command == "threads":
+                inventory = thread_inventory(str(args.payload), str(args.approval), pull)
+            else:
+                inventory = reviews_of(str(args.payload), str(args.approval), pull)
+                for review in inventory:
+                    if isinstance(review.get("body"), str):
+                        review["bodySha256"] = hashlib.sha256(review["body"].encode()).hexdigest()
+            json.dump(inventory, sys.stdout, indent=2)
             sys.stdout.write("\n")
         else:
             bind(str(args.payload), str(args.approval), pull, Path(args.extra) if args.extra else None)
     else:
         if args.payload is None or args.approval is None:
             parser.error("post requires a payload file and an approval file")
-        post(args.payload, args.approval)
+        post(args.payload, args.approval, args.token_env)
 
 
 if __name__ == "__main__":

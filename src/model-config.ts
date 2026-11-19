@@ -2,7 +2,10 @@ import {
   CURSOR_VARIANT_PARAMETERS_KEY,
   CURSOR_WIRE_MODEL_ID_KEY,
   findDefaultVariant,
+  isEffortParameter,
+  isEnabledReasoningValue,
   parseCursorContextLimit,
+  variantsSupportReasoning,
   type ModelInfo,
   type ModelVariant,
 } from "./models.js"
@@ -26,6 +29,7 @@ import { cursorModelReadsImages, getDocumentedCursorModelContext } from "./model
  *     would show as literal text. We drop the tags and keep the inner text
  *     ("Medium").
  *   • HTML/markup chars (`< > & " ' \``), parentheses.
+ *   • Zero-width / BOM characters Cursor sometimes embeds in Fast suffixes.
  *   • Tabs/newlines collapse to single spaces.
  * Dots and unicode letters are preserved so names stay readable.
  * Fixes https://github.com/oakimov/cursor-opencode-provider/issues/2.
@@ -53,6 +57,7 @@ function stripMarkupTags(value: string): string {
 function safeLabel(value: string): string {
   return (
     stripMarkupTags(value)
+      .replace(/[\u200B-\u200D\uFEFF]/g, "")
       .replace(/[()<>&"'`]/g, "")
       .replace(/\s+/g, " ")
       .trim() || "default"
@@ -63,57 +68,113 @@ function baseName(mi: ModelInfo): string {
   return safeLabel(mi.displayName ?? mi.id)
 }
 
+/**
+ * Effort values Cursor publishes, low → high. Disabled values (`off`, `false`)
+ * rank with `none`; unknown values sort last.
+ */
+const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const
+
+function effortRank(params: ModelVariant["parameterValues"]): number {
+  const raw = params.find((p) => isEffortParameter(p.id))?.value
+  if (raw === undefined) return -1
+  if (!isEnabledReasoningValue(raw)) return 0
+  const index = (EFFORT_ORDER as readonly string[]).indexOf(raw.trim().toLowerCase())
+  return index < 0 ? EFFORT_ORDER.length : index
+}
+
+function paramMap(params: ModelVariant["parameterValues"]): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const p of params) out[p.id] = p.value
+  return out
+}
+
+/** OpenCode's persisted "no explicit variant" sentinel (1.x and 2.x). */
+export const RESERVED_VARIANT_KEY = "default"
+
+/** Keys that config-object consumers can drop or interpret as object metadata. */
+function needsEscapedCatalogKey(value: string): boolean {
+  return value === "prototype" || Object.hasOwn(Object.prototype, value)
+}
+
+/** Drop a leading model-name prefix from a sanitized variant label. */
+function stripModelPrefix(label: string, prefix: string): string | null {
+  if (label === prefix) return ""
+  if (prefix.length > 0 && label.startsWith(`${prefix} `)) return label.slice(prefix.length + 1)
+  return null
+}
+
+/**
+ * OpenCode variant keys are the delta after the catalog model name — e.g.
+ * "Extra High", "No Thinking Low", "High Fast" — not Cursor's full
+ * "<model> <delta>" display string. Fast and dedicated context-tier entries
+ * also drop their redundant "Fast" / tier ("500k", "1M") tokens. The entry's
+ * own flags decide that, never its name: a Cursor model can be named "… Fast".
+ * Order: No Thinking before Thinking, then effort low→high, non-Fast before
+ * Fast, preserving the first-seen context-tier blocks.
+ */
 function modelInfoVariants(
   mi: ModelInfo,
   variants: ModelVariant[],
+  entry: { name: string; fast: boolean; contextTier: ContextTier },
 ): Record<string, Record<string, unknown>> | undefined {
   if (variants.length === 0) return undefined
-  const entries: Record<string, Record<string, unknown>> = {}
+  const entries: Record<string, Record<string, unknown>> = Object.create(null)
   const usedKeys = new Set<string>()
-  const baseName = safeLabel(mi.displayName ?? mi.id)
+  const modelBase = baseName(mi)
+  const entryName = safeLabel(entry.name)
+  const fastEntry = entry.fast
+  const redundant = new Set<string>()
+  if (fastEntry) redundant.add("fast")
+  if (entry.contextTier === "long") redundant.add("1m")
+  else if (typeof entry.contextTier === "number") redundant.add(contextSuffix(entry.contextTier))
+  const contextOrder: Array<string | undefined> = []
 
-  // Each variant's key is `safeLabel(displayName)` (the IDE's own label, e.g.
-  // "Opus 4.8 1M High Fast Thinking") so the picker matches what the user
-  // sees in Cursor. Two variants can sanitize to the same name when the IDE
-  // wraps a differentiator in `<span>…</span>` (e.g. Composer's "Fast"
-  // suffix collapses to the bare model name after stripping). To guarantee
-  // every variant stays pickable:
-  //   1. If the sanitized displayName matches the model name itself, suffix
-  //      it with distinguishing params (or "default") so it never collides
-  //      with the model entry in the variant panel.
-  //   2. If two variants still collide, tag the later one with its params.
-  // Suffixes must stay free of `()` / markup chars — same constraint as
-  // safeLabel (issue #2); use spaced tokens, not parenthetical tags.
-  const tagDims = (p: { id: string; value: string }[]): string => {
-    const labels: string[] = []
-    for (const d of p) {
-      if (d.id === "fast" && d.value === "true") labels.push("Fast")
-      else if (d.id === "thinking" && d.value === "true") labels.push("Thinking")
-      else if (d.id === "context") labels.push(d.value)
+  const labeled = variants.map((v) => {
+    const params = paramMap(v.parameterValues)
+    const full = safeLabel(v.displayName || v.key || "default")
+    let label = stripModelPrefix(full, entryName) ?? stripModelPrefix(full, modelBase) ?? full
+    if (redundant.size > 0) {
+      label = label.split(" ").filter((word) => !redundant.has(word.toLowerCase())).join(" ")
     }
-    if (labels.length > 0) return ` ${labels.join(" ")}`
-    // No params at all — still disambiguate from the model name itself.
-    if (p.length === 0) return ""
-    return " default"
-  }
+    // Cursor puts "No Thinking" after the effort; OpenCode shows it first.
+    if (/(?:^| )No Thinking(?: |$)/.test(label)) {
+      label = `No Thinking ${label.replace(/(?:^| )No Thinking(?: |$)/g, " ")}`
+        .replace(/\s+/g, " ")
+        .trim()
+    }
+    const flags = [
+      params.thinking === "true" ? "Thinking" : "",
+      !fastEntry && params.fast === "true" ? "Fast" : "",
+    ].filter(Boolean).join(" ")
+    // Both OpenCode majors reserve the variant id "default" for "no variant
+    // override", so a variant keyed "default" would never apply its params.
+    if (!label || label === RESERVED_VARIANT_KEY) label = flags || "Standard"
+    if (label === "__proto__") label += " Variant"
 
-  for (const v of variants) {
-    const sanitized = safeLabel(v.displayName || v.key || "default")
-    let key = sanitized
-    // Never let a variant key equal the model name — that would make the
-    // variant entry indistinguishable from the model entry in pickers that
-    // collapse them.
-    if (key === baseName && !usedKeys.has(key)) {
-      key = `${baseName}${tagDims(v.parameterValues) || " default"}`
-    } else if (usedKeys.has(key)) {
-      key = `${sanitized}${tagDims(v.parameterValues)}`
+    let key = label
+    if (usedKeys.has(key)) {
+      key = [label, flags, params.context].filter(Boolean).join(" ")
     }
     let n = 2
-    while (usedKeys.has(key)) key = `${sanitized}${tagDims(v.parameterValues)} ${n++}`
+    while (usedKeys.has(key)) key = `${label} ${n++}`
     usedKeys.add(key)
+    if (!contextOrder.includes(params.context)) contextOrder.push(params.context)
+    return { key, variant: v, params }
+  })
 
+  labeled.sort((a, b) => {
+    const think = Number(a.params.thinking === "true") - Number(b.params.thinking === "true")
+    if (think !== 0) return think
+    const ctx = contextOrder.indexOf(a.params.context) - contextOrder.indexOf(b.params.context)
+    if (ctx !== 0) return ctx
+    const effort = effortRank(a.variant.parameterValues) - effortRank(b.variant.parameterValues)
+    if (effort !== 0) return effort
+    return Number(a.params.fast === "true") - Number(b.params.fast === "true")
+  })
+
+  for (const { key, variant } of labeled) {
     entries[key] = {
-      [CURSOR_VARIANT_PARAMETERS_KEY]: v.parameterValues.map((p) => ({ ...p })),
+      [CURSOR_VARIANT_PARAMETERS_KEY]: variant.parameterValues.map((p) => ({ ...p })),
     }
   }
   return entries
@@ -141,7 +202,8 @@ function isSeparateContext(mi: ModelInfo, v: ModelVariant): boolean {
     (v.isMaxMode === true && context !== undefined && context !== mi.maxContext)
 }
 
-function contextSuffix(context: number): string {
+/** `1m`, `500k`, `272k` — the tier token shared by catalog ids and variant ids. */
+export function contextSuffix(context: number): string {
   return context % 1_000_000 === 0 ? `${context / 1_000_000}m` : `${context / 1_000}k`
 }
 
@@ -201,6 +263,12 @@ export function modelInfoToConfig(
     thinkingSuffix?: boolean
     contextTier?: ContextTier
     variants?: ModelVariant[]
+    /**
+     * Variants this entry publishes. Defaults to `variants`; `modelsToConfig`
+     * passes the speed group's advertised slice so a tier entry's `reasoning`
+     * reflects only the choices it actually offers.
+     */
+    advertisedVariants?: ModelVariant[]
     fast?: boolean
   } = {},
 ) {
@@ -234,7 +302,7 @@ export function modelInfoToConfig(
   const config: Record<string, any> = {
     name,
     attachment: readsImages,
-    reasoning: mi.supportsThinking ?? false,
+    reasoning: Boolean(mi.supportsThinking || variantsSupportReasoning(options.advertisedVariants ?? variants)),
     tool_call: mi.supportsAgent ?? true,
     temperature: false,
     modalities: {
@@ -251,7 +319,11 @@ export function modelInfoToConfig(
   const reported = typeof mi.family === "string" ? mi.family.trim() : ""
   const family = reported || cursorModelFamily(mi.id)
   if (family) config.family = family
-  const variantConfig = modelInfoVariants(mi, variants)
+  const variantConfig = modelInfoVariants(mi, variants, {
+    name,
+    fast: options.fast ?? false,
+    contextTier,
+  })
   if (variantConfig) config.variants = variantConfig
   if (contextTier !== "base" || options.fast) {
     const defaultVariant = findDefaultVariant(mi, variants, contextTier !== "base") ?? variants[0]
@@ -301,9 +373,10 @@ function uniqueCatalogId(usedIds: Set<string>, modelId: string, suffix: string):
 
 export function modelsToConfig(models: ModelInfo[]): Record<string, any> {
   const ambiguous = thinkingSuffixBaseNames(models)
-  const out: Record<string, any> = {}
+  const out: Record<string, any> = Object.create(null)
   const usedIds = new Set(models.map((m) => m.id))
   for (const m of models) {
+    const primaryId = needsEscapedCatalogKey(m.id) ? uniqueCatalogId(usedIds, m.id, "-cursor") : m.id
     const thinkingSuffix = !!m.supportsThinking && ambiguous.has(baseName(m))
     const splitFast = hasCursorFastPricing(m.id)
     const groups: Array<{
@@ -340,10 +413,9 @@ export function modelsToConfig(models: ModelInfo[]): Record<string, any> {
       }
     }
     if (groups.length === 0) {
-      out[m.id] = applyCursorModelCost(
-        m.id,
-        modelInfoToConfig(m, { thinkingSuffix, contextTier: "base" }),
-      )
+      const config = modelInfoToConfig(m, { thinkingSuffix, contextTier: "base" })
+      if (primaryId !== m.id) config.options = { [CURSOR_WIRE_MODEL_ID_KEY]: m.id }
+      out[primaryId] = applyCursorModelCost(m.id, config)
       continue
     }
 
@@ -351,16 +423,22 @@ export function modelsToConfig(models: ModelInfo[]): Record<string, any> {
     const primary = primaryIndex >= 0 ? primaryIndex : 0
     for (const [index, group] of groups.entries()) {
       const catalogId = index === primary
-        ? m.id
+        ? primaryId
         : uniqueCatalogId(usedIds, m.id, group.suffix || "-fast")
       const pricingId = group.fast ? `${m.id}-fast` : (group.contextTier === "long" ? `${m.id}-1m` : m.id)
       const config = modelInfoToConfig(m, {
         thinkingSuffix,
         contextTier: group.contextTier,
         variants: group.variants,
+        advertisedVariants: group.advertisedVariants,
         fast: group.fast,
       })
-      config.variants = modelInfoVariants(m, group.advertisedVariants)
+      config.variants = modelInfoVariants(m, group.advertisedVariants, {
+        name: config.name,
+        fast: group.fast,
+        contextTier: group.contextTier,
+      })
+      if (catalogId !== m.id) config.options = { ...config.options, [CURSOR_WIRE_MODEL_ID_KEY]: m.id }
       out[catalogId] = applyCursorModelCost(pricingId, config)
     }
   }

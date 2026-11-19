@@ -19,7 +19,10 @@ import {
   CURSOR_VARIANT_PARAMETERS_KEY,
   CURSOR_WIRE_MODEL_ID_KEY,
   resolveCursorWireModelId,
+  variantsSupportReasoning,
   type ModelCache,
+  type ModelInfo,
+  type ModelVariant,
 } from "../src/models.js"
 import { cursorModelFamily, modelInfoToConfig, modelsToConfig } from "../src/model-config.js"
 import { MODEL_CACHE_SCHEMA_VERSION } from "../src/shared.js"
@@ -98,8 +101,14 @@ describe("mapAvailableModelsResponse", () => {
         { name: "malformed", supports_images: "yes", variants: [] },
       ],
     })
-    expect(models.map((model) => model.id)).toEqual(["vision", "text", "malformed"])
-    for (const model of models) expect(Object.keys(model)).not.toContain("supportsImages")
+    expect(models.map(model => ({
+      id: model.id,
+      supportsImages: Object.prototype.hasOwnProperty.call(model, "supportsImages"),
+    }))).toEqual([
+      { id: "vision", supportsImages: false },
+      { id: "text", supportsImages: false },
+      { id: "malformed", supportsImages: false },
+    ])
   })
 
   it("maps multiple model entries with multiple variants", () => {
@@ -294,14 +303,15 @@ describe("cursorModelFamily", () => {
   })
 
   it("keeps context and speed suffixes out of the family", () => {
-    for (const [id, family] of [
+    const suffixed = [
       ["claude-sonnet-4-1m", "claude-sonnet"],
       ["gpt-5.4-1m", "gpt"],
       ["gpt-5.6-sol-1m", "gpt-sol"],
       ["composer-2.5-fast", "composer"],
       ["grok-4.7-fast", "grok"],
       ["claude-opus-5-5-1m-fast", "claude-opus"],
-    ] as const) expect(cursorModelFamily(id)).toBe(family)
+    ] as const
+    expect(suffixed.map(([id]) => [id, cursorModelFamily(id)])).toEqual(suffixed.map(([id, family]) => [id, family]))
   })
 
   it("groups Kimi minor versions and code speeds within their major family", () => {
@@ -341,8 +351,9 @@ describe("modelInfoToConfig family", () => {
         { key: "b", displayName: "High 1M", isDefaultNonMax: false, isDefaultMax: true, parameterValues: [{ id: "effort", value: "high" }, { id: "context", value: "1m" }] },
       ],
     }])
-    expect(Object.keys(config).length).toBeGreaterThan(1)
-    for (const entry of Object.values(config)) expect(entry.family).toBe("claude-opus")
+    const families = Object.values(config).map(entry => entry.family)
+    expect(families.length).toBeGreaterThan(1)
+    expect(families.filter(family => family !== "claude-opus")).toEqual([])
   })
 
   it("maps pricing-fixture ids onto OpenCode small-model families", async () => {
@@ -357,9 +368,7 @@ describe("modelInfoToConfig family", () => {
       .map((line) => line.trim())
       .filter((line) => line && !line.startsWith("#"))
     const families = new Set(ids.map((id) => cursorModelFamily(id)).filter((f): f is string => !!f))
-    for (const family of required) {
-      expect(families.has(family), `fixture must include a model that maps to ${family}`).toBe(true)
-    }
+    expect(required.filter(family => !families.has(family))).toEqual([])
   })
 })
 
@@ -538,11 +547,11 @@ describe("modelsToConfig (context-tier materialization)", () => {
     // variants. Keeping the synthetic id avoids inheriting the base variants;
     // the real Cursor id travels in options instead.
     expect(config["claude-opus-4-8-1m"]).not.toHaveProperty("id")
-    expect(Object.keys(config["claude-opus-4-8"].variants)).toEqual(["Opus 4.8 High"])
-    expect(Object.keys(config["claude-opus-4-8-1m"].variants)).toEqual(["Opus 4.8 1M High"])
+    expect(Object.keys(config["claude-opus-4-8"].variants)).toEqual(["High"])
+    expect(Object.keys(config["claude-opus-4-8-1m"].variants)).toEqual(["High"])
     expect(materializeVariantKeysLikeOpenCode(config)).toEqual({
-      "claude-opus-4-8": ["Opus 4.8 High"],
-      "claude-opus-4-8-1m": ["Opus 4.8 1M High"],
+      "claude-opus-4-8": ["High"],
+      "claude-opus-4-8-1m": ["High"],
     })
 
     const picked = extractCursorVariantParameters(config["claude-opus-4-8-1m"].options)
@@ -566,7 +575,7 @@ describe("modelsToConfig (context-tier materialization)", () => {
 
     const config = modelsToConfig([equivalent])
     expect(Object.keys(config)).toEqual(["claude-opus-4-8", "claude-opus-4-8-1m"])
-    expect(Object.keys(config["claude-opus-4-8-1m"].variants)).toEqual(["Opus 4.8 1M High"])
+    expect(Object.keys(config["claude-opus-4-8-1m"].variants)).toEqual(["High"])
   })
 
   it("avoids collisions with a real model id ending in -1m", () => {
@@ -621,8 +630,8 @@ describe("modelsToConfig (context-tier materialization)", () => {
       output: 15,
       cache_read: 0.5,
     })
-    expect(Object.keys(config["composer-2.5"].variants)).toEqual(["Composer 2.5 default"])
-    expect(Object.keys(config["composer-2.5-fast"].variants)).toEqual(["Composer 2.5 Fast"])
+    expect(Object.keys(config["composer-2.5"].variants)).toEqual(["Standard"])
+    expect(Object.keys(config["composer-2.5-fast"].variants)).toEqual(["Standard"])
   })
 
   it("keeps a Fast-only Composer catalog id on the wire model id", () => {
@@ -672,8 +681,8 @@ describe("modelsToConfig (context-tier materialization)", () => {
     const config = modelsToConfig([opus])
     expect(Object.keys(config)).toEqual(["claude-opus-4-8", "claude-opus-4-8-1m"])
     expect(Object.keys(config["claude-opus-4-8"].variants)).toEqual([
-      "Opus 4.8 High",
-      "Opus 4.8 Fast",
+      "Fast",
+      "High",
     ])
   })
 
@@ -1205,6 +1214,138 @@ function testCache(id = "cached"): ModelCache {
     }],
   }
 }
+
+describe("variantsSupportReasoning", () => {
+  function variant(parameterValues: ModelVariant["parameterValues"]): ModelVariant {
+    return {
+      key: "variant",
+      displayName: "Variant",
+      parameterValues,
+      isDefaultNonMax: true,
+      isDefaultMax: false,
+    }
+  }
+
+  const deepseek: ModelInfo = {
+    id: "deepseek-v41-flash-1017",
+    displayName: "DeepSeek V4.1 Flash 1017",
+    supportsThinking: false,
+    supportsAgent: true,
+    maxContext: 1_048_576,
+    variants: [variant([{ id: "reasoning_effort", value: "max" }])],
+  }
+
+  it("shares one effort vocabulary with variant resolution", () => {
+    const effortIds = ["effort", "reasoning", "reasoning_effort"]
+    // The default is `low`, so only a recognised effort id can select `high`.
+    expect(effortIds.map(id => {
+      const model: ModelInfo = {
+        id: "effort-params",
+        variants: [
+          variant([{ id, value: "low" }]),
+          { ...variant([{ id, value: "high" }]), isDefaultNonMax: false },
+        ],
+      }
+      return {
+        id,
+        selected: resolveVariantParameters(model, { reasoningEffort: "high" }),
+        reasoning: variantsSupportReasoning(model.variants),
+      }
+    })).toEqual(effortIds.map(id => ({
+      id,
+      selected: [{ id, value: "high" }],
+      reasoning: true,
+    })))
+    const unknown: ModelInfo = {
+      id: "effort-params",
+      variants: [
+        variant([{ id: "speed", value: "low" }]),
+        { ...variant([{ id: "speed", value: "high" }]), isDefaultNonMax: false },
+      ],
+    }
+    expect(resolveVariantParameters(unknown, { reasoningEffort: "high" })).toEqual([{ id: "speed", value: "low" }])
+    expect(variantsSupportReasoning(unknown.variants)).toBe(false)
+  })
+
+  it("infers reasoning from non-off effort variants", () => {
+    expect(variantsSupportReasoning(deepseek.variants)).toBe(true)
+    expect(modelInfoToConfig(deepseek).reasoning).toBe(true)
+    expect(modelsToConfig([deepseek])[deepseek.id].reasoning).toBe(true)
+  })
+
+  it("lets a published thinking parameter decide, even beside effort values", () => {
+    const allThinkingFalse: ModelInfo = {
+      ...deepseek,
+      variants: [
+        variant([{ id: "thinking", value: "false" }, { id: "reasoning_effort", value: "high" }]),
+        variant([{ id: "thinking", value: "false" }, { id: "effort", value: "max" }]),
+      ],
+    }
+    expect(variantsSupportReasoning(allThinkingFalse.variants)).toBe(false)
+    expect(modelInfoToConfig(allThinkingFalse).reasoning).toBe(false)
+    expect(modelsToConfig([allThinkingFalse])[allThinkingFalse.id].reasoning).toBe(false)
+
+    const thinkingTrue: ModelInfo = {
+      ...deepseek,
+      variants: [variant([{ id: "thinking", value: "true" }, { id: "effort", value: "high" }])],
+    }
+    expect(variantsSupportReasoning(thinkingTrue.variants)).toBe(true)
+    expect(modelInfoToConfig(thinkingTrue).reasoning).toBe(true)
+
+    for (const value of ["true", "enabled", "on"]) {
+      expect(variantsSupportReasoning([variant([{ id: "thinking", value }])]), value).toBe(true)
+    }
+    for (const value of ["false", "off", "disabled", "none", ""]) {
+      expect(variantsSupportReasoning([variant([{ id: "thinking", value }])]), value).toBe(false)
+    }
+  })
+
+  it("does not infer reasoning from off or false variants", () => {
+    const off = [
+      [{ id: "reasoning_effort", value: "none" }],
+      [{ id: "effort", value: "off" }],
+      [{ id: "reasoning", value: "FALSE" }],
+    ]
+    for (const parameterValues of off) {
+      const model: ModelInfo = { ...deepseek, variants: [variant(parameterValues)] }
+      expect(variantsSupportReasoning(model.variants), JSON.stringify(parameterValues)).toBe(false)
+      // Discovery still owns `supportsThinking`; the helper only adds a signal.
+      expect(modelInfoToConfig({ ...model, supportsThinking: true }).reasoning).toBe(true)
+    }
+  })
+
+  it("checks each entry against the variants it advertises", () => {
+    const tiered: ModelInfo = {
+      id: "claude-sonnet-5-5",
+      displayName: "Claude Sonnet 5.5",
+      supportsThinking: false,
+      maxContext: 200_000,
+      variants: [
+        {
+          key: "base",
+          displayName: "Claude Sonnet 5.5",
+          parameterValues: [{ id: "context", value: "200k" }, { id: "reasoning_effort", value: "high" }],
+          isDefaultNonMax: true,
+          isDefaultMax: false,
+          isMaxMode: false,
+        },
+        {
+          key: "long",
+          displayName: "Claude Sonnet 5.5 1M",
+          parameterValues: [{ id: "context", value: "1m" }],
+          isDefaultNonMax: false,
+          isDefaultMax: true,
+          isMaxMode: true,
+        },
+      ],
+    }
+    const config = modelsToConfig([tiered])
+    expect(Object.keys(config).sort()).toEqual([tiered.id, `${tiered.id}-1m`])
+    // The base entry advertises the effort variant; its 1M entry does not.
+    expect(config[tiered.id].reasoning).toBe(true)
+    expect(config[`${tiered.id}-1m`].reasoning).toBe(false)
+  })
+})
 
 describe("model cache integrity", () => {
   it("rejects an entire malformed cache rather than exposing a partial catalog", async () => {

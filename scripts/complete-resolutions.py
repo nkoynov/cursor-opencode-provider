@@ -11,6 +11,13 @@ an already-resolved thread is confirmed, not re-resolved. No reply, comment, or
 any other mutation is sent.
 
     python3 scripts/complete-resolutions.py <payload.json> <approval.json>
+    python3 scripts/complete-resolutions.py --token-env NAME <payload.json> <approval.json>
+
+Without --token-env, every gh call uses one GitHub App installation token.
+--token-env NAME reads a GitHub personal access token (ghp_ or github_pat_)
+from that environment variable and sends it as GH_TOKEN on every gh call,
+including the review lookup and resolveReviewThread. The token value is never
+taken from the command line. An ambient GH_TOKEN does not replace it.
 """
 
 from __future__ import annotations
@@ -41,6 +48,16 @@ def main() -> None:
     )
     parser.add_argument("payload", type=Path, help="the approved rendered payload")
     parser.add_argument("approval", type=Path, help="the approval record for that payload")
+    parser.add_argument(
+        "--token-env",
+        metavar="NAME",
+        help=(
+            "read a GitHub personal access token (ghp_ or github_pat_) from environment "
+            "variable NAME and send it as GH_TOKEN on every gh call, including the review "
+            "lookup and resolveReviewThread. NAME is the variable's name; do not pass the token "
+            "on the command line. Omit this option to mint a GitHub App installation token instead."
+        ),
+    )
     arguments = parser.parse_args()
     payload_path = arguments.payload
     approval_path = arguments.approval
@@ -62,16 +79,23 @@ def main() -> None:
     lock = lock_path.open("a+")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        publisher.begin_publication(str(owner), str(repo), arguments.token_env)
         marker = f"<!-- cursor-review:{identity} -->"
         existing = publisher.matching_review(publisher.reviews_of(owner, repo, pull), marker)
         journal = publisher.read_json_object(checkpoint_path)
         if existing is None or not isinstance(journal, dict) or journal.get("state") != "posted":
             print("No confirmed review receipt; threads were not resolved.", file=sys.stderr)
             raise SystemExit(1)
+        if "update" in payload:
+            publisher.checked_update_review(payload, existing, delivered=True)
+            if journal.get("review_id") != payload["update"]["review"]:
+                raise SystemExit("The update receipt names another review; threads were not resolved.")
         if not publisher.resolution_targets(payload):
             print("No approved resolve actions in this payload.")
             return
-        publisher.resolve_threads(payload_path, approval_path, payload, pinned, checkpoint_path)
+        publisher.resolve_threads(
+            payload_path, approval_path, payload, pinned, checkpoint_path, arguments.token_env,
+        )
         publisher.retain_receipt(payload_path, payload, checkpoint_path)
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)

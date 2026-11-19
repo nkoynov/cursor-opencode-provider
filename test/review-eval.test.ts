@@ -154,12 +154,18 @@ if ignore:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 (state / "descendant.pid").write_text(str(os.getpid()))
 (state / "workspace").write_text(os.getcwd())
+open("heartbeat", "a").close()
 (state / "descendant.ready").write_text("1")
 deadline = time.monotonic() + 20
 while time.monotonic() < deadline and not (state / "stop").exists():
     try:
-        with open("heartbeat", "a") as handle:
-            handle.write("x")
+        # Append without creating. A write that brought the file back between
+        # a runner's unlink and rmdir made that runner's removal fail.
+        handle = os.open("heartbeat", os.O_WRONLY | os.O_APPEND)
+        try:
+            os.write(handle, b"x")
+        finally:
+            os.close(handle)
     except OSError:
         pass
     time.sleep(0.05)
@@ -266,7 +272,11 @@ def scenario(name, mode, cancel, ignore, then=None, filler=0, after="leader.read
         for name in ("descendant.pid", "leader.pid", "service.pid"):
             pid = pid_of(state / name)
             if pid and alive(pid):
-                os.kill(pid, signal.SIGKILL)
+                try:
+                    # Same race as alive(): the process can exit between the check and kill.
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         deadline = time.monotonic() + 5
         while any(alive(pid_of(state / name) or 0) for name in ("descendant.pid", "leader.pid", "service.pid") if (state / name).exists()):
             if time.monotonic() > deadline:
