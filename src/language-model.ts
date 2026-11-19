@@ -1787,8 +1787,8 @@ async function doStreamImpl(
                 trace(`recovery: history-check hostSessionId=${failed.openCodeSessionId} sessionId=${failed.sessionId} ` +
                   `reason=${reason} execs=${coverage.hostExecs} terminalReads=${answers["terminal-read"] ?? 0} ` +
                   `missingReads=${answers["missing-read"] ?? 0} editHandshakes=${answers["edit-handshake"] ?? 0} ` +
-                  `attachmentReads=${answers["task-attachment"] ?? 0} refused=${answers.refusal ?? 0} ` +
-                  `results=${completed.size} pending=${failed.pending.size}`)
+                  `attachmentReads=${answers["task-attachment"] ?? 0} forceBackground=${answers["force-background"] ?? 0} ` +
+                  `refused=${answers.refusal ?? 0} results=${completed.size} pending=${failed.pending.size}`)
                 return reason === "completed-tool-results"
               },
               recover: (recovery) => openSession({ recovery }),
@@ -8202,7 +8202,9 @@ export async function pump(
             rethrowTransportWriteFailure(error)
             failRunProtocol("Cursor unsupported exec deny reply failed", RUN_REPLY_FAILED)
           }
-          replaySafety.recordProviderAnswer(esmId, "refusal")
+          // A request about a call already sent (force-background) is refused with a bare status:
+          // nothing ran and the model was told nothing, so a history rebuild needs no result for it.
+          if (isExecRequestWithoutNewCall(variantField)) replaySafety.recordProviderAnswer(esmId, "force-background")
           trace(`exec: SOFT-DENIED ${variant.requestName} id=${esmId}`)
           continue
         }

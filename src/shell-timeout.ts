@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { basename, delimiter, dirname as pathDirectory, join, resolve } from "node:path"
-import { payloadShellLines, releaseUnstartedTerminal, TIMEOUT_EXIT_CODE } from "./terminal-runner.js"
+import { payloadShellLines, releaseUnstartedTerminal, START_IN_OWN_GROUP, TIMEOUT_EXIT_CODE } from "./terminal-runner.js"
 import { processShared } from "./process-shared.js"
 import { niceExecLines, niceShellAdapter, resetToolNiceAdapters, toolNiceIncrement } from "./tool-nice.js"
 
@@ -281,6 +281,7 @@ export function buildSoftBackgroundCommand(policy: CursorShellPolicy): string {
   const lines = [
     ...payloadShellLines("cursor_payload_shell", policy.shellPath ?? resolveCursorShellPath()),
     'cursor_shell_log="$(mktemp "${TMPDIR:-/tmp}/cursor-opencode-shell.XXXXXX")" || exit 1',
+    // Stays in this launcher's process group, so Stop during the window stops it.
     `nohup "$cursor_payload_shell" "$@" -c ${shellQuote(policy.command)} >"$cursor_shell_log" 2>&1 </dev/null &`,
     "cursor_shell_pid=$!",
   ]
@@ -360,14 +361,11 @@ export function buildBackgroundShellCommand(command: string, shellPath?: string)
   return [
     ...payloadShellLines("cursor_payload_shell", shellPath ?? resolveCursorShellPath()),
     'bg_log="$(mktemp "${TMPDIR:-/tmp}/cursor-opencode-bg.XXXXXX")" || exit 1',
-    // OpenCode 2.3+ kills this launcher's process group when it forgets the
-    // exited command, so the spawn gets its own session where setsid exists.
-    "if command -v setsid >/dev/null 2>&1; then",
-    `  nohup setsid "$cursor_payload_shell" "$@" -c ${shellQuote(command)} >"$bg_log" 2>&1 </dev/null &`,
-    "else",
-    `  nohup "$cursor_payload_shell" "$@" -c ${shellQuote(command)} >"$bg_log" 2>&1 </dev/null &`,
-    "fi",
-    "bg_pid=$!",
+    // Nothing is left to cancel once the spawn returns: keep the command out
+    // of the process group the host signals after this launcher exits.
+    START_IN_OWN_GROUP,
+    `cursor_own_group "$bg_log" "$cursor_payload_shell" "$@" -c ${shellQuote(command)}`,
+    "bg_pid=$cursor_started",
     `printf '${BACKGROUND_SHELL_MARKER}%s:%s\\n' "$bg_pid" "$bg_log"`,
   ].join("\n")
 }
@@ -395,6 +393,8 @@ function writeShellEnvInjector(wrapperBody: string, command: string, shellPath?:
     "  return 0",
     "fi",
     "unset BASH_ENV ZDOTDIR ENV CURSOR_OPENCODE_WRAP_ACTIVE",
+    // The payload shell rides as an argument (`payloadShellLines`), never in
+    // the environment the command and its children inherit.
     `exec /bin/sh ${shellQuote(wrapperPath)} ${shellQuote(shellPath ?? resolveCursorShellPath())}`,
     "",
   ].join("\n")
@@ -517,13 +517,16 @@ function canonicalDirectory(directory: string): string {
 
 /**
  * OpenCode 2.0.27 calls create.before before its permission scanner, then
- * spawns the selected executable with [-c, command]. Preserve that command
+ * spawns the selected executable with [-c, command]; since 2.2.7 zsh gets
+ * [+o, nomatch, -c, command] (`ShellSelect.args`). Preserve that command
  * and the shell basename the scanner uses. The adapter runs only after host
- * approval, and uses the host's selected executable for the actual payload.
+ * approval, and uses the host's selected executable and options for the
+ * actual payload.
  * Every tool call's shell also runs at `CURSOR_PROVIDER_TOOL_NICE` (see
  * tool-nice.ts), wrapped or not.
  * Sources: upstream packages/core/src/shell.ts:274-305 and
- * packages/core/src/tool/plugin/shell.ts:125-145 at v2.0.27.
+ * packages/core/src/tool/plugin/shell.ts:125-145 at v2.0.27;
+ * packages/core/src/shell/select.ts `args` at v2.2.7.
  */
 export function prepareCursorShellCreate(event: {
   command: string; cwd: string; shell: string; env: Record<string, string | undefined>
@@ -559,37 +562,31 @@ export function prepareCursorShellCreate(event: {
     const executable = join(directory, basename(event.shell))
     const script = [
       "#!/bin/sh",
-      // OpenCode 2.2.7+ runs zsh as `zsh +o nomatch -c <command>`. Prints the
-      // options before `-c` when each is an `-o`/`+o` name pair or a flag that
-      // leaves the command and startup alone (not zsh's -f, which is NO_RCS);
-      // a subshell, so no name leaks. A failed name check refuses the wrap.
-      "cursor_options() (",
-      "  cursor_flag= cursor_command= cursor_seen=0 cursor_words= cursor_name=",
-      "  for cursor_arg do",
-      '    if [ "$cursor_seen" -ge 2 ]; then',
-      '      if [ -n "$cursor_name" ]; then',
-      "        cursor_name=",
-      "        case $cursor_flag in [A-Za-z]*) ;; *) exit 1 ;; esac",
-      "        case $cursor_flag in *[!A-Za-z_]*) exit 1 ;; esac",
-      `        cursor_key=$(printf '%s' "$cursor_flag" | tr -d _ | tr '[:upper:]' '[:lower:]') || exit 1`,
-      "        case $cursor_key in [a-z]*) ;; *) exit 1 ;; esac",
-      "        case $cursor_key in *[!a-z]*) exit 1 ;; esac",
-      "        case ${cursor_key#no} in login|interactive|shinstdin|singlecommand|onecmd|rcs|globalrcs|privileged|restricted|exec) exit 1 ;; esac",
-      "      else",
-      "        case $cursor_flag in -o|+o) cursor_name=1 ;; [+-][aCeuvx]) ;; *) exit 1 ;; esac",
-      "      fi",
-      '      cursor_words="$cursor_words${cursor_words:+ }$cursor_flag"',
-      "    fi",
-      "    cursor_flag=$cursor_command",
-      "    cursor_command=$cursor_arg",
-      "    cursor_seen=$((cursor_seen + 1))",
+      // The host runs `[option]... -c <command>`: zsh gets `+o nomatch` first
+      // since OpenCode 2.2.7. Wrap only the approved command after `-o NAME` /
+      // `+o NAME` pairs, and hand the wrapper this shell and those options so
+      // the payload runs the argv the host would have run.
+      "cursor_wraps() {",
+      '  while [ "$#" -gt 2 ]; do',
+      "    case $1 in -o|+o) ;; *) return 1 ;; esac",
+      "    case $2 in [A-Za-z_]*) ;; *) return 1 ;; esac",
+      "    case $2 in *[!A-Za-z0-9_]*) return 1 ;; esac",
+      "    shift 2",
       "  done",
-      `  [ -z "$cursor_name" ] && [ "$cursor_flag" = -c ] && [ "$cursor_command" = ${shellQuote(event.command)} ] && printf '%s\\n' "$cursor_words"`,
-      ")",
-      'if cursor_options "$@" >/dev/null; then',
-      "  IFS=' '",
-      `  set -- ${shellQuote(event.shell)} $(cursor_options "$@")`,
-      ...niceExecLines(`/bin/sh ${shellQuote(wrap.wrapperPath)} "$@"`, nice).map((line) => `  ${line}`),
+      `  [ "$#" -eq 2 ] && [ "$1" = -c ] && [ "$2" = ${shellQuote(event.command)} ]`,
+      "}",
+      'if cursor_wraps "$@"; then',
+      // Keep the options: append all but the last two arguments, then drop
+      // the originals. `for` reads the arguments it started with.
+      "  cursor_count=$#",
+      "  cursor_keep=$(($# - 2))",
+      "  for cursor_arg do",
+      '    [ "$cursor_keep" -gt 0 ] || break',
+      '    set -- "$@" "$cursor_arg"',
+      "    cursor_keep=$((cursor_keep - 1))",
+      "  done",
+      '  shift "$cursor_count"',
+      ...niceExecLines(`/bin/sh ${shellQuote(wrap.wrapperPath)} ${shellQuote(event.shell)} "$@"`, nice).map((line) => `  ${line}`),
       "fi",
       // A later host hook changed the command: execute exactly what the host
       // approved instead of the provider's earlier command snapshot.
@@ -883,16 +880,16 @@ export function capturedCursorShellOutcome(toolCallId: string): CursorShellOutco
   return outcomes.get(toolCallId)
 }
 
-/**
- * The command's own exit status. A captured outcome other than an exit (backgrounded, timed out, aborted) has none:
- * the host's exit then belongs to the launcher, not to the command.
- */
 /** Call when a shell call starts, so an outcome left by an earlier call with the same id can't be taken for its own. */
 export function forgetCursorShellOutcome(toolCallId: string): void {
   outcomes.delete(toolCallId)
   failures.delete(toolCallId)
 }
 
+/**
+ * The command's own exit status. A captured outcome other than an exit (backgrounded, timed out, aborted) has none:
+ * the host's exit then belongs to the launcher, not to the command.
+ */
 export function cursorShellExitCode(toolCallId: string, hostExit: unknown): number | undefined {
   const outcome = outcomes.get(toolCallId)
   if (outcome) return outcome.kind === "exit" ? outcome.code : undefined

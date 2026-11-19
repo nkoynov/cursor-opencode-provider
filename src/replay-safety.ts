@@ -72,12 +72,15 @@ export function takeAppendedInjection(
  * - `terminal-read`: a read of a host shell's terminal record (Cursor's AwaitShell polls);
  * - `missing-read`: the typed `file_not_found` / `invalid_file` of a read whose target is missing;
  * - `edit-handshake`: the empty read before an edit creates a new file;
- * - `task-attachment`: the placeholder read of a Task's attachment.
- * The last two are only complete with their call's host result: the edit's write, the Task.
- * Fork: `refusal`, the provider's refusal of a call (a refusal burst, a held call cancelled after a refused change,
- * a soft-denied Cursor-native exec the host cannot run).
+ * - `task-attachment`: the placeholder read of a Task's attachment;
+ * - `force-background`: the bare `NOT_FOUND` status refusing Cursor's request to move a call it
+ *   already sent to the background. It names no new call and tells the model nothing.
+ * `edit-handshake` and `task-attachment` are only complete with their call's host result: the
+ * edit's write, the Task.
+ * Fork: `refusal`, the provider's refusal of a call (a refusal burst, a held call cancelled after a refused change).
  */
-export type ProviderAnswer = "terminal-read" | "missing-read" | "edit-handshake" | "task-attachment" | "refusal"
+export type ProviderAnswer =
+  "terminal-read" | "missing-read" | "edit-handshake" | "task-attachment" | "force-background" | "refusal"
 
 const OWNED_ANSWERS: ReadonlySet<ProviderAnswer> = new Set(["edit-handshake", "task-attachment"])
 
@@ -105,6 +108,8 @@ export type ReplaySafetyState = {
   announcedCalls?: string[]
   /** Only strict inline catalog lookups qualify; spilled catalogs remain barriers. */
   catalogCalls?: Record<string, "started" | "completed">
+  /** Cursor-side AwaitShell starts and their matching completions. */
+  waitCalls?: Record<string, { args: string; completed?: true }>
   /** History cannot represent opaque interactions, unknown frames or unclaimed display work. */
   historyRebaseUnsafe?: boolean
   /** Fork: display calls the provider bridged to a host tool; the host result stands for each. */
@@ -143,9 +148,10 @@ export function heldRunLossRebuildable(state: ReplaySafetyState | undefined): bo
 }
 
 /**
- * Every display call Cursor announced must be represented by a host exec, a bridge to a host tool, or a
- * completed inline catalog lookup. `unfinished`: calls of the interrupted step that nothing ran, which a
- * rebuild may leave out. A started catalog lookup is Cursor's own work, so only its validated completion counts.
+ * Every display call Cursor announced must be represented by a host exec, a bridge to a host tool, a
+ * completed inline catalog lookup, or a Cursor-side wait that ended telling the model nothing history lacks.
+ * `unfinished`: calls of the interrupted step that nothing ran, which a rebuild may leave out. A started
+ * catalog lookup or wait is Cursor's own work, so only its validated completion counts.
  */
 export function announcedCallsClaimed(state: ReplaySafetyState | undefined, unfinished: readonly string[] = []): boolean {
   const bridged = new Set(state?.bridgedCalls)
@@ -154,7 +160,9 @@ export function announcedCallsClaimed(state: ReplaySafetyState | undefined, unfi
     ...bridged,
     ...state?.execs?.flatMap((exec) => exec.callId ? [exec.callId] : []) ?? [],
     ...Object.entries(state?.catalogCalls ?? {}).flatMap(([callId, stage]) => stage === "completed" ? [callId] : []),
-    ...unfinished.filter((callId) => !completed.has(callId) && !state?.catalogCalls?.[callId]),
+    ...Object.entries(state?.waitCalls ?? {}).flatMap(([callId, wait]) => wait.completed ? [callId] : []),
+    ...unfinished.filter((callId) => !completed.has(callId) && !state?.catalogCalls?.[callId]
+      && !state?.waitCalls?.[callId]),
   ])
   return (state?.announcedCalls ?? []).every((callId) => claimed.has(callId))
     && (state?.completedCalls ?? []).every((callId) => bridged.has(callId))
@@ -238,6 +246,7 @@ export function resumedReplaySafety(state: ReplaySafetyState | undefined): Repla
     bridgedCalls: state?.bridgedCalls?.slice(),
     completedCalls: state?.completedCalls?.slice(),
     catalogCalls: state?.catalogCalls && { ...state.catalogCalls },
+    waitCalls: state?.waitCalls && Object.assign(Object.create(null), state.waitCalls),
     appendedInjections: state?.appendedInjections?.slice(),
     sinceCheckpoint: undefined,
   }
@@ -264,9 +273,10 @@ export class AttemptReplaySafety {
   /**
    * A display lifecycle frame. A started call stays a stateful barrier but
    * blocks a history rebuild only until a host exec claims it; completion of a
-   * claimed call adds nothing history lacks. The sole server-side exception is
-   * a completed inline catalog lookup: it has no execution side effect. Other
-   * server-side calls and frames without a call id cannot be rebuilt.
+   * claimed call adds nothing history lacks. The server-side exceptions have no
+   * execution side effect: a completed inline catalog lookup, and an AwaitShell
+   * that slept or timed out (`cursorWaitArgs`). Other server-side calls and frames
+   * without a call id cannot be rebuilt.
    */
   recordToolLifecycle(lifecycle: ReplayToolLifecycle | undefined): void {
     if (lifecycle?.catalog && lifecycle.kind === "completed"
@@ -281,21 +291,30 @@ export class AttemptReplaySafety {
       trace(`replay: display completion of claimed callId=${lifecycle.callId} sessionId=${this.sessionId}`)
       return
     }
-    // Fork: Cursor runs AwaitShell itself, and a wait changes nothing, so history needs nothing for it.
-    if (lifecycle?.wait) {
-      trace(`replay: Cursor-side wait ${lifecycle.kind} callId=${lifecycle.callId} sessionId=${this.sessionId}`)
+    // The wait's result reached the model, so it stays a barrier for this attempt.
+    const waits = this.state.waitCalls
+    const wait = lifecycle && waits?.[lifecycle.callId]
+    if (waits && lifecycle?.waitArgs && lifecycle.kind === "completed" && wait
+      && !wait.completed && wait.args === lifecycle.waitArgs) {
+      waits[lifecycle.callId] = { args: wait.args, completed: true }
+      trace(`recovery: cursor-wait-completed callId=${lifecycle.callId} sessionId=${this.sessionId}`)
       this.mark("display-tool-lifecycle", true)
       return
     }
     if (lifecycle?.kind === "started" && !claimed) {
       // Fork: the unfinished-call exemption would otherwise let a rebuild drop Cursor's own lookup.
-      if (this.state.catalogCalls?.[lifecycle.callId] || lifecycle.unverifiedCatalog) {
+      if (this.state.catalogCalls?.[lifecycle.callId] || this.state.waitCalls?.[lifecycle.callId]
+        || lifecycle.unverifiedCatalog) {
         this.mark("display-tool-lifecycle", false)
         return
       }
       if (lifecycle.catalog) {
         this.state.catalogCalls ??= Object.create(null) as Record<string, "started" | "completed">
         this.state.catalogCalls[lifecycle.callId] = "started"
+      }
+      if (lifecycle.waitArgs) {
+        this.state.waitCalls ??= Object.create(null) as NonNullable<ReplaySafetyState["waitCalls"]>
+        this.state.waitCalls[lifecycle.callId] = { args: lifecycle.waitArgs }
       }
       const announced = this.state.announcedCalls ??= []
       if (!announced.includes(lifecycle.callId)) announced.push(lifecycle.callId)
@@ -469,66 +488,9 @@ export type DecodedReplayFrame = {
   interactionQuery?: Record<string, unknown>
 }
 
-/**
- * Fork: `unverifiedCatalog` marks a frame failing `inlineCatalog` that is a catalog lookup, or whose tool call is too
- * malformed to tell. `wait` marks an AwaitShell call and nothing else (`awaitVariant`).
- */
+/** Fork: `unverifiedCatalog` marks a frame failing `inlineCatalog` that is a catalog lookup, or whose tool call is too malformed to tell. */
 export type ReplayToolLifecycle = {
-  kind: "started" | "completed"; callId: string; catalog?: true; unverifiedCatalog?: true; wait?: true
-}
-
-// Cursor CLI 2026.11.11 `agent.v1`: AwaitArgs {task_id #1, block_until_ms #2, regex #3}; AwaitTaskStillRunning
-// {task_id #1, runtime_ms #2, output_file_path #3, output_length #4, regex_requested #5, regex_match #6, wake_reason #7}.
-// A timed-out wait carries neither regex_match nor wake_reason (none of 170 stored Await results had wake_reason).
-const AWAIT_ARGS: Record<number, number> = { 1: 2, 2: 0, 3: 2 }
-// output_length is an observation history lacks, but every timed-out wait has one, and a rebuild repeats nothing after it.
-const AWAIT_STILL_RUNNING: Record<number, number> = { 1: 2, 2: 0, 3: 2, 4: 0, 5: 0 }
-// An AwaitShell with no task sleeps: args {block_until_ms #2}, result success #4 holding `complete` #1 {runtime_ms #2},
-// runtime_ms equal to block_until_ms in every captured sleep (vm3c1 2026-11-13: 1234, 5000, 20000, 20000 ms).
-const SLEEP_ARGS: Record<number, number> = { 2: 0 }
-const SLEEP_COMPLETE: Record<number, number> = { 2: 0 }
-
-/** Fields only from `spec` (field number to wire type), each at most once, and every `required` one present. */
-function strictFields(
-  bytes: Uint8Array | undefined, spec: Record<number, number>, required: readonly number[] = [],
-): StrictRawField[] | undefined {
-  const fields = bytes && readAllFieldsStrict(bytes)
-  return fields && fields.every(field => spec[field.fn] === field.wt)
-    && Object.entries(spec).every(([fn, wt]) => optionalField(fields, Number(fn), wt))
-    && required.every(fn => fields.some(field => field.fn === fn)) ? fields : undefined
-}
-
-/** The bytes of a message's only field, a length-delimited `fn`. */
-function soleMessage(bytes: Uint8Array | undefined, fn: number): Uint8Array | undefined {
-  const fields = bytes && readAllFieldsStrict(bytes)
-  return fields?.length === 1 && fields[0]!.fn === fn && fields[0]!.wt === 2 ? fields[0]!.bytes : undefined
-}
-
-/**
- * Fork: the lifecycle's tool call is only `await_tool_call` #42 {args #1, result #2}, beside Cursor's call id and
- * timestamps: a start with its args alone, or a completion whose AwaitResult is `success` #4 holding `still_running` #2,
- * the shape of a wait that timed out, or a sleep (no task) whose `complete` holds only its full runtime. A finished task's
- * `complete` carries its exit code, `error` what went wrong, and a wake reason why the wait ended early; history holds
- * none of them.
- */
-function awaitVariant(topLevel: StrictRawField | undefined, completed: boolean): boolean {
-  const update = nestedFields(topLevel, 1).find(field => field.fn === (completed ? 3 : 2))
-  const call = update?.bytes && readAllFieldsStrict(update.bytes)?.find(field => field.fn === 2)
-  const toolFields = call?.bytes && readAllFieldsStrict(call.bytes)
-  if (!toolFields || !optionalField(toolFields, 57, 2)
-    || !optionalField(toolFields, 59, 0) || !optionalField(toolFields, 60, 0)) return false
-  const variants = toolFields.filter(field => ![57, 59, 60].includes(field.fn))
-  if (variants.length !== 1 || variants[0]!.fn !== 42 || variants[0]!.wt !== 2) return false
-  const wait = strictFields(variants[0]!.bytes, { 1: 2, 2: 2 })
-  const args = wait?.find(field => field.fn === 1)
-  const sleep = strictFields(args?.bytes, SLEEP_ARGS, [2])
-  // Every stored task wait had task_id and every stored timed-out wait all four fields; Cursor CLI defaults a missing block_until_ms.
-  if (!args || (!sleep && !strictFields(args.bytes, AWAIT_ARGS, [1]))) return false
-  const result = wait!.find(field => field.fn === 2)
-  if (!completed || !result) return completed === !!result
-  if (!sleep) return !!strictFields(soleMessage(soleMessage(result.bytes, 4), 2), AWAIT_STILL_RUNNING, [1, 2, 3, 4])
-  const runtime = strictFields(soleMessage(soleMessage(result.bytes, 4), 1), SLEEP_COMPLETE, [2])
-  return !!runtime && runtime[0]!.varint === sleep[0]!.varint
+  kind: "started" | "completed"; callId: string; catalog?: true; unverifiedCatalog?: true; waitArgs?: string
 }
 
 function catalogVariant(topLevel: StrictRawField | undefined): boolean {
@@ -566,6 +528,70 @@ function inlineCatalog(topLevel: StrictRawField | undefined, completed: boolean)
     && [1, 2].every(field => optionalField(success, field, 2))
     && success.some(field => field.fn === 1)
     && !success.some(field => field.fn === 2 && field.bytes?.length)
+}
+
+// Cursor CLI 2026.10.22 `agent.v1`: ToolCall.await_tool_call #42 is AwaitToolCall {args #1,
+// result #2}. AwaitArgs {task_id #1, block_until_ms #2 (uint32), regex #3}. AwaitResult
+// {complete #1, still_running #2, error #3, success #4}; the CLI renders only success and error.
+// AwaitSuccess {complete #1, still_running #2}. AwaitTaskStillRunning {task_id #1, runtime_ms #2,
+// output_file_path #3, output_length #4, regex_requested #5, regex_match #6, wake_reason #7}.
+// AwaitTaskComplete {#1–#6 likewise, exit_code #7, wake_reason #8}.
+const AWAIT_ARGS: Readonly<Record<number, number>> = { 1: 2, 2: 0, 3: 2 }
+/** A timed-out wait: no `regex_match` #6 and no `wake_reason` #7. */
+const AWAIT_STILL_RUNNING: Readonly<Record<number, number>> = { 1: 2, 2: 0, 3: 2, 4: 0, 5: 0 }
+
+/** Only fields `spec` names (field number to wire type), each at most once. */
+function onlyFields(bytes: Uint8Array | undefined, spec: Readonly<Record<number, number>>): StrictRawField[] | undefined {
+  const fields = bytes && readAllFieldsStrict(bytes)
+  return fields && fields.every(field => spec[field.fn] === field.wt)
+    && new Set(fields.map(field => field.fn)).size === fields.length ? fields : undefined
+}
+
+/** The bytes of a message whose only field is the length-delimited `fn`. */
+function soleField(bytes: Uint8Array | undefined, fn: number): Uint8Array | undefined {
+  const fields = bytes && readAllFieldsStrict(bytes)
+  return fields?.length === 1 && fields[0]!.fn === fn && fields[0]!.wt === 2 ? fields[0]!.bytes : undefined
+}
+
+/**
+ * An AwaitShell Cursor ran itself whose result tells the model nothing host history lacks, from the
+ * raw lifecycle bytes: a wait on a task that timed out with the task still running, or a sleep (no
+ * task) that ran its whole `block_until_ms`. The tool call holds `await_tool_call` alone beside
+ * Cursor's call id and timestamps; a start holds its args and no result. A finished task's exit
+ * code, an error, a regex match, a wake reason, a shorter sleep and any unknown field all carry
+ * something history lacks, so they stay unaccounted for.
+ */
+function cursorWaitArgs(topLevel: StrictRawField | undefined, completed: boolean): string | undefined {
+  const update = nestedFields(topLevel, 1).find(field => field.fn === (completed ? 3 : 2))
+  const lifecycle = update?.bytes && readAllFieldsStrict(update.bytes)
+  const call = lifecycle && lifecycle.find(field => field.fn === 2)
+  const toolFields = call?.bytes && readAllFieldsStrict(call.bytes)
+  if (!toolFields || !optionalField(toolFields, 57, 2)
+    || !optionalField(toolFields, 59, 0) || !optionalField(toolFields, 60, 0)) return
+  const variants = toolFields.filter(field => ![57, 59, 60].includes(field.fn))
+  if (variants.length !== 1 || variants[0]!.fn !== 42 || variants[0]!.wt !== 2) return
+  const wait = onlyFields(variants[0]!.bytes, { 1: 2, 2: 2 })
+  const args = onlyFields(wait?.find(field => field.fn === 1)?.bytes, AWAIT_ARGS)
+  if (!wait || !args) return
+  const task = args.find(field => field.fn === 1)?.bytes
+  const blockUntil = args.find(field => field.fn === 2)?.varint
+  const sleep = args.length === 1 && !!blockUntil
+  if ((!sleep && !task?.length) || (blockUntil !== undefined && blockUntil > 0xffff_ffffn)) return
+  // Retain the validated arguments across start and completion, independent of field order.
+  const key = JSON.stringify(args.sort((a, b) => a.fn - b.fn).map(field =>
+    [field.fn, field.bytes ? Buffer.from(field.bytes).toString("base64") : field.varint?.toString()]))
+  const result = wait.find(field => field.fn === 2)?.bytes
+  if (!completed) return result === undefined ? key : undefined
+  const success = soleField(result, 4)
+  const outcome = success && readAllFieldsStrict(success)
+  if (outcome?.length !== 1 || outcome[0]!.wt !== 2) return
+  if (!sleep) {
+    const running = outcome[0]!.fn === 2 ? onlyFields(outcome[0]!.bytes, AWAIT_STILL_RUNNING) : undefined
+    const resultTask = running?.find(field => field.fn === 1)?.bytes
+    return task && resultTask && Buffer.from(task).equals(resultTask) ? key : undefined
+  }
+  const slept = outcome[0]!.fn === 1 ? onlyFields(outcome[0]!.bytes, { 2: 0 }) : undefined
+  return slept?.length === 1 && slept[0]!.varint === blockUntil ? key : undefined
 }
 
 export type AppendedUserMessage = { messageId: string; text: string }
@@ -775,13 +801,15 @@ export function analyzeReplayFrame(
   const completed = decoded.interactionUpdate?.tool_call_completed as Record<string, unknown> | undefined
   if (started || completed) {
     const callId = (started ?? completed)?.call_id
+    const catalog = !malformed && inlineCatalog(topLevel, !!completed)
+    const waitArgs = !malformed && !catalog ? cursorWaitArgs(topLevel, !!completed) : undefined
     return {
       barrier: "display-tool-lifecycle",
       ...(!malformed && typeof callId === "string" && callId.length > 0
         ? { toolLifecycle: { kind: started ? "started" : "completed", callId,
-          ...(inlineCatalog(topLevel, !!completed) ? { catalog: true as const }
+          ...(catalog ? { catalog: true as const }
             : catalogVariant(topLevel) ? { unverifiedCatalog: true as const }
-            : awaitVariant(topLevel, !!completed) ? { wait: true as const } : {}),
+            : waitArgs ? { waitArgs } : {}),
         } }
         : {}),
     }

@@ -2868,7 +2868,9 @@ describe("opencode2 setup", () => {
     expect(event.command).toBe("echo hello")
     expect(event.shell.endsWith("/bash")).toBe(true)
     expect(event.shell).not.toBe("/bin/bash")
-    expect(readFileSync(event.shell, "utf8")).toContain(`set -- '/bin/bash' $(cursor_options "$@")`)
+    // The payload shell and its options ride as wrapper arguments, never in the environment.
+    expect(readFileSync(event.shell, "utf8")).toContain("'/bin/bash' \"$@\"")
+    expect(readFileSync(event.shell, "utf8")).not.toContain("CURSOR_SHELL_EXECUTABLE")
     expect(event.env).toEqual({})
   })
 

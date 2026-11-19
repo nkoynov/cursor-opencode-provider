@@ -234,10 +234,12 @@ text is passed on to be continued. Earlier reads the provider answered itself
 need no result in history: polls of a background shell's terminal record,
 reads of a missing path, and, once the edit's or Task's own result is in
 history, a new file's empty edit read and a Task's attachment read (#174);
-nor do the provider's refusals of a call (fork). Missing
-results, any other exec the provider answered, any provider answer or host
-tool in the interrupted step, or unrepresented activity remain final. A Run
-whose request upload is cut off is sent again.
+nor do the provider's refusals of a call (fork), its bare-status refusal of
+Cursor's request to move a running shell or subagent to the background, or an
+AwaitShell Cursor ran that slept its whole length or timed out with the shell
+still running. Missing results, any other exec the provider answered, any
+provider answer or host tool in the interrupted step, or unrepresented
+activity remain final. A Run whose request upload is cut off is sent again.
 A host note Cursor took into that Run does not block the rebuild while its
 text is still in host history.
 A rebuild too large for the model's context is reported as a context overflow
