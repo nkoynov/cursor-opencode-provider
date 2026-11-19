@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test"
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test"
 import { spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
@@ -402,12 +402,14 @@ describe("OpenCode stored tool media", () => {
   const store = path.join(root, "opencode", "tool-media")
   mkdirSync(store, { recursive: true })
   const dataHome = process.env.XDG_DATA_HOME
-  beforeAll(() => {
+  beforeEach(() => {
     process.env.XDG_DATA_HOME = root
   })
-  afterAll(() => {
+  afterEach(() => {
     if (dataHome === undefined) delete process.env.XDG_DATA_HOME
     else process.env.XDG_DATA_HOME = dataHome
+  })
+  afterAll(() => {
     rmSync(root, { recursive: true, force: true })
   })
   const png = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3])
