@@ -2267,8 +2267,8 @@ describe("opencode2 setup", () => {
           setSystemTime(new Date(expiresAt))
           await bus.publish(activity)
           await until(() => resolutions === 1)
-          // Stall before fetch so only the 10s readiness deadline can fire.
-          await Bun.sleep(10_100)
+          // Stall before fetch so only the readiness deadline can fire.
+          await Bun.sleep(Math.max(10_000, unaryWorstCaseMs() + 2_000) + 100)
           await bus.publish(activity)
           await bus.publish(activity)
           expect(resolutions).toBe(1)
@@ -2284,7 +2284,7 @@ describe("opencode2 setup", () => {
           expect(requests).toBe(1)
         } finally { credential.release() }
       })
-    }, 20_000)
+    }, 30_000)
   })
 
   test("credential updates replace a fresh cache with the selected account's inventory", async () => {
