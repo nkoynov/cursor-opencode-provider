@@ -5,6 +5,7 @@ import path from "node:path"
 import {
   mapAvailableModelsResponse,
   discoverModels,
+  discoverModelCache,
   isCacheFresh,
   cacheFilePath,
   normalizeModelCache,
@@ -660,7 +661,52 @@ describe("modelsToConfig (context-tier materialization)", () => {
     expect(config["composer-2.5"].options[CURSOR_WIRE_MODEL_ID_KEY]).toBe("composer-2.5")
   })
 
-  it("does not split Claude Fast variants when Cursor publishes one price", () => {
+  it("splits Fable 5.2 Fast onto the provider list price", () => {
+    const fable = {
+      ...model,
+      id: "claude-fable-5-2",
+      variants: [
+        ...model.variants,
+        {
+          key: "claude-fable-5-2",
+          displayName: "Fable 5.2 Fast",
+          isDefaultNonMax: false,
+          isDefaultMax: false,
+          parameterValues: [
+            { id: "context", value: "300k" },
+            { id: "fast", value: "true" },
+          ],
+        },
+      ],
+    }
+
+    const config = modelsToConfig([fable])
+    expect(Object.keys(config)).toEqual([
+      "claude-fable-5-2",
+      "claude-fable-5-2-fast",
+      "claude-fable-5-2-1m",
+    ])
+    expect(Object.keys(config["claude-fable-5-2"].variants)).toEqual(["High"])
+    expect(config["claude-fable-5-2-fast"].cost).toEqual({
+      input: 16,
+      output: 80,
+      cache_read: 0.4,
+      cache_write: 20,
+    })
+  })
+
+  it("does not split a model when Cursor publishes one price", () => {
+    const carbon = {
+      ...model,
+      id: "gemini-4-carbon",
+      displayName: "Gemini 4 Carbon",
+    }
+    const config = modelsToConfig([carbon])
+    expect(Object.keys(config)).toEqual(["gemini-4-carbon", "gemini-4-carbon-1m"])
+    expect(config["gemini-4-carbon-fast"]).toBeUndefined()
+  })
+
+  it("splits Opus 4.8 Fast onto its published rate", () => {
     const opus = {
       ...model,
       variants: [
@@ -679,11 +725,18 @@ describe("modelsToConfig (context-tier materialization)", () => {
     }
 
     const config = modelsToConfig([opus])
-    expect(Object.keys(config)).toEqual(["claude-opus-4-8", "claude-opus-4-8-1m"])
-    expect(Object.keys(config["claude-opus-4-8"].variants)).toEqual([
-      "Fast",
-      "High",
+    expect(Object.keys(config)).toEqual([
+      "claude-opus-4-8",
+      "claude-opus-4-8-fast",
+      "claude-opus-4-8-1m",
     ])
+    expect(Object.keys(config["claude-opus-4-8"].variants)).toEqual(["High"])
+    expect(config["claude-opus-4-8-fast"].cost).toEqual({
+      input: 10,
+      output: 50,
+      cache_read: 1,
+      cache_write: 12.5,
+    })
   })
 
   it("combines Fast and 1M into a -1m-fast catalog id", () => {
@@ -1386,6 +1439,124 @@ describe("model cache integrity", () => {
     await expect(writeCache(directory, invalid)).rejects.toThrow(/invalid Cursor model cache/)
     expect(await readCache(directory)).toEqual(cache)
     expect((await fs.readdir(directory)).filter((name) => name.includes(".tmp"))).toEqual([])
+  })
+
+  it("returns a value snapshot: an immediately succeeding write does not change its models or age", async () => {
+    const directory = await tempDir()
+    await writeCache(directory, testCache("old-account"))
+    using server = Bun.serve({
+      port: 0,
+      fetch() {
+        return Response.json({
+          models: [{ name: "new-account", client_display_name: "New Account", supports_agent: true, variants: [] }],
+        })
+      },
+    })
+    const snapshot = await discoverModelCache("new-account-token", directory, {
+      baseURL: server.url.origin,
+      forceRefresh: true,
+    })
+    expect(snapshot.models.map((model) => model.id)).toEqual(["new-account"])
+    expect(snapshot.schemaVersion).toBe(MODEL_CACHE_SCHEMA_VERSION)
+    expect(normalizeModelCache(snapshot)).toEqual(await readCache(directory))
+
+    const other = { ...testCache("other-process"), fetchedAt: Date.now() + 60_000 }
+    await writeCache(directory, other)
+    expect(snapshot.models.map((model) => model.id)).toEqual(["new-account"])
+    expect(snapshot.fetchedAt).not.toBe(other.fetchedAt)
+    expect(isCacheFresh(snapshot)).toBe(true)
+    expect(await readCache(directory)).toEqual(other)
+  })
+
+  it("serves the exact stale entry it read when a fetch fails", async () => {
+    const directory = await tempDir()
+    const stale = { ...testCache("stale-account"), fetchedAt: Date.now() - 30 * 3_600_000 }
+    const other = testCache("other-account")
+    await writeCache(directory, stale)
+    using server = Bun.serve({
+      port: 0,
+      async fetch() {
+        await writeCache(directory, other)
+        return new Response("unavailable", { status: 503 })
+      },
+    })
+    const snapshot = await discoverModelCache("token", directory, { baseURL: server.url.origin })
+    expect(snapshot).toEqual(stale)
+    expect(isCacheFresh(snapshot)).toBe(false)
+    expect(await readCache(directory)).toEqual(other)
+  })
+
+  it("preserves the last good cache on an empty refresh and recovers on the next discovery", async () => {
+    const directory = await tempDir()
+    const previous = { ...testCache("previous-model"), fetchedAt: Date.now() - 30 * 3_600_000 }
+    await writeCache(directory, previous)
+    const path = cacheFilePath(directory)
+    const before = await fs.readFile(path, "utf8")
+    let requests = 0
+    using server = Bun.serve({
+      port: 0,
+      fetch() {
+        const models = ++requests === 1 ? [] : [{ name: "replacement" }]
+        return Response.json({ models })
+      },
+    })
+    const options = { baseURL: server.url.origin }
+
+    await expect(discoverModelCache("token", directory, { ...options, forceRefresh: true }))
+      .rejects.toMatchObject({ code: "CURSOR_EMPTY_MODEL_CATALOG" })
+    expect(await fs.readFile(path, "utf8")).toBe(before)
+    expect(await readCache(directory)).toEqual(previous)
+
+    const models = await discoverModels("token", directory, options)
+    expect(requests).toBe(2)
+    expect(models.map(({ id }) => id)).toEqual(["replacement"])
+    expect((await readCache(directory))?.models).toEqual(models)
+  })
+
+  it("replaces a legacy empty cache before returning models, even when its timestamp is fresh", async () => {
+    const directory = await tempDir()
+    await writeCache(directory, { ...testCache(), models: [] })
+    using server = Bun.serve({
+      port: 0,
+      fetch: () => Response.json({ models: [{ name: "replacement" }] }),
+    })
+
+    const models = await discoverModels("token", directory, { baseURL: server.url.origin })
+    // On regression, settle the unexpected background write before cleanup.
+    if (models.length === 0) {
+      await refreshModelCache(directory, () => Promise.resolve(models))
+    }
+    expect(models.map(({ id }) => id)).toEqual(["replacement"])
+    expect((await readCache(directory))?.models).toEqual(models)
+  })
+
+  it("returns the fresh cache entry before its background refresh completes", async () => {
+    const directory = await tempDir()
+    const cached = testCache("cached-account")
+    await writeCache(directory, cached)
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    using server = Bun.serve({
+      port: 0,
+      async fetch() {
+        await gate
+        return Response.json({ models: [{ name: "replacement" }] })
+      },
+    })
+
+    try {
+      const snapshot = await discoverModelCache("token", directory, {
+        baseURL: server.url.origin,
+        timeoutMs: 1000,
+      })
+      expect(snapshot).toEqual(cached)
+      const background = refreshModelCache(directory, async () => {
+        throw new Error("expected to join the background refresh")
+      })
+      release()
+      expect((await background).map((model) => model.id)).toEqual(["replacement"])
+      expect(snapshot).toEqual(cached)
+    } finally { release() }
   })
 
   it("coalesces concurrent refreshes for the same cache directory", async () => {

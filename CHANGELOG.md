@@ -6,6 +6,8 @@
 
 - Saved OpenCode variant picks that use the old full-name keys (for example `grok-4.7#Grok 4.7 High 500k`) no longer match a variant until it is picked again under its new key. OpenCode 1.x sends the model's default variant meanwhile; OpenCode 2.x rejects the prompt with a variant-unavailable error. A variant whose delta is empty is keyed `Standard`, because OpenCode reserves `default` for "no variant".
 
+- Fast choices that now have a dedicated price move to the corresponding `-fast` model. Reselect any saved Fast choice under the new entry.
+
 ### Added
 
 - Gemini 4 Carbon, Hydrogen, and Neon token prices and context windows from Cursor's model docs (`gemini-4-carbon`, `gemini-4-hydrogen`, `gemini-4-neon`).
@@ -63,7 +65,10 @@
 
 ### Fixed
 
-- GPT-5.4, GPT-5.5, and GPT-5.6 Luna, Sol, and Terra include Cursor's published long-context rates. Above 200k tokens, input, cache read, and cache write are twice the standard rate.
+- OpenCode 2.x refreshes an expired Cursor model catalog on host activity without reloading the Location. Failed refreshes keep the last good catalog ([#194](https://github.com/oakimov/cursor-opencode-provider/issues/194), @adonm).
+- Use published Fast and long-context rates for selectable Cursor models. The pricing table takes precedence, followed by the Cursor model page and the provider's API list rate for supported gaps. OpenCode 2.x displays the context tiers. OpenCode 1.19.6 shows the flat model rate and uses the applicable tier when recording a step's cost. Auto stays unpriced because billing can vary by route and plan. ([#199](https://github.com/oakimov/cursor-opencode-provider/pull/199))
+- Apply Gemini 3.1 Pro's published Standard tier above 200k prompt tokens, even though Cursor serves it as one model entry.
+- Offline pricing generation uses saved markdown and model pages, plus provider inputs where needed. The same saved inputs reproduce the generated file regardless of local paths. Generation rejects missing Fast and long-context rates before writing.
 - A stall after a long chain of generated images no longer ends the turn with "Cursor Run failed after 2 attempts: Cursor Run sent no frames for 30000ms". Only a new checkpoint (or another kind of failure) ended the 180-second stall window, and Cursor saves no checkpoint while it generates images: on 2026-11-10 a Run that stalled once was rebuilt, ran 11 minutes and 42 image generations without a checkpoint, and failed at its next stall with 11 retries unused. A step the host receives from a Run that did not fail now ends the window too, so only stalls with no step in between share the 180 s cutoff
 - On Linux the shells of tool calls, and everything they start, now raise their own OOM score to 1000. They inherited the OpenCode server's score, so when a test suite filled the machine's memory the kernel killed the server, the largest single process, and failed every session on it (a host on 2026-11-09: one server of 1 GB killed while about 220 processes started from tool shells held 26 GB). The kernel now ends the tool processes first. It follows `CURSOR_PROVIDER_TOOL_NICE` (`0` turns both off), and adapters are now keyed by their whole script, so a server on a new build no longer reuses an older build's adapter
 - A Run resumed from its checkpoint no longer keeps the provider's empty handshake read of a new file's edit (or a Task's attachment read) that the cut Run began after that checkpoint and never handed to the host. The resumed Run redoes the edit under a new call, so the old read could never get its call's host result, and a later Run cut while the host ran its tools ended the turn as "automatic retry unsafe" (`provider-answered-exec id=…`) with nothing left for it to hold.
