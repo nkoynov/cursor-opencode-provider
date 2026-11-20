@@ -414,6 +414,26 @@ export function findDefaultVariant(
         candidates.find((v) => isTwinOf(v, declared, ["fast", "context"])))
 }
 
+/**
+ * Cursor can add a parameter to a model (Gemini 4 Neon gained `context`) while
+ * a host still lists the older tuples. Such a pick keeps every value it names
+ * and takes the default tier and non-Fast for the parameters it lacks.
+ */
+function widenStalePick(
+  model: ModelInfo,
+  picked: ModelParameterValue[],
+  wantMax: boolean,
+  isFast: (v: ModelVariant) => boolean,
+): ModelVariant | undefined {
+  const pickedIds = new Set(picked.map((parameter) => parameter.id))
+  if (pickedIds.size !== picked.length) return undefined
+  const candidates = model.variants.filter((v) =>
+    picked.every((p) => v.parameterValues.some((q) => q.id === p.id && q.value === p.value)) &&
+    variantIsMaxMode(v) === wantMax &&
+    (pickedIds.has("fast") || !isFast(v)))
+  return candidates.length === 1 ? candidates[0] : findDefaultVariant(model, candidates, wantMax)
+}
+
 /** Send an advertised tuple verbatim; never rewrite one of its values. */
 function copyParameters(parameters: ModelParameterValue[]): ModelParameterValue[] {
   return parameters.map((parameter) => ({ ...parameter }))
@@ -596,6 +616,10 @@ export function resolveVariantParameters(
     const exact = model.variants.find((v) => sameParameterTuple(v.parameterValues, picked))
     if (exact) {
       return copyParameters(exact.parameterValues)
+    }
+    const widened = widenStalePick(model, picked, wantMax, isFast)
+    if (widened) {
+      return copyParameters(widened.parameterValues)
     }
     throw new CursorVariantSelectionError(
       `is stale for model ${JSON.stringify(model.id)}: its exact parameter tuple is unavailable`,

@@ -3081,6 +3081,9 @@ async function startSession(
     maxMode: hintMaxMode,
     picked,
   })
+  if (picked && parameterValues.length !== picked.length) {
+    trace(`variant: stale pick for ${cursorModelId} widened ${JSON.stringify(picked)} → ${JSON.stringify(parameterValues)}`)
+  }
   // An explicit pick owns the context tier; otherwise honor the maxMode hint.
   // OpenCode's variant paramMap does not include maxMode, so the cataloged
   // variant's isMaxMode marker decides it (1m tiers, Grok 4.7's 500k).
