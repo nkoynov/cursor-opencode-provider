@@ -1114,6 +1114,74 @@ describe("resolveVariantParameters (picked variant + max mode)", () => {
   })
 })
 
+describe("resolveVariantParameters (pick from before Cursor added a parameter)", () => {
+  const variant = (parameterValues: ModelVariant["parameterValues"], extra: Partial<ModelVariant> = {}): ModelVariant => ({
+    key: "gemini-4-neon",
+    displayName: "Gemini 4 Neon",
+    parameterValues,
+    isDefaultNonMax: false,
+    isDefaultMax: false,
+    ...extra,
+  })
+  const efforts = ["low", "medium", "high", "xhigh"]
+  const neon: ModelInfo = {
+    id: "gemini-4-neon",
+    displayName: "Gemini 4 Neon",
+    supportsAgent: true,
+    supportsThinking: true,
+    supportsMaxMode: true,
+    maxContext: 300_000,
+    maxContextForMaxMode: 1_000_000,
+    variants: [
+      ...efforts.map((value) => variant(
+        [{ id: "context", value: "300k" }, { id: "reasoning_effort", value }],
+        { isDefaultNonMax: value === "high" },
+      )),
+      ...efforts.map((value) => variant(
+        [{ id: "context", value: "1m" }, { id: "reasoning_effort", value }],
+        { isDefaultMax: value === "high", isMaxMode: true },
+      )),
+    ],
+  }
+
+  it("keeps the picked values and takes the default tier for the new parameter", () => {
+    expect(resolveVariantParameters(neon, { picked: [{ id: "reasoning_effort", value: "xhigh" }] })).toEqual([
+      { id: "context", value: "300k" },
+      { id: "reasoning_effort", value: "xhigh" },
+    ])
+    expect(resolveVariantParameters(neon, { picked: [] })).toEqual([
+      { id: "context", value: "300k" },
+      { id: "reasoning_effort", value: "high" },
+    ])
+  })
+
+  it("takes the non-Fast twin when Cursor adds Fast", () => {
+    const sonic: ModelInfo = {
+      ...neon,
+      id: "sonic",
+      variants: [
+        variant([{ id: "effort", value: "high" }, { id: "fast", value: "true" }]),
+        variant([{ id: "effort", value: "high" }, { id: "fast", value: "false" }]),
+      ],
+    }
+    expect(resolveVariantParameters(sonic, { picked: [{ id: "effort", value: "high" }] })).toEqual([
+      { id: "effort", value: "high" },
+      { id: "fast", value: "false" },
+    ])
+  })
+
+  it("still rejects a pick with a value Cursor no longer offers, or one no default settles", () => {
+    expect(() => resolveVariantParameters(neon, { picked: [{ id: "reasoning_effort", value: "max" }] }))
+      .toThrow(/exact parameter tuple/)
+    const verbose: ModelInfo = {
+      ...neon,
+      variants: ["low", "high"].map((value) => variant([{ id: "effort", value: "high" }, { id: "verbosity", value }])),
+    }
+    expect(() => resolveVariantParameters(verbose, { picked: [{ id: "effort", value: "high" }] }))
+      .toThrow(/exact parameter tuple/)
+  })
+})
+
 describe("extractCursorVariantParameters", () => {
   it("extracts only the dedicated variant payload", () => {
     expect(extractCursorVariantParameters({

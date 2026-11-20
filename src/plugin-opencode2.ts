@@ -7,7 +7,9 @@ import {
 } from "./shared.js"
 import { createSdk, cursorApiBaseURL, cursorGetServerConfigTelemetryEnabled, isCursorPackage } from "./plugin-core.js"
 import { opencode2PlanDir, opencodeGlobalCacheDir, setNativePlansDir } from "./context/paths.js"
+import { stat } from "node:fs/promises"
 import {
+  cacheFilePath,
   discoverModelCache,
   isCacheFresh,
   readCache,
@@ -124,6 +126,15 @@ async function loadModels(
     // An empty response can be cached; it must not pin later retries to [].
     forceRefresh: forceRefresh || cached?.models.length === 0,
   })
+}
+
+async function cacheFileStamp(cacheDir: string): Promise<string | undefined> {
+  try {
+    const info = await stat(cacheFilePath(cacheDir))
+    return `${info.ino}:${info.size}:${info.mtimeMs}`
+  } catch {
+    return undefined
+  }
 }
 
 function toolExecutionID(event: { readonly id?: string; readonly callID?: string }): string {
@@ -748,7 +759,40 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
         trace(`opencode2 models: discovery/publication failed: ${String(error)}`)
       })
     }
-    refreshModelsOnContext = refreshModels
+    // Runs validate a picked variant against the shared cache file, so a newer
+    // file written by another Location or process replaces this catalog too.
+    let sharedCacheStamp: string | undefined
+    const adoptNewerSharedCatalog = async (): Promise<void> => {
+      const catalog = loadedCatalog
+      if (disposed || !catalog || ensureInflight) return
+      const stamp = await cacheFileStamp(cacheDir)
+      if (stamp === undefined || stamp === sharedCacheStamp) return
+      sharedCacheStamp = stamp
+      const shared = await readCache(cacheDir)
+      if (!shared?.models.length || shared.fetchedAt <= catalog.fetchedAt) return
+      const generation = credentialGeneration
+      const current = () => !disposed && loadedCatalog === catalog && credentialGeneration === generation
+      if (!current() || ensureInflight) return
+      if (JSON.stringify(shared.models) === JSON.stringify(catalog.models)) {
+        loadedCatalog = shared
+        return
+      }
+      const adoption: Promise<void> = (async () => {
+        if (!await publishModels(shared.models, current) || !current()) return
+        loadedCatalog = shared
+        resetRefreshBackoff()
+        trace(`opencode2 models: adopted a newer shared catalog count=${shared.models.length}`)
+      })().catch((error: unknown) => {
+        trace(`opencode2 models: shared catalog publication failed: ${String(error)}`)
+      }).finally(() => {
+        if (ensureInflight === adoption) ensureInflight = undefined
+      })
+      ensureInflight = adoption
+      await adoption
+    }
+    refreshModelsOnContext = () => {
+      void adoptNewerSharedCatalog().catch(() => {}).finally(refreshModels)
+    }
 
     const RETRY_INTERVAL_MS = 3_000
     const RETRY_WINDOW_MS = 300_000

@@ -54,7 +54,7 @@ import {
   resetBackgroundShellNotices,
   watchBackgroundShell,
 } from "../src/background-shell-notice.js"
-import { readCache, writeCache } from "../src/models.js"
+import { CURSOR_VARIANT_PARAMETERS_KEY, readCache, resolveVariantParameters, writeCache } from "../src/models.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
 import { MODEL_CACHE_SCHEMA_VERSION, MODEL_CACHE_TTL_MS } from "../src/shared.js"
 import {
@@ -2285,6 +2285,159 @@ describe("opencode2 setup", () => {
         } finally { credential.release() }
       })
     }, 30_000)
+  })
+
+  describe("newer shared catalog", () => {
+    const efforts = ["low", "medium", "high", "xhigh"]
+    const label = (effort: string) => effort === "xhigh" ? "Extra High" : effort[0]!.toUpperCase() + effort.slice(1)
+    const variant = (name: string, parameterValues: { id: string; value: string }[], extra: Record<string, unknown> = {}) => ({
+      key: "gemini-4-neon",
+      displayName: `Gemini 4 Neon ${name}`,
+      parameterValues,
+      isDefaultNonMax: false,
+      isDefaultMax: false,
+      ...extra,
+    })
+    const neon = (variants: ModelInfo["variants"]): ModelInfo => ({
+      id: "gemini-4-neon",
+      displayName: "Gemini 4 Neon",
+      supportsAgent: true,
+      supportsThinking: true,
+      supportsMaxMode: true,
+      maxContext: 300_000,
+      maxContextForMaxMode: 1_000_000,
+      variants,
+    })
+    // Gemini 4 Neon before and after Cursor added its `context` parameter (2026-11-20).
+    const before = neon(efforts.map((effort) =>
+      variant(label(effort), [{ id: "reasoning_effort", value: effort }], { isDefaultNonMax: effort === "high" })))
+    const after = neon([
+      ...efforts.map((effort) => variant(label(effort), [
+        { id: "context", value: "300k" },
+        { id: "reasoning_effort", value: effort },
+      ], { isDefaultNonMax: effort === "high" })),
+      ...efforts.map((effort) => variant(`1M ${label(effort)}`, [
+        { id: "context", value: "1m" },
+        { id: "reasoning_effort", value: effort },
+      ], { isDefaultMax: effort === "high", isMaxMode: true })),
+    ])
+    const availableModels = () => Response.json({ models: [{
+      name: after.id,
+      client_display_name: after.displayName,
+      supports_agent: true,
+      supports_thinking: true,
+      supports_max_mode: true,
+      variants: after.variants.map((v) => ({
+        display_name: v.displayName,
+        parameter_values: v.parameterValues,
+        is_default_non_max_config: v.isDefaultNonMax,
+        is_default_max_config: v.isDefaultMax,
+        ...(v.isMaxMode ? { is_max_mode: true } : {}),
+      })),
+    }] })
+    const seed = (cacheDir: string, model: ModelInfo, fetchedAt: number) =>
+      writeCache(cacheDir, { models: [model], fetchedAt, schemaVersion: MODEL_CACHE_SCHEMA_VERSION })
+    const activity = { type: "message.updated", data: { sessionID: "neon-session" } }
+    const xhigh = [{ id: "reasoning_effort", value: "xhigh" }]
+    const xhigh300k = [{ id: "context", value: "300k" }, { id: "reasoning_effort", value: "xhigh" }]
+
+    type Fixture = ReturnType<typeof connectedContext> & { bus: ReturnType<typeof fakeEventBus>; cacheDir: string }
+    const withNeon = (
+      fetchedAt: (start: number) => number,
+      availableModelsResponse: () => Response | Promise<Response>,
+      body: (fixture: Fixture & { start: number }) => Promise<void>,
+    ) => withTempHostCache(async (cacheDir) => {
+      const start = Date.now()
+      await seed(cacheDir, before, fetchedAt(start))
+      const bus = fakeEventBus()
+      const host = connectedContext()
+      host.ctx.event.subscribe = bus.subscribe
+      setSystemTime(new Date(start))
+      try {
+        await withFetch((url) => url.endsWith("/AvailableModels") ? availableModelsResponse() : Response.json({}), async () => {
+          const cleanup = await setupPlugin(host.ctx)
+          try {
+            await until(() => host.reloads.length === 2)
+            await body({ ...host, bus, cacheDir, start })
+          } finally { await cleanup() }
+        })
+      } finally { setSystemTime() }
+    })
+    // OpenCode resolves the step's variant from the published catalog, then runs
+    // the context hook; the Run validates that pick against the shared cache file.
+    const turn = async ({ bus, cacheDir, hooks, inventory }: Fixture) => {
+      await bus.publish(activity)
+      const picked = inventory.models.get("cursor/gemini-4-neon")?.variants
+        .find(({ id }) => id === "Extra High")?.settings?.[CURSOR_VARIANT_PARAMETERS_KEY]
+      await hooks.get("session.context")!({
+        sessionID: activity.data.sessionID,
+        agent: "build",
+        messages: [],
+        options: {},
+        model: { providerID: "cursor", id: "gemini-4-neon", variant: "Extra High" },
+      })
+      const shared = (await readCache(cacheDir))?.models.find(({ id }) => id === "gemini-4-neon")
+      return { picked, sent: resolveVariantParameters(shared, { picked }) }
+    }
+
+    test("a turn after another writer replaced a fresh shared cache keeps its pick and republishes without discovery", async () => {
+      let requests = 0
+      await withNeon((start) => start - 3_600_000, () => { requests++; return availableModels() }, async (fixture) => {
+        expect(await turn(fixture)).toEqual({ picked: xhigh, sent: xhigh })
+        await seed(fixture.cacheDir, after, Date.now())
+
+        expect(await turn(fixture)).toEqual({ picked: xhigh, sent: xhigh300k })
+        await until(() => fixture.inventory.models.has("cursor/gemini-4-neon-1m"))
+        expect(await turn(fixture)).toEqual({ picked: xhigh300k, sent: xhigh300k })
+        expect(fixture.reloads).toHaveLength(3)
+
+        // The adopted catalog carries the file's age, not the replaced one's.
+        setSystemTime(new Date(fixture.start + MODEL_CACHE_TTL_MS - 3_600_000))
+        expect(await turn(fixture)).toEqual({ picked: xhigh300k, sent: xhigh300k })
+        expect(requests).toBe(0)
+      })
+    })
+
+    test("the first turn after expiry keeps a pick the shared cache already replaced", async () => {
+      const discovery = deferred()
+      let requests = 0
+      await withNeon((start) => start - MODEL_CACHE_TTL_MS + 60_000, async () => {
+        requests++
+        await discovery.promise
+        return availableModels()
+      }, async (fixture) => {
+        try {
+          expect(await turn(fixture)).toEqual({ picked: xhigh, sent: xhigh })
+          setSystemTime(new Date(fixture.start + 60_000))
+          await seed(fixture.cacheDir, after, Date.now())
+
+          expect(await turn(fixture)).toEqual({ picked: xhigh, sent: xhigh300k })
+          expect(requests).toBe(1)
+          discovery.release()
+          await until(() => fixture.inventory.models.has("cursor/gemini-4-neon-1m"))
+          expect(await turn(fixture)).toEqual({ picked: xhigh300k, sent: xhigh300k })
+        } finally { discovery.release() }
+      })
+    })
+
+    test("an older or identical shared cache does not republish", async () => {
+      let requests = 0
+      await withNeon((start) => start - 3_600_000, () => { requests++; return availableModels() }, async (fixture) => {
+        await seed(fixture.cacheDir, after, fixture.start - 7_200_000)
+        await turn(fixture)
+        await Bun.sleep(20)
+        expect(fixture.reloads).toHaveLength(2)
+
+        await seed(fixture.cacheDir, before, Date.now())
+        await turn(fixture)
+        await Bun.sleep(20)
+        expect(fixture.reloads).toHaveLength(2)
+        // Identical content still refreshes this catalog's age.
+        setSystemTime(new Date(fixture.start + MODEL_CACHE_TTL_MS - 3_600_000))
+        expect(await turn(fixture)).toEqual({ picked: xhigh, sent: xhigh })
+        expect(requests).toBe(0)
+      })
+    })
   })
 
   test("credential updates replace a fresh cache with the selected account's inventory", async () => {
