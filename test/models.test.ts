@@ -1170,6 +1170,21 @@ describe("resolveVariantParameters (pick from before Cursor added a parameter)",
     ])
   })
 
+  it("keeps the tier a pick names without a maxMode hint", () => {
+    const tiers: ModelInfo = {
+      ...neon,
+      id: "tiers",
+      variants: ["300k", "1m"].flatMap((context) => ["false", "true"].map((fast) => variant(
+        [{ id: "context", value: context }, { id: "effort", value: "high" }, { id: "fast", value: fast }],
+        { isMaxMode: context === "1m" },
+      ))),
+    }
+    expect(resolveVariantParameters(tiers, { picked: [{ id: "context", value: "1m" }, { id: "effort", value: "high" }] }))
+      .toEqual([{ id: "context", value: "1m" }, { id: "effort", value: "high" }, { id: "fast", value: "false" }])
+    expect(resolveVariantParameters(tiers, { picked: [{ id: "effort", value: "high" }], maxMode: true }))
+      .toEqual([{ id: "context", value: "1m" }, { id: "effort", value: "high" }, { id: "fast", value: "false" }])
+  })
+
   it("still rejects a pick with a value Cursor no longer offers, or one no default settles", () => {
     expect(() => resolveVariantParameters(neon, { picked: [{ id: "reasoning_effort", value: "max" }] }))
       .toThrow(/exact parameter tuple/)
