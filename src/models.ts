@@ -428,12 +428,13 @@ function widenStalePick(
   const pickedIds = new Set(picked.map((parameter) => parameter.id))
   if (pickedIds.size !== picked.length) return undefined
   const containing = model.variants.filter((v) =>
-    picked.every((p) => v.parameterValues.some((q) => q.id === p.id && q.value === p.value)) &&
-    (pickedIds.has("fast") || !isFast(v)))
-  // A pick that names its tier (`context=1m`) keeps it whatever the hint says.
-  const tier = containing.filter((v) => variantIsMaxMode(v) === wantMax)
-  const candidates = tier.length > 0 ? tier : containing
-  const maxMode = tier.length > 0 ? wantMax : !wantMax
+    picked.every((p) => v.parameterValues.some((q) => q.id === p.id && q.value === p.value)))
+  // Only a pick that names its context (`1m`, Grok's `500k`) may leave the requested tier.
+  const maxMode = pickedIds.has("context") && !containing.some((v) => variantIsMaxMode(v) === wantMax)
+    ? !wantMax
+    : wantMax
+  const candidates = containing.filter((v) =>
+    variantIsMaxMode(v) === maxMode && (pickedIds.has("fast") || !isFast(v)))
   return candidates.length === 1 ? candidates[0] : findDefaultVariant(model, candidates, maxMode)
 }
 

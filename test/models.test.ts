@@ -1185,6 +1185,36 @@ describe("resolveVariantParameters (pick from before Cursor added a parameter)",
       .toEqual([{ id: "context", value: "1m" }, { id: "effort", value: "high" }, { id: "fast", value: "false" }])
   })
 
+  it("never moves a pick without a context into the other tier", () => {
+    // Shaped like Claude Opus 5.5 today: Fast and max effort only at 1m.
+    const opusLike: ModelInfo = {
+      ...neon,
+      id: "opus-like",
+      variants: [
+        variant([{ id: "context", value: "300k" }, { id: "effort", value: "high" }, { id: "fast", value: "false" }]),
+        ...[["high", "true"], ["high", "false"], ["max", "false"]].map(([effort, fast]) => variant(
+          [{ id: "context", value: "1m" }, { id: "effort", value: effort! }, { id: "fast", value: fast! }],
+          { isMaxMode: true },
+        )),
+      ],
+    }
+    for (const picked of [
+      [{ id: "effort", value: "high" }, { id: "fast", value: "true" }],
+      [{ id: "effort", value: "max" }],
+    ]) {
+      expect(() => resolveVariantParameters(opusLike, { picked })).toThrow(/exact parameter tuple/)
+    }
+    const fastOnly: ModelInfo = {
+      ...opusLike,
+      variants: [
+        variant([{ id: "context", value: "300k" }, { id: "effort", value: "high" }, { id: "fast", value: "true" }]),
+        variant([{ id: "context", value: "1m" }, { id: "effort", value: "high" }, { id: "fast", value: "false" }], { isMaxMode: true }),
+      ],
+    }
+    expect(() => resolveVariantParameters(fastOnly, { picked: [{ id: "effort", value: "high" }] }))
+      .toThrow(/exact parameter tuple/)
+  })
+
   it("still rejects a pick with a value Cursor no longer offers, or one no default settles", () => {
     expect(() => resolveVariantParameters(neon, { picked: [{ id: "reasoning_effort", value: "max" }] }))
       .toThrow(/exact parameter tuple/)

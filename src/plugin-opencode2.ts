@@ -785,16 +785,22 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
       if (sameModels(shared.models, catalog.models)) {
         loadedCatalog = shared
         sharedCacheStamp = stamp
+        resetRefreshBackoff()
         return
       }
       // The stamp is kept only once published, so a failed reload is retried next step.
-      const adoption: Promise<void> = (async () => {
-        if (!await publishModels(shared.models, current) || !current()) return
-        loadedCatalog = shared
-        sharedCacheStamp = stamp
-        resetRefreshBackoff()
-        trace(`opencode2 models: adopted a newer shared catalog count=${shared.models.length}`)
-      })().catch((error: unknown) => {
+      const adoption: Promise<void> = withAbortDeadline(
+        CACHE_PUBLICATION_TIMEOUT_MS,
+        () => modelReadinessTimeout(CACHE_PUBLICATION_TIMEOUT_MS),
+        async (signal) => {
+          const live = () => current() && !signal.aborted
+          if (!await publishModels(shared.models, live) || !live()) return
+          loadedCatalog = shared
+          sharedCacheStamp = stamp
+          resetRefreshBackoff()
+          trace(`opencode2 models: adopted a newer shared catalog count=${shared.models.length}`)
+        },
+      ).catch((error: unknown) => {
         trace(`opencode2 models: shared catalog publication failed: ${String(error)}`)
       }).finally(() => {
         if (ensureInflight === adoption) ensureInflight = undefined
