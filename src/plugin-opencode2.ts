@@ -12,6 +12,7 @@ import {
   cacheFilePath,
   discoverModelCache,
   isCacheFresh,
+  normalizeModelCache,
   readCache,
   type ModelCache,
   type ModelInfo,
@@ -126,6 +127,12 @@ async function loadModels(
     // An empty response can be cached; it must not pin later retries to [].
     forceRefresh: forceRefresh || cached?.models.length === 0,
   })
+}
+
+// A fetched catalog and its normalized file copy order keys differently.
+function sameModels(a: ModelInfo[], b: ModelInfo[]): boolean {
+  const normalized = (models: ModelInfo[]) => JSON.stringify(normalizeModelCache({ models, fetchedAt: 0 })?.models)
+  return normalized(a) === normalized(b)
 }
 
 async function cacheFileStamp(cacheDir: string): Promise<string | undefined> {
@@ -767,19 +774,24 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
       if (disposed || !catalog || ensureInflight) return
       const stamp = await cacheFileStamp(cacheDir)
       if (stamp === undefined || stamp === sharedCacheStamp) return
-      sharedCacheStamp = stamp
       const shared = await readCache(cacheDir)
-      if (!shared?.models.length || shared.fetchedAt <= catalog.fetchedAt) return
+      if (!shared?.models.length || !isCacheFresh(shared) || shared.fetchedAt <= catalog.fetchedAt) {
+        sharedCacheStamp = stamp
+        return
+      }
       const generation = credentialGeneration
       const current = () => !disposed && loadedCatalog === catalog && credentialGeneration === generation
       if (!current() || ensureInflight) return
-      if (JSON.stringify(shared.models) === JSON.stringify(catalog.models)) {
+      if (sameModels(shared.models, catalog.models)) {
         loadedCatalog = shared
+        sharedCacheStamp = stamp
         return
       }
+      // The stamp is kept only once published, so a failed reload is retried next step.
       const adoption: Promise<void> = (async () => {
         if (!await publishModels(shared.models, current) || !current()) return
         loadedCatalog = shared
+        sharedCacheStamp = stamp
         resetRefreshBackoff()
         trace(`opencode2 models: adopted a newer shared catalog count=${shared.models.length}`)
       })().catch((error: unknown) => {

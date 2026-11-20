@@ -2420,10 +2420,55 @@ describe("opencode2 setup", () => {
       })
     })
 
-    test("an older or identical shared cache does not republish", async () => {
+    test("a failed republication of a newer shared cache is retried on the next step", async () => {
+      await withNeon((start) => start - 3_600_000, availableModels, async (fixture) => {
+        const reload = fixture.ctx.provider.reload
+        let failures = 1
+        fixture.ctx.provider.reload = async () => {
+          if (failures-- > 0) throw new Error("reload failed")
+          return reload()
+        }
+        await seed(fixture.cacheDir, after, Date.now())
+        expect(await turn(fixture)).toEqual({ picked: xhigh, sent: xhigh300k })
+        await Bun.sleep(20)
+        expect(fixture.inventory.models.has("cursor/gemini-4-neon-1m")).toBe(false)
+
+        expect(await turn(fixture)).toEqual({ picked: xhigh, sent: xhigh300k })
+        await until(() => fixture.inventory.models.has("cursor/gemini-4-neon-1m"))
+        expect(await turn(fixture)).toEqual({ picked: xhigh300k, sent: xhigh300k })
+      })
+    })
+
+    test("a newer copy of the catalog this Location fetched itself only refreshes its age", async () => {
+      let requests = 0
+      await withNeon((start) => start - MODEL_CACHE_TTL_MS + 60_000, () => { requests++; return availableModels() }, async (fixture) => {
+        setSystemTime(new Date(fixture.start + 60_000))
+        await turn(fixture)
+        await until(() => fixture.inventory.models.has("cursor/gemini-4-neon-1m"))
+        expect(requests).toBe(1)
+        const reloads = fixture.reloads.length
+
+        setSystemTime(new Date(fixture.start + 61_000))
+        await seed(fixture.cacheDir, after, Date.now())
+        await turn(fixture)
+        await Bun.sleep(20)
+        expect(fixture.reloads).toHaveLength(reloads)
+        setSystemTime(new Date(fixture.start + 60_500 + MODEL_CACHE_TTL_MS))
+        await turn(fixture)
+        await Bun.sleep(20)
+        expect(requests).toBe(1)
+      })
+    })
+
+    test("an older, other-schema or identical shared cache does not republish", async () => {
       let requests = 0
       await withNeon((start) => start - 3_600_000, () => { requests++; return availableModels() }, async (fixture) => {
         await seed(fixture.cacheDir, after, fixture.start - 7_200_000)
+        await turn(fixture)
+        await Bun.sleep(20)
+        expect(fixture.reloads).toHaveLength(2)
+
+        await writeCache(fixture.cacheDir, { models: [after], fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION + 1 })
         await turn(fixture)
         await Bun.sleep(20)
         expect(fixture.reloads).toHaveLength(2)

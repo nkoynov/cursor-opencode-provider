@@ -427,11 +427,14 @@ function widenStalePick(
 ): ModelVariant | undefined {
   const pickedIds = new Set(picked.map((parameter) => parameter.id))
   if (pickedIds.size !== picked.length) return undefined
-  const candidates = model.variants.filter((v) =>
+  const containing = model.variants.filter((v) =>
     picked.every((p) => v.parameterValues.some((q) => q.id === p.id && q.value === p.value)) &&
-    variantIsMaxMode(v) === wantMax &&
     (pickedIds.has("fast") || !isFast(v)))
-  return candidates.length === 1 ? candidates[0] : findDefaultVariant(model, candidates, wantMax)
+  // A pick that names its tier (`context=1m`) keeps it whatever the hint says.
+  const tier = containing.filter((v) => variantIsMaxMode(v) === wantMax)
+  const candidates = tier.length > 0 ? tier : containing
+  const maxMode = tier.length > 0 ? wantMax : !wantMax
+  return candidates.length === 1 ? candidates[0] : findDefaultVariant(model, candidates, maxMode)
 }
 
 /** Send an advertised tuple verbatim; never rewrite one of its values. */
