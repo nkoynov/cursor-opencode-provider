@@ -6,6 +6,8 @@
 
 - Saved OpenCode variant picks that use the old full-name keys (for example `grok-4.7#Grok 4.7 High 500k`) no longer match a variant until it is picked again under its new key. OpenCode 1.x sends the model's default variant meanwhile; OpenCode 2.x rejects the prompt with a variant-unavailable error. A variant whose delta is empty is keyed `Standard`, because OpenCode reserves `default` for "no variant".
 
+- Fast choices that now have a dedicated price move to the corresponding `-fast` model. Reselect any saved Fast choice under the new entry.
+
 ### Added
 
 - Gemini 4 Carbon, Hydrogen, and Neon token prices and context windows from Cursor's model docs (`gemini-4-carbon`, `gemini-4-hydrogen`, `gemini-4-neon`).
