@@ -365,6 +365,38 @@ describe("Run write drain", () => {
       }
     }, 20_000)
 
+    it("opens a later turn's Run again with its host instruction update", async () => {
+      await run((index) => index === 1 ? "unauthenticated" : undefined, async (model, renewals) => {
+        const turn = (system: string, prompt: LanguageModelV3CallOptions["prompt"]) =>
+          ({ ...call("ses_upload_auth_epoch"), prompt: [{ role: "system", content: system }, ...prompt] }) as LanguageModelV3CallOptions
+        const first = await model.doStream(turn("Host rules A.", [{ role: "user", content: [{ type: "text", text: "Hello" }] }]))
+        const drained = (async () => {
+          const reader = first.stream.getReader()
+          while (!(await reader.read()).done) { /* consume */ }
+        })()
+        await waitUntil(() => fake!.body(0).includes("Hello"))
+        fake!.send(0, { interaction_update: { text_delta: { text: "Done." } } })
+        fake!.send(0, { conversation_checkpoint_update: Uint8Array.from([0x0a, 0x00]) })
+        fake!.send(0, { interaction_update: { turn_ended: { input_tokens: 10, output_tokens: 1 } } })
+        await drained
+        await settleRunSavesForTests()
+
+        const second = await model.doStream(turn("Host rules B.", [
+          { role: "user", content: [{ type: "text", text: "Hello" }] },
+          { role: "assistant", content: [{ type: "text", text: "Done." }] },
+          { role: "user", content: [{ type: "text", text: "x".repeat(250_000) }] },
+        ]))
+        try {
+          expect(renewals()).toBe(1)
+          expect(fake!.received).toHaveLength(3)
+          await waitUntil(() => fake!.body(2).includes("Host rules B."))
+          expect(fake!.body(2).includes("Host system instructions were updated")).toBe(true)
+        } finally {
+          await failureOf(second.stream.cancel())
+        }
+      })
+    }, 20_000)
+
     it("ends the turn when the renewed token is rejected too", async () => {
       await run(() => "unauthenticated", async (model, renewals) => {
         const error = await failureOf(Promise.resolve(model.doStream(call("ses_upload_auth_twice"))))

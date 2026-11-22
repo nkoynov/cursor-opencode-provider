@@ -5,7 +5,9 @@ import {
   clearContextEpoch,
   endContextEpoch,
   getContextEpoch,
+  peekContextEpoch,
   resetContextEpochsForTests,
+  restoreContextEpoch,
 } from "../src/context/epoch.js"
 import { transferFrozenRequestContext, resetFrozenRequestContextsForTests } from "../src/context/frozen.js"
 
@@ -57,6 +59,26 @@ describe("context epoch (V2-style)", () => {
     expect(again.midConversationMessage).toContain("Host primary agent is now \"plan\"")
     expect(again.midConversationMessage).toContain("Host system instructions were updated")
     expect(again.midConversationMessage).toContain("You are plan. No edits.")
+  })
+
+  it("restores an unsent admission unless the epoch was cleared or replaced since", () => {
+    const admit = (hostSystem: string, conversationId = "conv-1") =>
+      admitContextEpoch({ conversationId, hasCheckpoint: true, hostSystem, workspaceRoot: "/workspace" })
+    const first = admit("rules A")
+    restoreContextEpoch(first.epoch, undefined)
+    expect(getContextEpoch("conv-1")).toBeUndefined()
+
+    admit("rules A")
+    const before = peekContextEpoch("conv-1")
+    const unsent = admit("rules B")
+    restoreContextEpoch(unsent.epoch, before)
+    expect(admit("rules B").midConversationMessage).toContain("rules B")
+
+    const stale = admit("rules C")
+    clearContextEpoch("conv-1")
+    const replacement = admit("rules D")
+    restoreContextEpoch(stale.epoch, before)
+    expect(getContextEpoch("conv-1")).toBe(replacement.epoch)
   })
 
   it("admits source updates on checkpoint turns without a seed system prompt", () => {

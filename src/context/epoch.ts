@@ -324,6 +324,13 @@ export function attachContextEpoch(conversationId: string, epoch: ContextEpoch):
   touch({ ...epoch, conversationId })
 }
 
+/** Undo an admission no Run carried, unless the epoch was cleared or replaced since. */
+export function restoreContextEpoch(admitted: ContextEpoch, before: ContextEpoch | undefined): void {
+  if (byConversationId.get(admitted.conversationId) !== admitted) return
+  if (before) touch(structuredClone(before))
+  else byConversationId.delete(admitted.conversationId)
+}
+
 export function resetContextEpochsForTests(): void {
   byConversationId.clear()
 }

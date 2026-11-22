@@ -351,6 +351,7 @@ import {
   peekContextEpoch,
   type ContextEpoch,
   resetContextEpochsForTests,
+  restoreContextEpoch,
 } from "./context/epoch.js"
 import { workspaceRootFromRequestContext } from "./context/env.js"
 import {
@@ -1480,16 +1481,20 @@ async function doStreamImpl(
         ? prefetched
         : await resolveRunBearerToken(options, forceRefresh)
       const restoreModeDelivery = snapshotModeDelivery(opencodeSessionKey(callOptions))
+      const unsent: UnsentRunUndo = {}
       try {
         const opened = await startSession(modelId, token, { ...callOptions, abortSignal: runSignal }, options, {
           ...startOptions,
           requestedAt,
+          unsent,
         })
         cancelIfHostStoppedSince(opened)
         return opened
       } catch (error) {
-        // No Run took this request, so whatever sends the turn next carries the same one-shot guidance.
+        // No Run took this request, so whatever sends the turn next carries the same one-shot guidance
+        // and context updates.
         restoreModeDelivery()
+        unsent.restoreContextEpoch?.()
         // A rejection that reaches the open (a long upload) means Cursor took no Run.
         if (!credentialRenewable || credentialRenewed || callOptions.abortSignal?.aborted
           || !isRejectedCredentialError(error) || !error.replaySafe) throw error
@@ -2679,12 +2684,15 @@ async function openRunWithRequest(
   }
 }
 
+/** State a Run setup committed early, to put back when no Run took the request. */
+type UnsentRunUndo = { restoreContextEpoch?: () => void }
+
 async function startSession(
   modelId: string,
   token: string,
   callOptions: LanguageModelV3CallOptions,
   options: CreateCursorOptions,
-  startOptions?: { recovery?: CursorRunRecovery; isolate?: boolean; requestedAt?: number },
+  startOptions?: { recovery?: CursorRunRecovery; isolate?: boolean; requestedAt?: number; unsent?: UnsentRunUndo },
 ): Promise<CursorSession> {
   const continuationPolicy = resolveContinuationPolicy(options.continuation)
   const prompt = callOptions.prompt
@@ -3005,6 +3013,10 @@ async function startSession(
       oneShotReminders,
       recoveredBaseline: systemInstructionsRuleText(getFrozenRequestContext(conversationId) ?? {}),
     })
+    const epochBefore = epochAtTurnStart
+    if (startOptions?.unsent) {
+      startOptions.unsent.restoreContextEpoch = () => restoreContextEpoch(admitted.epoch, epochBefore)
+    }
     systemPrompt = startedWithCheckpoint ? undefined : admitted.seedSystemPrompt
     userText = appendMidConversationMessage(userText, admitted.midConversationMessage)
     // The epoch baseline is the rule for every Run of this conversation. A
