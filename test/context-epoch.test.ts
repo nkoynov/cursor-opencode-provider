@@ -79,6 +79,13 @@ describe("context epoch (V2-style)", () => {
     const replacement = admit("rules D")
     restoreContextEpoch(stale.epoch, before)
     expect(getContextEpoch("conv-1")).toBe(replacement.epoch)
+
+    const beforeOverlap = peekContextEpoch("conv-1")
+    const overtaken = admit("rules E")
+    const later = admit("rules F")
+    restoreContextEpoch(overtaken.epoch, beforeOverlap)
+    expect(getContextEpoch("conv-1")).toBe(later.epoch)
+    expect(admit("rules F").action).toBe("unchanged")
   })
 
   it("admits source updates on checkpoint turns without a seed system prompt", () => {

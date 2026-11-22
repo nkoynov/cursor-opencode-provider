@@ -232,10 +232,9 @@ export function admitContextEpoch(input: AdmitContextEpochInput): AdmitContextEp
     existing.snapshot.workspaceRoot !== observedSnap.workspaceRoot ? "workspaceRoot" : "",
   ].filter(Boolean)
   const changed = changedSources.length > 0
-  if (changed) {
-    existing.snapshot = observedSnap
-  }
-  touch(existing)
+  // A new object, so restoreContextEpoch can tell a later admission from this one.
+  const epoch = changed ? { ...existing, snapshot: observedSnap } : existing
+  touch(epoch)
 
   if (input.hasCheckpoint) {
     const midConversationMessage = combineMessages([...updates, ...oneShots])
@@ -249,7 +248,7 @@ export function admitContextEpoch(input: AdmitContextEpochInput): AdmitContextEp
     return {
       action: changed ? "updated" : "unchanged",
       midConversationMessage,
-      epoch: existing,
+      epoch,
     }
   }
 
@@ -264,7 +263,7 @@ export function admitContextEpoch(input: AdmitContextEpochInput): AdmitContextEp
     return {
       action: changed ? "updated" : "recovered",
       midConversationMessage,
-      epoch: existing,
+      epoch,
     }
   }
 
@@ -279,7 +278,7 @@ export function admitContextEpoch(input: AdmitContextEpochInput): AdmitContextEp
     action: changed ? "updated" : "unchanged",
     seedSystemPrompt: existing.baselineSystemPrompt || undefined,
     midConversationMessage,
-    epoch: existing,
+    epoch,
   }
 }
 
