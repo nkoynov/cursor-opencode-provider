@@ -170,7 +170,7 @@ cd /absolute/path/to/cursor-opencode-provider
 bun install && bun run build
 ```
 
-When the plugin's `sdk` hook leaves model creation to OpenCode, the host uses the AI SDK `package` from the provider catalog. A local build publishes `aisdk:file:///absolute/path/to/cursor-opencode-provider/dist/index.js`. After resolving symlinks, the plugin catalog and `dist/index.js` must belong to the same checkout outside `node_modules`. The checkout's `package.json` must name `cursor-opencode-provider` and directly declare `dist/index.js` as its root ESM entry. Registry installs, source runs and unverified layouts publish `aisdk:cursor-opencode-provider`, which OpenCode installs from npm.
+When the plugin's `sdk` hook leaves model creation to OpenCode, the host uses the AI SDK `package` from the provider catalog. A local build publishes `aisdk:file:///absolute/path/to/cursor-opencode-provider/dist/index.js`. After resolving symlinks, the plugin catalog and `dist/index.js` must belong to the same checkout outside `node_modules`. The checkout's `package.json` must name `cursor-opencode-provider` and directly declare `dist/index.js` as its root ESM entry. Registry installs, source runs and unverified layouts publish `aisdk:cursor-opencode-provider@<version>`, pinned to the plugin's own version, which OpenCode installs from npm.
 
 ```bash
 export OPENCODE_CONFIG_DIR=~/.config/opencode2
@@ -193,7 +193,7 @@ Use the wrapper directory, rather than the provider source root, as the local pl
 opencode2 api provider.list
 ```
 
-- **Choose another entry only when you need one.** `CURSOR_OPENCODE2_DEV_ENTRY`, an absolute path to a built entry file that exports `createCursor`, takes priority over every other choice. `CURSOR_OPENCODE2_USE_LOCAL_DIST=0` publishes `aisdk:cursor-opencode-provider` from a local build.
+- **Choose another entry only when you need one.** `CURSOR_OPENCODE2_DEV_ENTRY`, an absolute path to a built entry file that exports `createCursor`, takes priority over every other choice. `CURSOR_OPENCODE2_USE_LOCAL_DIST=0` publishes `aisdk:cursor-opencode-provider@<version>` from a local build.
 - **Set them before starting the daemon.** `opencode2 serve` / `service start` inherit env at start time, and the package is chosen when the plugin loads. After changing `CURSOR_OPENCODE2_DEV_ENTRY`, `CURSOR_OPENCODE2_USE_LOCAL_DIST`, `OPENCODE_CONFIG_DIR`, or rebuilding `dist/`, restart the service:
 
   ```bash
@@ -550,7 +550,7 @@ Then `/connect` → **Cursor** if credentials are missing. Filter the picker by 
 | Problem | What to try |
 |---------|-------------|
 | No Cursor models in the picker | `/connect` → **Cursor** (or shared `auth.json`). Dedicated `OPENCODE_CONFIG_DIR`. Plugin is a **directory** re-exporting `plugin/opencode2`, not a bare `.js`. Filter by provider **Cursor** (`time.released` is `0`). Remove leftover `providers.cursor` (see [Safe transition](#safe-transition)). |
-| Local daemon publishes the npm package | `opencode2 api provider.list` shows `"package": "aisdk:cursor-opencode-provider"` for `cursor`. Rebuild (`bun run build`) so `dist/index.js` exists, load the plugin from that build rather than a copy under `node_modules`, unset `CURSOR_OPENCODE2_USE_LOCAL_DIST`, and restart the daemon. To name the entry yourself, set `CURSOR_OPENCODE2_DEV_ENTRY` before start; see [From a local clone](#from-a-local-clone). |
+| Local daemon publishes the npm package | `opencode2 api provider.list` shows `"package": "aisdk:cursor-opencode-provider@<version>"` for `cursor`. Rebuild (`bun run build`) so `dist/index.js` exists, load the plugin from that build rather than a copy under `node_modules`, unset `CURSOR_OPENCODE2_USE_LOCAL_DIST`, and restart the daemon. To name the entry yourself, set `CURSOR_OPENCODE2_DEV_ENTRY` before start; see [From a local clone](#from-a-local-clone). |
 | The model cannot find an MCP tool and searches files for it instead | The server set `"codemode": true`, so its tools stay inside `execute`. Remove that field to put them on the direct catalog; see [MCP tools](#mcp-tools). |
 | A prompt immediately after startup does not see MCP tools | Expected. OpenCode connects MCP servers asynchronously and does not block startup on a slow server. The next turn in the same session includes tools that have connected. Do not treat this as a catalog bug or delay startup to wait for MCP. |
 | Picker / auth broke after an upgrade | You are likely still on the next-era `ctx.catalog` build or the dump-era plugin. Follow [Safe transition](#safe-transition) and restart. |

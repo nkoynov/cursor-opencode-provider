@@ -180,6 +180,11 @@ describe("resolveAiSdkPackageSpec", () => {
     }
   })
 
+  it("pins the published package to this package's own version", () => {
+    // A bare name is resolved as `@latest`, which would load a newer language model than the plugin.
+    expect(CURSOR_AISDK_REGISTRY_PACKAGE).toBe(`aisdk:cursor-opencode-provider@${repoManifest.version}`)
+  })
+
   it("lets CURSOR_OPENCODE2_DEV_ENTRY override every layout and the opt-out", () => {
     const base = scratch()
     const devEntry = path.join(base, "dev build", "dist", "index.js")
