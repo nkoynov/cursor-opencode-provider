@@ -2470,7 +2470,8 @@ async function startSession(
     model: modelInfo,
   })
 
-  if (foreignHistory || checkpointUnusable || unfinishedPriorRun || completedResultsRebase) {
+  const seededCompaction = isCompaction && history.some((entry) => entry.role !== "system")
+  if (foreignHistory || checkpointUnusable || unfinishedPriorRun || completedResultsRebase || seededCompaction) {
     assertForeignHistoryRebaseFits({
       modelInfo,
       cursorModelId,
@@ -2479,6 +2480,7 @@ async function startSession(
       history,
       systemPrompt,
       userText,
+      isCompaction: seededCompaction,
     })
   }
 
@@ -8535,9 +8537,20 @@ function appendSeedHistory(
 export const FOREIGN_HISTORY_REBASE_CONTEXT_SHARE = 0.8
 
 /**
+ * Characters per token for sizing a compaction request. Cursor counts about two
+ * per token of a coding session, half of what `estimateTokens` assumes.
+ */
+export const COMPACTION_CHARS_PER_TOKEN = 1.75
+
+/**
  * A foreign-history rebase replays the full host history. When that cannot fit,
  * fail before opening a Run with an error hosts classify as context overflow
  * (HTTP 413 + "prompt is too long"), so the host compacts and retries.
+ *
+ * Cursor does not reject an oversized message but cuts it, so a compaction Run
+ * over the window summarizes without its history or the template. It fails as
+ * payload too large instead (HTTP 413 without an overflow phrase), which
+ * OpenCode 2 answers by resending the history as a shorter transcript.
  */
 export function assertForeignHistoryRebaseFits(input: {
   modelInfo: ModelInfo | undefined
@@ -8548,6 +8561,7 @@ export function assertForeignHistoryRebaseFits(input: {
   history: SeedHistoryMessage[]
   systemPrompt: string | undefined
   userText: string
+  isCompaction?: boolean
 }): void {
   const documented = getDocumentedCursorModelContext(input.cursorModelId)
   // Max mode does not imply the model's largest tier: Opus 300k Fast is a
@@ -8561,9 +8575,23 @@ export function assertForeignHistoryRebaseFits(input: {
   const chars = input.history.reduce((sum, message) => sum + message.content.length, 0)
     + (input.systemPrompt?.length ?? 0)
     + input.userText.length
-  const tokens = estimateTokens(chars)
+  const tokens = input.isCompaction ? Math.ceil(chars / COMPACTION_CHARS_PER_TOKEN) : estimateTokens(chars)
   const budget = Math.floor(limit * FOREIGN_HISTORY_REBASE_CONTEXT_SHARE)
   if (tokens <= budget) return
+  if (input.isCompaction) {
+    trace(
+      `compaction request too large: model=${input.cursorModelId} estimatedTokens=${tokens} ` +
+        `budget=${budget} limit=${limit} → requesting a smaller compaction request`,
+    )
+    throw new APICallError({
+      message: `request too large: this compaction request needs ~${tokens} tokens, over ${budget} of the ` +
+        `${limit}-token Cursor window`,
+      url: "cursor://agent.v1.AgentService/Run",
+      requestBodyValues: {},
+      statusCode: 413,
+      isRetryable: false,
+    })
+  }
   trace(
     `foreign-history rebase too large: model=${input.cursorModelId} estimatedTokens=${tokens} ` +
       `budget=${budget} limit=${limit} → requesting host compaction`,

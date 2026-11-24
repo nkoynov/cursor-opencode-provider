@@ -346,6 +346,28 @@ describe("foreign-history rebase", () => {
     expect((thrown as APICallError).message).toMatch(/prompt is too long/i)
   })
 
+  it("sizes a compaction request as Cursor counts it and rejects it as too large, not as a context overflow", () => {
+    const input = {
+      modelInfo: { id: "m", maxContext: 1_000, variants: [] },
+      cursorModelId: "m",
+      maxMode: false,
+      history: [{ role: "user" as const, content: "x".repeat(2_000) }],
+      systemPrompt: undefined,
+      userText: "Summarize",
+    }
+    expect(() => assertForeignHistoryRebaseFits(input)).not.toThrow()
+    let thrown: unknown
+    try {
+      assertForeignHistoryRebaseFits({ ...input, isCompaction: true })
+    } catch (error) {
+      thrown = error
+    }
+    expect(APICallError.isInstance(thrown)).toBe(true)
+    expect((thrown as APICallError).statusCode).toBe(413)
+    expect((thrown as APICallError).message).toMatch(/^request too large: /)
+    expect((thrown as APICallError).message).not.toMatch(/prompt is too long|context length|too many tokens/i)
+  })
+
   it("uses the long-context window in max mode", () => {
     expect(() => assertForeignHistoryRebaseFits({
       modelInfo: { id: "m", maxContext: 1_000, maxContextForMaxMode: 100_000, variants: [] },
