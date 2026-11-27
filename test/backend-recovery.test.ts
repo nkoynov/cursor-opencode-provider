@@ -687,7 +687,7 @@ describe("capacity failures", () => {
         { frame: heartbeat(), afterMs: 35 },
         { frame: end, afterMs: 35 },
       ], slowIdle)
-    const triggerWords = /unavailable|exhausted|at capacity|try again|overloaded/i
+    const triggerWords = /unavailable|exhausted|at capacity|try again|overloaded|network[-_\s]error/i
 
     const cases: Array<[string, () => Frame, string]> = [
       ["Cursor's network error", networkError, "resource_exhausted"],
@@ -726,7 +726,8 @@ describe("capacity failures", () => {
         recover: async () => lateFailure("titled-again", networkError()),
       }).catch((error: unknown) => error)
       const host = hostFacingError(failure, { modelId: "gemini-4-neon" }) as Error
-      expect(host.message).toMatch(/\(Cursor: N\u2060?etwork Error\)/)
+      expect(host.message).toMatch(/\(Cursor: N\u2060etwork Error\)/)
+      expect((failure as Error).message).toMatch(/\(Cursor: N\u2060etwork Error\)/)
       expect(host.message).not.toMatch(/capacity|in a moment/i)
     })
 
@@ -775,10 +776,14 @@ describe("capacity failures", () => {
     })
 
     it("still counts a late failure that follows Cursor's step_completed", async () => {
-      const stepThenError = (id: string) => lateFailure(id, networkError(), [
+      const stepThenError = (id: string) => fakeSession(id, [
+        { frame: text("thinking") },
         { frame: checkpoint([0x0a, 0x01, 0x07]) },
-        { frame: frame({ interaction_update: { step_completed: { step_id: 1, step_duration_ms: 100 } } }), afterMs: 35 },
-      ])
+        { frame: heartbeat(), afterMs: 35 },
+        { frame: heartbeat(), afterMs: 35 },
+        { frame: frame({ interaction_update: { step_completed: { step_id: 1, step_duration_ms: 100 } } }) },
+        { frame: networkError() },
+      ], slowIdle)
       let recoveries = 0
       const failure = await pumpWithRecovery({
         initialSession: stepThenError("step-done"),

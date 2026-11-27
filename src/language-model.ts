@@ -2182,7 +2182,7 @@ export async function pumpWithRecovery(input: {
         // Fork: one retry, since another would likely stream as long and fail at the same point.
         retryBudget.lateFailures = (retryBudget.lateFailures ?? 0) + 1
         trace(`Run failed late: sessionId=${pumpedSession.sessionId} lateFailures=${retryBudget.lateFailures} ` +
-          `streamedMs=${streamedMs} code=${failure.code}${retryBudget.lateFailures >= 2 ? " — ending the turn" : ""}`)
+          `streamedMs=${streamedMs} code=${failure.code ?? failure.statusCode ?? failure.grpcStatus}${retryBudget.lateFailures >= 2 ? " — ending the turn" : ""}`)
         if (retryBudget.lateFailures >= 2) throw new CursorLateFailureError(failure, streamedMs)
       }
       const capacity = isCapacityFailure(failure)
