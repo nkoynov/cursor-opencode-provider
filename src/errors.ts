@@ -657,7 +657,7 @@ export class CursorLateFailureError extends CursorProviderError {
     const title = cause.cursorDetails?.title
     super(
       `Cursor Run stopped: Cursor ended the step with an error ${Math.round(streamedMs / 1_000)} s into it, ` +
-        `for the second time (${title ? `Cursor: ${title}` : sanitizeHostTerminalMessage(cause.message)}). ` +
+        `for the second time (${sanitizeHostTerminalMessage(title ? `Cursor: ${title}` : cause.message)}). ` +
         "The same step would likely fail at the same point again: ask for the work in smaller steps. " +
         "A message such as \"continue\" resumes the same step from the last saved state",
       {
