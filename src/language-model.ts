@@ -2175,9 +2175,13 @@ export async function pumpWithRecovery(input: {
       if (!failure.transient) throw failure
       // A Cursor-side wait or tool call before the failure is not part of the step that failed.
       const streamedMs = Date.now() - Math.max(pumpStartedAt, pumpedSession.stepActivityAt ?? 0)
-      if (failure.origin === "server" && streamedMs >= (retryPolicy.lateFailureMs ?? LATE_FAILURE_MS)) {
+      // A failure during Cursor's own AwaitShell wait is not a step that generated for minutes.
+      if (failure.origin === "server" && !pumpedSession.cursorWaits?.size
+        && streamedMs >= (retryPolicy.lateFailureMs ?? LATE_FAILURE_MS)) {
         // Fork: one retry, since another would likely stream as long and fail at the same point.
-        retryBudget.lateFailures = (retryBudget.lateFailures ?? 0) + 1
+        // A step Cursor finished earlier in this pass makes this the first late failure of a new step.
+        const progressed = (pumpedSession.stepActivityAt ?? 0) >= pumpStartedAt
+        retryBudget.lateFailures = (progressed ? 0 : retryBudget.lateFailures ?? 0) + 1
         if (retryBudget.lateFailures >= 2) {
           trace(`Run failed late again: sessionId=${pumpedSession.sessionId} lateFailures=${retryBudget.lateFailures} ` +
             `streamedMs=${streamedMs} code=${failure.code} — ending the turn`)
@@ -3450,6 +3454,7 @@ async function startSession(
     await replaceRun(freshToken, reqBytes, "progress-only continuation Run", nextRunId, signal)
     session.resumedFromCheckpoint = conversationState
     session.checkpointAcceptedAt = undefined
+    session.stepActivityAt = Date.now()
   }
 
   callOptions.abortSignal?.addEventListener("abort", () => {

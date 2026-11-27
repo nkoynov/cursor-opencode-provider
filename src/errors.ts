@@ -653,11 +653,13 @@ export function noProgressResumeError(cause: CursorProviderError, resumes: numbe
 /** Fork: Cursor failed a step late in its stream for the second time since the host last received a step. */
 export class CursorLateFailureError extends CursorProviderError {
   constructor(cause: CursorProviderError, streamedMs: number) {
+    // Cursor's own detail says to try again, which is what failed.
+    const title = cause.cursorDetails?.title
     super(
       `Cursor Run stopped: Cursor ended the step with an error ${Math.round(streamedMs / 1_000)} s into it, ` +
-        `for the second time (${sanitizeHostTerminalMessage(cause.message)}). Another attempt would likely fail ` +
-        "the same way. Ask for the work in smaller steps, or send a message such as \"continue\" to resume from " +
-        "the last saved state",
+        `for the second time (${title ? `Cursor: ${title}` : sanitizeHostTerminalMessage(cause.message)}). ` +
+        "The same step would likely fail at the same point again: ask for the work in smaller steps. " +
+        "A message such as \"continue\" resumes the same step from the last saved state",
       {
         origin: cause.origin,
         transient: false,
@@ -671,6 +673,7 @@ export class CursorLateFailureError extends CursorProviderError {
         cause,
       },
     )
+    this.name = "CursorLateFailureError"
   }
 }
 
