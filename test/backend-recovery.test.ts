@@ -9,9 +9,11 @@ import {
 import { encodeMessage } from "../src/protocol/messages.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import {
+  CursorLateFailureError,
   CursorRetryExhaustedError,
   CursorServerError,
   CursorTransportError,
+  hostFacingError,
   isCapacityFailure,
 } from "../src/errors.js"
 import { newRetryBudget } from "../src/retry-budget.js"
@@ -649,34 +651,150 @@ describe("capacity failures", () => {
   describe("late failures", () => {
     const LATE_MS = 50
     const policy = { baseDelayMs: 0, maxDelayMs: 0, capacityMaxAttempts: 6, lateFailureMs: LATE_MS }
-    const lateFailure = (id: string, code: string) => fakeSession(id, [
-      { frame: text("thinking") },
-      { frame: checkpoint([0x0a, 0x01, 0x07]) },
-      { frame: heartbeat(), afterMs: 35 },
-      { frame: endStreamError(code), afterMs: 35 },
-    ])
+    const slowIdle = { policy: { semanticIdleMs: 1_000, hardCapMs: 600_000, heartbeatMs: 5 } }
+    const endStreamBody = (error: Record<string, unknown>): Frame => ({
+      flags: 0x02,
+      payload: new TextEncoder().encode(JSON.stringify({ error })),
+    })
+    // Cursor's end-stream error of 2026-11-26 (debug-2346521.log), byte for byte.
+    const networkError = () => endStreamBody({
+      code: "resource_exhausted",
+      message: "Error",
+      details: [{
+        type: "aiserver.v1.ErrorDetails",
+        debug: {
+          error: "ERROR_NETWORK_ERROR",
+          details: {
+            title: "Network Error",
+            detail: "We're having trouble connecting to the model provider. This might be temporary - please try again in a moment.",
+            isRetryable: true,
+          },
+          isExpected: true,
+        },
+        value: "CDgSgQEKDU5ldHdvcmsgRXJyb3ISbldlJ3JlIGhhdmluZyB0cm91YmxlIGNvbm5lY3RpbmcgdG8gdGhlIG1vZGVsIHByb3ZpZGVyLiBUaGlzIG1pZ2h0IGJlIHRlbXBvcmFyeSAtIHBsZWFzZSB0cnkgYWdhaW4gaW4gYSBtb21lbnQuIAEYAQ",
+      }],
+    })
+    const providerError = () => endStreamBody({
+      code: "internal",
+      message: "Error",
+      details: [{ type: "aiserver.v1.ErrorDetails", value: "CDk=" }],
+    })
+    const lateFailure = (id: string, end: Frame, opening: TimedFrame[] = [{ frame: checkpoint([0x0a, 0x01, 0x07]) }]) =>
+      fakeSession(id, [
+        { frame: text("thinking") },
+        ...opening,
+        { frame: heartbeat(), afterMs: 35 },
+        { frame: end, afterMs: 35 },
+      ], slowIdle)
+    const triggerWords = /unavailable|exhausted|at capacity|try again|overloaded/i
 
-    for (const code of ["internal", "resource_exhausted"]) {
-      it(`ends the turn at a second ${code} Cursor sends late in the stream`, async () => {
+    const cases: Array<[string, () => Frame, string]> = [
+      ["Cursor's network error", networkError, "resource_exhausted"],
+      ["an internal error", () => endStreamError("internal"), "internal"],
+      ["a capacity refusal", () => endStreamError("resource_exhausted"), "resource_exhausted"],
+      ["a model provider error", providerError, "internal"],
+    ]
+    for (const [name, end, code] of cases) {
+      it(`ends the turn at the second late ${name}, and says why`, async () => {
         let recoveries = 0
         const failure = await pumpWithRecovery({
-          initialSession: lateFailure("late", code),
+          initialSession: lateFailure("late", end()),
           controller: controller(),
           retryPolicy: policy,
-          recover: async () => lateFailure(`late-${++recoveries}`, code),
+          recover: async () => lateFailure(`late-${++recoveries}`, end()),
         }).catch((error: unknown) => error)
         expect(recoveries).toBe(1)
+        expect(failure).toBeInstanceOf(CursorLateFailureError)
         expect(failure).toMatchObject({ code, transient: false, retryable: false })
-        const message = (failure as Error).message
-        expect(message).toContain("the second time in a row")
-        expect(message).not.toMatch(/unavailable|exhausted|at capacity|try again|overloaded/i)
+        expect((failure as Error).message).not.toMatch(triggerWords)
+        const host = hostFacingError(failure, { modelId: "gemini-4-neon" }) as Error
+        expect(host.message).toContain("for the second time")
+        expect(host.message).toContain("smaller steps")
+        expect(host.message).not.toMatch(triggerWords)
       })
     }
+
+    it("counts late failures across the host's retry of the turn", async () => {
+      const retryBudget = newRetryBudget()
+      const noCheckpoint = (id: string) => lateFailure(id, networkError(), [])
+      await expect(pumpWithRecovery({
+        initialSession: noCheckpoint("host-first"),
+        controller: controller(),
+        retryPolicy: policy,
+        retryBudget,
+        recover: async () => fakeSession("unused", [{ frame: turnEnded() }]),
+      })).rejects.toMatchObject({ hostRetryable: true })
+      let recoveries = 0
+      const failure = await pumpWithRecovery({
+        initialSession: noCheckpoint("host-retry"),
+        controller: controller(),
+        retryPolicy: policy,
+        retryBudget,
+        recover: async () => {
+          recoveries++
+          return fakeSession("unused", [{ frame: turnEnded() }])
+        },
+      }).catch((error: unknown) => error)
+      expect(recoveries).toBe(0)
+      expect(failure).toBeInstanceOf(CursorLateFailureError)
+    })
+
+    it("keeps counting across an early failure between two late ones", async () => {
+      let recoveries = 0
+      const failure = await pumpWithRecovery({
+        initialSession: lateFailure("late", networkError()),
+        controller: controller(),
+        retryPolicy: policy,
+        recover: async () => ++recoveries === 1
+          ? fakeSession("early", [{ frame: endStreamError("internal") }])
+          : lateFailure("late-again", networkError()),
+      }).catch((error: unknown) => error)
+      expect(recoveries).toBe(2)
+      expect(failure).toBeInstanceOf(CursorLateFailureError)
+    })
+
+    it("does not count a Cursor-side wait or tool call before the failure", async () => {
+      const afterWait = (id: string) => fakeSession(id, [
+        { frame: awaitStarted("w1", 10_000) },
+        { frame: heartbeat(), afterMs: 35 },
+        { frame: awaitCompleted("w1"), afterMs: 35 },
+        { frame: checkpoint([0x0a, 0x01, 0x08]) },
+        { frame: endStreamError("internal") },
+      ], slowIdle)
+      let recoveries = 0
+      const final = await pumpWithRecovery({
+        initialSession: afterWait("wait"),
+        controller: controller(),
+        retryPolicy: policy,
+        recover: async () => ++recoveries < 3 ? afterWait(`wait-${recoveries}`) : fakeSession("served", [{ frame: turnEnded() }]),
+      })
+      expect(final.sessionId).toBe("served")
+      expect(recoveries).toBe(3)
+    })
+
+    it("still ends the turn at the second late failure in endless retry mode", async () => {
+      const saved = process.env.CURSOR_ENDLESS_RETRIES
+      process.env.CURSOR_ENDLESS_RETRIES = "1"
+      try {
+        let recoveries = 0
+        const failure = await pumpWithRecovery({
+          initialSession: lateFailure("endless-late", networkError()),
+          controller: controller(),
+          retryPolicy: policy,
+          recover: async () => lateFailure(`endless-late-${++recoveries}`, networkError()),
+        }).catch((error: unknown) => error)
+        expect(recoveries).toBe(1)
+        expect(failure).toBeInstanceOf(CursorLateFailureError)
+      } finally {
+        if (saved === undefined) delete process.env.CURSOR_ENDLESS_RETRIES
+        else process.env.CURSOR_ENDLESS_RETRIES = saved
+      }
+    })
 
     it("still retries the first late failure", async () => {
       const recoveries: CursorRunRecovery[] = []
       const final = await pumpWithRecovery({
-        initialSession: lateFailure("late-once", "internal"),
+        initialSession: lateFailure("late-once", networkError()),
         controller: controller(),
         retryPolicy: policy,
         recover: async (recovery) => {
@@ -726,7 +844,7 @@ describe("capacity failures", () => {
       let recoveries = 0
       for (const step of ["first", "second"]) {
         const final = await pumpWithRecovery({
-          initialSession: lateFailure(step, "internal"),
+          initialSession: lateFailure(step, networkError()),
           controller: controller(),
           retryPolicy: policy,
           retryBudget,

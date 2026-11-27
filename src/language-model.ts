@@ -330,7 +330,7 @@ import {
   isCapacityFailure,
   isRejectedCredentialError,
   isTransientGrpcStatus,
-  lateFailureRepeatedError,
+  CursorLateFailureError,
   noProgressResumeError,
   retrySuppressedError,
   toCursorProviderError,
@@ -2112,6 +2112,7 @@ export async function pumpWithRecovery(input: {
         pumpedSession.resendRunRequest = undefined
       }
       if (!pumpedSession.closeError) noteStepCompleted(retryBudget)
+      retryBudget.lateFailures = undefined
       if (pumpedSession.closed && pumpedSession.pending.size === 0) {
         forgetRetryBudget(pumpedSession.openCodeSessionId, retryBudget)
       }
@@ -2172,14 +2173,15 @@ export async function pumpWithRecovery(input: {
         continue
       }
       if (!failure.transient) throw failure
-      const streamedMs = Date.now() - pumpStartedAt
+      // A Cursor-side wait or tool call before the failure is not part of the step that failed.
+      const streamedMs = Date.now() - Math.max(pumpStartedAt, pumpedSession.stepActivityAt ?? 0)
       if (failure.origin === "server" && streamedMs >= (retryPolicy.lateFailureMs ?? LATE_FAILURE_MS)) {
         // Fork: one retry, since another would likely stream as long and fail at the same point.
         retryBudget.lateFailures = (retryBudget.lateFailures ?? 0) + 1
         if (retryBudget.lateFailures >= 2) {
           trace(`Run failed late again: sessionId=${pumpedSession.sessionId} lateFailures=${retryBudget.lateFailures} ` +
             `streamedMs=${streamedMs} code=${failure.code} — ending the turn`)
-          throw lateFailureRepeatedError(failure, streamedMs)
+          throw new CursorLateFailureError(failure, streamedMs)
         }
       }
       const capacity = isCapacityFailure(failure)
@@ -7496,6 +7498,7 @@ export async function pump(
           `hostCalls=${toolStep.hostCalls}`,
       )
     } else if (iu?.tool_call_completed) {
+      session.stepActivityAt = Date.now()
       const completed = iu.tool_call_completed as Record<string, unknown>
       const callId = typeof completed.call_id === "string" ? completed.call_id : ""
       // Only a call no exec has claimed completes here; Cursor also closes the
@@ -7629,6 +7632,7 @@ export async function pump(
       startOrderedStep(session.stepOrder)
       cacheDiagnostics.stepStarts++
     } else if (iu?.step_completed) {
+      session.stepActivityAt = Date.now()
       cacheDiagnostics.stepCompletes++
       session.announcedCallIds?.clear()
     } else if (iu?.context_injection_state) {

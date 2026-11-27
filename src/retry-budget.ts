@@ -8,7 +8,7 @@ export type RetryBudget = {
   retries: number
   /** Fork: capacity retries, outside the CLI counts but under an explicit maxAttempts. */
   capacity?: number
-  /** Fork: failures Cursor sent late in a pass, since the last completed step. */
+  /** Fork: failures Cursor sent late in a step, since the host last received a step. */
   lateFailures?: number
   stallStartedAt?: number
   /** A plain-text host continuation is admitted only after we requested a host retry. */
@@ -102,7 +102,6 @@ export function noteRunFailure(budget: RetryBudget, failure: CursorProviderError
  */
 export function noteStepCompleted(budget: RetryBudget): void {
   budget.stallStartedAt = undefined
-  budget.lateFailures = undefined
 }
 
 /** Reserve one retry before either reopening locally or handing it to OpenCode. */
