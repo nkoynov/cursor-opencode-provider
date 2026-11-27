@@ -228,7 +228,7 @@ export type CursorSession = {
   resumedFromCheckpoint?: Uint8Array
   /** When this Run attempt last accepted a checkpoint other than the one it resumed from (epoch ms). */
   checkpointAcceptedAt?: number
-  /** Fork: when Cursor last completed a step or a tool call in this Run (epoch ms). */
+  /** Fork: when Cursor last completed a tool call in this Run, or a follow-up Run opened (epoch ms). */
   stepActivityAt?: number
   /**
    * This Run asked the host for something, or the provider answered a query, since its last

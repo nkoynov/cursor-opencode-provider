@@ -2173,20 +2173,17 @@ export async function pumpWithRecovery(input: {
         continue
       }
       if (!failure.transient) throw failure
-      // A Cursor-side wait or tool call before the failure is not part of the step that failed.
+      // Fork: a Cursor-side tool call this pass finished moved the Run on to a new step.
+      if ((pumpedSession.stepActivityAt ?? 0) >= pumpStartedAt) retryBudget.lateFailures = undefined
       const streamedMs = Date.now() - Math.max(pumpStartedAt, pumpedSession.stepActivityAt ?? 0)
       // A failure during Cursor's own AwaitShell wait is not a step that generated for minutes.
       if (failure.origin === "server" && !pumpedSession.cursorWaits?.size
         && streamedMs >= (retryPolicy.lateFailureMs ?? LATE_FAILURE_MS)) {
         // Fork: one retry, since another would likely stream as long and fail at the same point.
-        // A step Cursor finished earlier in this pass makes this the first late failure of a new step.
-        const progressed = (pumpedSession.stepActivityAt ?? 0) >= pumpStartedAt
-        retryBudget.lateFailures = (progressed ? 0 : retryBudget.lateFailures ?? 0) + 1
-        if (retryBudget.lateFailures >= 2) {
-          trace(`Run failed late again: sessionId=${pumpedSession.sessionId} lateFailures=${retryBudget.lateFailures} ` +
-            `streamedMs=${streamedMs} code=${failure.code} — ending the turn`)
-          throw new CursorLateFailureError(failure, streamedMs)
-        }
+        retryBudget.lateFailures = (retryBudget.lateFailures ?? 0) + 1
+        trace(`Run failed late: sessionId=${pumpedSession.sessionId} lateFailures=${retryBudget.lateFailures} ` +
+          `streamedMs=${streamedMs} code=${failure.code}${retryBudget.lateFailures >= 2 ? " — ending the turn" : ""}`)
+        if (retryBudget.lateFailures >= 2) throw new CursorLateFailureError(failure, streamedMs)
       }
       const capacity = isCapacityFailure(failure)
       const recoveries = capacity ? capacityMaxRecoveries : maxRecoveries
@@ -7637,7 +7634,6 @@ export async function pump(
       startOrderedStep(session.stepOrder)
       cacheDiagnostics.stepStarts++
     } else if (iu?.step_completed) {
-      session.stepActivityAt = Date.now()
       cacheDiagnostics.stepCompletes++
       session.announcedCallIds?.clear()
     } else if (iu?.context_injection_state) {

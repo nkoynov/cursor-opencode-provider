@@ -396,9 +396,10 @@ including when a plugin appends recognized `<system-reminder>` or
 `<system-update>` text parts. These notes remain in the request sent to Cursor;
 attachments and ordinary follow-up text still identify a new request.
 An error Cursor sends three minutes or more into a step (counted from when the
-provider last sent the Run something or Cursor last finished a step or tool
-call in it, whichever is latest) gets one retry. A second such error with no
-step or tool call finished in between ends the turn and suggests smaller steps:
+provider last sent the Run something or Cursor last finished a tool call in
+it, whichever is latest) gets one retry. A second such error with no step
+handed to OpenCode and no tool call Cursor finished in between ends the turn
+and suggests smaller steps:
 Cursor's "Network Error" from the model provider has repeated at the same point
 of a regenerated step. Errors early in a step or during Cursor's own AwaitShell
 wait, dropped connections and stalls keep the budgets above.

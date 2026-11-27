@@ -730,12 +730,16 @@ describe("capacity failures", () => {
       expect(host.message).not.toMatch(/capacity|in a moment/i)
     })
 
+    const cursorToolDone: TimedFrame[] = [
+      { frame: text("done with the first step") },
+      { frame: awaitStarted("t1") },
+      { frame: awaitCompleted("t1") },
+      { frame: checkpoint([0x0a, 0x01, 0x09]) },
+    ]
+
     it("gives a late failure of a new step in the same pass its own retry", async () => {
-      const stepCompleted = frame({ interaction_update: { step_completed: { step_id: 1, step_duration_ms: 100 } } })
       const nextStepLate = fakeSession("next-step", [
-        { frame: text("done with the first step") },
-        { frame: stepCompleted },
-        { frame: checkpoint([0x0a, 0x01, 0x09]) },
+        ...cursorToolDone,
         { frame: heartbeat(), afterMs: 35 },
         { frame: networkError(), afterMs: 35 },
       ], slowIdle)
@@ -751,6 +755,39 @@ describe("capacity failures", () => {
       })
       expect(final.sessionId).toBe("served")
       expect(recoveries).toHaveLength(2)
+    })
+
+    it("gives the next step its own retry after a retry that moved on and then failed early", async () => {
+      let recoveries = 0
+      const final = await pumpWithRecovery({
+        initialSession: lateFailure("first-step", networkError()),
+        controller: controller(),
+        retryPolicy: policy,
+        recover: async () => {
+          recoveries++
+          if (recoveries === 1) return fakeSession("moved-on", [...cursorToolDone, { frame: endStreamError("internal") }], slowIdle)
+          if (recoveries === 2) return lateFailure("second-step", networkError())
+          return fakeSession("served", [{ frame: turnEnded() }])
+        },
+      })
+      expect(final.sessionId).toBe("served")
+      expect(recoveries).toBe(3)
+    })
+
+    it("still counts a late failure that follows Cursor's step_completed", async () => {
+      const stepThenError = (id: string) => lateFailure(id, networkError(), [
+        { frame: checkpoint([0x0a, 0x01, 0x07]) },
+        { frame: frame({ interaction_update: { step_completed: { step_id: 1, step_duration_ms: 100 } } }), afterMs: 35 },
+      ])
+      let recoveries = 0
+      const failure = await pumpWithRecovery({
+        initialSession: stepThenError("step-done"),
+        controller: controller(),
+        retryPolicy: policy,
+        recover: async () => stepThenError(`step-done-${++recoveries}`),
+      }).catch((error: unknown) => error)
+      expect(recoveries).toBe(1)
+      expect(failure).toBeInstanceOf(CursorLateFailureError)
     })
 
     it("counts late failures across the host's retry of the turn", async () => {
