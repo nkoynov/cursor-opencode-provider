@@ -395,6 +395,11 @@ OpenCode 2.x's interruption notices keep the same budget as the original request
 including when a plugin appends recognized `<system-reminder>` or
 `<system-update>` text parts. These notes remain in the request sent to Cursor;
 attachments and ordinary follow-up text still identify a new request.
+An error Cursor sends three minutes or more into a stream gets one retry: a
+second such error before a step completes ends the turn, since the retried step
+streamed as long and failed at the same point (Cursor's "Network Error" from the
+model provider). Errors early in a stream, dropped connections and stalls keep
+the budgets above.
 A failure that shows this computer has no usable network, because name
 resolution or routing failed before any host answered (`ENOTFOUND`, `EAI_AGAIN`,
 `ENETDOWN`, `ENETUNREACH`, `EHOSTDOWN`, `EHOSTUNREACH`, also when resolving an
@@ -459,7 +464,7 @@ new checkpoint end the turn, and consecutive semantic-stall retries stop once
 180 seconds have elapsed since the first stall retry. A non-stall failure, a step
 the host received since the window opened, or a new checkpoint the stalled Run
 saved after the window opened (not the one it was resumed from), resets that
-stall window. The setting does not override
+stall window. A second error Cursor sends late in a stream still ends the turn. The setting does not override
 OpenCode's own retry limits.
 
 ## Environment variables

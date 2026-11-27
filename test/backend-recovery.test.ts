@@ -646,6 +646,101 @@ describe("capacity failures", () => {
     expect(failure).toMatchObject({ attempts: 6 })
   })
 
+  describe("late failures", () => {
+    const LATE_MS = 50
+    const policy = { baseDelayMs: 0, maxDelayMs: 0, capacityMaxAttempts: 6, lateFailureMs: LATE_MS }
+    const lateFailure = (id: string, code: string) => fakeSession(id, [
+      { frame: text("thinking") },
+      { frame: checkpoint([0x0a, 0x01, 0x07]) },
+      { frame: heartbeat(), afterMs: 35 },
+      { frame: endStreamError(code), afterMs: 35 },
+    ])
+
+    for (const code of ["internal", "resource_exhausted"]) {
+      it(`ends the turn at a second ${code} Cursor sends late in the stream`, async () => {
+        let recoveries = 0
+        const failure = await pumpWithRecovery({
+          initialSession: lateFailure("late", code),
+          controller: controller(),
+          retryPolicy: policy,
+          recover: async () => lateFailure(`late-${++recoveries}`, code),
+        }).catch((error: unknown) => error)
+        expect(recoveries).toBe(1)
+        expect(failure).toMatchObject({ code, transient: false, retryable: false })
+        const message = (failure as Error).message
+        expect(message).toContain("the second time in a row")
+        expect(message).not.toMatch(/unavailable|exhausted|at capacity|try again|overloaded/i)
+      })
+    }
+
+    it("still retries the first late failure", async () => {
+      const recoveries: CursorRunRecovery[] = []
+      const final = await pumpWithRecovery({
+        initialSession: lateFailure("late-once", "internal"),
+        controller: controller(),
+        retryPolicy: policy,
+        recover: async (recovery) => {
+          recoveries.push(recovery)
+          return fakeSession("served", [{ frame: turnEnded() }])
+        },
+      })
+      expect(final.sessionId).toBe("served")
+      expect(recoveries.map((recovery) => recovery.kind)).toEqual(["resume"])
+    })
+
+    it("keeps every retry for failures Cursor sends early in the stream", async () => {
+      let recoveries = 0
+      const failure = await pumpWithRecovery({
+        initialSession: fakeSession("early", [{ frame: endStreamError("internal") }]),
+        controller: controller(),
+        retryPolicy: { ...policy, lateFailureMs: 60_000 },
+        recover: async () => fakeSession(`early-${++recoveries}`, [{ frame: endStreamError("internal") }]),
+      }).catch((error: unknown) => error)
+      expect(recoveries).toBe(3)
+      expect((failure as Error).message).toStartWith("Cursor Run failed after 4 attempts")
+    })
+
+    it("keeps every retry for a connection that drops late in the stream", async () => {
+      const dropped = (id: string) => fakeSession(id, [], {
+        policy: { semanticIdleMs: 1_000, hardCapMs: 600_000, heartbeatMs: 5 },
+        frames: {
+          next: async () => {
+            await new Promise((resolve) => setTimeout(resolve, LATE_MS + 20))
+            throw new CursorTransportError("stream reset", { transient: true, replaySafe: true, code: "ERR_HTTP2_STREAM_CANCEL" })
+          },
+        },
+      })
+      let recoveries = 0
+      const final = await pumpWithRecovery({
+        initialSession: dropped("dropped"),
+        controller: controller(),
+        retryPolicy: policy,
+        recover: async () => ++recoveries < 3 ? dropped(`dropped-${recoveries}`) : fakeSession("served", [{ frame: turnEnded() }]),
+      })
+      expect(final.sessionId).toBe("served")
+      expect(recoveries).toBe(3)
+    })
+
+    it("gives a late failure its retry again after a completed step", async () => {
+      const retryBudget = newRetryBudget()
+      let recoveries = 0
+      for (const step of ["first", "second"]) {
+        const final = await pumpWithRecovery({
+          initialSession: lateFailure(step, "internal"),
+          controller: controller(),
+          retryPolicy: policy,
+          retryBudget,
+          recover: async () => {
+            recoveries++
+            return fakeSession(`${step}-served`, [{ frame: turnEnded() }])
+          },
+        })
+        expect(final.sessionId).toBe(`${step}-served`)
+      }
+      expect(recoveries).toBe(2)
+    })
+  })
+
   it("keeps retrying capacity refusals in endless retry mode", async () => {
     const saved = process.env.CURSOR_ENDLESS_RETRIES
     process.env.CURSOR_ENDLESS_RETRIES = "1"

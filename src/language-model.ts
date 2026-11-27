@@ -330,6 +330,7 @@ import {
   isCapacityFailure,
   isRejectedCredentialError,
   isTransientGrpcStatus,
+  lateFailureRepeatedError,
   noProgressResumeError,
   retrySuppressedError,
   toCursorProviderError,
@@ -517,6 +518,8 @@ const MAX_RETRY_DELAY_MS = 30_000
 const DEFAULT_CAPACITY_MAX_ATTEMPTS = 6
 /** Capacity retries start this many times `baseDelayMs` above the normal backoff. */
 const CAPACITY_DELAY_FACTOR = 4
+/** Fork: a failure Cursor sends this far into one pass tends to recur at the same point of the regenerated step. */
+const LATE_FAILURE_MS = 180_000
 const RUN_REQUEST_DECODE_FAILED = "CURSOR_RUN_REQUEST_DECODE_FAILED"
 const RUN_REQUEST_UNSUPPORTED = "CURSOR_RUN_REQUEST_UNSUPPORTED"
 const RUN_REPLY_FAILED = "CURSOR_RUN_REPLY_FAILED"
@@ -601,6 +604,8 @@ export type CursorRetryPolicy = {
   maxDelayMs: number
   /** Total attempts when Cursor refuses the Run for capacity. Default: `maxAttempts`. */
   capacityMaxAttempts?: number
+  /** Fork: a failure Cursor sends this long into a pass is late. Default: `LATE_FAILURE_MS`. */
+  lateFailureMs?: number
 }
 
 function retryInteger(name: string, value: unknown, fallback: number): number {
@@ -2167,6 +2172,16 @@ export async function pumpWithRecovery(input: {
         continue
       }
       if (!failure.transient) throw failure
+      const streamedMs = Date.now() - pumpStartedAt
+      if (failure.origin === "server" && streamedMs >= (retryPolicy.lateFailureMs ?? LATE_FAILURE_MS)) {
+        // Fork: one retry, since another would likely stream as long and fail at the same point.
+        retryBudget.lateFailures = (retryBudget.lateFailures ?? 0) + 1
+        if (retryBudget.lateFailures >= 2) {
+          trace(`Run failed late again: sessionId=${pumpedSession.sessionId} lateFailures=${retryBudget.lateFailures} ` +
+            `streamedMs=${streamedMs} code=${failure.code} — ending the turn`)
+          throw lateFailureRepeatedError(failure, streamedMs)
+        }
+      }
       const capacity = isCapacityFailure(failure)
       const recoveries = capacity ? capacityMaxRecoveries : maxRecoveries
       if (!pumpedSession.resumeCheckpoint && !pumpedSession.checkpointRevoked && !pumpedSession.resultsAfterCheckpoint

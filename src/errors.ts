@@ -649,6 +649,28 @@ export function noProgressResumeError(cause: CursorProviderError, resumes: numbe
   )
 }
 
+/** Fork: Cursor failed the step late in the stream twice in a row. */
+export function lateFailureRepeatedError(cause: CursorProviderError, streamedMs: number): CursorProviderError {
+  return new CursorProviderError(
+    `Cursor Run stopped: Cursor ended the step with an error after ${Math.round(streamedMs / 1_000)} s ` +
+      `of streaming, the second time in a row (${sanitizeHostTerminalMessage(cause.message)}). Another attempt ` +
+      `would likely stream as long and fail the same way. Send a message such as "continue" to resume from the ` +
+      "last saved state, or split the work into smaller steps",
+    {
+      origin: cause.origin,
+      transient: false,
+      replaySafe: false,
+      retryable: false,
+      statusCode: cause.statusCode,
+      grpcStatus: cause.grpcStatus,
+      rstCode: cause.rstCode,
+      code: cause.code,
+      retryAfterMs: cause.retryAfterMs,
+      cause,
+    },
+  )
+}
+
 export function retrySuppressedError(
   cause: CursorProviderError,
   reason: string,
